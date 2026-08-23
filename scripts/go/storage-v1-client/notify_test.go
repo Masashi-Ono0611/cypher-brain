@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +18,13 @@ func TestParseNotifyFlagsHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(p.providerPubkey) != 32 {
-		t.Fatalf("providerPubkey length = %d, want 32", len(p.providerPubkey))
+	// Codex review suggestion: assert the exact decoded bytes, not just the
+	// length — locks in that --provider-pubkey is consumed as raw key bytes
+	// (parseHex32), not routed through any address-shaped parsing that could
+	// reintroduce the address/pubkey conflation this fix removes.
+	wantPubkey := bytes.Repeat([]byte{0xbb}, 32)
+	if !bytes.Equal(p.providerPubkey, wantPubkey) {
+		t.Fatalf("providerPubkey = %x, want %x", p.providerPubkey, wantPubkey)
 	}
 	if p.byteToProof != 42 {
 		t.Fatalf("byteToProof = %d, want 42", p.byteToProof)
