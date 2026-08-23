@@ -101,7 +101,7 @@ func parseNotifyFlags(args []string) (*notifyParams, error) {
 	providerPubkeyRaw := fs.String("provider-pubkey", "", "provider's ADNL/Ed25519 public key, 64 hex chars — mytonprovider.org's registry 'pubkey' field, NOT its 'address' field (required)")
 	contractRaw := fs.String("contract", "", "deployed StorageV1 contract address (required)")
 	byteToProofRaw := fs.Uint64("byte-to-proof", 0, "byte offset to ask the provider to prove")
-	timeoutSeconds := fs.Uint64("timeout", 20, "ADNL/DHT operation timeout, in seconds")
+	timeoutSeconds := fs.Uint64("timeout", uint64(defaultNotifyTimeout/time.Second), "ADNL/DHT operation timeout, in seconds")
 	mainnet := fs.Bool("mainnet", false, "opt in to mainnet")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -143,6 +143,7 @@ func parseNotifyFlags(args []string) (*notifyParams, error) {
 func runNotify(ctx context.Context, args []string, stdout io.Writer) error {
 	p, err := parseNotifyFlags(args)
 	if errIsHelp(err) {
+		fmt.Fprint(stdout, helpText)
 		return nil
 	}
 	if err != nil {

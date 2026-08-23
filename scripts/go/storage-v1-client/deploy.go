@@ -21,7 +21,7 @@ type deployParams struct {
 	dataSizeBytes uint64
 	pieceSize     uint32
 	owner         *address.Address
-	provider      *address.Address // workchain 0; Data() doubles as the provider's ADNL pubkey
+	provider      *address.Address // workchain 0; the provider's TON wallet address — NOT its ADNL pubkey (see notify.go/main.go field notes)
 	rateNanoPerMB uint64
 	spanDays      uint64
 	maxSpendNano  *big.Int
@@ -271,6 +271,7 @@ func resolveDeployParams(ctx context.Context, f *deployFlags) (*deployParams, er
 func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 	f, err := parseDeployFlagSet(args)
 	if errIsHelp(err) {
+		fmt.Fprint(stdout, helpText)
 		return nil
 	}
 	if err != nil {
@@ -322,8 +323,11 @@ func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "  storage-v1-client status --contract %s%s\n", res.contractAddr.StringRaw(), statusFlag)
 	fmt.Fprintln(stdout, "then tell the provider it exists with:")
-	fmt.Fprintf(stdout, "  storage-v1-client notify --provider %s --contract %s%s\n",
-		p.provider.StringRaw(), res.contractAddr.StringRaw(), statusFlag)
+	fmt.Fprintf(stdout, "  storage-v1-client notify --provider-pubkey <64hex> --contract %s%s\n",
+		res.contractAddr.StringRaw(), statusFlag)
+	fmt.Fprintln(stdout, "  (--provider-pubkey is the provider's ADNL/Ed25519 public key — mytonprovider.org's")
+	fmt.Fprintln(stdout, "  registry 'pubkey' field. This is NOT the --provider address used above; deploy")
+	fmt.Fprintln(stdout, "  never sees the pubkey, so it cannot fill this in for you — see main.go field notes.)")
 	return nil
 }
 

@@ -89,10 +89,16 @@
 //     program does not call the registry itself (kept out of scope — see
 //     --help); the operator resolves the rate externally and passes it in.
 //
-// THIS PROGRAM NEVER TOUCHES A PRIVATE KEY. `deploy` only prints a Tonkeeper
-// deeplink for a human to review and sign. `notify` and `status` are
-// read-only network calls (ADNL query / HTTP GET respectively) that move no
-// funds.
+// THIS PROGRAM NEVER TOUCHES YOUR WALLET'S PRIVATE KEY. `deploy` only prints
+// a Tonkeeper deeplink for a human to review and sign — no funds move without
+// that signature. `notify` and `status` move no funds either, but are not
+// otherwise both "read-only": `status` is a plain read-only HTTP GET;
+// `notify` generates its own ephemeral, throwaway Ed25519 keypair (used only
+// to open an ADNL/RLDP session — it is not your wallet key, is never
+// persisted, and is discarded when the process exits) and sends a real
+// request that a live provider daemon acts on (it starts downloading/
+// checking the bag) — a genuine remote side effect, even though it costs no
+// TON and needs no signature.
 package main
 
 import (
@@ -107,9 +113,11 @@ Storage Go/StorageV1 provider market (registry: mytonprovider.org).
 
 This is NOT a cypher-brain CLI feature — see the top-of-file comment in
 main.go for what it is, what it is ported from, and its field notes.
-It never touches a private key: 'deploy' prints a Tonkeeper transfer deeplink
-for a human to review and sign; 'notify' and 'status' are read-only network
-calls that move no funds.
+It never touches your wallet's private key: 'deploy' prints a Tonkeeper
+transfer deeplink for a human to review and sign. 'status' is a read-only
+network call; 'notify' moves no funds and needs no signature, but is NOT
+read-only — it sends a real ADNL request a live provider daemon acts on (see
+the top-of-file comment for detail on its own throwaway session key).
 
 Usage:
   storage-v1-client deploy --bag-id <64hex> --provider <raw-addr> \
