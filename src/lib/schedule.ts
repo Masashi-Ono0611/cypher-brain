@@ -43,6 +43,7 @@ import {
 import { exists } from './util.js';
 import { printJson } from './ui.js';
 import { assertExportRequiresO2bProfile } from './profiles.js';
+import { tonWalletConfigured } from './wallet.js';
 import type { CliOptions } from './types.js';
 
 // LABEL/CRON_MARKER are scoped to CYPHER_BRAIN_HOME (#114) so a second `install` under a
@@ -71,7 +72,22 @@ const SNAPS_DIR = join(SCHEDULE_DIR, 'snapshots');
 const PLIST = join(LAUNCHD_DIR, `${LABEL}.plist`);
 const CRON_ENTRY_FILE = join(SCHEDULE_DIR, 'cron.entry'); // Linux: the exact registered line, kept as an artifact for status/uninstall
 
-const BACKENDS = new Set(['file', 'arweave', 'turbo']); // rclone, ton, and ton-provider (#396) are excluded from unattended scheduling: rclone/ton need operator-side setup a launchd/cron job can't collect, and ton-provider additionally requires a human to sign a Tonkeeper deeplink mid-push, which an unattended run has no way to wait for
+// rclone and the self-hosted `ton` backend stay excluded from unattended scheduling —
+// both need operator-side setup (--remote / a configured seeder box) a launchd/cron job
+// can't collect. `ton-provider` used to be excluded too, for the separate reason that
+// every deploy needed a HUMAN to sign a Tonkeeper deeplink mid-push, something an
+// unattended run has no way to wait for. PR2 (issue #396) added a local TON wallet
+// (wallet.ts's `wallet create --chain ton`) that lets put() auto-sign instead — so this
+// is now computed FRESH at each `schedule install` call (not a frozen module constant:
+// unlike mcp.ts's long-running server process, install() is a one-shot CLI invocation,
+// so there is no "stale until restart" tradeoff to accept) via the exact same
+// presence-check arweave/turbo's own wallet already uses. `install` bakes whatever is
+// in effect AT INSTALL TIME into the generated runner (see the file's own header) — a
+// wallet created afterward needs a re-`install` to be picked up by the nightly runner,
+// same as any other setting.
+async function scheduleableBackends(): Promise<Set<string>> {
+  return new Set(['file', 'arweave', 'turbo', ...((await tonWalletConfigured()) ? ['ton-provider'] : [])]);
+}
 const PAID = new Set(['arweave', 'turbo']);
 
 // Every CYPHER_BRAIN_* var a snapshot+push run could need that this runner does NOT
@@ -550,7 +566,9 @@ async function readOwnCronEntry(): Promise<string | null> {
 
 async function install(o: CliOptions): Promise<void> {
   if (!o.backend) throw new Error('--backend <file|arweave|turbo> required');
-  if (!BACKENDS.has(o.backend)) throw new Error(`unknown backend: ${o.backend} (expected file|arweave|turbo)`);
+  const backends = await scheduleableBackends();
+  if (!backends.has(o.backend))
+    throw new Error(`unknown backend: ${o.backend} (expected one of ${[...backends].join('|')})`);
   // #206/multi-model review: install() bakes cfg.export into the runner's snapshot line
   // unconditionally (below) — it never calls resolveProfilePaths() itself, so an --export
   // given without --profile o2b would install cleanly and only turn out to be a no-op

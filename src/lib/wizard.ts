@@ -57,7 +57,7 @@ import { snapshot } from './snapshot.js';
 import { push, PushPartialSuccessError } from './pushpull.js';
 import { estimateCost, formatEstimate } from './estimate.js';
 import { BACKEND_NAMES } from './backends/index.js';
-import { walletConfigured } from './wallet.js';
+import { walletConfigured, tonWalletConfigured } from './wallet.js';
 import { exists, errMsg } from './util.js';
 import { buildRecoveryKit, writeRecoveryKitFile } from './recoverykit.js';
 import type { BackupKey, SigningKey } from './recoverykit.js';
@@ -625,6 +625,7 @@ export async function init(_o: CliOptions): Promise<void> {
       // walletConfigured() already has below, so an unrelated backend's run never pays
       // for an fs.access() call it has no use for.
       let tonProviderReady = false;
+      let tonProviderAutoSigns = false;
       if (backend === 'ton-provider') {
         let notifyBinReady = false;
         if (TON_PROVIDER_NOTIFY_BIN) {
@@ -635,19 +636,26 @@ export async function init(_o: CliOptions): Promise<void> {
             notifyBinReady = false;
           }
         }
-        tonProviderReady = Boolean(TON_PROVIDER_OWNER) && TON_PROVIDER_MAX_SPEND > 0n && notifyBinReady;
+        // #396 PR2: a configured local TON wallet ALSO satisfies "owner is known" — it
+        // derives the owner itself (ton-provider.ts's put()), so CYPHER_BRAIN_TON_PROVIDER_OWNER
+        // is no longer the only way to be ready. Checked lazily, same as notifyBinReady
+        // above, so an unrelated backend's run never pays for the fs.access() this needs.
+        tonProviderAutoSigns = await tonWalletConfigured();
+        tonProviderReady =
+          (Boolean(TON_PROVIDER_OWNER) || tonProviderAutoSigns) && TON_PROVIDER_MAX_SPEND > 0n && notifyBinReady;
       }
       if (paid && backend === 'ton-provider' && !tonProviderReady) {
         console.log(
-          `\n${backend} needs CYPHER_BRAIN_TON_PROVIDER_OWNER (the TON wallet address that will own the ` +
-            'deployed StorageV1 contract) and CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (a nanoTON spend cap) set — ' +
+          `\n${backend} needs an owner set ONE of two ways: CYPHER_BRAIN_TON_WALLET (a local TON wallet — ` +
+            "'wallet create --chain ton' — auto-signs deploys with no human involved) or " +
+            'CYPHER_BRAIN_TON_PROVIDER_OWNER (a plain address; deploys need a human to sign a Tonkeeper deeplink ' +
+            'instead). Either way, CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (a nanoTON spend cap) is also required — ' +
             'a StorageV1 deploy spends real funds, so there is no safe default amount to let through uncapped.',
         );
         console.log(
           'It also needs a locally built scripts/go/storage-v1-client binary at ' +
-            'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (checked for presence AND executability) and a HUMAN present ' +
-            'to sign a Tonkeeper deeplink at push time — see "cypher-brain push --help" for the full ' +
-            'prerequisite list.',
+            'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (checked for presence AND executability) — see ' +
+            '"cypher-brain push --help" for the full prerequisite list.',
         );
         console.log(
           `\nEverything this run already set up — primary identity (${IDENTITY})` +
@@ -705,16 +713,20 @@ export async function init(_o: CliOptions): Promise<void> {
         // ton-provider is PAID but NOT permanent the way arweave/turbo are (durability
         // depends on the chosen provider continuing to renew/serve the contract, see
         // docs/durability.md) — the consent wording must not claim a guarantee this
-        // backend does not make. It also blocks on a human signature (up to 20 minutes),
-        // unlike arweave/turbo's automatic JWK signing — said here so the wait itself
-        // isn't mistaken for a hang once "Proceed?" is answered.
+        // backend does not make. Signing itself now depends on tonProviderAutoSigns
+        // (#396 PR2, computed above): auto-sign broadcasts immediately, same as
+        // arweave/turbo; the Tonkeeper path still blocks on a human signature (up to 20
+        // minutes) — said here so that wait itself isn't mistaken for a hang once
+        // "Proceed?" is answered.
         const consent = await askYesNo(
           backend === 'ton-provider'
             ? `${backend} is a PAID store — deploying spends real funds and cannot be undone. Unlike arweave/turbo ` +
                 'it is availability-based, not permanent: durability depends on the chosen provider continuing to ' +
-                'renew/serve the contract (see docs/durability.md). It also requires a HUMAN to sign a Tonkeeper ' +
-                'deeplink once the deploy is built (up to 20 minutes) — this prompt will not return until that ' +
-                'happens. Proceed?'
+                'renew/serve the contract (see docs/durability.md). ' +
+                (tonProviderAutoSigns
+                  ? 'The configured local TON wallet auto-signs and broadcasts the deploy, no human involved. Proceed?'
+                  : 'It also requires a HUMAN to sign a Tonkeeper deeplink once the deploy is built (up to 20 ' +
+                    'minutes) — this prompt will not return until that happens. Proceed?')
             : `${backend} is a PAID, PERMANENT store — uploading spends real funds and cannot be undone. Proceed?`,
           false,
         );

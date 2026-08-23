@@ -47,6 +47,7 @@ import {
   RECIPIENT,
   SIGN_IDENTITY,
   AR_WALLET,
+  TON_WALLET,
   PIN_RECIPIENTS,
   CONFIG_FILE_PATH,
   AGE_MAGIC,
@@ -54,7 +55,7 @@ import {
 } from './config.js';
 import { exists, errMsg } from './util.js';
 import { recipientEntries, resolvePinnedRecipients } from './keys.js';
-import { WALLET_DEFAULT_PATH } from './wallet.js';
+import { WALLET_DEFAULT_PATH, TON_WALLET_DEFAULT_PATH } from './wallet.js';
 import { scheduleStatusReport, ScheduleNotInstalledError } from './schedule.js';
 import { buildInfo, buildAgeDays, BUILD_STALE_DAYS } from './buildinfo.js';
 import { printJson, printMascot, moodForVerdict } from './ui.js';
@@ -168,7 +169,13 @@ async function checkHomeDirPerms(): Promise<DoctorCheck> {
 // set it clearly intends to use a wallet there; nothing at that exact path should FAIL,
 // not SKIP with the same wording an unconfigured-and-that-is-fine wallet gets (Codex
 // review, #333).
-async function checkKeyPerms(id: string, path: string, label: string, explicitPath = false): Promise<DoctorCheck> {
+async function checkKeyPerms(
+  id: string,
+  path: string,
+  label: string,
+  explicitPath = false,
+  envName = 'CYPHER_BRAIN_AR_WALLET',
+): Promise<DoctorCheck> {
   let st: Stats | null;
   try {
     st = await statOrNotFound(path);
@@ -185,8 +192,8 @@ async function checkKeyPerms(id: string, path: string, label: string, explicitPa
       return {
         id,
         status: 'fail',
-        message: `CYPHER_BRAIN_AR_WALLET is set to ${path}, but nothing is there`,
-        remediation: `create the wallet ('cypher-brain wallet create --out ${path}'), fix the CYPHER_BRAIN_AR_WALLET path, or unset it`,
+        message: `${envName} is set to ${path}, but nothing is there`,
+        remediation: `create the wallet ('cypher-brain wallet create --out ${path}'), fix the ${envName} path, or unset it`,
       };
     }
     return { id, status: 'skip', message: `no ${label} at ${path} — nothing to check` };
@@ -672,6 +679,13 @@ export async function computeDoctorReport(): Promise<DoctorReport> {
     await checkKeyPerms('identity-perms', IDENTITY, 'age identity (private key)'),
     await checkKeyPerms('sign-identity-perms', SIGN_IDENTITY, 'signing identity (private key)'),
     await checkKeyPerms('wallet-perms', AR_WALLET || WALLET_DEFAULT_PATH, 'arweave JWK wallet', AR_WALLET !== ''),
+    await checkKeyPerms(
+      'ton-wallet-perms',
+      TON_WALLET || TON_WALLET_DEFAULT_PATH,
+      'TON wallet mnemonic',
+      TON_WALLET !== '',
+      'CYPHER_BRAIN_TON_WALLET',
+    ),
     await checkIdentityRecipientPairing(),
     ...(await checkPinRecipients()),
     await checkOfflineBackupDisk(),

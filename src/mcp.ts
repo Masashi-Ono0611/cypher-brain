@@ -65,7 +65,7 @@ import { lookupIdempotencyResult, recordIdempotencyResult, IdempotencyStoreError
 import { schedule, scheduleStatusReport } from './lib/schedule.js';
 import { estimateCost } from './lib/estimate.js';
 import { keygenAt } from './lib/keys.js';
-import { wallet } from './lib/wallet.js';
+import { wallet, tonWalletConfigured } from './lib/wallet.js';
 import { SCAN_SECRETS_MODES, isScanSecretsMode } from './lib/secrets-scan.js';
 import { exists, requireFile, MissingPathError, sha256, errMsg } from './lib/util.js';
 import { annotateErrorMessage, matchErrorCode } from './lib/errors.js';
@@ -76,8 +76,23 @@ import type { CliOptions } from './lib/types.js';
 const SERVER_NAME = 'cypher-brain-mcp';
 const SERVER_VERSION = '0.0.1'; // keep in sync with package.json "version"
 
-const BACKENDS = ['file', 'arweave', 'turbo']; // rclone (#204), ton, and ton-provider (#396) are CLI/verify-only — each needs operator-side setup (--remote / a configured seeder box / a funded owner wallet) an MCP host cannot collect, and ton-provider additionally requires a HUMAN to sign a Tonkeeper deeplink mid-push — something an MCP tool call has no way to pause for — so none of the three is exposed as an MCP tool backend
-const PAID_BACKENDS = new Set(['arweave', 'turbo']);
+// rclone (#204) and the self-hosted `ton` backend stay CLI-only: each needs
+// operator-side setup (--remote / a configured seeder box) an MCP host cannot collect,
+// so a caller offering either would sail past this list into a "missing config" error
+// deep inside push() with no way to have supplied what was missing. `ton-provider`
+// used to be excluded for a THIRD, different reason — no local TON wallet existed at
+// all, so every deploy needed a HUMAN to sign a Tonkeeper deeplink mid-push, which an
+// MCP tool call has no way to pause for. PR2 (issue #396) added that wallet
+// (src/lib/wallet.ts's `wallet create --chain ton`), so `ton-provider` is now listed
+// HERE precisely when one is configured (tonWalletConfigured(), the same presence-check
+// arweave/turbo's own wallet already uses) — an MCP host that never got one configured
+// still never sees it offered, so it can't get stuck waiting on a signature nobody is
+// there to give. Computed once at module load (top-level await), same as every other
+// env-derived constant in this file — matches how AR_WALLET etc. are already frozen for
+// the process's lifetime; creating a wallet mid-session needs an MCP server restart to
+// be picked up here, same as changing any other env-backed setting would.
+const BACKENDS = ['file', 'arweave', 'turbo', ...((await tonWalletConfigured()) ? ['ton-provider'] : [])];
+const PAID_BACKENDS = new Set(['arweave', 'turbo', 'ton-provider']); // ton-provider always spends real funds when reachable at all (#396 PR2) — safe to list unconditionally even when BACKENDS above omits it (an unreachable value can never trigger this check)
 // NON_CONTENT_ADDRESSED_BACKENDS: arweave/turbo locators are post-assigned tx/upload ids
 // and rclone's is an operator-chosen remote path — none of the three are content hashes,
 // so pulling by bare locator cannot detect a rolled-back/substituted (yet still

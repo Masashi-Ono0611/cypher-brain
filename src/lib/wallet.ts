@@ -15,7 +15,7 @@
 // arweave/turbo backends that consume the resulting file.
 import { mkdir, chmod, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { HOME, AR_WALLET, AR_PAID_BY } from './config.js';
+import { HOME, AR_WALLET, AR_PAID_BY, TON_WALLET, TON_TONAPI_URL } from './config.js';
 import { writeKeyFile } from './keys.js';
 import {
   exists,
@@ -28,9 +28,10 @@ import {
 } from './util.js';
 import { fetchBalance, type CreditApproval } from './balance.js';
 import { warn } from './warn.js';
-import { arUsdRate, turboUsdRate, usdApprox } from './estimate.js';
+import { arUsdRate, turboUsdRate, usdApprox, tonUsdRate } from './estimate.js';
 import { printJson } from './ui.js';
 import type { CliOptions } from './types.js';
+import type { WalletContractV4 as TonWalletContractV4 } from '@ton/ton';
 
 // Minimal shape actually used here — hand-rolled rather than statically importing the
 // `arweave` package's own types, mirroring backends/arweave.ts's ArweaveClient: the SDK
@@ -68,6 +69,154 @@ async function getArweave(): Promise<ArweaveWalletClient> {
 // of re-deriving it and risking the two drifting apart. Exported so `doctor` (#201) can
 // check the SAME default path's permissions rather than re-deriving it a third time.
 export const WALLET_DEFAULT_PATH = join(HOME, 'wallet.json');
+
+// ---------- TON wallet (issue #396 PR2: local auto-signing for ton-provider) ----------
+// `wallet create --chain ton` generates a locally-held TON wallet (WalletContractV4 —
+// not W5/V5R1: this wallet is entirely cypher-brain-managed, never opened in Tonkeeper
+// itself, so matching a real Tonkeeper wallet's default version buys nothing). Its
+// mnemonic is what ton-provider.ts's put() uses to sign+broadcast a StorageV1 deploy
+// itself instead of printing a Tonkeeper deeplink for a human — see that file's
+// autoSignAndBroadcastDeploy(). Deliberately a SEPARATE credential type from the
+// Arweave JWK above (`wallet.json`) — TON's is a BIP39 mnemonic, not a JSON keypair —
+// so this gets its own file, its own lazy SDK loader, and its own functions, mirroring
+// getArweave()'s shape rather than trying to force one generic "wallet" abstraction
+// over two unrelated credential formats.
+interface TonSigningModule {
+  mnemonicNew(wordCount?: number): Promise<string[]>;
+  mnemonicToPrivateKey(mnemonic: string[]): Promise<{ publicKey: Buffer; secretKey: Buffer }>;
+  WalletContractV4: {
+    create(args: { workchain: number; publicKey: Buffer }): TonWalletContractV4;
+  };
+}
+
+async function getTonSigning(): Promise<TonSigningModule> {
+  let crypto: {
+    mnemonicNew: TonSigningModule['mnemonicNew'];
+    mnemonicToPrivateKey: TonSigningModule['mnemonicToPrivateKey'];
+  };
+  let ton: { WalletContractV4: TonSigningModule['WalletContractV4'] };
+  try {
+    crypto = await import('@ton/crypto');
+  } catch (e) {
+    const problem = sdkImportAdvice(e, '@ton/crypto');
+    if (problem?.kind === 'absent') throw new SdkMissingError(`wallet: ${problem.advice}`);
+    if (problem !== null) throw new Error(`wallet: ${problem.advice}`);
+    throw e;
+  }
+  try {
+    ton = await import('@ton/ton');
+  } catch (e) {
+    const problem = sdkImportAdvice(e, '@ton/ton');
+    if (problem?.kind === 'absent') throw new SdkMissingError(`wallet: ${problem.advice}`);
+    if (problem !== null) throw new Error(`wallet: ${problem.advice}`);
+    throw e;
+  }
+  return {
+    mnemonicNew: crypto.mnemonicNew,
+    mnemonicToPrivateKey: crypto.mnemonicToPrivateKey,
+    WalletContractV4: ton.WalletContractV4,
+  };
+}
+
+// Mirrors WALLET_DEFAULT_PATH exactly (same rationale: `tonWalletAddress`'s fallback
+// below and ton-provider.ts's own read must never drift apart on which path they mean).
+export const TON_WALLET_DEFAULT_PATH = join(HOME, 'ton-wallet.json');
+
+// Mirrors walletConfigured() above — the SAME "presence-checkable capability" question,
+// answered for the TON credential instead of the Arweave one. Reused by ton-provider.ts
+// (does this push get to auto-sign?) and by mcp.ts/schedule.ts (does this backend get
+// listed as available at all for an unattended/AI-driven caller?).
+export async function tonWalletConfigured(walletPath: string = TON_WALLET): Promise<boolean> {
+  return !!walletPath && (await exists(walletPath));
+}
+
+interface TonMnemonicFile {
+  mnemonic: string[];
+}
+
+async function tonWalletCreate(o: CliOptions): Promise<void> {
+  const usingDefaultPath = !o.out;
+  const outPath = o.out || TON_WALLET_DEFAULT_PATH;
+  // Same no-clobber posture as walletCreate above, checked before any keygen work.
+  if ((await exists(outPath)) && !o.force) {
+    throw new Error(
+      `TON wallet already exists at ${outPath} (refusing to overwrite — losing it = losing spend authority ` +
+        `and control over any StorageV1 contracts it owns). Pass --force only if you are certain.`,
+    );
+  }
+  const ton = await getTonSigning();
+  const mnemonic = await ton.mnemonicNew(24);
+  const keyPair = await ton.mnemonicToPrivateKey(mnemonic);
+  const walletContract = ton.WalletContractV4.create({ workchain: 0, publicKey: keyPair.publicKey });
+  const address = walletContract.address.toString({ bounceable: true });
+  const dir = dirname(outPath);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  if (usingDefaultPath) await chmod(dir, 0o700);
+  const payload: TonMnemonicFile = { mnemonic };
+  await writeKeyFile(outPath, JSON.stringify(payload), 0o600, !!o.force);
+  console.log(`TON wallet (PRIVATE, keep offline): ${outPath}`);
+  console.log(`address (PUBLIC, safe to share — fund THIS address): ${address}`);
+  console.log(
+    `\n⚠  Back up the mnemonic now. Fund the address above with TON, then set CYPHER_BRAIN_TON_WALLET=${outPath} ` +
+      'so ton-provider push auto-signs deploys with it instead of printing a Tonkeeper deeplink.',
+  );
+}
+
+// Loads the mnemonic file and derives the wallet contract + signing keypair — the one
+// place both `tonWalletAddress`/`tonWalletBalance` here AND ton-provider.ts's
+// autoSignAndBroadcastDeploy() need, so the derivation logic (workchain 0, V4) lives
+// exactly once. `what` names the caller in the error, matching addressFromWallet's
+// precedent above.
+export async function loadTonWallet(
+  walletPath: string,
+  what: string,
+): Promise<{ wallet: TonWalletContractV4; secretKey: Buffer }> {
+  await warnIfLooseKeyPerms(walletPath, 'TON wallet mnemonic');
+  let parsed: TonMnemonicFile;
+  try {
+    parsed = JSON.parse(await readFile(walletPath, 'utf8'));
+  } catch (e) {
+    throw new Error(`${what}: cannot read TON wallet at ${walletPath}: ${errMsg(e)}`);
+  }
+  if (!Array.isArray(parsed.mnemonic) || parsed.mnemonic.length === 0) {
+    throw new Error(`${what}: TON wallet at ${walletPath} has no mnemonic array`);
+  }
+  const ton = await getTonSigning();
+  const keyPair = await ton.mnemonicToPrivateKey(parsed.mnemonic);
+  const wallet = ton.WalletContractV4.create({ workchain: 0, publicKey: keyPair.publicKey });
+  return { wallet, secretKey: keyPair.secretKey };
+}
+
+async function addressFromTonWallet(o: CliOptions, what: string): Promise<string> {
+  const walletPath = o.wallet || TON_WALLET || TON_WALLET_DEFAULT_PATH;
+  const { wallet } = await loadTonWallet(walletPath, what);
+  return wallet.address.toString({ bounceable: true });
+}
+
+async function tonWalletAddress(o: CliOptions): Promise<void> {
+  console.log(await addressFromTonWallet(o, 'wallet address'));
+}
+
+async function tonWalletBalance(o: CliOptions): Promise<void> {
+  // --address queries any address WITHOUT a key — same rationale as walletBalance above:
+  // the address that just got funded from an exchange/another wallet is precisely the
+  // one this machine may not hold a mnemonic for.
+  const address = o.address ?? (await addressFromTonWallet(o, 'wallet balance'));
+  const res = await fetch(`${TON_TONAPI_URL}/v2/blockchain/accounts/${address}`, {
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`wallet balance: GET tonapi accounts/${address} -> HTTP ${res.status}`);
+  const body = (await res.json()) as { balance?: unknown; status?: unknown };
+  const balanceNano = typeof body.balance === 'number' ? body.balance : 0;
+  if (o.json) return printJson({ address, balance_nanoton: balanceNano, status: body.status ?? 'unknown' });
+  const rate = await tonUsdRate();
+  console.log(`address : ${address}`);
+  console.log(`status  : ${body.status ?? 'unknown'}`);
+  console.log(
+    `balance : ${balanceNano} nanoTON (~${(balanceNano / 1e9).toFixed(9)} TON)` +
+      (rate !== null ? ` = ~$${((balanceNano / 1e9) * rate).toFixed(balanceNano > 0 ? 2 : 6)} USD` : ''),
+  );
+}
 
 async function walletCreate(o: CliOptions): Promise<void> {
   const usingDefaultPath = !o.out;
@@ -235,6 +384,22 @@ async function walletBalance(o: CliOptions): Promise<void> {
 }
 
 export async function wallet(o: CliOptions): Promise<void> {
+  const chain = o.chain || 'arweave';
+  if (chain !== 'arweave' && chain !== 'ton') {
+    throw new Error(`wallet: --chain must be arweave or ton, got: ${JSON.stringify(chain)}`);
+  }
+  if (chain === 'ton') {
+    switch (o._) {
+      case 'create':
+        return tonWalletCreate(o);
+      case 'address':
+        return tonWalletAddress(o);
+      case 'balance':
+        return tonWalletBalance(o);
+      default:
+        throw new Error(`wallet: expected create | address | balance, got: ${o._ || '(nothing)'}`);
+    }
+  }
   switch (o._) {
     case 'create':
       return walletCreate(o);
