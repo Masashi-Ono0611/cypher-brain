@@ -23,7 +23,7 @@ binaries.
 |---|---|---|
 | **Self-hosted seeder** — droplet seeds our own bags directly, no payment | mainnet | **WORKS, in production** (2026-08-22) |
 | **Self-hosted seeder** | testnet | dogfood only; not used for real backups |
-| **Our droplet as a paid provider** (earns — discoverable by other users) | mainnet | **registered & live** in the mytonprovider.org registry (2026-08-23, pubkey `f5f603c7…`, uptime 100%); zero paid contracts received yet |
+| **Our droplet as a paid provider** (earns — discoverable by other users) | mainnet | **registered & live, econ params fixed** in the mytonprovider.org registry (2026-08-23, pubkey `f5f603c7…`, uptime 100%, rating 17.9, telemetry on, wallet funded ~1 TON); zero paid contracts received yet |
 | **Our droplet as a paid provider** | testnet | standing twin (same Go binaries, isolated units) — controlled environment, no real earnings expected |
 | **We pay a legacy C++ provider** (spends — fabric-contract ecosystem) | mainnet | **GRAVEYARD** (115 listed, 0 active ≤7d, 94 silent >1y) — not pursuing |
 | **We pay a legacy C++ provider** | testnet | **DEAD DAEMONS, live contracts** (2026-08-22 experiment) |
@@ -171,9 +171,73 @@ checked in any future assessment.
   — the same registry the transaction targets — not that the provider daemon
   is independently reachable or functioning (uptime/telemetry in this
   registry are also self-reported by the same daemon). No paid contracts
-  received yet (expected — registration alone doesn't generate demand). Its
-  wallet needs topping up beyond 0.1 TON if real contracts arrive (0.05
-  TON/proof).
+  received yet (expected — registration alone doesn't generate demand).
+- **Default config, then a self-inflicted bounty trap, both found + fixed
+  (2026-08-23).** The provider ran with unmodified
+  `tonutils-storage-provider` defaults: `MaxBagSizeBytes: 0` (confirmed
+  byte-identical to the config's own `envDefault` — silently caps every
+  contract to zero bytes, regardless of price), `MinSpan: 600s`,
+  `MaxSpan: 172800s` (2 days), `MinRatePerMBDay: "0.0001"`. First fix pass
+  targeted the size cap and moved pricing toward the live market:
+  `MinRatePerMBDay` → `"0.0000008"` (discount-tier, in line with the
+  cheapest live third-party providers), `MinSpan` → `604800s` (7 days),
+  `MaxSpan` → `8294400s` (96 days). That combination introduced a *new*
+  problem: the daemon's own bounty check (`internal/service/worker.go`:
+  `bounty = rate × size × MaxSpan / (86400×1024×1024)`, contract
+  auto-dropped if `bounty < 0.05 TON` proof gas) computed a 481 MB
+  (481×1024×1024 bytes) contract at the new discount rate + 96-day span to
+  **0.037 TON bounty — below the
+  0.05 TON gas fee — so the daemon would have silently refused the exact
+  size of bag we care about**, with no error visible anywhere in the
+  registry (caught only because a bounty recheck was run after the price
+  drop). Fixed by extending `MaxSpan` further, to `16588800s` (192 days,
+  matching the longest live provider, Hetzner/FI) — 481 MB now bounties at
+  **0.074 TON, clearing the gas fee** at the discount rate. Verified via a
+  fresh `providers/search` query after each change (`price`/`min_span`/
+  `max_span` updated within ~1–2 min of the `systemctl restart`, matching
+  the backend's 1-minute `UpdateKnownProviders` ADNL rate-poll cycle).
+- **Telemetry implemented (2026-08-23).** `is_send_telemetry` was `false`,
+  and the registry's `max_bag_size_bytes` field — a *separate* reporting
+  channel from the bounty bug above, but one that was echoing the same
+  `MaxBagSizeBytes: 0` config value — also showed `0` until telemetry
+  started reporting the post-fix config. Source read of
+  `dearjohndoe/mytonprovider-backend` confirmed `POST
+  /api/v1/providers` has **no auth middleware and no `telemetry_pass`
+  field in the current API** (that field only exists in the unrelated
+  Python `igroman787/mytonprovider` client) — the only server-side checks
+  are a non-empty `provider.pubkey` and a body-size cap. A minimal Python
+  sender (`/opt/tsp/telemetry-send.py`, gzip JSON POST every 15 min via a
+  `systemd` oneshot timer, independent unit with no `After`/`Requires` on
+  the provider service so a sender failure can't touch it) reads only
+  non-secret fields from `config.json` via `jq` (never touches
+  `ADNLKey`/`ProviderKey`) plus local `df`/`free`/`uname`/`/proc/cpuinfo`.
+  Confirmed live in the registry: `max_bag_size_bytes` 0 → `4294967296`,
+  `is_send_telemetry` → `true`, `rating` 5.96 → **17.9** (on par with
+  established third-party providers).
+- **Wallet funded (2026-08-23).** Provider wallet
+  (`UQCCrKrQHLpB75vvrd5js78eB7qK6v7Cpz4WJpV2DoZnY-GC`) topped up from 0.1 TON
+  to **~1 TON** (operator-sent) — enough headroom for the first several proof
+  cycles (0.05 TON/proof) before contract income needs to cover it.
+- **Two registry-UI fields stayed unresolved and why (2026-08-23):**
+  `Location` shows "Unknown" and `Status` shows "No Data" on
+  mytonprovider.org, unlike established providers ("United States (US)",
+  "Stable (100%)"). Source-traced both: `Location` is filled by the
+  backend's own `UpdateIPInfo` worker, which only sweeps every **240
+  minutes** — expected to self-resolve, not a config problem (droplet's
+  `ExternalIP`/firewall for ADNL udp/18555 were confirmed correctly set).
+  `Status`, however, **will not self-resolve** — the backend's
+  `UpdateStatuses` SQL `LEFT JOIN`s `providers.storage_contracts`, so a
+  provider with zero contracts has no join row to derive a status from and
+  stays "No Data" indefinitely; it only starts showing "Stable" once at
+  least one real contract exists. (A same-droplet self-contract — using our
+  own provider to store our own masabrain bag — would clear this: 481 MB at
+  the fixed rate/span bounties above the gas fee, so it's technically viable.
+  Deprioritized versus the third-party test though, since seeder and provider
+  would be the same single failure domain — fixing the cosmetic status this
+  way adds zero real redundancy. The Go client being built for the "pay a
+  live Go provider" lane above takes the provider address as a parameter, so
+  pointing it at our own pubkey later is a cheap follow-up if the cosmetic
+  fix is ever wanted.)
 - **Testnet: standing twin, unchanged.** tonutils-storage-provider v0.4.3 +
   its own testnet tonutils-storage, running as transient systemd units on the
   droplet (isolated under `/opt/tsp/testnet-*`, mainnet services untouched);
@@ -219,7 +283,9 @@ the storage; it buys availability, not permanence.
   under `~/cypher-brain-ton/`, healthcheck pinned to the live brain bag. The
   provider service is now also registered in the mytonprovider.org registry
   (see above) — same binary, two roles (seeds our bag for free; separately,
-  discoverable as a paid provider for others).
+  discoverable as a paid provider for others). `tsp-telemetry.service` +
+  `tsp-telemetry.timer` (added 2026-08-23, 15 min interval) run independently
+  alongside it to report registry telemetry — see the telemetry bullet above.
 - Droplet (testnet, experiment, transient systemd units — disposable):
   `tsp-testnet-provider-storage` (Go storage, udp 17556),
   `tsp-testnet-provider` (provider daemon, udp 18556), both under
