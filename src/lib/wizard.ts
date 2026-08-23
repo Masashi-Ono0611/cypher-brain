@@ -620,17 +620,23 @@ export async function init(_o: CliOptions): Promise<void> {
       // both presence AND executability, X_OK, before spending anything) — omitting it
       // from this precheck would let a run with owner+max-spend set but no built
       // scripts/go/storage-v1-client binary sail past this guard and fail deep inside
-      // push() anyway, the exact bad UX #161 (and this precheck) exists to avoid.
-      let tonProviderNotifyBinReady = false;
-      if (TON_PROVIDER_NOTIFY_BIN) {
-        try {
-          await access(TON_PROVIDER_NOTIFY_BIN, fsConstants.X_OK);
-          tonProviderNotifyBinReady = true;
-        } catch {
-          tonProviderNotifyBinReady = false;
+      // push() anyway, the exact bad UX #161 (and this precheck) exists to avoid. Only
+      // evaluated when ton-provider was actually chosen — same lazy, backend-gated shape
+      // walletConfigured() already has below, so an unrelated backend's run never pays
+      // for an fs.access() call it has no use for.
+      let tonProviderReady = false;
+      if (backend === 'ton-provider') {
+        let notifyBinReady = false;
+        if (TON_PROVIDER_NOTIFY_BIN) {
+          try {
+            await access(TON_PROVIDER_NOTIFY_BIN, fsConstants.X_OK);
+            notifyBinReady = true;
+          } catch {
+            notifyBinReady = false;
+          }
         }
+        tonProviderReady = Boolean(TON_PROVIDER_OWNER) && TON_PROVIDER_MAX_SPEND > 0n && notifyBinReady;
       }
-      const tonProviderReady = Boolean(TON_PROVIDER_OWNER) && TON_PROVIDER_MAX_SPEND > 0n && tonProviderNotifyBinReady;
       if (paid && backend === 'ton-provider' && !tonProviderReady) {
         console.log(
           `\n${backend} needs CYPHER_BRAIN_TON_PROVIDER_OWNER (the TON wallet address that will own the ` +
