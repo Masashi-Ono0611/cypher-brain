@@ -76,7 +76,7 @@ import type { CliOptions } from './lib/types.js';
 const SERVER_NAME = 'cypher-brain-mcp';
 const SERVER_VERSION = '0.0.1'; // keep in sync with package.json "version"
 
-const BACKENDS = ['file', 'arweave', 'turbo']; // rclone (#204) and ton are CLI/verify-only — both need operator-side setup (--remote / a configured seeder box) an MCP host cannot collect, so neither is exposed as an MCP tool backend
+const BACKENDS = ['file', 'arweave', 'turbo']; // rclone (#204), ton, and ton-provider (#396) are CLI/verify-only — each needs operator-side setup (--remote / a configured seeder box / a funded owner wallet) an MCP host cannot collect, and ton-provider additionally requires a HUMAN to sign a Tonkeeper deeplink mid-push — something an MCP tool call has no way to pause for — so none of the three is exposed as an MCP tool backend
 const PAID_BACKENDS = new Set(['arweave', 'turbo']);
 // NON_CONTENT_ADDRESSED_BACKENDS: arweave/turbo locators are post-assigned tx/upload ids
 // and rclone's is an operator-chosen remote path — none of the three are content hashes,

@@ -152,7 +152,10 @@ async function seederApi<T>(pathAndQuery: string, postBody?: string, timeoutS = 
 // on purpose — see header). Extension preserved the same way file.ts's put() does, for
 // the same #214 reason: the .minisig sidecar pushed through this SAME backend must not
 // be misnamed snapshot.age.
-const entryNameFor = (file: string): string => {
+// Exported for ton-provider.ts: the SAME "a bag holds exactly one entry, named
+// snapshot.<ext>" rule applies there too — the locator carries no entry name for either
+// backend (see header), so both must derive the identical name from the pushed file.
+export const entryNameFor = (file: string): string => {
   const ext = extname(file) || '.age';
   if (ext !== '.age' && ext !== '.minisig') {
     throw new Error(
@@ -244,7 +247,12 @@ const CREATE_CALL_TIMEOUT_S = 600;
 const P2P_INFO_TIMEOUT_MS = 180_000;
 const P2P_STALL_TIMEOUT_MS = 300_000;
 
-async function p2pFetch(bagId: string, expect: FetchShape, out: string): Promise<void> {
+// Exported for ton-provider.ts (issue #396): the P2P download path is protocol-level
+// content-addressed retrieval, identical regardless of WHO is seeding the bag (our own
+// seeder box vs a paid mytonprovider.org provider) — ton-provider.ts has no seeder-SSH
+// fallback of its own (it never operates a seeder), so it reuses this P2P-only phase and
+// surfaces a failure directly rather than duplicating this logic.
+export async function p2pFetch(bagId: string, expect: FetchShape, out: string): Promise<void> {
   // The WHOLE body sits inside the tmpRoot try/finally — a daemon that fails to start
   // must not leak the temp tree it was about to use (review W2). What is downloaded
   // here is ciphertext, so the leak class is disk garbage, not secrets — but garbage
