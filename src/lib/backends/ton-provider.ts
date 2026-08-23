@@ -213,6 +213,33 @@ function spanDaysFor(provider: ProviderCandidate): bigint {
   return spanDays;
 }
 
+// A too-low deploy is a real, observed dead end (issue #403): the provider's own
+// `notify` handler refuses to ever fetch a bag whose computed "bounty" (what a proof
+// transaction would net the provider) falls below a fixed floor it enforces regardless
+// of how the deploy's rate/size/span were chosen — and by the time that refusal
+// surfaces, the deploy has already been paid for and confirmed on-chain, with no
+// in-product way to notice this BEFORE spending. The floor and the formula below are
+// not a guess: read directly from tonutils-storage-provider@v0.4.3's
+// internal/service/service.go (`ErrLowBounty`) — the same library mytonprovider.org's
+// listed Go/StorageV1 providers are built on, so this floor is a shared PROTOCOL
+// constant, not something an individual provider configures. `PROVIDER_BOUNTY_FLOOR_NANO`
+// could still drift in a future provider-library version; that's why the check below
+// only WARNS (matching the funds-check precedent just below it in put()) rather than
+// refusing — an assumption about someone else's code should never be what blocks a
+// user's own deploy, only what alerts them to a real risk before they commit to it.
+export const PROVIDER_BOUNTY_FLOOR_NANO = 50_000_000n; // 0.05 TON
+const BOUNTY_MB_BYTES = 1024n * 1024n; // binary MB — the PROVIDER's own formula's unit (service.go: `24*60*60*1024*1024`), deliberately NOT this file's own decimal MB_BYTES above (that one is cypher-brain's OWN cost-estimate unit; matching the provider's exact math is what matters here)
+
+// bounty (nanoTON) = rateNanoPerMB * dataSizeBytes * spanSeconds / (86400 * 1024 * 1024)
+// — the exact expression tonutils-storage-provider computes before comparing it against
+// its 0.05 TON floor (service.go: `mul := rate * size; mul *= maxSpanSeconds; bounty :=
+// mul / (24*60*60*1024*1024)`). Integer arithmetic throughout, matching Go's own
+// (rate/size/span are all non-negative, so floor-division here matches Go's).
+export function estimatedBountyNano(rateNanoPerMB: bigint, dataSizeBytes: bigint, spanDays: bigint): bigint {
+  const spanSeconds = spanDays * 86400n;
+  return (rateNanoPerMB * dataSizeBytes * spanSeconds) / (86400n * BOUNTY_MB_BYTES);
+}
+
 // ---------- provider search (mytonprovider.org) ----------
 export interface ProviderCandidate {
   pubkey: string; // ProviderKey (Ed25519) — NOT ADNLKey, NOT the `address` field (see main.go field-notes in scripts/go/storage-v1-client — the same distinction applies here)
@@ -591,6 +618,7 @@ async function waitForContractActive(addr: TonAddress): Promise<void> {
 export interface NotifyResult {
   status: string;
   downloaded: bigint;
+  reason: string; // the provider's own stated reason for a non-full-download response (e.g. "bounty should be at least 0.05 TON to cover fees") — empty string when the tool prints none (notify.go always prints the line, but often empty)
 }
 
 // Parses the Go tool's plain-text "== notify response ==" block (notify.go's own
@@ -605,7 +633,8 @@ export interface NotifyResult {
 function parseNotifyOutput(out: string): NotifyResult {
   const status = /^\s*status:\s*(\S+)/m.exec(out)?.[1] ?? 'unknown';
   const downloadedRaw = /^\s*downloaded:\s*(\d+)\s*bytes/m.exec(out)?.[1];
-  return { status, downloaded: downloadedRaw ? BigInt(downloadedRaw) : 0n };
+  const reason = /^\s*reason:\s*(.*)$/m.exec(out)?.[1]?.trim() ?? '';
+  return { status, downloaded: downloadedRaw ? BigInt(downloadedRaw) : 0n, reason };
 }
 
 async function notifyProvider(providerPubkeyHex: string, contractAddrRaw: string): Promise<NotifyResult> {
@@ -618,9 +647,24 @@ async function notifyProvider(providerPubkeyHex: string, contractAddrRaw: string
     );
   }
   try {
+    // Network selection (issue #404) matches every OTHER network-sensitive call this
+    // backend makes: CYPHER_BRAIN_TON_NETWORK_CONFIG unset/empty means mainnet (the
+    // daemon's own default — config.ts's own comment on TON_NETWORK_CONFIG), a path
+    // means testnet. startLocalTonDaemon() above already keys off the exact same
+    // `TON_NETWORK_CONFIG || undefined` check. Before this, notify() alone ignored the
+    // signal and always queried mainnet tonapi — hit directly while dogfooding a
+    // testnet push: a contract confirmed active on testnet still 404'd here because the
+    // account genuinely doesn't exist on the mainnet this call was hard-coded to ask.
     const { out } = await run(
       TON_PROVIDER_NOTIFY_BIN,
-      ['notify', '--provider-pubkey', providerPubkeyHex, '--contract', contractAddrRaw, '--mainnet'],
+      [
+        'notify',
+        '--provider-pubkey',
+        providerPubkeyHex,
+        '--contract',
+        contractAddrRaw,
+        ...(TON_NETWORK_CONFIG ? [] : ['--mainnet']),
+      ],
       { timeoutMs: 60_000 },
     );
     console.error(out.trim());
@@ -714,12 +758,23 @@ async function notifyProviderWithRetry(
   // guard before a push ever reaches this loop, so narrowing it to Number() here is safe.
   const progress = progressReporter('ton-provider notify');
   const total = Number(dataSizeBytes);
+  // Surfaces the provider's own stated reason (issue #403) the FIRST time it appears,
+  // and again if it changes — not every attempt, since a long retry window (10min
+  // default / 15s interval) would otherwise spam an identical line ~40 times. A silent
+  // retry loop that discards the provider's own diagnosis (e.g. "bounty should be at
+  // least 0.05 TON to cover fees") until a generic timeout 10 minutes later is exactly
+  // what made this issue hard to diagnose in the first place.
+  let lastReason = '';
   for (;;) {
     try {
       const res = await notifyProvider(providerPubkeyHex, contractAddrRaw);
       if (res.downloaded >= dataSizeBytes) {
         progress.report(total, total);
         return;
+      }
+      if (res.reason && res.reason !== lastReason) {
+        warn(`ton-provider: notify response so far — status=${res.status}: ${res.reason}`);
+        lastReason = res.reason;
       }
       progress.report(Number(res.downloaded), total);
     } catch (e) {
@@ -871,6 +926,21 @@ export function tonProviderBackend(): StorageBackend {
         console.error(
           `ton-provider: storage cost ${deploy.costNano} nanoTON + ${DEPLOY_BUFFER_NANO} nanoTON deploy buffer = ${deploy.amountNano} nanoTON`,
         );
+        // Advisory pre-deploy bounty check (issue #403) — see estimatedBountyNano()'s
+        // own comment for what this is and why it warns rather than refuses. Placed
+        // BEFORE the deploy is signed (both paths below) so the warning is visible to
+        // whoever/whatever is about to commit real funds, not discovered only after a
+        // 10-minute notify timeout.
+        const bounty = estimatedBountyNano(rateNanoPerMB, bag.dataSizeBytes, spanDays);
+        if (bounty < PROVIDER_BOUNTY_FLOOR_NANO) {
+          warn(
+            `ton-provider: the computed bounty for this deploy (${bounty} nanoTON, from rate ${rateNanoPerMB} ` +
+              `nanoTON/MB/day × ${bag.dataSizeBytes} bytes × ${spanDays} day(s)) looks BELOW the ~${PROVIDER_BOUNTY_FLOOR_NANO} ` +
+              "nanoTON floor providers built on tonutils-storage-provider enforce — this specific provider's notify " +
+              'may refuse to ever fetch the bag even though the deploy itself will still succeed and be paid for. ' +
+              'A bigger bag, a longer span, or a higher rate would raise this estimate.',
+          );
+        }
         // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
         // signer balance, #342) — WARN only, never abort, for BOTH signing paths: a
         // balance read has no freshness guarantee, so it must never be what blocks a
@@ -946,11 +1016,21 @@ export async function estimateTonProviderCost(sizeBytes: number): Promise<{
   amountNano: bigint;
   provider: ProviderCandidate;
   spanDays: bigint;
+  bountyNano: bigint;
+  belowBountyFloor: boolean;
 }> {
   const candidates = await searchProviders(sizeBytes);
   const provider = selectProvider(candidates);
   const rateNanoPerMB = providerRateNanoPerMB(provider.price);
   const spanDays = spanDaysFor(provider);
   const costNano = storageCostNano(BigInt(sizeBytes), rateNanoPerMB, spanDays);
-  return { costNano, amountNano: costNano + DEPLOY_BUFFER_NANO, provider, spanDays };
+  const bountyNano = estimatedBountyNano(rateNanoPerMB, BigInt(sizeBytes), spanDays);
+  return {
+    costNano,
+    amountNano: costNano + DEPLOY_BUFFER_NANO,
+    provider,
+    spanDays,
+    bountyNano,
+    belowBountyFloor: bountyNano < PROVIDER_BOUNTY_FLOOR_NANO,
+  };
 }
