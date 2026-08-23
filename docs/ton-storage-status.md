@@ -10,15 +10,25 @@ The product stance this log justifies is unchanged (docs/durability.md):
 Arweave/`turbo` is the permanence mainline; `ton` is a sovereign self-hosted
 replica; third-party TON providers are an experiment lane, not a dependency.
 
-## The four lanes
+## The landscape (role × network)
 
-| lane | what it is | verdict (date) |
+Three independent roles exist, each on mainnet and testnet. Keep them
+separate — "our droplet seeds our own bag" (free, self-hosted), "our droplet
+is registered so OTHERS can pay it to store THEIR bags" (earns, not spends),
+and "we pay someone else's provider to store OUR bag" (spends) are three
+different things that happen to share the same droplet and the same Go
+binaries.
+
+| role | network | verdict (date) |
 |---|---|---|
-| **Mainnet, our own seeder** | The `ton` backend's normal path: an operator box (currently one DigitalOcean droplet) seeds our bags | **WORKS, in production** (2026-08-22) |
-| **Mainnet third-party — legacy C++ ecosystem** | Providers that deployed on-chain fabric contracts; indexed by tonapi `/v2/storage/providers` | **GRAVEYARD** (2026-08-23: 115 listed, 0 active ≤7d, 94 silent >1y; the one faint candidate has accept OFF on-chain) |
-| **Mainnet third-party — live Go ecosystem** | tonutils-storage-provider operators; contracts are CLIENT-deployed (StorageV1); registry = mytonprovider.org | **ALIVE by telemetry** (2026-08-23: 76 registered, 20 with uptime >90%; top operator self-reports 2,263 GB of 2,700 GB used — paid demand not yet independently verified) |
-| **Testnet, third-party (C++ lane)** | Same legacy scheme, on testnet | **DEAD DAEMONS, live contracts** (2026-08-22 experiment) |
-| **Testnet, our own Go provider** | Our tonutils-storage-provider on the droplet | **STANDING; blocked on incompatible client implementation** (2026-08-23 — our script speaks the C++ scheme; a Go-scheme scripting client is not built) |
+| **Self-hosted seeder** — droplet seeds our own bags directly, no payment | mainnet | **WORKS, in production** (2026-08-22) |
+| **Self-hosted seeder** | testnet | dogfood only; not used for real backups |
+| **Our droplet as a paid provider** (earns — discoverable by other users) | mainnet | **registered & live** in the mytonprovider.org registry (2026-08-23, pubkey `f5f603c7…`, uptime 100%); zero paid contracts received yet |
+| **Our droplet as a paid provider** | testnet | standing twin (same Go binaries, isolated units) — controlled environment, no real earnings expected |
+| **We pay a legacy C++ provider** (spends — fabric-contract ecosystem) | mainnet | **GRAVEYARD** (115 listed, 0 active ≤7d, 94 silent >1y) — not pursuing |
+| **We pay a legacy C++ provider** | testnet | **DEAD DAEMONS, live contracts** (2026-08-22 experiment) |
+| **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **IN PROGRESS** (2026-08-23) — building a small Go client (reuses xssnick's own `pkg/contract` + `pkg/transport`) to deploy a StorageV1 contract against a real registry provider and pay for masabrain (481 MB) |
+| **We pay a live Go provider** | testnet | not attempted (mainnet-first, per operator decision — the registry itself is a mainnet market) |
 
 **The single most important 2026-08-23 correction**: the provider market is TWO
 incompatible ecosystems, and every earlier "dormant/graveyard" measurement
@@ -66,33 +76,51 @@ checked in any future assessment.
 ## Mainnet — third-party providers, live Go ecosystem (mytonprovider.org)
 
 - Discovery (2026-08-23, `POST https://mytonprovider.org/api/v1/providers/search`):
-  **76 registered providers, 20 with uptime >90%**. The top-rated operator
+  **77 registered providers (76 third-party + our own, added 2026-08-23),
+  20+ with uptime >90%**. The top-rated operator
   (Dallas, uptime 99.2%, 370 days of continuous operation) **self-reports
   2,263 GB used of 2,700 GB offered** via registry telemetry — a strong demand
   signal, but allocation/usage as REPORTED, not yet an independently verified
   paid contract (the first live test will settle that).
   Spans are sane here too: min_span typically 7 days (vs the C++ listing's 1 day).
-- How it works (verified from source on 2026-08-23, xssnick/tonutils-storage-provider +
-  mytonprovider + mytonstorage repos): the provider deploys NO contract — the
-  CLIENT builds and deploys a per-bag `StorageV1` contract (address derived
-  from its stateInit) and funds it; the provider daemon learns of it via an
-  ADNL `storageRequest` push (primary) or a startup wallet scan (catch-up),
-  then downloads the bag and submits proofs from its own wallet (0.05 TON gas
-  per proof — a provider wallet must stay funded). Registration on
-  mytonprovider.org is a 0.01 TON transfer with a `tsp-<provider-pubkey>`
-  comment to a fixed address; no stake, no slashing, telemetry-based rating.
+- How it works (verified from xssnick source, re-confirmed 2026-08-23 by a
+  targeted read of `tonutils-storage` @ `e80866d`, `tonutils-storage-provider`
+  @ `e624ea4`, `tonutils-contracts` @ `1fa35d6`): the provider deploys NO
+  contract — the CLIENT builds and deploys a per-bag `StorageV1` contract
+  (`contracts/storage/storage-contract.fc`; address = `hash(StateInit)`,
+  workchain 0) and funds it, then submits proofs against gas the provider's
+  own wallet spends (0.05 TON/proof).
+  **Correction from the earlier "ADNL push" description**: there is no push.
+  `FetchStorageInfo` (the provider-side handler that registers a new contract)
+  is reachable from exactly three call sites in the provider daemon, and only
+  one is a discovery path — the **client must send a direct ADNL/RLDP query**
+  (`storageProvider.storageRequest`) to the provider's own ADNL address
+  (resolved via DHT) after deploying. The other two call sites
+  (`startup_wallet_scan.go`, `stopped_reconciler.go`) only re-confirm
+  contracts that already had at least one accepted proof — they cannot
+  discover a brand-new contract. **Practical consequence: on-chain deploy +
+  fund alone will never be noticed by the provider; the client must also send
+  the RLDP query.**
+- The `price` field in the mytonprovider.org registry response is **not**
+  the on-chain `rate_per_mb_day` — the registry backend derives it as
+  `rate_per_mb_day × 1024 × 200 × 30` ("cost to store 200 GB for 30 days").
+  Using it directly as a contract rate overshoots by ~6.1M×; divide back down,
+  or query the provider's live ADNL rate directly.
 - The production client is **mytonstorage.org** (TON Connect + upload +
-  provider choice + contract management). Driving the flow from our own CLI
-  hit tooling walls (below), so the first live-provider contract test will run
-  through that client; results land here when it happens.
-- **Automation status (honest, measured 2026-08-23)**: `tonutils-storage`'s `rent-storage` REPL
-  command is the CLI client, but the REPL only functions on a real TTY — in
-  every non-TTY harness we tried (piped stdin, held-open fifo) it enters a
-  prompt-redraw loop (measured: 6.3 GB and 108 MB of output before our size
-  guards killed it), and under expect/pty our command drive still produced no
-  parseable response. A JS port of the Go client scheme
-  (`PrepareV1DeployData` + ADNL rates) is the clean path for scripting this
-  lane; not built yet.
+  provider choice + contract management) — still the only *browser* path.
+  Re-uploading a 481 MB file through it is impractical from a remote laptop,
+  so the CLI path below is what we're building instead.
+- **Automation status (2026-08-23)**: `tonutils-storage`'s `rent-storage` REPL
+  is TTY-only (piped/expect drives produced multi-GB prompt-redraw storms, no
+  parseable output) — ruled out for scripting. Reimplementing ADNL/RLDP/DHT
+  from scratch in JS was considered and rejected as too risky for a P2P crypto
+  protocol with no mature JS implementation confirmed production-ready.
+  **Current path: a small standalone Go program that imports xssnick's own
+  `pkg/contract` (deploy-message construction, non-`internal`) and
+  `pkg/transport` (`RequestStorageInfo`, the same RLDP client the real daemon
+  uses, also non-`internal`) directly** — reuses tested code instead of
+  re-deriving the cell layout and ADNL handshake by hand. Lives alongside the
+  other operator-run experiment scripts, not the shipped CLI. In progress.
 
 ## Testnet — third-party providers (C++ lane)
 
@@ -115,36 +143,46 @@ checked in any future assessment.
     loss 0.022 TON, matching the 2026-05 mainnet figure.
 - Net: same shape as mainnet 2026-05 — the chain-side machinery is alive, the
   operator-side daemons are not.
+- The droplet's C++ testnet seeder used for this experiment was **torn down**
+  after use (2026-08-22): `tsp-testnet-storage` unit, `testnet-db` and
+  `testnet-experiment` dirs removed, udp 17777 firewall rule closed. Its
+  binaries remain at `/opt/tsp/testnet-bin/` (harmless leftovers, not
+  wired to any running unit) — kept because the same C++ `storage-daemon`
+  binary is a candidate tool for cross-checking a bag's TorrentInfo hash
+  offline if that's ever needed again.
 
-## Our own provider (testnet twin standing; mainnet registration path known)
+## Our own droplet as a Go provider (mainnet: registered; testnet: standing twin)
 
-- Original purpose was to separate protocol from market within the GO scheme
-  (a success here says nothing about the incompatible legacy C++ lane, whose
-  failures are already explained by its own dead daemons). With live Go
-  providers now known, testing against a real third party largely supersedes
-  this twin — it stays standing as a controlled environment.
-- Standing (2026-08-23): tonutils-storage-provider v0.4.3 + its own testnet
-  tonutils-storage run as transient units on the droplet (isolated under
-  `/opt/tsp/testnet-*`, mainnet services untouched); provider wallet funded
-  with 2 testnet TON.
-- Two findings from source (xssnick/tonutils-storage-provider):
+- **Mainnet (2026-08-23): registered and confirmed live.** The 0.01 TON
+  `tsp-<pubkey>` registration transfer (to the shared TON Storage registration
+  address `0:7777…7777`, verified against the `igroman787/mytonprovider`
+  tooling source — not a placeholder) was sent and independently confirmed via
+  `POST https://mytonprovider.org/api/v1/providers/search`: pubkey
+  `f5f603c7a2d1719a834e153c27b4fad4fa9da0d532d6ac5f013547cafc91fb0b`,
+  `address: EQAwUvvYnPpImBfrKl3-KRYh05aNrUKTGgcarTB_yzhAt1eh`, `uptime: 100`,
+  `reg_time` matching the day of registration. No paid contracts received
+  yet (expected — registration alone doesn't generate demand). Its wallet
+  needs topping up beyond 0.1 TON if real contracts arrive (0.05 TON/proof).
+- **Testnet: standing twin, unchanged.** tonutils-storage-provider v0.4.3 +
+  its own testnet tonutils-storage, running as transient systemd units on the
+  droplet (isolated under `/opt/tsp/testnet-*`, mainnet services untouched);
+  provider wallet funded with 2 testnet TON. Original purpose was to separate
+  protocol from market within the Go scheme; with live third-party Go
+  providers now known and reachable, testing against a real third party
+  (see the section above) largely supersedes this twin for that goal — it
+  stays standing as a controlled environment.
+- Two findings from source (xssnick/tonutils-storage-provider), still valid:
   1. The Go provider **never self-deploys a contract** — deployment is always
-     client-initiated (offer to the provider address); the daemon answers ADNL
-     rate queries and reacts to offers.
-  2. Chicken-egg blocking the offer: the C++ `storage-daemon-cli --provider`
-     path calls a get-method only C++-style provider CONTRACTS have (a plain
-     wallet fails with exit code -13, incompatibility confirmed by source and
-     by measurement), and our own experiment script's `--provider` flag
-     required the address to appear in tonapi's provider index; the
-     `--provider-rate`/`--provider-span` bypass shipped (2026-08-23) — but the
-     deeper block is that our script builds the LEGACY C++ offer message,
-     while a Go provider needs the client-deployed StorageV1 scheme (see the
-     Go-ecosystem section above). The C++-scheme script stays valid for
-     C++-contract providers only.
-- Mainnet path forward (2026-08-23): our droplet's mainnet provider
-  (pubkey `f5f603c7…`) can join the living registry via the 0.01 TON
-  `tsp-<pubkey>` registration — operator-signed, pending. Its wallet needs
-  topping up beyond 0.1 TON if real contracts arrive (0.05 TON per proof).
+     client-initiated; the daemon answers ADNL rate queries and reacts to a
+     deployed contract once it learns about it (see the RLDP discovery
+     requirement above — this applies symmetrically whether OUR droplet is
+     the provider being paid, or we're paying SOMEONE ELSE'S).
+  2. The C++-scheme `ton-provider-experiment.mjs offer` command (this repo's
+     existing experiment script) cannot be pointed at a Go provider — it
+     builds the legacy `OP_OFFER_STORAGE_CONTRACT` message, which a
+     StorageV1-scheme provider does not understand. It stays valid for
+     C++-contract providers only (the graveyard lane above). The Go program
+     described in the section above is the real client for this lane.
 
 ## Cost reality check (so nobody misreads "cheap")
 
@@ -155,19 +193,29 @@ Arweave (~$28/GB one-time, measured via turbo) vs provider contracts
 breakeven at the floor rate is over a decade, mid-tier listed rates 2–9 years — and the market behind those listed rates is, per
 above, mostly not real IN THE LEGACY LANE — the live Go lane (mytonprovider)
 does carry real paid usage; its pricing surfaces as a `price` field per
-provider (units not yet verified against a real contract — pending the first
-live test). Self-hosted TON is cheap because you are the storage; it buys
-availability, not permanence.
+provider (see the unit-conversion note above — divide by 1024×200×30 to get
+back to nanoTON/MB/day before comparing). Self-hosted TON is cheap because
+you are the storage; it buys availability, not permanence.
 
 ## Operational inventory (what exists where, as of 2026-08-23)
 
 - Droplet (mainnet, production): `tonutils-storage.service` +
-  `tonutils-storage-provider.service` (long-standing), the cypher-brain bag
-  layout under `~/cypher-brain-ton/`, healthcheck pinned to the live brain bag.
+  `tonutils-storage-provider.service` (long-standing, binary refreshed to
+  clean v0.4.3 2026-08-22 — was `v0.4.3-dirty`), the cypher-brain bag layout
+  under `~/cypher-brain-ton/`, healthcheck pinned to the live brain bag. The
+  provider service is now also registered in the mytonprovider.org registry
+  (see above) — same binary, two roles (seeds our bag for free; separately,
+  discoverable as a paid provider for others).
 - Droplet (testnet, experiment, transient systemd units — disposable):
-  `tsp-testnet-storage` (C++ seeder, udp 17777), `tsp-testnet-provider-storage`
-  (Go storage, udp 17556), `tsp-testnet-provider` (provider daemon, udp 18556),
-  all under `/opt/tsp/testnet-*`. Stop with `systemctl stop <unit>`; nothing
-  survives a reboot by design.
+  `tsp-testnet-provider-storage` (Go storage, udp 17556),
+  `tsp-testnet-provider` (provider daemon, udp 18556), both under
+  `/opt/tsp/testnet-*`. The C++ testnet seeder (`tsp-testnet-storage`, udp
+  17777) that was here earlier was torn down 2026-08-22 (see the C++ lane
+  section above) — its binaries remain on disk but nothing runs them.
+  Stop remaining units with `systemctl stop <unit>`; nothing survives a
+  reboot by design.
 - Experiment wallet (testnet, throwaway): provider key lives in
   `/opt/tsp/testnet-provider/config.json` on the droplet only.
+- Go toolchain: available locally (`go1.26.5`, macOS arm64) for building the
+  StorageV1 client program described above; **not installed on the droplet**
+  (the droplet only runs prebuilt Go binaries, it doesn't compile).
