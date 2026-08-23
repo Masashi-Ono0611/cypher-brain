@@ -41,7 +41,8 @@
 // retrieval, correct regardless of who is seeding); there is no seeder-SSH fallback
 // here, because this backend never operates a seeder of its own — a P2P failure is a
 // hard error, not a silent downgrade to a less-verified path.
-import { mkdir, mkdtemp, copyFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, copyFile, access } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -141,7 +142,13 @@ const ProviderEntryCodec = {
 // ---------- cost math (ported from scripts/go/storage-v1-client/amount.go) ----------
 const MB_BYTES = 1_000_000n; // decimal MB — the contract's OWN per-MB unit (matches mytonprovider.org's rate_per_mb_day, see providerRateNanoPerMB below)
 const MIN_SIZE_MB_BYTES = 100_000n; // 0.1 MB floor, same as amount.go
-export const DEPLOY_BUFFER_NANO = 300_000_000n; // 0.3 TON gas buffer, same as amount.go
+// 0.3 TON gas buffer, same as amount.go — this is a TRANSFER-AMOUNT cap (Codex review):
+// CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND bounds `amountNano` (storage cost + this buffer),
+// not the wallet's total on-chain debit. The buffer is sized generously against real
+// TON network fees (fractions of a cent), matching the already real-money-tested
+// scripts/go/storage-v1-client reference this ports, but an operator relying on the cap
+// as an exact ceiling on wallet balance movement should read it that way.
+export const DEPLOY_BUFFER_NANO = 300_000_000n;
 
 // ceil(max(dataSizeBytes, 0.1MB) * rateNanoPerMB * spanDays / 1_000_000), exact
 // integer arithmetic throughout (no floating point ever touches a money value).
@@ -161,6 +168,24 @@ export function providerRateNanoPerMB(price: number): bigint {
     throw new Error(`ton-provider backend: provider "price" field is not a usable positive number: ${price}`);
   }
   return BigInt(Math.ceil(rate));
+}
+
+// Default span = the provider's own min_span, converted to WHOLE days (rounded up) —
+// docs/ton-storage-status.md: "min_span is typically 7+ days for Go-scheme providers",
+// i.e. shorter spans are usually refused anyway. Rounding up can push the requested
+// span past the provider's own max_span when min_span isn't an exact multiple of a day
+// (Codex review) — checked here rather than left to the provider's own eventual refusal,
+// since by the time that would surface the deploy has already been paid for.
+function spanDaysFor(provider: ProviderCandidate): bigint {
+  const spanDays = BigInt(Math.ceil(provider.min_span / 86400)) || 1n;
+  if (spanDays * 86400n > BigInt(provider.max_span)) {
+    throw new Error(
+      `ton-provider backend: provider ${provider.pubkey}'s min_span (${provider.min_span}s) rounds up to ` +
+        `${spanDays} day(s), which exceeds its own max_span (${provider.max_span}s) — refusing to deploy terms ` +
+        'this provider would reject',
+    );
+  }
+  return spanDays;
 }
 
 // ---------- provider search (mytonprovider.org) ----------
@@ -196,14 +221,27 @@ export async function searchProviders(sizeBytes: number): Promise<ProviderCandid
   });
   if (!res.ok) throw new Error(`ton-provider backend: mytonprovider.org search failed: HTTP ${res.status}`);
   const body = (await res.json()) as ProviderSearchResponse;
-  return (body.providers ?? []).filter(
+  const providers = Array.isArray(body?.providers) ? body.providers : [];
+  // Numeric fields are explicitly finite-checked (Codex review), not just compared with
+  // `>`/`>=`: a JS comparison against a malformed value (a string, NaN, or a field the
+  // registry omitted entirely) can be true or false in surprising ways, and the fields
+  // checked here (price, min_span, max_span) all end up driving on-chain payment/deploy
+  // parameters downstream — a candidate with an unusable value must be filtered out here,
+  // not let through to fail confusingly (or not fail at all) later.
+  return providers.filter(
     (p) =>
+      p &&
       p.status === 0 &&
       typeof p.pubkey === 'string' &&
       /^[0-9a-f]{64}$/.test(p.pubkey) &&
+      Number.isFinite(p.max_bag_size_bytes) &&
       p.max_bag_size_bytes >= sizeBytes &&
+      Number.isFinite(p.price) &&
       p.price > 0 &&
-      p.min_span > 0,
+      Number.isFinite(p.min_span) &&
+      p.min_span > 0 &&
+      Number.isFinite(p.max_span) &&
+      p.max_span > 0,
   );
 }
 
@@ -257,8 +295,27 @@ export async function buildDeploy(p: BuildDeployParams): Promise<BuildDeployResu
   }
   const spanSeconds = Number(p.spanDays * 86400n);
   if (p.rateNanoPerMB <= 0n) throw new Error('ton-provider backend: rate must be positive');
-  if (p.dataSizeBytes <= 0n) throw new Error('ton-provider backend: data size must be positive');
-  if (p.pieceSize <= 0) throw new Error('ton-provider backend: piece size must be positive');
+  // Bounded at Number.MAX_SAFE_INTEGER, not the on-chain uint64 max (Codex review
+  // suggestion): callers elsewhere in this module convert dataSizeBytes to a JS `number`
+  // (e.g. searchProviders(Number(bag.dataSizeBytes))), which silently loses precision
+  // past 2^53-1 — a value that big would already have been mis-selected against a
+  // provider's capacity before reaching here, so this is the last chance to fail loudly
+  // instead of deploying a contract for a size that was never accurately compared.
+  if (p.dataSizeBytes <= 0n || p.dataSizeBytes > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(
+      `ton-provider backend: data size must be a positive integer no larger than ${Number.MAX_SAFE_INTEGER} bytes, got ${p.dataSizeBytes}`,
+    );
+  }
+  if (p.pieceSize <= 0 || p.pieceSize > 0xffffffff || !Number.isInteger(p.pieceSize)) {
+    throw new Error(`ton-provider backend: piece size must be a positive uint32, got ${p.pieceSize}`);
+  }
+  // Defense-in-depth on this function's own money-safety boundary (Codex review): this
+  // is exported, so a caller other than put() (which always passes a validated positive
+  // bigint from TON_PROVIDER_MAX_SPEND) could in principle pass something that slipped
+  // past TypeScript. A non-positive value here must never be treated as "no cap".
+  if (p.maxSpendNano <= 0n) {
+    throw new Error(`ton-provider backend: maxSpendNano must be positive, got ${p.maxSpendNano}`);
+  }
 
   const { beginCell, Dictionary, contractAddress, storeStateInit } = await getTon();
 
@@ -343,6 +400,17 @@ const DEPLOY_POLL_INTERVAL_MS = 5_000;
 // tonapi's account-state endpoint until it reports 'active'. Bounded (20 min): a human
 // is on the other end of this, not a script, so timing out is a real, expected outcome
 // (the operator can re-run push once they have signed), not a bug.
+//
+// 'active' alone does not prove the deploy message's modify_providers body specifically
+// added THIS provider to the on-chain dict (Codex review) — it only proves some message
+// initialized the contract. This backend does not read back the on-chain provider dict
+// here to confirm that; instead, the notify step right after this (notifyProviderWithRetry)
+// provides that confirmation indirectly: the provider daemon's own FetchStorageInfo
+// handler looks itself up in the SAME dict this deploy populated, and replies "provider
+// does not exist in this contract" if it isn't there — which is exactly the failure mode
+// that surfaced the original ProviderV1.Address field-mapping incident this session
+// (docs/ton-storage-status.md). A silently-empty provider dict would fail loudly at that
+// step, not pass silently through this one.
 async function waitForContractActive(addr: TonAddress): Promise<void> {
   const deadline = Date.now() + DEPLOY_CONFIRM_TIMEOUT_MS;
   for (;;) {
@@ -362,18 +430,22 @@ async function waitForContractActive(addr: TonAddress): Promise<void> {
 // ---------- notify (shells out to scripts/go/storage-v1-client — see header) ----------
 export interface NotifyResult {
   status: string;
-  downloaded: number;
+  downloaded: bigint;
 }
 
 // Parses the Go tool's plain-text "== notify response ==" block (notify.go's own
 // fmt.Fprintf lines) rather than requiring a --json mode neither side has — brittle to
-// upstream wording changes, but bounded: a parse miss makes downloaded read as 0 (an
+// upstream wording changes, but bounded: a parse miss makes downloaded read as 0n (an
 // under-count, never an over-count), so put()'s "wait until fully downloaded" loop below
 // fails closed (keeps waiting / eventually times out) rather than declaring success early.
+// `downloaded` is parsed straight from the regex-captured decimal digits into a BigInt
+// (Codex review) — routing it through `Number` first could round a very large byte count
+// UP past Number.MAX_SAFE_INTEGER, which would make the "under-count, never over-count"
+// guarantee above false for a large enough bag.
 function parseNotifyOutput(out: string): NotifyResult {
   const status = /^\s*status:\s*(\S+)/m.exec(out)?.[1] ?? 'unknown';
-  const downloaded = Number(/^\s*downloaded:\s*(\d+)\s*bytes/m.exec(out)?.[1] ?? '0');
-  return { status, downloaded: Number.isFinite(downloaded) ? downloaded : 0 };
+  const downloadedRaw = /^\s*downloaded:\s*(\d+)\s*bytes/m.exec(out)?.[1];
+  return { status, downloaded: downloadedRaw ? BigInt(downloadedRaw) : 0n };
 }
 
 async function notifyProvider(providerPubkeyHex: string, contractAddrRaw: string): Promise<NotifyResult> {
@@ -475,7 +547,7 @@ async function notifyProviderWithRetry(
   for (;;) {
     try {
       const res = await notifyProvider(providerPubkeyHex, contractAddrRaw);
-      if (BigInt(res.downloaded) >= dataSizeBytes) return;
+      if (res.downloaded >= dataSizeBytes) return;
       console.error(`ton-provider: provider has ${res.downloaded}/${dataSizeBytes} bytes so far — waiting`);
     } catch (e) {
       if (Date.now() > deadline) {
@@ -526,13 +598,26 @@ export function tonProviderBackend(): StorageBackend {
       // this backend's own selftest: scripts/selftest-ton-provider.sh's "notify binary
       // missing" positive control hung for the full retry budget before this check was
       // added here). Failing fast here also avoids spending a real deploy's worth of
-      // work (bag creation, provider search) on a push that cannot finish anyway.
+      // work (bag creation, provider search) — and, more importantly, the deploy PAYMENT
+      // itself — on a push that cannot finish anyway. Checks the path is actually an
+      // EXECUTABLE file, not just a non-empty string (Codex review): a stale/typo'd path
+      // would otherwise only surface as an ENOENT after the operator has already signed
+      // and paid for the deploy.
       if (!TON_PROVIDER_NOTIFY_BIN) {
         throw new Error(
           'ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN is not set — build ' +
             "scripts/go/storage-v1-client ('go build .' in that directory) and point this at the resulting " +
             'binary. Notifying a provider requires an ADNL/RLDP query with no mature TypeScript implementation, ' +
             'so this step shells out to that tested Go program rather than reimplementing the protocol.',
+        );
+      }
+      try {
+        await access(TON_PROVIDER_NOTIFY_BIN, fsConstants.X_OK);
+      } catch {
+        throw new Error(
+          `ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (${TON_PROVIDER_NOTIFY_BIN}) does not exist ` +
+            "or is not executable — build scripts/go/storage-v1-client ('go build .' in that directory) and " +
+            'point this at the resulting binary before pushing (checked before any funds are spent).',
         );
       }
 
@@ -552,10 +637,7 @@ export function tonProviderBackend(): StorageBackend {
         const candidates = await searchProviders(Number(bag.dataSizeBytes));
         const provider = selectProvider(candidates);
         const rateNanoPerMB = providerRateNanoPerMB(provider.price);
-        // Default span = the provider's own min_span, converted to whole days
-        // (rounded up) — docs/ton-storage-status.md: "min_span is typically 7+ days for
-        // Go-scheme providers", i.e. shorter spans are usually refused anyway.
-        const spanDays = BigInt(Math.ceil(provider.min_span / 86400)) || 1n;
+        const spanDays = spanDaysFor(provider);
 
         const deploy = await buildDeploy({
           bagId: Buffer.from(bag.bagId, 'hex'),
@@ -586,7 +668,10 @@ export function tonProviderBackend(): StorageBackend {
 
         return tonProviderLocator(bag.bagId);
       } finally {
-        if (daemon) await daemon.stop();
+        // Each cleanup step runs regardless of whether the other one throws (Codex
+        // review): a daemon.stop() failure must not skip the tmpRoot removal, or a
+        // paid-for push leaves both the daemon and its temp directory behind.
+        if (daemon) await daemon.stop().catch(() => undefined);
         await rmrf(tmpRoot).catch(() => undefined);
       }
     },
@@ -611,7 +696,7 @@ export async function estimateTonProviderCost(sizeBytes: number): Promise<{
   const candidates = await searchProviders(sizeBytes);
   const provider = selectProvider(candidates);
   const rateNanoPerMB = providerRateNanoPerMB(provider.price);
-  const spanDays = BigInt(Math.ceil(provider.min_span / 86400)) || 1n;
+  const spanDays = spanDaysFor(provider);
   const costNano = storageCostNano(BigInt(sizeBytes), rateNanoPerMB, spanDays);
   return { costNano, amountNano: costNano + DEPLOY_BUFFER_NANO, provider, spanDays };
 }

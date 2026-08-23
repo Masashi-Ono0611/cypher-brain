@@ -413,8 +413,11 @@ export const TON_TONAPI_URL = readEnv('CYPHER_BRAIN_TON_TONAPI_URL') || 'https:/
 // arweave/turbo there is no meaningful testnet mode to gate behind a flag.
 export const TON_PROVIDER_OWNER = readEnv('CYPHER_BRAIN_TON_PROVIDER_OWNER') || ''; // TON wallet address that will own the deployed StorageV1 contract (required to push)
 const TON_PROVIDER_MAX_SPEND_RAW = readEnv('CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND');
-// Same BigInt-cap posture as AR_MAX_SPEND above, in nanoTON: 0/unset = no cap (the --yes
-// guard still fires). Separate variable from AR_MAX_SPEND — different backend, different
+// Unlike AR_MAX_SPEND (0/unset = no cap, the --yes guard alone gates spend), ton-provider.ts's
+// put() deliberately REFUSES to push at all when this is 0/unset — a StorageV1 deploy has no
+// SDK-computed "market price" the way arweave/turbo do, so there is no safe default amount to
+// let through uncapped (Codex review: the prior wording here claimed the opposite of the
+// enforced behavior). Separate variable from AR_MAX_SPEND — different backend, different
 // native unit, so one accidental cap must never silently apply to the other's spend.
 export const TON_PROVIDER_MAX_SPEND = TON_PROVIDER_MAX_SPEND_RAW ? BigInt(TON_PROVIDER_MAX_SPEND_RAW) : 0n;
 // Path to a locally-built scripts/go/storage-v1-client binary (`go build` in that dir) —
@@ -431,9 +434,29 @@ export const TON_PROVIDER_MYTONPROVIDER_URL =
 // so its "push waits, does not succeed early" positive control finishes in seconds
 // instead of the real 10-minute default a genuine push needs (a fresh provider fetch of
 // a large brain over P2P is real network work, not instantaneous).
-export const TON_PROVIDER_NOTIFY_RETRY_MS = Number(readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS') || 10 * 60_000);
-export const TON_PROVIDER_NOTIFY_INTERVAL_MS = Number(
-  readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS') || 15_000,
+// Validated the same way TON_HTTP_TIMEOUT_MS above is (Codex review): an unvalidated
+// NaN/Infinity/negative override would make notifyProviderWithRetry()'s `Date.now() >
+// deadline` comparison never trip, silently leaving the paid deploy's local ephemeral
+// daemon (and the temp directory it seeds from) retrying forever instead of the bounded
+// failure this budget exists to guarantee.
+function parsePositiveMsOverride(raw: string | undefined, defaultMs: number, name: string): number {
+  if (raw === undefined) return defaultMs;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    warn(`${name} must be a positive integer (ms) — got ${JSON.stringify(raw)}; using the ${defaultMs}ms default`);
+    return defaultMs;
+  }
+  return n;
+}
+export const TON_PROVIDER_NOTIFY_RETRY_MS = parsePositiveMsOverride(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS'),
+  10 * 60_000,
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS',
+);
+export const TON_PROVIDER_NOTIFY_INTERVAL_MS = parsePositiveMsOverride(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS'),
+  15_000,
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS',
 );
 export const AR_HOST = readEnv('CYPHER_BRAIN_AR_HOST') || 'arweave.net';
 export const AR_PORT = Number(readEnv('CYPHER_BRAIN_AR_PORT') || 443);

@@ -817,10 +817,12 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
   cypher-brain estimate --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--json]
       Read-only preview: print what pushing --in to --backend would cost WITHOUT
       uploading anything. turbo/arweave show the native unit (winc/winston) plus
-      an approximate USD line when a USD/AR rate is fetchable; file, rclone and ton
-      are always reported as free (rclone's actual transfer/storage cost, if any, is
-      whatever the operator's own cloud contract for that remote charges — cypher-
-      brain cannot query it; ton's is the operator's own seeder box). Sizes --in the same way push does (a real byte count
+      an approximate USD line when a USD/AR rate is fetchable; ton-provider shows
+      the native unit too (nanoTON, a real mytonprovider.org priced query), but no
+      USD line yet. file, rclone and ton are always reported as free (rclone's
+      actual transfer/storage cost, if any, is whatever the operator's own cloud
+      contract for that remote charges — cypher-brain cannot query it; ton's is the
+      operator's own seeder box). Sizes --in the same way push does (a real byte count
       off disk). The SAME computation backs the MCP estimate_cost tool, so the two
       never disagree.
       --json prints the same CostEstimate object as one JSON line on stdout

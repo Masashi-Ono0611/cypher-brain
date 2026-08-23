@@ -54,12 +54,14 @@ const port = Number(process.argv[2]);
 const pubkey = process.argv[3];
 const address = process.argv[4];
 const emptyFlagPath = process.argv[5]; // if this file exists, respond with zero candidates
+const badSpanFlagPath = process.argv[6]; // if this file exists, min_span rounds up past max_span
 createServer((req, res) => {
   let body = '';
   req.on('data', (d) => (body += d));
   req.on('end', () => {
     res.writeHead(200, { 'content-type': 'application/json' });
     const empty = emptyFlagPath && existsSync(emptyFlagPath);
+    const badSpan = badSpanFlagPath && existsSync(badSpanFlagPath);
     res.end(
       JSON.stringify({
         providers: empty
@@ -71,8 +73,11 @@ createServer((req, res) => {
                 uptime: 99.5,
                 rating: 20.5,
                 price: 4915200000, // -> rate 800 nanoTON/MB/day (price / (1024*200*30))
-                min_span: 604800, // 7 days
-                max_span: 8294400,
+                // Normal case: min_span=7 days exactly, well under max_span. Bad-span
+                // case: min_span rounds UP to 2 days (ceil(90000/86400)) but max_span is
+                // only 1.5 days — exercises spanDaysFor()'s own guard.
+                min_span: badSpan ? 90000 : 604800,
+                max_span: badSpan ? 129600 : 8294400,
                 max_bag_size_bytes: 1073741824,
                 status: 0,
               },
@@ -83,7 +88,7 @@ createServer((req, res) => {
 }).listen(port, '127.0.0.1');
 MOCKEOF
 MYTONPROVIDER_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-mytonprovider.mjs" "$MYTONPROVIDER_PORT" "$PROVIDER_PUBKEY" "$PROVIDER_WALLET" "$TMP/empty-providers-flag" &
+node "$TMP/mock-mytonprovider.mjs" "$MYTONPROVIDER_PORT" "$PROVIDER_PUBKEY" "$PROVIDER_WALLET" "$TMP/empty-providers-flag" "$TMP/bad-span-flag" &
 MYTONPROVIDER_PID=$!
 export CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL="http://127.0.0.1:$MYTONPROVIDER_PORT"
 
@@ -101,10 +106,15 @@ node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" &
 TONAPI_PID=$!
 export CYPHER_BRAIN_TON_TONAPI_URL="http://127.0.0.1:$TONAPI_PORT"
 
+READY=0
 for _ in $(seq 1 50); do
-  curl -s "http://127.0.0.1:$MYTONPROVIDER_PORT" >/dev/null 2>&1 && curl -s "http://127.0.0.1:$TONAPI_PORT" >/dev/null 2>&1 && break
+  if curl -s "http://127.0.0.1:$MYTONPROVIDER_PORT" >/dev/null 2>&1 && curl -s "http://127.0.0.1:$TONAPI_PORT" >/dev/null 2>&1; then
+    READY=1
+    break
+  fi
   sleep 0.1
 done
+[ "$READY" = 1 ] || { echo "[FAIL] mock mytonprovider.org/tonapi servers did not come up on ports $MYTONPROVIDER_PORT/$TONAPI_PORT"; exit 1; }
 
 # ---- PATH shim: tonutils-storage -> the same mock daemon selftest-ton.sh uses ----
 SHIM="$TMP/bin"
@@ -205,6 +215,15 @@ fi
 grep -q 'no live mytonprovider.org provider' "$TMP/no-providers.err" || { echo "[FAIL] wrong no-providers message"; exit 1; }
 rm -f "$TMP/empty-providers-flag"
 echo "[PASS] no-live-providers guard fired"
+
+echo "== positive control: a provider whose rounded-up span exceeds its own max_span is refused =="
+touch "$TMP/bad-span-flag"
+if cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/bad-span.err"; then
+  echo "[FAIL] push with an impossible provider span was accepted"; exit 1
+fi
+grep -q 'exceeds its own max_span' "$TMP/bad-span.err" || { echo "[FAIL] wrong bad-span message"; exit 1; }
+rm -f "$TMP/bad-span-flag"
+echo "[PASS] bad-span guard fired"
 
 echo "== positive control: notify binary missing refuses with an actionable message =="
 if CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN= cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/no-bin.err"; then
