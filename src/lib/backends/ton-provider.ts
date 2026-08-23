@@ -650,11 +650,19 @@ async function notifyProvider(providerPubkeyHex: string, contractAddrRaw: string
     // Network selection (issue #404) matches every OTHER network-sensitive call this
     // backend makes: CYPHER_BRAIN_TON_NETWORK_CONFIG unset/empty means mainnet (the
     // daemon's own default — config.ts's own comment on TON_NETWORK_CONFIG), a path
-    // means testnet. startLocalTonDaemon() above already keys off the exact same
-    // `TON_NETWORK_CONFIG || undefined` check. Before this, notify() alone ignored the
-    // signal and always queried mainnet tonapi — hit directly while dogfooding a
-    // testnet push: a contract confirmed active on testnet still 404'd here because the
-    // account genuinely doesn't exist on the mainnet this call was hard-coded to ask.
+    // means testnet. This is this project's own documented CONTRACT for the variable
+    // (cli.ts --help: "path to a TON global config JSON for testnet") — presence, not
+    // the file's actual contents, is the signal; nothing here (or in
+    // startLocalTonDaemon() above, which already keys off the exact same
+    // `TON_NETWORK_CONFIG || undefined` check) verifies a given path truly points at
+    // testnet vs. some other network (Codex review). Pointing it at a non-testnet
+    // config would already have misconfigured the bag-hashing daemon identically,
+    // before this notify call is ever reached — this is an existing characteristic of
+    // the variable's contract, not a new risk this fix introduces. Before this fix,
+    // notify() alone ignored the signal and always queried mainnet tonapi — hit
+    // directly while dogfooding a testnet push: a contract confirmed active on testnet
+    // still 404'd here because the account genuinely doesn't exist on the mainnet this
+    // call was hard-coded to ask.
     const { out } = await run(
       TON_PROVIDER_NOTIFY_BIN,
       [
