@@ -23,11 +23,11 @@ binaries.
 |---|---|---|
 | **Self-hosted seeder** — droplet seeds our own bags directly, no payment | mainnet | **WORKS, in production** (2026-08-22) |
 | **Self-hosted seeder** | testnet | dogfood only; not used for real backups |
-| **Our droplet as a paid provider** (earns — discoverable by other users) | mainnet | **registered & live, econ params fixed** in the mytonprovider.org registry (2026-08-23, pubkey `f5f603c7…`, uptime 100%, rating 17.9, telemetry on, wallet funded ~1 TON); zero paid contracts received yet |
+| **Our droplet as a paid provider** (earns — discoverable by other users) | mainnet | **registered, live, econ params fixed, and has now processed one real contract** — but it's our own (see "We pay a live Go provider" row below): mytonprovider.org registry (pubkey `f5f603c7…`, uptime 100%, rating 17.9, telemetry on, wallet funded ~1 TON); no THIRD-PARTY-originated paid contract yet, so "does this provider earn from strangers" is still unproven |
 | **Our droplet as a paid provider** | testnet | standing twin (same Go binaries, isolated units) — controlled environment, no real earnings expected |
 | **We pay a legacy C++ provider** (spends — fabric-contract ecosystem) | mainnet | **GRAVEYARD** (115 listed, 0 active ≤7d, 94 silent >1y) — not pursuing |
 | **We pay a legacy C++ provider** | testnet | **DEAD DAEMONS, live contracts** (2026-08-22 experiment) |
-| **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **IN PROGRESS** (2026-08-23) — building a small Go client (reuses xssnick's own `pkg/contract` + `pkg/transport`) to deploy a StorageV1 contract against a real registry provider and pay for masabrain (481 MB) |
+| **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **WORKS through discovery + fetch, proof-reward payout not yet observed** (2026-08-23) — `scripts/go/storage-v1-client` (deploy/notify/status/update-providers) deployed and funded a StorageV1 contract for masabrain (481 MB) against our own registered droplet-as-provider, and the provider self-reported the full bag downloaded. Getting there required one real-money field-mapping bug (fixed by an in-place repair, not a re-deploy) — see below |
 | **We pay a live Go provider** | testnet | not attempted (mainnet-first, per operator decision — the registry itself is a mainnet market) |
 
 **The single most important 2026-08-23 correction**: the provider market is TWO
@@ -80,8 +80,11 @@ checked in any future assessment.
   21 with uptime >90%**. The top-rated operator
   (Dallas, uptime 99.2%, 370 days of continuous operation) **self-reports
   2,263 GB used of 2,700 GB offered** via registry telemetry — a strong demand
-  signal, but allocation/usage as REPORTED, not yet an independently verified
-  paid contract (the first live test will settle that).
+  signal, but allocation/usage as REPORTED, not yet independently verified
+  against a paid contract with a STRANGER's provider — our own first live
+  test (below) proves the payment mechanism works, but paid our own droplet,
+  so it doesn't settle whether third-party operators like the Dallas one
+  actually honor contracts from strangers.
   Spans are sane here too: min_span typically 7 days (vs the C++ listing's 1 day).
 - How it works (verified from xssnick source, re-confirmed 2026-08-23 by a
   targeted read of `tonutils-storage` @ `e80866d`, `tonutils-storage-provider`
@@ -113,18 +116,76 @@ checked in any future assessment.
 - The production client is **mytonstorage.org** (TON Connect + upload +
   provider choice + contract management) — still the only *browser* path.
   Re-uploading a 481 MB file through it is impractical from a remote laptop,
-  so the CLI path below is what we're building instead.
-- **Automation status (2026-08-23)**: `tonutils-storage`'s `rent-storage` REPL
-  is TTY-only (piped/expect drives produced multi-GB prompt-redraw storms, no
-  parseable output) — ruled out for scripting. Reimplementing ADNL/RLDP/DHT
-  from scratch in JS was considered and rejected as too risky for a P2P crypto
+  so the CLI path below is what we built instead (and is now the one that's
+  actually confirmed working, not just the fallback).
+- **Automation status (2026-08-23): built, and the first real payment
+  succeeded.** `tonutils-storage`'s `rent-storage` REPL is TTY-only
+  (piped/expect drives produced multi-GB prompt-redraw storms, no parseable
+  output) — ruled out for scripting. Reimplementing ADNL/RLDP/DHT from
+  scratch in JS was considered and rejected as too risky for a P2P crypto
   protocol with no mature JS implementation confirmed production-ready.
-  **Current path: a small standalone Go program that imports xssnick's own
-  `pkg/contract` (deploy-message construction, non-`internal`) and
-  `pkg/transport` (`RequestStorageInfo`, the same RLDP client the real daemon
-  uses, also non-`internal`) directly** — reuses tested code instead of
-  re-deriving the cell layout and ADNL handshake by hand. Lives alongside the
-  other operator-run experiment scripts, not the shipped CLI. In progress.
+  Built instead: `scripts/go/storage-v1-client`, a standalone Go program that
+  imports xssnick's own `pkg/contract` (deploy-message construction,
+  non-`internal`) and `pkg/transport` (`RequestStorageInfo`, the same RLDP
+  client the real daemon uses, also non-`internal`) directly — reuses tested
+  code instead of re-deriving the cell layout and ADNL handshake by hand.
+  `deploy`/`notify`/`status`/`update-providers` subcommands; never touches a
+  wallet private key (prints a Tonkeeper deeplink for a human to sign). Lives
+  alongside the other operator-run experiment scripts, not the shipped CLI.
+- **Real-money incident during the first live use (2026-08-23) — full
+  account, since it's the reason two PRs exist between "built" and
+  "confirmed working"**: one wrong mental model about `ProviderV1.Address`
+  produced two attempts before landing on the correct design — an earlier,
+  never-actually-deployed version of this tool already had `deploy` take a
+  wallet address and `notify` take a pubkey on that theory; the FIRST
+  attempt ever run for real used that same split and failed. So it's one
+  root cause, tested for real exactly once before the fix below. The first
+  real `deploy` + `notify` against our own
+  registered provider (see the section below) failed with `"provider does
+  not exist in this contract"`. Root cause: `ProviderV1.Address` (the
+  on-chain field identifying which provider a contract is for) was assumed
+  to be the provider's real TON wallet address — the tool's *first* version
+  had already split a single `--provider` flag into a wallet-address `deploy`
+  variant and a pubkey `notify` variant on exactly that theory, reasoning
+  from a `.Address.Data() != .pubkey` byte comparison against two real
+  registry entries. That split was itself wrong. A from-scratch Codex
+  deep-check (source + web search, run at the operator's explicit request to
+  "double check with Codex, official docs included") found the real rule:
+  `address.NewAddress(0, 0, pubkey)` is just how the Go SDK's dict-key API
+  wants the type shaped — only `.Data()` (the raw ProviderKey pubkey bytes)
+  is ever serialized on-chain, and the contract's `proof_storage` handler
+  runs `check_signature` against that same key, which only an Ed25519 public
+  key (not a wallet's StateInit hash) can satisfy. **Both `deploy` and
+  `notify` take the SAME value: the provider's ProviderKey pubkey**
+  (mytonprovider.org's registry `pubkey` field, not its `address` field) —
+  confirmed independently by decoding the droplet's own
+  `config.json`'s `ProviderKey` public half and matching it byte-for-byte to
+  the registry `pubkey`. Funds were not sent to a wrong recipient: StorageV1
+  pays proof rewards to whoever *sends* a valid signed proof, not to the
+  dictionary key, so a contract with the wrong key just sits inert rather
+  than paying out incorrectly — but "inert" is not "safe": absent the repair
+  below, the balance would have stayed stranded in that contract (recoverable
+  in principle via the owner's withdrawal path, which this incident did not
+  need and so did not exercise). It's repairable in place, since the provider list
+  never touches the StateInit that determines the contract's address (added
+  `update-providers`, a bare `modify_providers`-only repair subcommand, for
+  exactly this). Real transactions involved: 0.374 TON initial deploy,
+  0.05 TON repair message — both against the operator's own droplet, so IF
+  the provider daemon goes on to submit successful proofs, those payouts
+  would net back to the operator's own provider wallet — not yet observed at
+  the time of writing (see the next bullet for what *is* confirmed).
+- **Confirmed working: contract deploy, on-chain landing, RLDP discovery, and
+  provider fetch (2026-08-23)**: after the repair,
+  `notify --provider-pubkey f5f603c7… --contract 0:465347a9…` returned
+  `status: active, downloaded: 481489880 bytes` — matching masabrain's bag
+  size — i.e. the (self-owned) provider daemon found the corrected contract
+  and already fetched the full bag via P2P. This is the provider's own
+  self-report (the tool does not call `VerifyStorageADNLProof`/
+  `checkProofBranch` to check it against a merkle proof), not yet
+  cross-checked against an independent source (e.g. mytonstorage.org), but
+  it is the first real evidence the whole pipeline — deploy → on-chain
+  landing → RLDP discovery → provider fetch — works end to end against the
+  live Go ecosystem.
 
 ## Testnet — third-party providers (C++ lane)
 
@@ -170,8 +231,10 @@ checked in any future assessment.
   it proves the self-reported registration was recorded by mytonprovider.org
   — the same registry the transaction targets — not that the provider daemon
   is independently reachable or functioning (uptime/telemetry in this
-  registry are also self-reported by the same daemon). No paid contracts
-  received yet (expected — registration alone doesn't generate demand).
+  registry are also self-reported by the same daemon). At registration time,
+  no paid contracts had been received yet (expected — registration alone
+  doesn't generate demand); it has since processed exactly one, from
+  ourselves — see the "Confirmed working end to end" bullet above.
 - **Default config, then a self-inflicted bounty trap, both found + fixed
   (2026-08-23).** The provider ran with unmodified
   `tonutils-storage-provider` defaults: `MaxBagSizeBytes: 0` (confirmed
@@ -218,26 +281,27 @@ checked in any future assessment.
   (`UQCCrKrQHLpB75vvrd5js78eB7qK6v7Cpz4WJpV2DoZnY-GC`) topped up from 0.1 TON
   to **~1 TON** (operator-sent) — enough headroom for the first several proof
   cycles (0.05 TON/proof) before contract income needs to cover it.
-- **Two registry-UI fields stayed unresolved and why (2026-08-23):**
-  `Location` shows "Unknown" and `Status` shows "No Data" on
-  mytonprovider.org, unlike established providers ("United States (US)",
-  "Stable (100%)"). Source-traced both: `Location` is filled by the
-  backend's own `UpdateIPInfo` worker, which only sweeps every **240
-  minutes** — expected to self-resolve, not a config problem (droplet's
+- **Two registry-UI fields, both still pending despite a real contract now
+  existing (2026-08-23):** `Location` showed "Unknown" and `Status`
+  showed "No Data" on mytonprovider.org, unlike established providers
+  ("United States (US)", "Stable (100%)"). Source-traced both: `Location` is
+  filled by the backend's own `UpdateIPInfo` worker, which only sweeps every
+  **240 minutes** — expected to self-resolve, not a config problem (droplet's
   `ExternalIP`/firewall for ADNL udp/18555 were confirmed correctly set).
-  `Status`, however, **will not self-resolve** — the backend's
-  `UpdateStatuses` SQL `LEFT JOIN`s `providers.storage_contracts`, so a
-  provider with zero contracts has no join row to derive a status from and
-  stays "No Data" indefinitely; it only starts showing "Stable" once at
-  least one real contract exists. (A same-droplet self-contract — using our
-  own provider to store our own masabrain bag — would clear this: 481 MB at
-  the fixed rate/span bounties above the gas fee, so it's technically viable.
-  Deprioritized versus the third-party test though, since seeder and provider
-  would be the same single failure domain — fixing the cosmetic status this
-  way adds zero real redundancy. The Go client being built for the "pay a
-  live Go provider" lane above takes the provider address as a parameter, so
-  pointing it at our own pubkey later is a cheap follow-up if the cosmetic
-  fix is ever wanted.)
+  `Status` needs at least one real contract to stop being "No Data" (the
+  backend's `UpdateStatuses` SQL `LEFT JOIN`s `providers.storage_contracts`,
+  so zero contracts means no join row). This section originally deprioritized
+  fixing `Status` via a same-droplet self-contract, reasoning that seeder and
+  provider sharing one droplet is a single failure domain that adds no real
+  redundancy — **that plan changed**: the "pay a live Go provider" lane above
+  needed a real end-to-end payment test regardless, and paying our own
+  already-registered provider was the lowest-friction way to get one (no
+  waiting on a third-party operator's daemon behavior). The self-contract now
+  exists (`0:465347a9…`, masabrain, 481 MB) and the provider confirmed the
+  full download — but as of the incident's resolution, `status`/`location`
+  on the registry are **still `null`**, even after the contract landed and
+  `notify` succeeded; whether that's a scan-cycle lag or something else is
+  unresolved and being checked separately.
 - **Testnet: standing twin, unchanged.** tonutils-storage-provider v0.4.3 +
   its own testnet tonutils-storage, running as transient systemd units on the
   droplet (isolated under `/opt/tsp/testnet-*`, mainnet services untouched);
@@ -299,3 +363,10 @@ the storage; it buys availability, not permanence.
 - Go toolchain: available locally (`go1.26.5`, macOS arm64) for building the
   StorageV1 client program described above; **not installed on the droplet**
   (the droplet only runs prebuilt Go binaries, it doesn't compile).
+- `scripts/go/storage-v1-client` (local, not deployed anywhere — a laptop
+  CLI): `deploy`/`notify`/`status`/`update-providers`, 49 tests, contract
+  deployment + provider discovery/fetch confirmed working end to end (see
+  above; proof-reward payout not yet observed). Its one live mainnet contract:
+  `0:465347a9b5152bf6f69e1bc47ce82c537aee5ae4e3d00437d4a514f0e9cc452a` —
+  masabrain (481 MB), rate 800 nanoTON/MB/day, span 192 days, provider
+  pubkey `f5f603c7…` (our own droplet), balance ~0.42 TON.
