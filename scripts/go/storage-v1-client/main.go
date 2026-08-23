@@ -18,40 +18,36 @@
 //
 // Ported (faithfully, with credit) from two upstream repositories:
 //
-//   - github.com/xssnick/tonutils-storage-provider (v0.4.3)
-//     pkg/contract/v1.go   — StorageV1 TL-B layout, V1Code (compiled
-//     contract code BOC), PrepareV1DeployData (builds
-//     the StateInit data cell + modify_providers body
+// github.com/xssnick/tonutils-storage-provider (v0.4.3):
 //
-//   - derives the contract address from the
-//     StateInit hash). This is the exact function
-//     this program calls for `deploy` — not a
-//     reimplementation.
-//     pkg/transport/client.go — Client.RequestStorageInfo: the ADNL/RLDP
-//     "storageProvider.storageRequest" query that
-//     tells a provider daemon a contract exists for
-//     it to check. This program calls it directly for
-//     `notify`.
+//	pkg/contract/v1.go — StorageV1 TL-B layout, V1Code (compiled contract
+//	code BOC), and PrepareV1DeployData, which builds the StateInit data
+//	cell + modify_providers body and derives the contract address from
+//	the StateInit hash. This is the exact function this program calls
+//	for `deploy` — not a reimplementation.
 //
-//   - github.com/xssnick/tonutils-storage (v1.5.3)
-//     provider/provider.go — provider.Client.BuildAddProviderTransaction,
-//     the function the upstream tonutils-storage CLI's
-//     own "rent-storage" REPL command uses. It is a
-//     thin wrapper around PrepareV1DeployData (adding
-//     the target provider(s) to the modify_providers
-//     dict included in the SAME deploy message — see
-//     "field notes" below) plus BOC serialization.
-//     This program's deploy.go inlines that same
-//     wrapping directly against pkg/contract, since
-//     BuildAddProviderTransaction itself requires a
-//     running local tonutils-storage daemon (via
-//     *db.Storage) that this standalone experiment
-//     does not have.
-//     cli/main.go           — the "rent-storage" REPL command: confirms the
-//     exact Tonkeeper deeplink shape
-//     (ton://transfer/<addr>?bin=<b64>&init=<b64>&amount=<n>,
-//     using padded base64.URLEncoding) this program
-//     reproduces byte-for-byte in deeplink.go.
+//	pkg/transport/client.go — Client.RequestStorageInfo: the ADNL/RLDP
+//	"storageProvider.storageRequest" query that tells a provider daemon
+//	a contract exists for it to check. This program calls it directly
+//	for `notify`.
+//
+// github.com/xssnick/tonutils-storage (v1.5.3):
+//
+//	provider/provider.go — provider.Client.BuildAddProviderTransaction,
+//	the function the upstream tonutils-storage CLI's own "rent-storage"
+//	REPL command uses. It is a thin wrapper around PrepareV1DeployData
+//	(adding the target provider(s) to the modify_providers dict included
+//	in the SAME deploy message — see "field notes" below) plus BOC
+//	serialization. This program's deploy.go inlines that same wrapping
+//	directly against pkg/contract, since BuildAddProviderTransaction
+//	itself requires a running local tonutils-storage daemon (via
+//	*db.Storage) that this standalone experiment does not have.
+//
+//	cli/main.go — the "rent-storage" REPL command: confirms the exact
+//	Tonkeeper deeplink shape
+//	(ton://transfer/<addr>?bin=<b64>&init=<b64>&amount=<n>, using padded
+//	base64.URLEncoding) this program reproduces byte-for-byte in
+//	deeplink.go.
 //
 // Field notes (verified against the above source, 2026-08-23):
 //   - StorageV1's on-chain STATE starts with an EMPTY ActiveProviders dict —
