@@ -64,10 +64,14 @@
 //     only new-contract discovery path is the ADNL push `notify` sends.
 //   - SECOND CORRECTION (2026-08-23, this one found via a REAL mainnet
 //     incident — a live deploy + notify against a real provider; see the fix
-//     commit and docs/ton-storage-status.md for the full account): the FIRST
-//     correction above (which split --provider into a wallet address for
-//     deploy vs. a pubkey for notify) was ITSELF wrong. `ProviderV1.Address`
-//     is not a real TON wallet at all — `address.NewAddress(0, 0, pubkey)` is
+//     commit and docs/ton-storage-status.md for the full account). An EARLIER
+//     version of this program (since reverted — no trace of it remains in
+//     the current flags/code, described here only for the record) had
+//     `deploy --provider` take a wallet address while `notify
+//     --provider-pubkey` took a pubkey, on the theory that those were two
+//     genuinely different required identifiers. That was ITSELF wrong.
+//     `ProviderV1.Address` is not a real TON wallet at all —
+//     `address.NewAddress(0, 0, pubkey)` is
 //     just how the Go SDK's dict-key API wants the type shaped; only
 //     `.Data()` (the raw pubkey bytes) is ever serialized on-chain
 //     (pkg/contract/v1.go PrepareV1DeployData: `providersDict.SetIntKey(new(
@@ -92,13 +96,20 @@
 //     reference-CLI and daemon behavior, which a from-scratch web+source
 //     review (2026-08-23) called "effectively definitive" despite the
 //     absence of an explicit written spec.
-//   - Money-safety note from the same incident: getting this field wrong
-//     does NOT lose funds. StorageV1 pays proof rewards to whichever address
-//     SENDS a valid signed proof message, not to the dictionary key itself —
-//     a contract with the wrong key installed just sits inert (the intended
-//     provider daemon can never find itself, so it never proves, so it never
-//     gets paid, but the contract's balance stays put under the owner's
-//     control). It is also repairable in place: `providers` never touches
+//   - Money-safety note from the same incident (Codex review, 2026-08-23:
+//     the original wording here was too absolute — corrected): getting this
+//     field wrong does not send the contract's balance to a wrong recipient.
+//     StorageV1 pays proof rewards to whichever address SENDS a valid signed
+//     proof message, not to the dictionary key itself — a contract with the
+//     wrong key installed just sits inert (the intended provider daemon can
+//     never find itself, so it never proves, so it never gets paid). This is
+//     NOT the same as "the balance is safe from all costs": normal TON
+//     account storage/rent fees still apply regardless, and once the
+//     dictionary key is corrected, whatever rate/span you supply then
+//     governs real future spending of that same balance via proof payouts —
+//     get the correction's rate/span wrong and you've authorized real future
+//     spending on a mistake, just not an immediate one. It is repairable in
+//     place: `providers` never touches
 //     the StateInit `data` cell (only bagID/merkleHash/dataSize/pieceSize/
 //     ownerAddr do — see PrepareV1DeployData above), so re-deriving the
 //     contract address with a corrected provider list reproduces the exact
@@ -165,12 +176,14 @@ prints a Tonkeeper deeplink. Refuses (exit 2) if the computed amount exceeds
                              (== StorageV1.TorrentHash). This is the same
                              64-hex value as a cypher-brain "ton:v1:<hex>"
                              locator's suffix.
-  --provider-pubkey <64hex> required. The provider's ADNL/Ed25519 public key
-                             — mytonprovider.org's registry 'pubkey' field
-                             (NOT its 'address' field — see main.go field
-                             notes: this is the same value 'notify' below
-                             takes, not a TON wallet address, despite
-                             ProviderV1.Address's Go type name).
+  --provider-pubkey <64hex> required. The provider's ProviderKey (Ed25519)
+                             public key — mytonprovider.org's registry
+                             'pubkey' field (NOT its 'address' field, and NOT
+                             the daemon's separate lower-level ADNLKey — see
+                             main.go field notes: this is the same value
+                             'notify'/'update-providers' below take, not a
+                             TON wallet address, despite ProviderV1.Address's
+                             Go type name).
   --owner <raw-addr>        required. Raw TON address ("0:<64hex>" or
                              "-1:<64hex>") that will own the contract
                              (StorageV1.OwnerAddr) — normally your own wallet.
@@ -225,10 +238,11 @@ proceeds. Run this ONLY after --contract has actually landed on-chain from a
 signed 'deploy' deeplink — querying too early wastes the round trip and this
 program cannot distinguish "not yet confirmed" from "never happened".
 
-  --provider-pubkey <64hex> required. The provider's ADNL/Ed25519 public key
-                             — mytonprovider.org's registry 'pubkey' field.
-                             Same value 'deploy' and 'update-providers' take
-                             (see main.go field notes).
+  --provider-pubkey <64hex> required. The provider's ProviderKey (Ed25519)
+                             public key — mytonprovider.org's registry
+                             'pubkey' field; NOT ADNLKey. Same value 'deploy'
+                             and 'update-providers' take (see main.go field
+                             notes).
   --contract <raw-addr>     required. The deployed StorageV1 contract address
                              (printed by 'deploy', or found in your wallet
                              history / tonviewer after signing).

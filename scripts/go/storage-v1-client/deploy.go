@@ -147,7 +147,7 @@ func parseDeployFlagSet(args []string) (*deployFlags, error) {
 	fs := newFlagSet("deploy")
 	f := &deployFlags{}
 	fs.StringVar(&f.bagIDHex, "bag-id", "", "bag id / torrent hash, 64 hex chars (required)")
-	fs.StringVar(&f.providerPubkeyRaw, "provider-pubkey", "", "provider's ADNL/Ed25519 public key, 64 hex chars — mytonprovider.org's registry 'pubkey' field (required)")
+	fs.StringVar(&f.providerPubkeyRaw, "provider-pubkey", "", "provider's ProviderKey (Ed25519) public key, 64 hex chars — mytonprovider.org's registry 'pubkey' field; NOT ADNLKey or a wallet address (required)")
 	fs.StringVar(&f.ownerRaw, "owner", "", "raw owner wallet address (required)")
 	fs.StringVar(&f.rateRaw, "rate-nano-per-mb-day", "", "nanoTON/MB/day (required)")
 	fs.StringVar(&f.spanDaysRaw, "span-days", "", "proof span in days (required)")

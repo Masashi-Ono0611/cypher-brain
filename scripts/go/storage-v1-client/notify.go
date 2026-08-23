@@ -78,7 +78,9 @@ func notifyProvider(ctx context.Context, providerKey []byte, contractAddr *addre
 // verified against xssnick/tonutils-storage-provider@v0.4.3 pkg/transport/
 // client.go connect() — RequestStorageInfo's `provider []byte` parameter is
 // wrapped as keys.PublicKeyED25519{Key: providerKey} and hashed to build the
-// DHT lookup key. This is the provider's ADNL/Ed25519 public key, which
+// DHT lookup key. This is the provider's ProviderKey (Ed25519) public key —
+// NOT its lower-level ADNLKey (the stock daemon generates those as separate
+// keys) — which
 // mytonprovider.org's registry exposes as its own `pubkey` field — a
 // DIFFERENT 32 bytes from the provider's TON wallet `address` field (used by
 // `deploy`'s --provider instead; see main.go field notes and deploy.go).
@@ -98,7 +100,7 @@ type notifyParams struct {
 
 func parseNotifyFlags(args []string) (*notifyParams, error) {
 	fs := newFlagSet("notify")
-	providerPubkeyRaw := fs.String("provider-pubkey", "", "provider's ADNL/Ed25519 public key, 64 hex chars — mytonprovider.org's registry 'pubkey' field, NOT its 'address' field (required)")
+	providerPubkeyRaw := fs.String("provider-pubkey", "", "provider's ProviderKey (Ed25519) public key, 64 hex chars — mytonprovider.org's registry 'pubkey' field; NOT ADNLKey or a wallet address (required)")
 	contractRaw := fs.String("contract", "", "deployed StorageV1 contract address (required)")
 	byteToProofRaw := fs.Uint64("byte-to-proof", 0, "byte offset to ask the provider to prove")
 	timeoutSeconds := fs.Uint64("timeout", uint64(defaultNotifyTimeout/time.Second), "ADNL/DHT operation timeout, in seconds")

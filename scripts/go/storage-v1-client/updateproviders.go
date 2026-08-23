@@ -38,6 +38,21 @@ import (
 // update-providers call (this program only supports one provider per call
 // today — re-run for each, understanding that only the LAST call's set
 // survives on-chain).
+// checkUpdateProvidersGasGuard is the pure, network-free half of the
+// --gas-ton/--max-spend-ton check — pulled out of runUpdateProviders (which
+// also does a network call to fetch account state) so it is directly
+// unit-testable, mirroring how buildDeploy's own max-spend guard is pure and
+// tested without touching the network.
+func checkUpdateProvidersGasGuard(gasNano, maxSpendNano *big.Int) error {
+	if gasNano.Cmp(maxSpendNano) > 0 {
+		return guardf(
+			"--gas-ton %s nanoTON exceeds --max-spend-ton guard %s nanoTON — refusing to build the repair",
+			gasNano, maxSpendNano,
+		)
+	}
+	return nil
+}
+
 func buildUpdateProvidersBody(providerPubkey []byte, rateNanoPerMB uint64, spanDays uint64) (*cell.Cell, error) {
 	if len(providerPubkey) != 32 {
 		return nil, fmt.Errorf("provider pubkey must be 32 bytes, got %d", len(providerPubkey))
@@ -121,7 +136,7 @@ func parseUpdateProvidersFlags(args []string) (*updateProvidersParams, error) {
 	fs := newFlagSet("update-providers")
 	f := &updateProvidersFlags{}
 	fs.StringVar(&f.contractRaw, "contract", "", "the ALREADY-DEPLOYED StorageV1 contract's raw address (required)")
-	fs.StringVar(&f.providerPubkeyRaw, "provider-pubkey", "", "provider's ADNL/Ed25519 public key, 64 hex chars (required)")
+	fs.StringVar(&f.providerPubkeyRaw, "provider-pubkey", "", "provider's ProviderKey (Ed25519) public key, 64 hex chars — NOT ADNLKey or a wallet address (required)")
 	fs.StringVar(&f.rateRaw, "rate-nano-per-mb-day", "", "nanoTON/MB/day (required)")
 	fs.StringVar(&f.spanDaysRaw, "span-days", "", "proof span in days (required)")
 	fs.StringVar(&f.gasTon, "gas-ton", "0.05", "TON to attach for message-processing gas only (the contract's existing balance is NOT re-sent)")
@@ -215,21 +230,23 @@ func runUpdateProviders(ctx context.Context, args []string, stdout io.Writer) er
 	if acc.Status == "nonexist" {
 		return guardf("contract %s is nonexist on %s — update-providers is only for an ALREADY-DEPLOYED contract; use deploy instead", p.contract.StringRaw(), network)
 	}
+	// Codex review finding (Warning): unlike notify (a read-only-ish ADNL
+	// query that's harmless to send early), a body-only modify_providers
+	// message CANNOT initialize an uninitialized account or revive a frozen
+	// one — sending it to anything other than 'active' cannot succeed and
+	// just wastes --gas-ton. This is therefore a hard refusal, not a warning
+	// to proceed past. If tonapi is genuinely lagging a just-landed deploy,
+	// the fix is to wait and re-run `status` until it reports 'active', not
+	// to fire a repair blind.
 	if acc.Status != "active" {
-		// Not a hard refusal (matches notify.go's own non-active handling):
-		// tonapi's index can lag a just-signed transaction, and "uninit" in
-		// particular ALSO means "contract code has not run yet" per
-		// stateVerdict — proceeding here just risks a wasted --gas-ton send
-		// to a contract that won't process it correctly, not fund loss.
-		fmt.Fprintf(stdout, "  [WARN] account status is %q, not 'active' — modify_providers may not be processed correctly\n", acc.Status)
-		fmt.Fprintln(stdout, "  until the contract has actually run its code; proceeding anyway in case tonapi's index is lagging.")
+		return guardf(
+			"contract %s status is %q, not 'active' — a body-only modify_providers message cannot initialize or revive it; wait for `status` to report 'active' and retry",
+			p.contract.StringRaw(), acc.Status,
+		)
 	}
 
-	if p.gasNano.Cmp(p.maxSpendNano) > 0 {
-		return guardf(
-			"--gas-ton %s nanoTON exceeds --max-spend-ton guard %s nanoTON — refusing to build the repair",
-			p.gasNano, p.maxSpendNano,
-		)
+	if err := checkUpdateProvidersGasGuard(p.gasNano, p.maxSpendNano); err != nil {
+		return err
 	}
 
 	body, err := buildUpdateProvidersBody(p.providerPubkey, p.rateNanoPerMB, p.spanDays)

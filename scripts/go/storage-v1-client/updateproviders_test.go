@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"math/big"
 	"strings"
 	"testing"
+
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func TestBuildUpdateProvidersBodyValidation(t *testing.T) {
@@ -41,6 +44,143 @@ func TestBuildUpdateProvidersBodyDeterministicShape(t *testing.T) {
 	boc := body.ToBOC()
 	if len(boc) == 0 {
 		t.Fatal("expected a non-empty BOC")
+	}
+}
+
+// decodedProviderEntry pulls the opcode, dict key, and the two ProviderV1
+// body fields (MaxSpan, PricePerMBDay) back out of a modify_providers body —
+// used below to prove buildUpdateProvidersBody's hand-copied dict-building
+// logic actually encodes what it claims to, not just that it produces SOME
+// non-empty cell (Codex review finding: a shape-only check would pass even
+// if the pubkey were dropped or written to the wrong field).
+type decodedProviderEntry struct {
+	opcode  uint64
+	key     []byte
+	maxSpan uint64
+	rate    *big.Int
+}
+
+func decodeSingleProviderBody(t *testing.T, body *cell.Cell, expectKey []byte) decodedProviderEntry {
+	t.Helper()
+	s, err := body.BeginParse()
+	if err != nil {
+		t.Fatalf("BeginParse: %v", err)
+	}
+	opcode, err := s.LoadUInt(32)
+	if err != nil {
+		t.Fatalf("LoadUInt(opcode): %v", err)
+	}
+	if _, err := s.LoadUInt(64); err != nil { // query_id — randomized, not compared
+		t.Fatalf("LoadUInt(query_id): %v", err)
+	}
+	dict, err := s.LoadDict(256)
+	if err != nil {
+		t.Fatalf("LoadDict: %v", err)
+	}
+	val, err := dict.LoadValueByIntKey(new(big.Int).SetBytes(expectKey))
+	if err != nil {
+		t.Fatalf("LoadValueByIntKey(%x): %v — the dict does not contain the expected key at all", expectKey, err)
+	}
+	maxSpan, err := val.LoadUInt(32)
+	if err != nil {
+		t.Fatalf("LoadUInt(MaxSpan): %v", err)
+	}
+	rate, err := val.LoadBigCoins()
+	if err != nil {
+		t.Fatalf("LoadBigCoins(PricePerMBDay): %v", err)
+	}
+	return decodedProviderEntry{opcode: opcode, key: expectKey, maxSpan: maxSpan, rate: rate}
+}
+
+// TestBuildUpdateProvidersBodySemanticContents proves (not just asserts) that
+// buildUpdateProvidersBody encodes the exact pubkey/rate/span it was given,
+// by decoding the body back and checking every field — closing the gap the
+// shape-only test above leaves.
+func TestBuildUpdateProvidersBodySemanticContents(t *testing.T) {
+	pubkey := bytes.Repeat([]byte{0xbb}, 32)
+	const rateNanoPerMB = 800
+	const spanDays = 192
+
+	body, err := buildUpdateProvidersBody(pubkey, rateNanoPerMB, spanDays)
+	if err != nil {
+		t.Fatalf("buildUpdateProvidersBody: %v", err)
+	}
+	got := decodeSingleProviderBody(t, body, pubkey)
+
+	if got.opcode != 0x3dc680ae {
+		t.Errorf("opcode = 0x%x, want 0x3dc680ae (modify_providers)", got.opcode)
+	}
+	if got.maxSpan != spanDays*86400 {
+		t.Errorf("MaxSpan = %d, want %d (spanDays*86400)", got.maxSpan, spanDays*86400)
+	}
+	// rateNanoPerMB is already in nanoTON (tlb.FromNanoTONU takes a value
+	// already denominated in nanoTON, unlike tlb.FromTON which takes whole
+	// TON) — this test itself first asserted a wrong x1e9 expectation here
+	// and caught it failing against the real implementation, which is
+	// correct; confirms buildUpdateProvidersBody does NOT introduce a
+	// TON/nanoTON scaling bug.
+	wantRate := big.NewInt(rateNanoPerMB)
+	if got.rate.Cmp(wantRate) != 0 {
+		t.Errorf("rate = %s nanoTON, want %s nanoTON", got.rate, wantRate)
+	}
+}
+
+// TestUpdateProvidersBodyMatchesDeployBody is the golden compatibility test
+// Codex flagged as missing: it proves buildUpdateProvidersBody's hand-copied
+// dict/body logic stays byte-compatible with contract.PrepareV1DeployData's
+// OWN body construction (called via buildDeploy) for the identical
+// conceptual provider inputs — so a future upstream layout change to either
+// path, or a typo introduced into the hand copy, shows up as a test failure
+// instead of silently desynchronizing the two.
+func TestUpdateProvidersBodyMatchesDeployBody(t *testing.T) {
+	pubkey := bytes.Repeat([]byte{0x77}, 32)
+	const rateNanoPerMB = 12345
+	const spanDays = 30
+
+	dp := fixedDeployParams(t)
+	dp.providerPubkey = pubkey
+	dp.rateNanoPerMB = rateNanoPerMB
+	dp.spanDays = spanDays
+	deployRes, err := buildDeploy(dp)
+	if err != nil {
+		t.Fatalf("buildDeploy: %v", err)
+	}
+
+	repairBody, err := buildUpdateProvidersBody(pubkey, rateNanoPerMB, spanDays)
+	if err != nil {
+		t.Fatalf("buildUpdateProvidersBody: %v", err)
+	}
+
+	deployBOC := deployRes.bodyBOC
+	deployCell, err := cell.FromBOC(deployBOC)
+	if err != nil {
+		t.Fatalf("cell.FromBOC(deploy body): %v", err)
+	}
+
+	deployDecoded := decodeSingleProviderBody(t, deployCell, pubkey)
+	repairDecoded := decodeSingleProviderBody(t, repairBody, pubkey)
+
+	if deployDecoded.opcode != repairDecoded.opcode {
+		t.Errorf("opcode mismatch: deploy=0x%x repair=0x%x", deployDecoded.opcode, repairDecoded.opcode)
+	}
+	if deployDecoded.maxSpan != repairDecoded.maxSpan {
+		t.Errorf("MaxSpan mismatch: deploy=%d repair=%d", deployDecoded.maxSpan, repairDecoded.maxSpan)
+	}
+	if deployDecoded.rate.Cmp(repairDecoded.rate) != 0 {
+		t.Errorf("rate mismatch: deploy=%s repair=%s", deployDecoded.rate, repairDecoded.rate)
+	}
+}
+
+func TestCheckUpdateProvidersGasGuard(t *testing.T) {
+	if err := checkUpdateProvidersGasGuard(big.NewInt(50_000_000), big.NewInt(100_000_000)); err != nil {
+		t.Fatalf("gas within limit: unexpected error: %v", err)
+	}
+	err := checkUpdateProvidersGasGuard(big.NewInt(5_000_000_000), big.NewInt(100_000_000))
+	if err == nil {
+		t.Fatal("gas over limit: expected an error, got nil")
+	}
+	if _, ok := err.(*guardError); !ok {
+		t.Fatalf("expected *guardError, got %T: %v", err, err)
 	}
 }
 
