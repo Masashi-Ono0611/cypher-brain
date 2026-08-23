@@ -33,7 +33,16 @@ import { realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
 import { join, resolve, dirname, basename } from 'node:path';
-import { HOME, SCHEDULE_DIR, LAUNCHD_DIR, CONFIG_FILE, readEnv, type EnvName } from './config.js';
+import {
+  HOME,
+  SCHEDULE_DIR,
+  LAUNCHD_DIR,
+  CONFIG_FILE,
+  readEnv,
+  type EnvName,
+  TON_PROVIDER_MAX_SPEND,
+  TON_PROVIDER_NOTIFY_BIN,
+} from './config.js';
 import {
   SCAN_SECRETS_INSTALL_HINT,
   SCAN_SECRETS_MODES,
@@ -117,6 +126,20 @@ const ENV_CAPTURE_VARS: readonly EnvName[] = [
   // is reached only from arweave's get(), and this runner only snapshots and pushes.
   'CYPHER_BRAIN_AR_USD_RATE_URL',
   'CYPHER_BRAIN_PIPE_TIMEOUT',
+  // ton-provider (#396 PR2): install() below REQUIRES CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND
+  // and CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN to be set before allowing this backend to be
+  // scheduled — but requiring them at install time is worthless if they are not ALSO
+  // captured here, since the runner's own environment is otherwise bare. Without this
+  // list entry every scheduled push would fail nightly with the exact "must be set"
+  // errors install() exists to catch up front (Codex review, xhigh pass).
+  'CYPHER_BRAIN_TON_WALLET',
+  'CYPHER_BRAIN_TON_PROVIDER_OWNER',
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND',
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN',
+  'CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL',
+  'CYPHER_BRAIN_TON_BIN',
+  'CYPHER_BRAIN_TON_NETWORK_CONFIG',
+  'CYPHER_BRAIN_TON_TONAPI_URL',
 ];
 
 // Of ENV_CAPTURE_VARS, the ones config.ts documents as naming a filesystem path (a
@@ -129,6 +152,9 @@ const PATH_ENV_VARS = new Set([
   'CYPHER_BRAIN_FILE_DIR', // config.ts: "file backend object store"
   'CYPHER_BRAIN_PG_BIN', // config.ts: "dir holding pg_dump/pg_restore"
   'CYPHER_BRAIN_AR_WALLET', // config.ts: "path to a JWK key file"
+  'CYPHER_BRAIN_TON_WALLET', // wallet.ts: "path to a local TON wallet mnemonic file" (#396 PR2)
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN', // config.ts: "path to a locally-built scripts/go/storage-v1-client binary"
+  'CYPHER_BRAIN_TON_NETWORK_CONFIG', // config.ts: "path to a TON global config JSON for testnet"
 ]);
 
 // Vars that may hold EITHER a path or a bare value, so resolve() must be conditional on
@@ -137,6 +163,7 @@ const PATH_ENV_VARS = new Set([
 const MAYBE_PATH_ENV_VARS = new Set([
   'CYPHER_BRAIN_PIN_RECIPIENTS', // a recipients FILE or an inline age1... list
   'CYPHER_BRAIN_GITLEAKS_BIN', // a binary PATH or a bare name resolved via PATH (#307)
+  'CYPHER_BRAIN_TON_BIN', // config.ts: "local binary for the ephemeral P2P download daemon" — a PATH or a bare name resolved via PATH, same shape as gitleaks
 ]);
 
 // Snapshot + resolve, at install time, every ENV_CAPTURE_VARS value that is actually set —
@@ -698,7 +725,38 @@ async function install(o: CliOptions): Promise<void> {
       throw new Error(`--max-spend must be a positive integer (native units), got: ${o.max_spend}`);
     }
   } else if (o.max_spend) {
-    throw new Error(`--max-spend only applies to the paid backends (arweave|turbo); --backend ${o.backend} is free`);
+    throw new Error(
+      `--max-spend only applies to arweave/turbo (native units: winc/winston); --backend ${o.backend} either is free ` +
+        'or (ton-provider) uses its own CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) instead — see below',
+    );
+  }
+  // ton-provider (#396 PR2) has its OWN spend-cap variable — CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND
+  // (nanoTON), a different variable and unit from --max-spend/PAID above (winc/winston) — so
+  // it gets a parallel, separate required-config check rather than being folded into PAID
+  // (which would wrongly imply --max-spend is the right knob for it, and break the "free
+  // backend" branch's error message above). scheduleableBackends() already guarantees
+  // CYPHER_BRAIN_TON_WALLET is configured by the time backend==='ton-provider' reaches here
+  // (that Set only ever contains 'ton-provider' when tonWalletConfigured() is true) — this
+  // additionally requires the deploy spend cap AND the notify binary, the other two things
+  // put() itself throws on if missing, so a scheduled install fails now with actionable
+  // guidance instead of every night at push time (Codex review, xhigh pass: the original cut
+  // of this PR made ton-provider "schedule install"-eligible without ALSO requiring or
+  // carrying forward what a nightly run actually needs to succeed).
+  if (o.backend === 'ton-provider') {
+    if (TON_PROVIDER_MAX_SPEND <= 0n) {
+      throw new Error(
+        'ton-provider is a paid store: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) must be set in the ' +
+          'environment before install — a StorageV1 deploy spends real funds, so there is no safe default ' +
+          'to let an unattended schedule run uncapped through',
+      );
+    }
+    if (!TON_PROVIDER_NOTIFY_BIN) {
+      throw new Error(
+        'ton-provider requires CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (a locally built ' +
+          'scripts/go/storage-v1-client binary) set in the environment before install — otherwise every ' +
+          'scheduled push would fail at the notify step',
+      );
+    }
   }
   // --ping-url-fail (issue #202) only makes sense as an override of the success URL's
   // implied /fail sibling — refuse it standalone rather than silently pinging a failure

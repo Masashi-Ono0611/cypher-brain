@@ -724,7 +724,8 @@ export async function init(_o: CliOptions): Promise<void> {
                 'it is availability-based, not permanent: durability depends on the chosen provider continuing to ' +
                 'renew/serve the contract (see docs/durability.md). ' +
                 (tonProviderAutoSigns
-                  ? 'The configured local TON wallet auto-signs and broadcasts the deploy, no human involved. Proceed?'
+                  ? 'This "Proceed?" IS the consent — the configured local TON wallet then auto-signs and ' +
+                    'broadcasts the deploy on its own, with no separate Tonkeeper signature to approve afterward. Proceed?'
                   : 'It also requires a HUMAN to sign a Tonkeeper deeplink once the deploy is built (up to 20 ' +
                     'minutes) — this prompt will not return until that happens. Proceed?')
             : `${backend} is a PAID, PERMANENT store — uploading spends real funds and cannot be undone. Proceed?`,

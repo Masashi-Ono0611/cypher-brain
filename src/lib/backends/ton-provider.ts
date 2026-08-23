@@ -466,6 +466,23 @@ async function fetchWalletSeqno(addr: TonAddress): Promise<number> {
 // observed in the testnet PoC — the wallet's balance had already moved by the time the
 // client-side response parsing failed on an unrelated bug, proving the two are separate
 // events).
+//
+// KNOWN LIMITATIONS (Codex review, xhigh pass — accepted as-is, not fixed here):
+// - No cross-process seqno lock: two overlapping pushes against the SAME wallet (a manual
+//   CLI run racing a cron-fired schedule, or two concurrent MCP calls) can read the same
+//   seqno and race to broadcast. TON's own seqno-replay-protection bounds the blast
+//   radius — the SECOND external message to actually land on-chain is rejected outright
+//   (wrong seqno), not silently double-spent or misdirected — so the worst case is "one of
+//   the two pushes fails and needs a retry," not fund loss. A file lock would close this
+//   gap but adds real complexity for a rare edge case with a self-healing failure mode;
+//   left as a documented limitation rather than implemented speculatively.
+// - CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND caps `deploy.amountNano` (the internal transfer
+//   value), not literally every nanoTON the wallet's balance drops by: SendMode.PAY_GAS_SEPARATELY
+//   means the wallet's own forward/network fee (observed ~0.001 TON in real dogfooding,
+//   negligible next to a multi-0.1-TON deploy) is debited ADDITIONALLY, same as Tonkeeper's
+//   own UI already shows the "Fee" line separately from the transfer amount for the
+//   human-signed path. Pre-existing PR1 semantics (MAX_SPEND was never a hard ceiling on
+//   Tonkeeper's total wallet debit either) — not a gap PR2 introduces or worsens.
 async function autoSignAndBroadcastDeploy(
   wallet: TonWalletContractV4,
   secretKey: Buffer,
@@ -505,6 +522,13 @@ async function autoSignAndBroadcastDeploy(
       }),
     ],
   });
+  // The signature is already computed and embedded in transferBody — secretKey is no
+  // longer needed past this point. Zeroed IN PLACE (Codex review, xhigh pass), not just
+  // dropped: this Buffer is the SAME object put() below still holds a reference to
+  // (autoSignWallet.secretKey) for the duration of the subsequent up-to-20-minute
+  // waitForContractActive() wait, so zeroing here also clears what that reference sees —
+  // shrinking the in-memory exposure window to "while signing", not "until push returns".
+  secretKey.fill(0);
 
   const extMsg = external({
     to: wallet.address,
@@ -727,6 +751,16 @@ export function tonProviderBackend(): StorageBackend {
       // DIFFERENT address than the wallet that actually signed). Deriving owner from the
       // wallet, rather than trusting a separately-set env var, removes that mismatch
       // class structurally instead of just documenting it.
+      //
+      // A LEFTOVER, DISAGREEING CYPHER_BRAIN_TON_PROVIDER_OWNER is a HARD ERROR, not a
+      // warning (Codex review, xhigh pass): this push is reachable unattended now (MCP,
+      // `schedule install`, #396 PR2) — nobody may be watching stderr for a warning that
+      // silently overrides what the operator's config says the owner should be. The
+      // wallet's own address is cryptographically the only one that COULD sign here, so
+      // this is never "the wrong wallet spends" (only one wallet ever can) — but a stale
+      // TON_PROVIDER_OWNER left over from a pre-PR2 Tonkeeper-only setup is exactly the
+      // kind of drift that deserves a stop, not a silent proceed: unset it, or fix it to
+      // match, before this backend spends anything.
       let owner: TonAddress;
       let autoSignWallet: { wallet: TonWalletContractV4; secretKey: Buffer } | null = null;
       if (await tonWalletConfigured()) {
@@ -737,14 +771,15 @@ export function tonProviderBackend(): StorageBackend {
           try {
             explicit = Address.parse(TON_PROVIDER_OWNER);
           } catch {
-            /* invalid value — the mismatch warning below covers this too, no separate message needed */
+            /* invalid value — the mismatch error below covers this too, no separate message needed */
           }
           if (explicit === null || !explicit.equals(owner)) {
-            warn(
+            throw new Error(
               `ton-provider: CYPHER_BRAIN_TON_PROVIDER_OWNER (${TON_PROVIDER_OWNER}) is set but does not match ` +
                 `the configured CYPHER_BRAIN_TON_WALLET's own address (${owner.toString({ bounceable: true })}) — ` +
-                'the wallet address is used as owner (auto-signing requires sender===owner); ' +
-                'CYPHER_BRAIN_TON_PROVIDER_OWNER is ignored.',
+                'refusing to proceed with an ambiguous owner. Auto-signing requires sender===owner, so this can ' +
+                "only ever deploy as the wallet's own address; unset CYPHER_BRAIN_TON_PROVIDER_OWNER (it is not " +
+                'needed when a wallet is configured) or fix it to match, then re-run.',
             );
           }
         }

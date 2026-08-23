@@ -189,11 +189,17 @@ async function checkKeyPerms(
   }
   if (!st) {
     if (explicitPath) {
+      // Codex review, xhigh pass: this remediation is shared between the Arweave JWK
+      // check (envName's default) and the TON wallet check (#396 PR2) — a bare
+      // 'wallet create --out <path>' would create an ARWEAVE wallet at a path the
+      // operator configured for TON, the exact "wrong credential at that path" mistake
+      // this check exists to catch. `--chain ton` only when this IS the TON check.
+      const chainFlag = envName === 'CYPHER_BRAIN_TON_WALLET' ? ' --chain ton' : '';
       return {
         id,
         status: 'fail',
         message: `${envName} is set to ${path}, but nothing is there`,
-        remediation: `create the wallet ('cypher-brain wallet create --out ${path}'), fix the ${envName} path, or unset it`,
+        remediation: `create the wallet ('cypher-brain wallet create${chainFlag} --out ${path}'), fix the ${envName} path, or unset it`,
       };
     }
     return { id, status: 'skip', message: `no ${label} at ${path} — nothing to check` };
