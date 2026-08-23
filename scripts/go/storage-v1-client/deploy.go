@@ -16,16 +16,16 @@ import (
 // the seeder) has already happened by the time this is constructed — see
 // runDeploy — so buildDeploy itself is pure and unit-testable.
 type deployParams struct {
-	bagID         []byte // 32 bytes — StorageV1.TorrentHash
-	merkleHash    []byte // 32 bytes — StorageV1.MerkleHash
-	dataSizeBytes uint64
-	pieceSize     uint32
-	owner         *address.Address
-	provider      *address.Address // workchain 0; the provider's TON wallet address — NOT its ADNL pubkey (see notify.go/main.go field notes)
-	rateNanoPerMB uint64
-	spanDays      uint64
-	maxSpendNano  *big.Int
-	testnet       bool
+	bagID          []byte // 32 bytes — StorageV1.TorrentHash
+	merkleHash     []byte // 32 bytes — StorageV1.MerkleHash
+	dataSizeBytes  uint64
+	pieceSize      uint32
+	owner          *address.Address
+	providerPubkey []byte // 32 bytes — the provider's ProviderKey (Ed25519) public key, NOT a TON wallet address. Confirmed 2026-08-23 against xssnick source + a live incident: ActiveProviders is keyed by this exact value, and the contract's proof_storage handler runs check_signature against it — a wallet address (a StateInit hash) cannot satisfy that check. See main.go field notes for the full trail and the real-money incident that surfaced this.
+	rateNanoPerMB  uint64
+	spanDays       uint64
+	maxSpendNano   *big.Int
+	testnet        bool
 }
 
 type deployResult struct {
@@ -50,8 +50,8 @@ func buildDeploy(p deployParams) (*deployResult, error) {
 	if len(p.merkleHash) != 32 {
 		return nil, fmt.Errorf("merkle hash must be 32 bytes, got %d", len(p.merkleHash))
 	}
-	if p.provider.Workchain() != 0 {
-		return nil, fmt.Errorf("provider address must be workchain 0, got %d", p.provider.Workchain())
+	if len(p.providerPubkey) != 32 {
+		return nil, fmt.Errorf("provider pubkey must be 32 bytes, got %d", len(p.providerPubkey))
 	}
 
 	const uint32Max = uint64(^uint32(0))
@@ -78,8 +78,13 @@ func buildDeploy(p deployParams) (*deployResult, error) {
 	}
 
 	rate := tlb.FromNanoTONU(p.rateNanoPerMB)
+	// address.NewAddress(0, 0, providerPubkey) is not a real TON wallet — it's
+	// how the reference CLI (tonutils-storage cli/main.go rentStorage) wraps a
+	// provider's raw pubkey bytes to satisfy contract.ProviderV1.Address's Go
+	// type; only .Data() (the pubkey bytes themselves) is ever serialized
+	// on-chain (pkg/contract/v1.go PrepareV1DeployData). See main.go field notes.
 	providers := []contract.ProviderV1{{
-		Address:       p.provider,
+		Address:       address.NewAddress(0, 0, p.providerPubkey),
 		MaxSpan:       uint32(spanSeconds),
 		PricePerMBDay: rate,
 	}}
@@ -126,23 +131,23 @@ func buildDeploy(p deployParams) (*deployResult, error) {
 // deployFlags holds the raw, as-parsed (but not yet cross-validated) flag
 // values for `deploy`, before any seeder lookup or buildDeploy call.
 type deployFlags struct {
-	bagIDHex      string
-	providerRaw   string
-	ownerRaw      string
-	rateRaw       string
-	spanDaysRaw   string
-	sizeBytesRaw  string
-	pieceSizeRaw  string
-	merkleHashRaw string
-	maxSpendTon   string
-	mainnet       bool
+	bagIDHex          string
+	providerPubkeyRaw string
+	ownerRaw          string
+	rateRaw           string
+	spanDaysRaw       string
+	sizeBytesRaw      string
+	pieceSizeRaw      string
+	merkleHashRaw     string
+	maxSpendTon       string
+	mainnet           bool
 }
 
 func parseDeployFlagSet(args []string) (*deployFlags, error) {
 	fs := newFlagSet("deploy")
 	f := &deployFlags{}
 	fs.StringVar(&f.bagIDHex, "bag-id", "", "bag id / torrent hash, 64 hex chars (required)")
-	fs.StringVar(&f.providerRaw, "provider", "", "raw workchain-0 provider address (required)")
+	fs.StringVar(&f.providerPubkeyRaw, "provider-pubkey", "", "provider's ProviderKey (Ed25519) public key, 64 hex chars — mytonprovider.org's registry 'pubkey' field; NOT ADNLKey or a wallet address (required)")
 	fs.StringVar(&f.ownerRaw, "owner", "", "raw owner wallet address (required)")
 	fs.StringVar(&f.rateRaw, "rate-nano-per-mb-day", "", "nanoTON/MB/day (required)")
 	fs.StringVar(&f.spanDaysRaw, "span-days", "", "proof span in days (required)")
@@ -174,10 +179,10 @@ func resolveDeployParams(ctx context.Context, f *deployFlags) (*deployParams, er
 	if err != nil {
 		return nil, err
 	}
-	if f.providerRaw == "" {
-		return nil, fmt.Errorf("deploy requires --provider <raw-addr>")
+	if f.providerPubkeyRaw == "" {
+		return nil, fmt.Errorf("deploy requires --provider-pubkey <64hex>")
 	}
-	provider, err := parseRawAddr("--provider", f.providerRaw, 0)
+	providerPubkey, err := parseHex32("--provider-pubkey", f.providerPubkeyRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -255,16 +260,16 @@ func resolveDeployParams(ctx context.Context, f *deployFlags) (*deployParams, er
 	}
 
 	return &deployParams{
-		bagID:         bagID,
-		merkleHash:    merkleHash,
-		dataSizeBytes: dataSizeBytes,
-		pieceSize:     pieceSize,
-		owner:         owner,
-		provider:      provider,
-		rateNanoPerMB: rate,
-		spanDays:      spanDays,
-		maxSpendNano:  maxSpendNano,
-		testnet:       !f.mainnet,
+		bagID:          bagID,
+		merkleHash:     merkleHash,
+		dataSizeBytes:  dataSizeBytes,
+		pieceSize:      pieceSize,
+		owner:          owner,
+		providerPubkey: providerPubkey,
+		rateNanoPerMB:  rate,
+		spanDays:       spanDays,
+		maxSpendNano:   maxSpendNano,
+		testnet:        !f.mainnet,
 	}, nil
 }
 
@@ -303,7 +308,7 @@ func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "  network:        %s\n", network)
 	fmt.Fprintf(stdout, "  bag id:         %x\n", p.bagID)
 	fmt.Fprintf(stdout, "  contract addr:  %s\n", res.contractAddr.StringRaw())
-	fmt.Fprintf(stdout, "  provider:       %s\n", p.provider.StringRaw())
+	fmt.Fprintf(stdout, "  provider pubkey: %x\n", p.providerPubkey)
 	fmt.Fprintf(stdout, "  owner:          %s\n", p.owner.StringRaw())
 	fmt.Fprintf(stdout, "  rate:           %d nanoTON/MB/day\n", p.rateNanoPerMB)
 	fmt.Fprintf(stdout, "  span:           %d day(s)\n", p.spanDays)
@@ -323,11 +328,8 @@ func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "  storage-v1-client status --contract %s%s\n", res.contractAddr.StringRaw(), statusFlag)
 	fmt.Fprintln(stdout, "then tell the provider it exists with:")
-	fmt.Fprintf(stdout, "  storage-v1-client notify --provider-pubkey <64hex> --contract %s%s\n",
-		res.contractAddr.StringRaw(), statusFlag)
-	fmt.Fprintln(stdout, "  (--provider-pubkey is the provider's ADNL/Ed25519 public key — mytonprovider.org's")
-	fmt.Fprintln(stdout, "  registry 'pubkey' field. This is NOT the --provider address used above; deploy")
-	fmt.Fprintln(stdout, "  never sees the pubkey, so it cannot fill this in for you — see main.go field notes.)")
+	fmt.Fprintf(stdout, "  storage-v1-client notify --provider-pubkey %x --contract %s%s\n",
+		p.providerPubkey, res.contractAddr.StringRaw(), statusFlag)
 	return nil
 }
 
