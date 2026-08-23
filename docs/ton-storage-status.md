@@ -28,7 +28,7 @@ binaries.
 | **We pay a legacy C++ provider** (spends — fabric-contract ecosystem) | mainnet | **GRAVEYARD** (115 listed, 0 active ≤7d, 94 silent >1y) — not pursuing |
 | **We pay a legacy C++ provider** | testnet | **DEAD DAEMONS, live contracts** (2026-08-22 experiment) |
 | **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **WORKS end to end, including a confirmed proof-reward payout** (2026-08-23) — `scripts/go/storage-v1-client` (deploy/notify/status/update-providers) deployed and funded a StorageV1 contract for masabrain (481 MB) against our own registered droplet-as-provider, the provider self-reported the full bag downloaded, and a `storage_reward_withdrawal` (op `0xa91baf56`) transaction of 0.119662827 TON from the contract to the provider's registered wallet followed shortly after. Getting there required one real-money field-mapping bug (fixed by an in-place repair, not a re-deploy) — see below |
-| **We pay a live Go provider** | testnet | not attempted (mainnet-first, per operator decision — the registry itself is a mainnet market) |
+| **We pay a live Go provider** | testnet | **WORKS end to end** (2026-08-23) — `scripts/go/storage-v1-client` deployed and funded a StorageV1 contract for a throwaway 71-byte bag against our own droplet's testnet standing twin, notified it, and the provider fetched the bag; content verified byte-identical via sha256 on both sides. No public testnet registry exists (mytonprovider.org is mainnet-only — see below), so this is dev-only, not an OSS-facing feature — see below |
 
 **The single most important 2026-08-23 correction**: the provider market is TWO
 incompatible ecosystems, and every earlier "dormant/graveyard" measurement
@@ -227,6 +227,58 @@ checked in any future assessment.
   wired to any running unit) — kept because the same C++ `storage-daemon`
   binary is a candidate tool for cross-checking a bag's TorrentInfo hash
   offline if that's ever needed again.
+
+## Testnet — the Go lane, end to end (dev-only, not an OSS feature)
+
+**No public testnet registry exists for the Go/StorageV1 scheme** —
+mytonprovider.org is a mainnet-only market (`testnet.mytonprovider.org`
+does not resolve), so a third party running cypher-brain has no discovery
+path to a testnet provider even if one exists. This is why
+`push --backend ton-provider` stays mainnet-only in cypher-brain proper:
+shipping a testnet code path with zero real-world discoverability behind it
+would be dead weight for every OSS user except an operator who, like this
+one, already runs their own standing Go provider twin (see below) and wants
+to test against it directly. `scripts/go/storage-v1-client` (the same
+operator-run CLI already used for the mainnet Go-lane proof above) is
+EXPERIMENTAL and explicitly says so in its own `--help` output — that
+framing is unchanged by this section; what changed is that it has now also
+been exercised against a real testnet provider, not just mainnet.
+
+- 2026-08-23 live experiment (bag `881203e8…`, 71 bytes, seeded from a
+  throwaway `tonutils-storage` instance started on the droplet for this
+  test — the droplet's testnet Go provider standing twin,
+  `tsp-testnet-provider(-storage)`, was already running):
+  - `deploy` — first attempt used a throwaway generated wallet as
+    `--owner`, distinct from the wallet actually used to sign in Tonkeeper.
+    Tonkeeper's own deeplink signing always uses whichever wallet is
+    currently selected in the extension, not necessarily the address the
+    deeplink assumed as `--owner` — a client-side mismatch, not a protocol
+    bug. Result: `modify_providers`' `sender == owner` check failed on-chain
+    exactly like the real mainnet incident earlier in this doc (see
+    "Mainnet — third-party providers, live Go ecosystem" above) — same root
+    cause, reproduced on purpose this time. Re-deployed with `--owner` set
+    to the operator's actual signing wallet; landed `active` cleanly.
+  - `notify` — first call was refused by the provider (`bounty should be at
+    least 0.05 TON to cover fees`): the initial `--rate-nano-per-mb-day`
+    was too low for a 71-byte bag to clear the provider's own minimum
+    bounty floor. Fixed in place with `update-providers` (same contract,
+    same balance, corrected rate) — no re-deploy needed, confirming the
+    Phase-A repair path works on testnet too.
+  - Re-`notify` succeeded: `resolving` → `active`, `downloaded: 71 bytes`
+    (self-reported).
+  - Independently verified via the provider's OWN `tonutils-storage` HTTP
+    API (not the notify self-report): `completed: true, downloaded: 71/71`,
+    with the seeder correctly listed as a peer. Content verified
+    byte-identical: `sha256sum` of the file on both the seeder and the
+    provider's storage directory matched exactly.
+  - Net: the full `deploy` → `notify` → provider-fetch cycle from the
+    mainnet Go-lane proof above reproduces on testnet against a real
+    (self-run) provider daemon, byte-for-byte verified — with the SAME two
+    failure modes (owner mismatch, bounty-too-low) hit and recovered from
+    in the process, reinforcing that both are real operational hazards
+    worth the guardrails cypher-brain's `push --backend ton-provider`
+    already has (the hard owner-mismatch refusal, specifically) rather
+    than corner cases.
 
 ## Our own droplet as a Go provider (mainnet: registered; testnet: standing twin)
 
