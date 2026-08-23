@@ -72,6 +72,19 @@ if (!apiAddr) {
       seeding: true,
       path: b.path,
       files: [{ index: 0, name: b.entry, size: b.size }],
+      // Additive fields for scripts/selftest-ton-provider.sh (src/lib/backends/
+      // ton-provider.ts's createLocalBag()) — NOT exercised by selftest-ton.sh, which
+      // reads none of these. `bag_size` is a second alias of `size` (both present: the
+      // real tonutils-storage API's own struct comment in
+      // scripts/go/storage-v1-client/seeder.go names it `bag_size`, but ton.ts's
+      // production-tested TonBagDetails reads `size` — this mock does not know which
+      // is the wire truth, so it emits both). piece_size/merkle_hash are NOT a real
+      // merkle computation (this mock tracks raw file bytes, not TON Storage's actual
+      // piece/merkle-tree protocol — see the file header) — just plausible-shaped fake
+      // values so ton-provider.ts's field presence/shape checks have something to read.
+      bag_size: b.size,
+      piece_size: 131072,
+      merkle_hash: id,
     };
   };
 
@@ -101,8 +114,20 @@ if (!apiAddr) {
           const entry = entries[0];
           const file = join(path, entry);
           const id = createHash('sha256').update(readFileSync(file)).digest('hex');
+          // Copy into a STABLE location under the shared store, rather than remembering
+          // `path` itself: a real tonutils-storage daemon ingests and internally retains
+          // piece data at create() time, so a bag stays fetchable over "P2P" even after
+          // the caller's own source directory is gone (selftest-ton-provider.sh's put()
+          // uses a torn-down-on-return local ephemeral directory — see ton-provider.ts's
+          // header comment on why). Registering the original `path` here reproduced that
+          // exact class of bug: a later /api/v1/add from a DIFFERENT mock instance failed
+          // with ENOENT once the first instance's temp dir was cleaned up.
+          const blobsDir = join(store, 'blobs');
+          mkdirSync(blobsDir, { recursive: true });
+          const stableFile = join(blobsDir, `${id}-${entry}`);
+          copyFileSync(file, stableFile);
           const reg = readRegistry();
-          reg[id] = { source: file, entry };
+          reg[id] = { source: stableFile, entry };
           writeRegistry(reg);
           local.set(id, { path, entry, size: statSync(file).size, description });
           return reply(200, details(id));

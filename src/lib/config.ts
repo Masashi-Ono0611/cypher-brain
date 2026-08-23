@@ -53,6 +53,12 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_TON_NO_FALLBACK',
   'CYPHER_BRAIN_TON_NETWORK_CONFIG',
   'CYPHER_BRAIN_TON_TONAPI_URL',
+  'CYPHER_BRAIN_TON_PROVIDER_OWNER',
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND',
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN',
+  'CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL',
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS', // test-only override (scripts/selftest-ton-provider.sh) — a real push waits on the 10-minute default
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS', // test-only override, same reason
   'CYPHER_BRAIN_YES',
   'CYPHER_BRAIN_MAX_SPEND',
   'CYPHER_BRAIN_SKIP_FUNDS_CHECK', // #342: one-run bypass of the turbo pre-upload funds check (stale balance reads)
@@ -401,6 +407,57 @@ export const TON_NETWORK_CONFIG = readEnv('CYPHER_BRAIN_TON_NETWORK_CONFIG') || 
 // scripts/selftest-ton-dns.sh can point it at a local mock HTTP server instead of the
 // real service (no real-network calls in CI).
 export const TON_TONAPI_URL = readEnv('CYPHER_BRAIN_TON_TONAPI_URL') || 'https://tonapi.io';
+// ton-provider backend (src/lib/backends/ton-provider.ts, issue #396): pays a live
+// mytonprovider.org market provider instead of self-hosting a seeder. Mainnet-only —
+// the provider market itself is a mainnet market (docs/ton-storage-status.md), so unlike
+// arweave/turbo there is no meaningful testnet mode to gate behind a flag.
+export const TON_PROVIDER_OWNER = readEnv('CYPHER_BRAIN_TON_PROVIDER_OWNER') || ''; // TON wallet address that will own the deployed StorageV1 contract (required to push)
+const TON_PROVIDER_MAX_SPEND_RAW = readEnv('CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND');
+// Unlike AR_MAX_SPEND (0/unset = no cap, the --yes guard alone gates spend), ton-provider.ts's
+// put() deliberately REFUSES to push at all when this is 0/unset — a StorageV1 deploy has no
+// SDK-computed "market price" the way arweave/turbo do, so there is no safe default amount to
+// let through uncapped (Codex review: the prior wording here claimed the opposite of the
+// enforced behavior). Separate variable from AR_MAX_SPEND — different backend, different
+// native unit, so one accidental cap must never silently apply to the other's spend.
+export const TON_PROVIDER_MAX_SPEND = TON_PROVIDER_MAX_SPEND_RAW ? BigInt(TON_PROVIDER_MAX_SPEND_RAW) : 0n;
+// Path to a locally-built scripts/go/storage-v1-client binary (`go build` in that dir) —
+// the ONLY step that needs it: notifying a provider over ADNL/RLDP has no mature
+// TypeScript implementation (checked; even thekiba/tonutils's storage package is
+// unimplemented), so this shells out to the tested Go program rather than reimplementing
+// a P2P protocol handshake by hand. Cross-platform prebuilt-binary distribution is out of
+// scope for this PR (issue #396) — an operator builds it once with a Go toolchain.
+export const TON_PROVIDER_NOTIFY_BIN = readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN') || '';
+export const TON_PROVIDER_MYTONPROVIDER_URL =
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL') || 'https://mytonprovider.org';
+// Test-only overrides for how long/how often put() retries notify() waiting for the
+// provider to report a full download — scripts/selftest-ton-provider.sh sets these short
+// so its "push waits, does not succeed early" positive control finishes in seconds
+// instead of the real 10-minute default a genuine push needs (a fresh provider fetch of
+// a large brain over P2P is real network work, not instantaneous).
+// Validated the same way TON_HTTP_TIMEOUT_MS above is (Codex review): an unvalidated
+// NaN/Infinity/negative override would make notifyProviderWithRetry()'s `Date.now() >
+// deadline` comparison never trip, silently leaving the paid deploy's local ephemeral
+// daemon (and the temp directory it seeds from) retrying forever instead of the bounded
+// failure this budget exists to guarantee.
+function parsePositiveMsOverride(raw: string | undefined, defaultMs: number, name: string): number {
+  if (raw === undefined) return defaultMs;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    warn(`${name} must be a positive integer (ms) — got ${JSON.stringify(raw)}; using the ${defaultMs}ms default`);
+    return defaultMs;
+  }
+  return n;
+}
+export const TON_PROVIDER_NOTIFY_RETRY_MS = parsePositiveMsOverride(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS'),
+  10 * 60_000,
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS',
+);
+export const TON_PROVIDER_NOTIFY_INTERVAL_MS = parsePositiveMsOverride(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS'),
+  15_000,
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS',
+);
 export const AR_HOST = readEnv('CYPHER_BRAIN_AR_HOST') || 'arweave.net';
 export const AR_PORT = Number(readEnv('CYPHER_BRAIN_AR_PORT') || 443);
 export const AR_PROTOCOL = readEnv('CYPHER_BRAIN_AR_PROTOCOL') || 'https';

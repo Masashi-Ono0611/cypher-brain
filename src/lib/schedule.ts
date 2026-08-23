@@ -71,7 +71,7 @@ const SNAPS_DIR = join(SCHEDULE_DIR, 'snapshots');
 const PLIST = join(LAUNCHD_DIR, `${LABEL}.plist`);
 const CRON_ENTRY_FILE = join(SCHEDULE_DIR, 'cron.entry'); // Linux: the exact registered line, kept as an artifact for status/uninstall
 
-const BACKENDS = new Set(['file', 'arweave', 'turbo']);
+const BACKENDS = new Set(['file', 'arweave', 'turbo']); // rclone, ton, and ton-provider (#396) are excluded from unattended scheduling: rclone/ton need operator-side setup a launchd/cron job can't collect, and ton-provider additionally requires a human to sign a Tonkeeper deeplink mid-push, which an unattended run has no way to wait for
 const PAID = new Set(['arweave', 'turbo']);
 
 // Every CYPHER_BRAIN_* var a snapshot+push run could need that this runner does NOT

@@ -18,8 +18,8 @@ import type { CliOptions } from './types.js';
 export interface CostEstimate {
   backend: string;
   size_bytes: number;
-  cost: string | null; // native units (winc/winston), "0" for file, or null when unavailable
-  unit: 'winc' | 'winston' | null; // null: no native unit for this backend, or the query failed
+  cost: string | null; // native units (winc/winston/nanoTON), "0" for file, or null when unavailable
+  unit: 'winc' | 'winston' | 'nanoTON' | null; // null: no native unit for this backend, or the query failed
   approx_ar: number | null;
   usd_estimate: number | null; // null when the USD/AR rate could not be fetched
   note: string;
@@ -104,7 +104,7 @@ export async function turboUsdRate(): Promise<{ ratePer1e12Winc: number; usdPerG
 }
 
 // Estimate what pushing `sizeBytes` to `backend` would cost, WITHOUT uploading
-// anything (price queries only). `backend` must be one of file|arweave|turbo|rclone|ton —
+// anything (price queries only). `backend` must be one of file|arweave|turbo|rclone|ton|ton-provider —
 // any other value is a caller bug (mcp.ts validates via requireBackend before calling
 // this; the CLI estimate() below validates too), so it is rejected explicitly
 // rather than silently falling through to the arweave branch.
@@ -156,6 +156,36 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
         "charge, only that box's own running cost. NOT permanent storage: the bag is retrievable only while at " +
         'least one reachable seeder retains it (see docs/durability.md).',
     };
+  }
+
+  if (backend === 'ton-provider') {
+    // A REAL priced query (issue #396): selects a live mytonprovider.org provider and
+    // runs the same cost math src/lib/backends/ton-provider.ts's put() uses, without
+    // deploying or spending anything.
+    try {
+      const { estimateTonProviderCost } = await import('./backends/ton-provider.js');
+      const est = await estimateTonProviderCost(sizeBytes);
+      return {
+        backend,
+        size_bytes: sizeBytes,
+        cost: est.amountNano.toString(),
+        unit: 'nanoTON',
+        note:
+          `ton-provider backend pays a live mytonprovider.org provider (pubkey ${est.provider.pubkey}, ` +
+          `rating ${est.provider.rating.toFixed(2)}) to hold the bag for ${est.spanDays} day(s) ` +
+          `(cost ${est.costNano} nanoTON + ${est.amountNano - est.costNano} nanoTON deploy buffer). ` +
+          'Durability depends on that provider continuing to renew/serve the contract — weaker than ' +
+          "Arweave's one-time, network-guaranteed permanence (see docs/durability.md). This mode requires " +
+          'a human to sign a Tonkeeper deeplink at push time; it does not run unattended yet.',
+      };
+    } catch (e) {
+      return {
+        backend,
+        size_bytes: sizeBytes,
+        cost: null,
+        note: `estimate unavailable (mytonprovider.org query failed: ${errMsg(e)})`,
+      };
+    }
   }
 
   if (backend === 'turbo') {
@@ -263,7 +293,7 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
     }
   }
 
-  throw new Error(`unknown backend: ${backend} — use file|arweave|turbo|rclone|ton`);
+  throw new Error(`unknown backend: ${backend} — use file|arweave|turbo|rclone|ton|ton-provider`);
 }
 
 // Render a CostEstimate as human-readable lines — SHARED by the CLI `estimate` command
@@ -303,7 +333,7 @@ export function formatEstimate(e: CostEstimate): string[] {
 // or the MCP estimate_cost tool.
 export async function estimate(o: CliOptions): Promise<void> {
   if (!o.in) throw new Error('--in <file.age> required');
-  if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton> required');
+  if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton|ton-provider> required');
   await requireFile(o.in); // #267: one shared check/wording across every command
   const st = await stat(o.in);
   if (!st.isFile())

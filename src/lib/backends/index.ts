@@ -8,6 +8,7 @@ import { arweaveBackend } from './arweave.js';
 import { turboBackend } from './turbo.js';
 import { rcloneBackend } from './rclone.js';
 import { tonBackend } from './ton.js';
+import { tonProviderBackend } from './ton-provider.js';
 import type { StorageBackend } from '../types.js';
 
 // The `init` wizard's interactive backend choices — NOT the complete/canonical list
@@ -37,5 +38,6 @@ export async function backendFor(name: string | undefined): Promise<StorageBacke
   if (name === 'turbo') return turboBackend();
   if (name === 'rclone') return rcloneBackend();
   if (name === 'ton') return tonBackend();
-  throw new Error(`unknown backend: ${name || '(none)'} — use --backend file|arweave|turbo|rclone|ton`);
+  if (name === 'ton-provider') return tonProviderBackend();
+  throw new Error(`unknown backend: ${name || '(none)'} — use --backend file|arweave|turbo|rclone|ton|ton-provider`);
 }

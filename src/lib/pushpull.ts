@@ -272,7 +272,7 @@ export async function push(o: CliOptions): Promise<boolean> {
   // (a real, independent price query, moments apart) — the backend's own re-check
   // immediately before signing is, and remains, the sole authority on whether an
   // upload proceeds. Skipped for the free `file` backend (no cost, nothing to show).
-  if (o.backend === 'arweave' || o.backend === 'turbo') {
+  if (o.backend === 'arweave' || o.backend === 'turbo' || o.backend === 'ton-provider') {
     const { size: sizeBytes } = await stat(o.in);
     const est = await estimateCost(o.backend, sizeBytes);
     // Wording deliberately avoids the literal substring "--yes"/"CYPHER_BRAIN_YES" here:
@@ -290,6 +290,13 @@ export async function push(o: CliOptions): Promise<boolean> {
     throw new Error(
       `${o.backend}: uploading to a permanent Arweave store spends real funds — ` +
         `re-run push with --yes or set CYPHER_BRAIN_YES=1 in the environment to confirm`,
+    );
+  }
+  if (o.backend === 'ton-provider' && !yes) {
+    throw new Error(
+      `ton-provider: deploying a TON Storage contract to a paid provider spends real funds — ` +
+        `re-run push with --yes or set CYPHER_BRAIN_YES=1 in the environment to confirm ` +
+        `(a human must still sign the resulting Tonkeeper deeplink — this does not run unattended yet)`,
     );
   }
   const backend = await backendFor(o.backend);
