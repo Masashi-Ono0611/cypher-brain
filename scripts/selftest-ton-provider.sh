@@ -45,6 +45,11 @@ sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 # not the wallet address, is the on-chain identifier).
 PROVIDER_PUBKEY="abababababababababababababababababababababababababababababababab"
 PROVIDER_WALLET="UQCCrKrQHLpB75vvrd5js78eB7qK6v7Cpz4WJpV2DoZnY-GC"
+# Declared here (not down at its export near the push tests) so the tonapi mock
+# below can be launched already knowing which address the pre-deploy funds-check
+# positive control (#396 Phase B) needs to answer with a low balance.
+TON_PROVIDER_OWNER_ADDR="0:0000000000000000000000000000000000000000000000000000000000000001"
+LOW_BALANCE_FLAG="$TMP/low-owner-balance-flag"
 
 # ---- mock mytonprovider.org: POST /api/v1/providers/search -> one live candidate ----
 cat > "$TMP/mock-mytonprovider.mjs" <<'MOCKEOF'
@@ -92,17 +97,34 @@ node "$TMP/mock-mytonprovider.mjs" "$MYTONPROVIDER_PORT" "$PROVIDER_PUBKEY" "$PR
 MYTONPROVIDER_PID=$!
 export CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL="http://127.0.0.1:$MYTONPROVIDER_PORT"
 
-# ---- mock tonapi: GET /v2/blockchain/accounts/<addr> -> always 'active' ----
+# ---- mock tonapi: GET /v2/blockchain/accounts/<addr> -> always 'active', PLUS
+# (#396 Phase B) GET /v2/rates?... for the USD-estimate line and an owner-specific
+# low-balance mode for the pre-deploy funds-check positive control below. The
+# low-balance flag is keyed to the EXACT owner address string this script exports
+# as CYPHER_BRAIN_TON_PROVIDER_OWNER (already in raw workchain:hex form, so
+# Address.parse(...).toRawString() round-trips it unchanged) — any OTHER address
+# (i.e. the deployed contract's own address, polled by waitForContractActive())
+# keeps returning the generous fixed balance, so that polling path is unaffected.
 cat > "$TMP/mock-tonapi.mjs" <<'MOCKEOF'
 import { createServer } from 'node:http';
+import { existsSync } from 'node:fs';
 const port = Number(process.argv[2]);
-createServer((_req, res) => {
+const ownerAddr = process.argv[3];
+const lowBalanceFlagPath = process.argv[4];
+createServer((req, res) => {
+  const url = new URL(req.url, 'http://127.0.0.1');
+  if (url.pathname === '/v2/rates') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ rates: { TON: { prices: { USD: 3.5 } } } }));
+    return;
+  }
+  const lowBalance = lowBalanceFlagPath && existsSync(lowBalanceFlagPath) && url.pathname.includes(ownerAddr);
   res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ status: 'active', balance: 5000000000 }));
+  res.end(JSON.stringify({ status: 'active', balance: lowBalance ? 1 : 5000000000 }));
 }).listen(port, '127.0.0.1');
 MOCKEOF
 TONAPI_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" &
+node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" &
 TONAPI_PID=$!
 export CYPHER_BRAIN_TON_TONAPI_URL="http://127.0.0.1:$TONAPI_PORT"
 
@@ -142,7 +164,7 @@ EOF
 chmod +x "$SHIM/fake-notify"
 export CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN="$SHIM/fake-notify"
 
-export CYPHER_BRAIN_TON_PROVIDER_OWNER="0:0000000000000000000000000000000000000000000000000000000000000001"
+export CYPHER_BRAIN_TON_PROVIDER_OWNER="$TON_PROVIDER_OWNER_ADDR"
 export CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND="5000000000" # 5 TON — generous, well above the tiny test file's computed cost
 export CYPHER_BRAIN_YES=1
 
@@ -161,6 +183,12 @@ echo "== estimate --backend ton-provider (real priced query against the mock reg
 EST=$(cb estimate --in "$TMP/snap.age" --backend ton-provider --json)
 echo "$EST" | grep -q '"unit":"nanoTON"' || { echo "[FAIL] estimate did not price in nanoTON: $EST"; exit 1; }
 echo "[PASS] estimate returns a real nanoTON cost"
+# #396 Phase B: usd_estimate is now populated too (tonUsdRate(), estimate.ts), sourced
+# from the mock tonapi's /v2/rates handler above (fixed at $3.5/TON) — a real number,
+# not the null every OTHER field-completeness gap in this backend used to leave.
+echo "$EST" | grep -q '"usd_estimate":null' && { echo "[FAIL] estimate's usd_estimate is null despite the mock tonapi rates endpoint answering"; echo "$EST"; exit 1; }
+echo "$EST" | grep -Eq '"usd_estimate":[0-9]' || { echo "[FAIL] estimate did not include a numeric usd_estimate: $EST"; exit 1; }
+echo "[PASS] estimate --json also carries a real usd_estimate (tonapi rates, #396 Phase B)"
 
 echo "== push --backend ton-provider (deploy -> wait active -> notify-until-full) =="
 echo "$SIZE" > "$TMP/notify-downloaded" # first notify call already reports "fully downloaded" — the common case
@@ -169,6 +197,14 @@ printf '%s' "$LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' || { echo "[FAIL]
 echo "[PASS] locator matches ton-provider:v1:<64-hex>"
 grep -q "selected provider $PROVIDER_PUBKEY" "$TMP/push.err" || { echo "[FAIL] did not report the selected provider"; exit 1; }
 echo "[PASS] provider selection ran against the mock registry"
+# #396 Phase B: the mock tonapi's balance for this owner is generously sufficient
+# (5 TON vs. a tiny test snapshot's nanoTON-scale cost) — the advisory funds check
+# must stay SILENT here. See the dedicated low-balance positive control below for
+# the warning actually firing.
+if grep -q 'balance.*looks lower than' "$TMP/push.err"; then
+  echo "[FAIL] the funds-check warning fired despite a sufficient mock balance"; cat "$TMP/push.err"; exit 1
+fi
+echo "[PASS] the pre-deploy funds check stays silent when the owner's balance is sufficient"
 
 echo "== pull over the (mock) P2P path =="
 rm -f "$TMP/snap.age"
@@ -248,9 +284,30 @@ if CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS=2000 CYPHER_BRAIN_TON_PROVIDER_NOTI
   cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/partial.err"; then
   echo "[FAIL] push returned despite the provider reporting only 1/$SIZE bytes downloaded"; exit 1
 fi
-grep -q 'bytes so far — waiting' "$TMP/partial.err" || { echo "[FAIL] push did not report partial-download progress"; exit 1; }
+# #396 Phase B: this line used to be a bare per-retry console.error; it now goes
+# through the SAME shared progress.ts module turbo's upload / rclone's transfer
+# use (rate/ETA math, self-limiting cadence) — see backends/ton-provider.ts's
+# notifyProviderWithRetry(). Match the component label, not the old exact wording.
+grep -q 'ton-provider notify:' "$TMP/partial.err" || { echo "[FAIL] push did not report partial-download progress"; exit 1; }
 grep -Eq 'did not (finish fetching the bag|report a full download)' "$TMP/partial.err" || { echo "[FAIL] push did not time out with the expected message"; exit 1; }
 echo "$SIZE" > "$TMP/notify-downloaded" # restore for any later runs
 echo "[PASS] push correctly waits on a partial provider download instead of declaring success early"
+
+echo "== positive control: an insufficient owner balance WARNS but does not abort the push (advisory funds check, #396 Phase B) =="
+touch "$LOW_BALANCE_FLAG"
+cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/low-balance.err" >/dev/null \
+  || { echo "[FAIL] push aborted on a low-balance warning — the funds check must be advisory only, never a hard block"; cat "$TMP/low-balance.err"; exit 1; }
+grep -q 'balance.*looks lower than' "$TMP/low-balance.err" || { echo "[FAIL] the funds-check warning did not fire despite the mocked low owner balance"; cat "$TMP/low-balance.err"; exit 1; }
+grep -q 'CYPHER_BRAIN_SKIP_FUNDS_CHECK' "$TMP/low-balance.err" || { echo "[FAIL] the warning does not mention the skip flag"; cat "$TMP/low-balance.err"; exit 1; }
+echo "[PASS] a low owner balance prints a warning but still lets the push proceed (a human signs the real deploy either way)"
+
+echo "== positive control: CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences the same warning (shared flag with turbo's own funds check) =="
+CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/low-balance-skip.err" >/dev/null \
+  || { echo "[FAIL] push failed under CYPHER_BRAIN_SKIP_FUNDS_CHECK=1"; cat "$TMP/low-balance-skip.err"; exit 1; }
+if grep -q 'balance.*looks lower than' "$TMP/low-balance-skip.err"; then
+  echo "[FAIL] CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 did not silence the funds-check warning"; cat "$TMP/low-balance-skip.err"; exit 1
+fi
+rm -f "$LOW_BALANCE_FLAG"
+echo "[PASS] CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences the ton-provider funds-check warning too"
 
 echo "ALL PASS"

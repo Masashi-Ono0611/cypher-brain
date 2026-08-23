@@ -95,6 +95,46 @@ fi
 grep -qi "no directory given" "$TMP/nodir.log" || { echo "[FAIL] refusal does not explain the missing directory"; cat "$TMP/nodir.log"; exit 1; }
 echo "[PASS] init refuses profile=none with no directory given"
 
+echo "== (c2) select() offers ton-provider by name, and picking it with no CYPHER_BRAIN_TON_PROVIDER_OWNER/MAX_SPEND set refuses BEFORE spending (issue #396 Phase B) =="
+TONPROV_USER_HOME="$TMP/tonprov-user-home"; mkdir -p "$TONPROV_USER_HOME" # HOME override, same as test (d)'s WIZ_HOME below: without this, step 6 detects the REAL machine's ~/.gbrain/config.json (if any) and asks an extra --pg prompt this qa.json does not script for
+TONPROV_HOME="$TMP/tonprov-home"
+TONPROV_SRC="$TMP/tonprov-src"; mkdir -p "$TONPROV_SRC"
+printf 'ton-provider select() positive control\n' > "$TONPROV_SRC/note.txt"
+# Up-arrow, written in the JSON below as the six-character escape sequence
+# u-0-0-1-b prefixed by a backslash (a raw ESC byte in the .json file itself
+# is illegal -- JSON disallows unescaped control characters in strings, so
+# drive-init.mjs's JSON.parse would reject it; the escape decodes to the real
+# ESC/'['/'A' bytes once parsed) moves the select() cursor from its initial
+# `file` (last in BACKEND_NAMES) up one slot to `ton-provider` (third),
+# exactly like a real terminal's arrow key would; the trailing carriage
+# return drive-init.mjs always appends then submits it -- no
+# CYPHER_BRAIN_TON_PROVIDER_OWNER/MAX_SPEND is exported for this run, so the
+# wizard's own pre-flight check (wizard.ts, mirroring #161's arweave/turbo
+# wallet-presence check) should refuse BEFORE the "spends real funds"
+# consent prompt, let alone push().
+cat > "$TMP/qa-tonprov.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile [none/", ""],
+  ["Directory path(s) to back up", "$TONPROV_SRC"],
+  ["Choose a backend", "\u001b[A"]
+]
+JSON
+CYPHER_BRAIN_HOME="$TONPROV_HOME" HOME="$TONPROV_USER_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  CYPHER_BRAIN_TON_PROVIDER_OWNER= CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND= \
+  with_timeout 30 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-tonprov.json" --out "$TMP/tonprov.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] the ton-provider select()+refuse run did not complete cleanly"; cat "$TMP/tonprov.log"; exit 1; }
+grep -q 'ton-provider' "$TMP/tonprov.log" || { echo "[FAIL] the select() menu never showed ton-provider"; cat "$TMP/tonprov.log"; exit 1; }
+grep -q 'CYPHER_BRAIN_TON_PROVIDER_OWNER' "$TMP/tonprov.log" || { echo "[FAIL] missing-prerequisites guidance did not name CYPHER_BRAIN_TON_PROVIDER_OWNER"; cat "$TMP/tonprov.log"; exit 1; }
+grep -q 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND' "$TMP/tonprov.log" || { echo "[FAIL] missing-prerequisites guidance did not name CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND"; cat "$TMP/tonprov.log"; exit 1; }
+[ -f "$TONPROV_HOME/identity.age" ] || { echo "[FAIL] the primary identity this run set up before the backend step was rolled back / never written"; exit 1; }
+[ ! -f "$TONPROV_HOME/latest-locator.tsv" ] || { echo "[FAIL] a push happened despite the missing ton-provider prerequisites"; exit 1; }
+echo "[PASS] select() offers ton-provider, arrow-key navigation picks it, and the missing-prerequisites guard refuses before any push — identity preserved, nothing rolled back"
+
 echo "== (d) THE SCRIPTED END-TO-END RUN (issue #68 acceptance criterion 1): init -> first push, driven entirely via a scripted stdin sequence =="
 SRC="$TMP/brain-src"; mkdir -p "$SRC"
 MARKER="drill-thought-$(od -An -N6 -tx1 /dev/urandom | tr -d ' ')"
@@ -108,7 +148,12 @@ BACKUP_HOME="${WIZ_CB_HOME}-backup"               # the default sibling path the
 
 # The realistic path from the issue: file backend, no profile, backup key YES,
 # signing key YES (#214 — proves the wizard's own signing step + kit inclusion),
-# passphrase NO, pin-recipients SKIP.
+# passphrase NO, pin-recipients SKIP. The "Choose a backend" answer is an empty
+# send (just the trailing '\r' drive-init.mjs always appends) — #396 Phase B's
+# select() prompt starts its cursor on `file` regardless of menu order (see
+# BACKEND_NAMES's own doc comment in backends/index.ts), so a bare Enter here
+# submits `file` exactly like the old askLine default did; no arrow-key
+# navigation needed for THIS path (see test (c2) below for one that navigates).
 cat > "$TMP/qa.json" <<JSON
 [
   ["Generate an offline backup keypair now?", "y"],
@@ -118,7 +163,7 @@ cat > "$TMP/qa.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$SRC"],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "$KIT_PATH"]
 ]
 JSON
@@ -218,7 +263,7 @@ cat > "$TMP/qa-o2b.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", "o2b"],
   ["Path to the o2b bank-export bundle", "$O2B_BUNDLE"],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "$O2B_KIT_PATH"]
 ]
 JSON
@@ -278,7 +323,7 @@ cat > "$TMP/qa-pass.json" <<JSON
   ["Suggested line (edit or press Enter to accept)", ""],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$F_SRC"],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "$F_KIT_PATH"]
 ]
 JSON
@@ -349,21 +394,32 @@ echo "[PASS] pin=yes suggests a config.env KEY=value line (no export prefix), na
 
 echo "== (h) rollback + clean retry: a failure AFTER identity creation must not brick a retry (P2 fix) =="
 # The primary identity is created in step 1/6, well before later prompts that can
-# fail/abort (an unknown backend name, an empty directory answer, ...). Before the
-# fix, any such later failure left the identity behind — and `init` refuses
-# unconditionally whenever an identity already exists — so a typo'd retry was
-# permanently stuck needing the scarier `keygen --force`. Drive a run that succeeds
-# through backup-key generation (so BOTH primary and backup identities exist) and
-# THEN fails at the very last prompt (an unrecognized backend name), then prove (1)
-# the rollback actually deleted every file this run wrote, and (2) a second, genuine
-# `cypher-brain init` run against the SAME CYPHER_BRAIN_HOME starts clean and
-# completes — the retry story working end-to-end, not just files disappearing.
+# fail/abort (declining the paid-backend spend consent, an empty directory answer,
+# ...). Before the fix, any such later failure left the identity behind — and
+# `init` refuses unconditionally whenever an identity already exists — so a
+# declined-then-retried run was permanently stuck needing the scarier `keygen
+# --force`. Drive a run that succeeds through backup-key generation (so BOTH
+# primary and backup identities exist), picks arweave with a wallet FILE present
+# (so the #161 precheck above lets it through to the real consent prompt — see
+# (o3) below, which proves that same precheck-bypass-then-decline path in
+# isolation) and THEN declines the "spends real funds" consent, then prove (1)
+# the rollback actually deleted every file this run wrote, and (2) a second,
+# genuine `cypher-brain init` run against the SAME CYPHER_BRAIN_HOME starts clean
+# and completes — the retry story working end-to-end, not just files
+# disappearing. (#396 Phase B: the OLD version of this test used a free-text
+# "not-a-real-backend" typo to reach this same post-identity failure point —
+# select() makes that specific typo structurally unreachable now (askSelect's own
+# doc comment in wizard.ts), so this test needed a different, still-genuine late
+# failure; declining consent already existed as a throw path before this PR.)
 RB_HOME="$TMP/rollback-home"; mkdir -p "$RB_HOME"
 RB_CB_HOME="$TMP/rollback-cb-home"
 RB_STORE="$TMP/rollback-store"
 RB_SRC="$TMP/rollback-src"; mkdir -p "$RB_SRC"
 printf 'rollback-marker\n' > "$RB_SRC/note.txt"
 RB_BACKUP_HOME="${RB_CB_HOME}-backup" # the default sibling path the wizard suggests for the backup key
+RB_WALLET="$TMP/rollback-wallet.json"
+cb wallet create --out "$RB_WALLET" > "$TMP/rollback-walletcreate.log" 2>&1 \
+  || { echo "[FAIL] test setup: could not create a wallet fixture for the rollback test"; cat "$TMP/rollback-walletcreate.log"; exit 1; }
 
 cat > "$TMP/qa-rollback-fail.json" <<JSON
 [
@@ -374,16 +430,17 @@ cat > "$TMP/qa-rollback-fail.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$RB_SRC"],
-  ["Backend [file/", "not-a-real-backend"]
+  ["Choose a backend", "\u001b[A\u001b[A"],
+  ["PAID, PERMANENT store", "n"]
 ]
 JSON
 
-if CYPHER_BRAIN_HOME="$RB_CB_HOME" CYPHER_BRAIN_FILE_DIR="$RB_STORE" HOME="$RB_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+if CYPHER_BRAIN_HOME="$RB_CB_HOME" CYPHER_BRAIN_FILE_DIR="$RB_STORE" HOME="$RB_HOME" CYPHER_BRAIN_AR_WALLET="$RB_WALLET" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
   with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-rollback-fail.json" --out "$TMP/rollback-fail.log" \
   -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
-  echo "[FAIL] init did not fail on an unknown backend name"; cat "$TMP/rollback-fail.log"; exit 1
+  echo "[FAIL] init did not fail when the spend-consent prompt was declined"; cat "$TMP/rollback-fail.log"; exit 1
 fi
-grep -qi "unknown backend" "$TMP/rollback-fail.log" || { echo "[FAIL] failure was not the expected unknown-backend error"; cat "$TMP/rollback-fail.log"; exit 1; }
+grep -qi "aborted before spending" "$TMP/rollback-fail.log" || { echo "[FAIL] failure was not the expected declined-consent error"; cat "$TMP/rollback-fail.log"; exit 1; }
 [ ! -f "$RB_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity survived a post-creation failure — rollback did not run"; exit 1; }
 [ ! -f "$RB_CB_HOME/recipient.txt" ] || { echo "[FAIL] primary recipient survived a post-creation failure"; exit 1; }
 [ ! -f "$RB_BACKUP_HOME/identity.age" ] || { echo "[FAIL] backup identity survived a post-creation failure"; exit 1; }
@@ -399,7 +456,7 @@ cat > "$TMP/qa-rollback-retry.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$RB_SRC"],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "$RB_KIT_PATH"]
 ]
 JSON
@@ -435,7 +492,7 @@ cat > "$TMP/qa-tilde.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "~/$TILDE_SRC_REL"],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "~/tilde-recovery-kit.txt"]
 ]
 JSON
@@ -476,7 +533,7 @@ cat > "$TMP/qa-prepush-rollback-fail.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$J0_SRC"],
-  ["Backend [file/", ""]
+  ["Choose a backend", ""]
 ]
 JSON
 
@@ -522,7 +579,7 @@ cat > "$TMP/qa-snap-preserve-fail.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$SNAP_SRC"],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "$BLOCKED_KIT_PATH"]
 ]
 JSON
@@ -583,7 +640,7 @@ cat > "$TMP/qa-locator-preserve-fail.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$K_SRC"],
-  ["Backend [file/", ""]
+  ["Choose a backend", ""]
 ]
 JSON
 # (Same reasoning as (j0)'s QA script: push() throws right after the backend prompt,
@@ -682,7 +739,7 @@ cat > "$TMP/qa-backup-partial-retry.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$L_SRC"],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "$L_HOME/recovery-kit.txt"]
 ]
 JSON
@@ -829,7 +886,7 @@ cat > "$TMP/qa-pg.json" <<JSON
   ["Directory path(s) to back up", "$PG_SRC"],
   ["Include a Postgres database dump", ""],
   ["Postgres connection string", "$TEST_PG_CONN"],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "$PG_KIT_PATH"]
 ]
 JSON
@@ -886,7 +943,7 @@ cat > "$TMP/qa-pg-decline.json" <<JSON
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$PG_SRC"],
   ["Include a Postgres database dump", "n"],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "$PG2_KIT_PATH"]
 ]
 JSON
@@ -930,7 +987,7 @@ cat > "$TMP/qa-pg-whitespace.json" <<JSON
   ["Directory path(s) to back up", "$PG_SRC"],
   ["Include a Postgres database dump", ""],
   ["Postgres connection string", "   "],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "$PG3_KIT_PATH"]
 ]
 JSON
@@ -1016,9 +1073,11 @@ cat > "$TMP/qa-wallet-precheck.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$O_SRC"],
-  ["Backend [file/", "arweave"]
+  ["Choose a backend", "\u001b[A\u001b[A"]
 ]
 JSON
+# Two Up-arrows move the select() cursor from its initial `file` (last in
+# BACKEND_NAMES) to `arweave` (second) -- see (c2) above for the same technique.
 # (Same reasoning as (j0)/(k)'s QA scripts: the wizard returns right after the
 # backend prompt on this path — never reaching the recovery-kit path prompt — so
 # the QA script intentionally stops there too.)
@@ -1050,6 +1109,9 @@ O2_SRC="$TMP/wallet-precheck-missing-src"; mkdir -p "$O2_SRC"
 printf 'wallet-precheck-missing-marker\n' > "$O2_SRC/note.txt"
 O2_WALLET="$TMP/no-such-wallet.json" # set but deliberately never created
 
+# Three Up-arrows move the select() cursor from its initial `file` (last in
+# BACKEND_NAMES) all the way to `turbo` (first) -- see (c2) above for the
+# same technique.
 cat > "$TMP/qa-wallet-precheck-missing.json" <<JSON
 [
   ["Generate an offline backup keypair now?", "n"],
@@ -1058,7 +1120,7 @@ cat > "$TMP/qa-wallet-precheck-missing.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$O2_SRC"],
-  ["Backend [file/", "turbo"]
+  ["Choose a backend", "\u001b[A\u001b[A\u001b[A"]
 ]
 JSON
 
@@ -1087,7 +1149,7 @@ cat > "$TMP/qa-wallet-precheck-present.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$O3_SRC"],
-  ["Backend [file/", "arweave"],
+  ["Choose a backend", "\u001b[A\u001b[A"],
   ["PAID, PERMANENT store", "n"]
 ]
 JSON

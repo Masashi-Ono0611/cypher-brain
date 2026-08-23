@@ -7,7 +7,7 @@
 // same "pay once, don't operate infrastructure yourself" shape arweave/turbo already
 // have, not a self-hosted "sovereignty lane" (that stays ton.ts's job).
 //
-// PR1 scope (issue #396 Phase A) — what this does NOT do yet:
+// PR1 scope (issue #396 Phase A) — what this still does NOT do:
 //   - No local TON wallet: the StorageV1 deploy is signed via a Tonkeeper deeplink,
 //     same as this project's own dogfooding (docs/ton-storage-status.md). Unlike
 //     arweave/turbo's wallet.ts (a locally-held JWK signs with no human in the loop,
@@ -16,8 +16,15 @@
 //     Fully automated signing (a TON-side wallet.ts equivalent) is a separate PR.
 //   - Provider-payment mode only: the self-hosted ton.ts backend is unchanged and
 //     stays the "sovereignty" path for operators who want to run their own seeder.
-//   - No wizard/--help/estimate/README symmetry work (issue #396 Phase B) — this PR
-//     only makes `--backend ton-provider` a real, working capability.
+//
+// Phase B (issue #396) landed in a follow-up PR: the `init` wizard now offers this
+// backend via a select() prompt (src/lib/wizard.ts), --help/estimate/README present it
+// with the same structural weight as arweave/turbo (see push's --help section below and
+// README's "## Backends"), estimate carries a USD line (tonUsdRate() below), and put()
+// runs an advisory pre-deploy funds check plus a shared-module progress line during the
+// notify-until-full wait (mirroring turbo.ts's own funds check/progress reporting) — so
+// the "no wizard/--help/estimate/README symmetry work yet" note that used to sit here is
+// no longer accurate; only the two bullets above remain genuinely unfinished.
 //
 // Cell-encoding correctness: the StorageV1 data-cell layout and the modify_providers
 // deploy-message body below were cross-verified, byte-for-byte, against
@@ -66,11 +73,14 @@ import {
   TON_TONAPI_URL,
   TON_BIN,
   TON_NETWORK_CONFIG,
+  SKIP_FUNDS_CHECK,
 } from '../config.js';
 import { run } from '../proc.js';
 import { sleep, rmrf, errMsg, SdkMissingError, sdkImportAdvice } from '../util.js';
+import { warn } from '../warn.js';
 import { tonApi, startLocalTonDaemon, type TonBagDetails, type LocalTonDaemon } from './ton-client.js';
 import { p2pFetch, entryNameFor } from './ton.js';
+import { progressReporter } from '../progress.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 // Lazy loader for @ton/ton's VALUE exports (beginCell/Cell/Dictionary/Address/
@@ -544,11 +554,24 @@ async function notifyProviderWithRetry(
   dataSizeBytes: bigint,
 ): Promise<void> {
   const deadline = Date.now() + TON_PROVIDER_NOTIFY_RETRY_MS;
+  // Same shared cadence/formatting module turbo's upload and rclone's transfer progress
+  // use (progress.ts, #283) — a rate + ETA line instead of a bare byte count, and it
+  // self-limits how often a line is written on an unattended run (nightly log / MCP
+  // result) the same way those backends already do (this loop's own retry interval,
+  // 15s by default, is already well below the throttle turbo's per-event SDK callback
+  // needs, but the shared module is what gives rate/ETA math, not just the throttle).
+  // dataSizeBytes is bounded well under Number.MAX_SAFE_INTEGER by buildDeploy()'s own
+  // guard before a push ever reaches this loop, so narrowing it to Number() here is safe.
+  const progress = progressReporter('ton-provider notify');
+  const total = Number(dataSizeBytes);
   for (;;) {
     try {
       const res = await notifyProvider(providerPubkeyHex, contractAddrRaw);
-      if (res.downloaded >= dataSizeBytes) return;
-      console.error(`ton-provider: provider has ${res.downloaded}/${dataSizeBytes} bytes so far — waiting`);
+      if (res.downloaded >= dataSizeBytes) {
+        progress.report(total, total);
+        return;
+      }
+      progress.report(Number(res.downloaded), total);
     } catch (e) {
       if (Date.now() > deadline) {
         throw new Error(
@@ -657,6 +680,39 @@ export function tonProviderBackend(): StorageBackend {
         console.error(
           `ton-provider: storage cost ${deploy.costNano} nanoTON + ${DEPLOY_BUFFER_NANO} nanoTON deploy buffer = ${deploy.amountNano} nanoTON`,
         );
+        // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
+        // signer balance, #342) — WARN only, never abort: unlike turbo's locally-held
+        // JWK signer, this deploy is always signed by a HUMAN in their own Tonkeeper app
+        // (see header), so an actual shortfall already gets its own unambiguous feedback
+        // there (the wallet app refuses the transaction) — this exists only to save that
+        // human the trip through waitForContractActive()'s up-to-20-minute wait on a
+        // signature that was always going to fail. Same availability posture as turbo's
+        // check: a balance read that fails or looks unusable must never block a push, and
+        // CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences it for one run (the same flag, not a
+        // ton-provider-specific one — same shortfall-with-no-freshness-guarantee shape).
+        // Both lines go through warn() (#347), not a raw console.error — the same
+        // chokepoint turbo.ts's own funds check already uses — so an agent-driven push
+        // carries this in the MCP result's warnings[] array and the CLI's end-of-run
+        // summary, instead of it only ever landing in a background log (multi-model
+        // review finding: the plain console.error version bypassed both surfaces).
+        if (!SKIP_FUNDS_CHECK) {
+          try {
+            const ownerState = await fetchAccountState(owner);
+            if (!Number.isFinite(ownerState.balance)) {
+              throw new Error(`tonapi returned a non-numeric balance: ${JSON.stringify(ownerState.balance)}`);
+            }
+            if (ownerState.balance < Number(deploy.amountNano)) {
+              warn(
+                `ton-provider: owner ${TON_PROVIDER_OWNER}'s on-chain balance (${ownerState.balance} ` +
+                  `nanoTON) looks lower than the ${deploy.amountNano} nanoTON this deploy needs; the Tonkeeper ` +
+                  'signature below may be rejected for insufficient funds. Fund the wallet first, or set ' +
+                  'CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 to silence this check.',
+              );
+            }
+          } catch (e) {
+            warn(`ton-provider: could not pre-check the owner's balance (${errMsg(e)}); proceeding`);
+          }
+        }
         console.error(`ton-provider: sign this to deploy the contract (bag stays seeded locally while you do):`);
         console.error(`  ${deploy.deeplink}`);
 

@@ -87,10 +87,16 @@ printf 'gbrain-pglite-selftest\n' > "$CB_SRC/note.txt"
 # (a) the wizard's engine-resolution matrix
 # ---------------------------------------------------------------------------
 # Each case gets its own HOME (so ~/.gbrain/config.json is a fixture) and its own
-# CYPHER_BRAIN_HOME. The run is deliberately CUT SHORT at the backend prompt with an
-# unknown backend name: everything this test asserts is printed before that point,
-# and stopping there skips the snapshot/push/kit work four times over. The same
-# rollback path scripts/selftest-init.sh's test (h) already covers then cleans up.
+# CYPHER_BRAIN_HOME. The run is deliberately CUT SHORT at the backend prompt by
+# picking `ton-provider` with no CYPHER_BRAIN_TON_PROVIDER_OWNER/MAX_SPEND set:
+# everything this test asserts is printed before that point, and stopping there
+# skips the snapshot/push/kit work four times over. (#396 Phase B: this used to
+# answer the backend prompt with a free-text "not-a-real-backend" typo, which threw
+# — select() makes that specific typo structurally unreachable now (askSelect's own
+# doc comment in wizard.ts), so this needed a different, still-cheap early stop.
+# ton-provider's missing-prerequisites guard is a CLEAN, non-throwing exit instead
+# — see below, the wizard invocation is expected to SUCCEED here, not fail.
+# scripts/selftest-init.sh's own (c2) test covers this exact guard in isolation.)
 #
 # config.json also carries a decoy secret in every case. gbrain's real config.json
 # holds API keys, so detectGbrainEngine reads the engine fields and nothing else —
@@ -133,18 +139,24 @@ wizard_case() {
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$answer_dir"],
 $pg_line
-  ["Backend [file/", "not-a-real-backend"]
+  ["Choose a backend", "\u001b[A"]
 ]
 JSON
   local extra_env=("${WIZARD_EXTRA_ENV[@]+"${WIZARD_EXTRA_ENV[@]}"}")
   WIZARD_EXTRA_ENV=()
-  if CYPHER_BRAIN_HOME="$cbhome" HOME="$home" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  # Up-arrow moves the select() cursor from its initial `file` (last in
+  # BACKEND_NAMES) up one slot to `ton-provider` (third) — see (c2) in
+  # scripts/selftest-init.sh for the same technique. No CYPHER_BRAIN_TON_PROVIDER_
+  # OWNER/MAX_SPEND is set anywhere in this file, so the wizard's own pre-flight
+  # check (wizard.ts) fires and returns CLEANLY (exit 0) right after printing the
+  # gbrain-detection prose this test wants — the invocation below is expected to
+  # SUCCEED, not fail (the opposite polarity from the old free-text-typo version).
+  CYPHER_BRAIN_HOME="$cbhome" HOME="$home" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
     with_timeout 60 env ${extra_env[@]+"${extra_env[@]}"} \
     node "$ROOT/scripts/drive-init.mjs" --qa "$qa" --out "$logfile" \
-    -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
-    echo "[FAIL] $label: init did not stop at the unknown backend name"; cat "$logfile"; exit 1
-  fi
-  grep -qi "unknown backend" "$logfile" || { echo "[FAIL] $label: the run ended for some reason other than the scripted unknown-backend stop (a stalled prompt means the wrong engine branch ran)"; cat "$logfile"; exit 1; }
+    -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+    || { echo "[FAIL] $label: init did not stop cleanly at the ton-provider prerequisites guard"; cat "$logfile"; exit 1; }
+  grep -qF "CYPHER_BRAIN_TON_PROVIDER_OWNER" "$logfile" || { echo "[FAIL] $label: the run ended for some reason other than the scripted ton-provider-prerequisites stop (a stalled prompt means the wrong engine branch ran)"; cat "$logfile"; exit 1; }
   if grep -qF "$DECOY_SECRET" "$logfile"; then
     echo "[FAIL] $label: a value from ~/.gbrain/config.json reached the transcript — engine detection must read the engine fields and echo nothing"; exit 1
   fi
@@ -280,7 +292,7 @@ cat > "$TMP/qa-e2e.json" <<JSON
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile [none/", ""],
   ["Directory path(s) to back up", "$E2E_HOME/.gbrain"],
-  ["Backend [file/", ""],
+  ["Choose a backend", ""],
   ["Path to write the recovery kit", "$E2E_KIT_PATH"]
 ]
 JSON

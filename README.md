@@ -256,11 +256,29 @@ That's it. The manual flow below is exactly what it wraps — useful once you kn
 what you want, or for scripting/automation `init` itself refuses (it is
 interactive only).
 
-`init` finishing, and each successful paid `push` to arweave/turbo (never a
+`init` finishing, and each successful paid `push` to arweave/turbo/ton-provider (never a
 `--skip-unchanged` no-op, and never the free `file` backend), print a short
 STDERR-only note (a note from the person who built this, or a cited quote from an
 encryption/privacy precursor) alongside the mascot — decoration only, never mixed
 into `--save-locator`/stdout or the MCP server's output.
+
+#### Choosing a paid store: Arweave vs. TON Storage
+
+`init`'s wizard presents both as a straight choice (a `select()` prompt, one hint
+line per option) — this is the same tradeoff spelled out:
+
+| | Arweave (`turbo`) | TON Storage (`ton-provider`) |
+|---|---|---|
+| **Pay** | Once, at upload | Once per deploy, to a provider who must keep renewing |
+| **Durability** | Network-guaranteed permanence | Depends on the chosen provider staying up (see [`docs/durability.md`](docs/durability.md)) |
+| **Signing** | Local JWK wallet — fully unattended, works under `schedule install` | A human signs a Tonkeeper deeplink every push — never unattended |
+| **Cost preview** | `estimate --backend turbo` (winc + USD) | `estimate --backend ton-provider` (nanoTON + USD) |
+| **Recommended for** | Most users — the default | An explicit TON-network choice |
+
+Both are real, working "pay once, don't run your own server" options — see
+[Backends](#backends) for the full mechanics of every backend, including the
+self-hosted `ton` seeder mode this table deliberately leaves out (that one needs
+an always-on box of your own, so it isn't part of the wizard's default choice).
 
 ### Manual flow
 
@@ -739,11 +757,13 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       Storage sees ciphertext only.
       Transfer progress (#283) is printed to stderr on the backends that can actually be
       slow: turbo uploads (from the SDK's own progress events), rclone transfers (rclone's
-      periodic stats, translated), and an arweave gateway READ during pull. file is a local
-      copy and the L1 arweave upload is capped at ~10 MiB, so neither reports anything. How
-      OFTEN depends on whether stderr is a terminal — roughly every 2s when a human is
-      watching, roughly every 30s when it is a nightly log or an MCP tool result, both of
-      which keep everything they are given.
+      periodic stats, translated), an arweave gateway READ during pull, and ton-provider's
+      wait for the chosen provider to finish fetching the bag over P2P (bytes downloaded
+      so far, from its own self-reported status). file is a local copy and the L1 arweave
+      upload is capped at ~10 MiB, so neither reports anything. How OFTEN depends on
+      whether stderr is a terminal — roughly every 2s when a human is watching, roughly
+      every 30s when it is a nightly log or an MCP tool result, both of which keep
+      everything they are given.
       arweave/turbo are paid permanent stores — require --yes or CYPHER_BRAIN_YES=1;
       both print a native-unit cost estimate (winston/winc) before uploading, plus an
       approximate USD line when a USD/AR rate is fetchable — a rate failure drops that
@@ -771,11 +791,18 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       CYPHER_BRAIN_TON_PROVIDER_OWNER (the TON wallet address that will own the
       contract) and CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (a nanoTON spend cap; a
       StorageV1 deploy spends real funds, same posture as arweave/turbo's spend cap).
-      Prints a Tonkeeper deeplink and waits for a HUMAN to sign it — unlike
-      arweave/turbo this does not run unattended yet (no local TON wallet exists to
-      sign automatically). Notifying the chosen provider shells out to a locally
-      built scripts/go/storage-v1-client binary (CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN)
-      — an ADNL/RLDP query with no mature TypeScript implementation. The locator is
+      Before printing the deeplink it runs an advisory pre-deploy funds check against
+      the owner address's own on-chain balance (see Spend below) — a WARNING only,
+      never a refusal: unlike arweave/turbo's automatic JWK signer, this deploy is
+      always signed by a human in their own wallet app, which already refuses an
+      underfunded transaction on its own; this just saves the trip through the wait
+      below on a signature that was always going to fail. Prints a Tonkeeper deeplink
+      and waits for a HUMAN to sign it — unlike arweave/turbo this does not run
+      unattended yet (no local TON wallet exists to sign automatically). Notifying the
+      chosen provider shells out to a locally built scripts/go/storage-v1-client binary
+      (CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN) — an ADNL/RLDP query with no mature
+      TypeScript implementation — and the wait for it to report a full download is what
+      the Transfer progress paragraph above covers. The locator is
       "ton-provider:v1:<64-hex-bag-id>"; pull is the same P2P download ton uses, with
       no seeder-SSH fallback (this backend never operates a seeder of its own).
       --save-locator writes "<locator>\t<backend>\t<sha256>[\t<content_digest>[\t
@@ -818,8 +845,10 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       Read-only preview: print what pushing --in to --backend would cost WITHOUT
       uploading anything. turbo/arweave show the native unit (winc/winston) plus
       an approximate USD line when a USD/AR rate is fetchable; ton-provider shows
-      the native unit too (nanoTON, a real mytonprovider.org priced query), but no
-      USD line yet. file, rclone and ton are always reported as free (rclone's
+      the native unit too (nanoTON, a real mytonprovider.org priced query) plus its
+      own approximate USD line when a USD/TON rate is fetchable (tonapi's public
+      rates endpoint — a rate failure drops that line only, same posture as
+      turbo/arweave). file, rclone and ton are always reported as free (rclone's
       actual transfer/storage cost, if any, is whatever the operator's own cloud
       contract for that remote charges — cypher-brain cannot query it; ton's is the
       operator's own seeder box). Sizes --in the same way push does (a real byte count
@@ -1009,8 +1038,8 @@ Storage: CYPHER_BRAIN_FILE_DIR (file);
          turbo: CYPHER_BRAIN_AR_WALLET (JWK signer) + optional CYPHER_BRAIN_AR_PAID_BY (an address sharing Turbo Credits to that signer); needs '@ardrive/turbo-sdk' to PUSH (a pull reuses the arweave gateway read, no SDK). Funding/credit-share details: docs/arweave-upload-runbook.md.
          rclone: CYPHER_BRAIN_RCLONE_BIN (path to the rclone binary; default 'rclone' on PATH) — the remote itself is whatever --remote <name>:<path> names in your own 'rclone config'.
          ton: CYPHER_BRAIN_TON_SSH_HOST (user@host of your seeder box running tonutils-storage — required to PUSH; also the pull fallback), CYPHER_BRAIN_TON_SSH_KEY (optional ssh -i identity file), CYPHER_BRAIN_TON_REMOTE_DIR (seeder-side layout root; default 'cypher-brain-ton' in the SSH user's home — plain relative or absolute path, a literal ~ is refused), CYPHER_BRAIN_TON_REMOTE_API (the seeder daemon's API address as seen FROM the seeder itself; default '127.0.0.1:9955' — it stays loopback-bound there, reached via ssh, never exposed), CYPHER_BRAIN_TON_BIN (local tonutils-storage binary for the P2P pull; default 'tonutils-storage' on PATH), CYPHER_BRAIN_TON_HTTP_TIMEOUT (ms; default 30000), CYPHER_BRAIN_TON_NO_FALLBACK=1 (strictly '1': forbid the seeder fallback on pull, so a success PROVES P2P availability — use for verify --level remote when you want that proof), CYPHER_BRAIN_TON_NETWORK_CONFIG (path to a TON global config JSON for testnet; default mainnet), CYPHER_BRAIN_TON_TONAPI_URL (tonapi.io base URL 'publish-latest' resolves a .ton domain's NFT address and polls its DNS record against; default 'https://tonapi.io').
-         ton-provider: CYPHER_BRAIN_TON_PROVIDER_OWNER (TON wallet address that will own the deployed StorageV1 contract — required to PUSH), CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON spend cap — required to PUSH, a deploy spends real funds), CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (path to a locally built scripts/go/storage-v1-client binary — required to PUSH, notifying a provider needs an ADNL/RLDP query this project has no TypeScript implementation for), CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL (provider registry base URL; default 'https://mytonprovider.org'). Also uses CYPHER_BRAIN_TON_BIN/CYPHER_BRAIN_TON_NETWORK_CONFIG (the local ephemeral daemon that hashes and temporarily seeds the bag) and CYPHER_BRAIN_TON_TONAPI_URL (polling the deploy for on-chain confirmation) from the ton settings above.
-Spend: arweave/turbo PUSH needs --yes or CYPHER_BRAIN_YES=1 (paid, permanent); CYPHER_BRAIN_MAX_SPEND caps the arweave/turbo cost estimate (winston/winc). ton-provider PUSH needs --yes or CYPHER_BRAIN_YES=1 too, plus CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) — and still requires a human to sign the resulting Tonkeeper deeplink; it does not run unattended. A turbo push also runs a funds check BEFORE signing: when the estimated cost exceeds even the reachable credit (the signer's own balance + the live approvals CYPHER_BRAIN_AR_PAID_BY selects), the spend is headed for a payment-service refusal that would otherwise arrive only after minutes of signing. On a TTY (a human watching) it aborts with the funding steps spelled out, after confirming the shortfall on a second balance read so a top-up landing that same moment is not blocked; without a TTY (a nightly runner, an MCP host) it only WARNS and proceeds — a balance read has no freshness guarantee, and it must never be what blocks an unattended backup. Skipped entirely when the balance cannot be read at all; CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 (strictly '1') bypasses it for one run.
+         ton-provider: CYPHER_BRAIN_TON_PROVIDER_OWNER (TON wallet address that will own the deployed StorageV1 contract — required to PUSH), CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON spend cap — required to PUSH, a deploy spends real funds), CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (path to a locally built scripts/go/storage-v1-client binary — required to PUSH, notifying a provider needs an ADNL/RLDP query this project has no TypeScript implementation for), CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL (provider registry base URL; default 'https://mytonprovider.org'). Also uses CYPHER_BRAIN_TON_BIN/CYPHER_BRAIN_TON_NETWORK_CONFIG (the local ephemeral daemon that hashes and temporarily seeds the bag) and CYPHER_BRAIN_TON_TONAPI_URL (polling the deploy for on-chain confirmation, AND the approximate-USD line's rate source — tonapi's own public rates endpoint, no separate URL setting needed) from the ton settings above.
+Spend: arweave/turbo PUSH needs --yes or CYPHER_BRAIN_YES=1 (paid, permanent); CYPHER_BRAIN_MAX_SPEND caps the arweave/turbo cost estimate (winston/winc). ton-provider PUSH needs --yes or CYPHER_BRAIN_YES=1 too, plus CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) — and still requires a human to sign the resulting Tonkeeper deeplink; it does not run unattended. A turbo push also runs a funds check BEFORE signing: when the estimated cost exceeds even the reachable credit (the signer's own balance + the live approvals CYPHER_BRAIN_AR_PAID_BY selects), the spend is headed for a payment-service refusal that would otherwise arrive only after minutes of signing. On a TTY (a human watching) it aborts with the funding steps spelled out, after confirming the shortfall on a second balance read so a top-up landing that same moment is not blocked; without a TTY (a nightly runner, an MCP host) it only WARNS and proceeds — a balance read has no freshness guarantee, and it must never be what blocks an unattended backup. Skipped entirely when the balance cannot be read at all; CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 (strictly '1') bypasses it for one run. A ton-provider push runs the SAME kind of pre-deploy funds check (querying the owner address's own on-chain balance via tonapi), but only ever WARNS, never aborts — every ton-provider deploy is already signed by a human in their own wallet app (there is no unattended path to protect the way turbo's TTY-detection branch protects one), so an underfunded transaction gets its own unambiguous refusal there regardless; this check exists only to save the trip through the up-to-20-minute signature wait first. Shares CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 with turbo's check above (not a separate ton-provider-specific flag).
 Consent: restore --pg (pg_restore --clean --if-exists, irreversible) needs --yes or CYPHER_BRAIN_YES=1.
 Permanence: there is NO delete, at any granularity (#301). cypher-brain has no forget/prune/delete
      command and will not grow one: arweave/turbo are write-once, and destroying your identity does
@@ -1034,7 +1063,7 @@ line only, never the native estimate). Preview that same estimate WITHOUT pushin
 `cypher-brain estimate --in <file.age> --backend <backend>` (also exposed as the
 `estimate_cost` MCP tool — see below); `push --skip-unchanged` skips a paid
 re-upload when the snapshot's plaintext content digest (the `<out>.digest`
-sidecar `snapshot` writes) matches the previous push. Four backends ship, but
+sidecar `snapshot` writes) matches the previous push. Six backends ship, but
 they are not peers:
 
 - **`turbo` — the recommended mainline.** Uploads the ciphertext to the Arweave
@@ -1074,11 +1103,33 @@ they are not peers:
   [`docs/durability.md`](docs/durability.md) for the honest comparison with
   Arweave, and treat `ton` as a redundancy/sovereignty lane next to `turbo`'s
   permanence, not a replacement for it.
+- **`ton-provider`** — the real, general-user-reachable way to use TON Storage
+  (issue #396): the same network as `ton` above, but paying a **live,
+  third-party provider** (self-registered on
+  [mytonprovider.org](https://mytonprovider.org), the current Go/StorageV1
+  scheme) to hold the bag instead of seeding it yourself — no always-on box of
+  your own required, the same "pay once, don't operate infrastructure
+  yourself" shape `turbo` has for Arweave. `push` deploys a per-bag StorageV1
+  contract, signed via a **Tonkeeper deeplink** — a human must be present to
+  approve it; unlike arweave/turbo's locally-held JWK there is no wallet that
+  signs unattended yet — then notifies the chosen provider over ADNL/RLDP
+  (shelling out to a locally built `scripts/go/storage-v1-client` binary; no
+  mature TypeScript implementation exists for that query) and waits for it to
+  report a full P2P fetch, printing a rate/ETA progress line the same way
+  `turbo`'s upload does. The locator is `ton-provider:v1:<64-hex-bag-id>`;
+  `pull` is the same real P2P download `ton` uses, with no seeder-SSH fallback
+  (this backend never operates a seeder of its own). `estimate` prices it in
+  **nanoTON** (a real `mytonprovider.org` query, not a guess) plus an
+  approximate USD line. **Not permanent storage the way Arweave is**:
+  durability depends on the chosen provider continuing to renew/serve the
+  contract — see [`docs/durability.md`](docs/durability.md) for the honest
+  comparison, and prefer `turbo` as the mainline recommendation unless you
+  specifically want the TON-network option.
 
 The backend abstraction is what makes the same `snapshot → push … pull → restore`
-pipeline work across all five — locators known before upload (`file`'s content
+pipeline work across all six — locators known before upload (`file`'s content
 hash, `rclone`'s caller-chosen `--remote`) and post-assigned-id ones
-(`arweave`/`turbo`/`ton`) alike.
+(`arweave`/`turbo`/`ton`/`ton-provider`) alike.
 
 ## Validation
 

@@ -69,10 +69,13 @@ Honest operational notes, so nothing here silently over-promises:
   (`CYPHER_BRAIN_TON_NO_FALLBACK=1`) in **95 s (~5 MB/s)**, sha256 matching the
   save-locator pin — that bag is now the live self-hosted replica of the real
   brain, replacing the earlier hand-managed one. Paying third-party storage
-  providers for retention exists as a protocol (per-day storage contracts with
-  on-chain proofs) but was measured dormant in practice (providers listed, none
-  accepting contracts) as of mid-2026 — which is exactly why this backend seeds
-  from your OWN box instead of depending on that market.
+  providers for retention was measured DORMANT (providers listed, none
+  accepting contracts) as of mid-2026 — which is exactly why this backend
+  seeds from your OWN box instead of depending on that market. **That
+  measurement sampled the legacy C++/tonapi scheme specifically (issue #376);
+  it does not describe the market as a whole** — see the `ton-provider`
+  section right below, which pays into the CURRENT, live Go/StorageV1 scheme
+  instead.
 - **`publish-latest` is discovery, not integrity — and it is public.** The opt-in
   `cypher-brain publish-latest` command points a `.ton` domain's DNS `storage` record
   at the latest bag id so a fresh machine can find it by a memorable name instead of
@@ -83,6 +86,46 @@ Honest operational notes, so nothing here silently over-promises:
   by watching it change, your snapshot cadence. It is never run automatically (no
   `schedule install` wiring); an operator opts in per publish, deliberately, and the
   CLI itself never signs the on-chain update.
+
+## TON Storage, paying a provider (`--backend ton-provider`): availability while the provider renews, not permanence
+
+`ton-provider` is TON Storage's OTHER lane — same content-addressed bags as `ton`
+above (a `ton-provider:v1:<bag-id>` locator is the same merkle root), but paying
+a **live, third-party provider** (self-registered on
+[mytonprovider.org](https://mytonprovider.org), the current Go/StorageV1
+scheme — issue #396) to hold the bag instead of running your own seeder. As of
+2026-08-23: 76 self-registered providers, ~20 with >90% uptime, and the top
+providers show real multi-TB usage (2.26 TB/2.7 TB on the largest) — this
+session deployed a real StorageV1 contract and confirmed, via the provider's
+own response, that it fully fetched and served the exact bag pushed.
+
+The mechanics work end-to-end on mainnet today, but its durability profile is
+still weaker than Arweave's, and DIFFERENT from `ton`'s self-hosted profile
+above — worth stating plainly rather than glossing over:
+
+- **You are not the one keeping it alive.** Unlike `ton`, there is no seeder
+  box of your own to stop; the CHOSEN PROVIDER is the single point of failure.
+  If that provider stops renewing the contract, the bag becomes unretrievable
+  the same way an unseeded `ton` bag does — cypher-brain has no mechanism today
+  to detect that and re-deploy to a different provider automatically.
+  `estimate --backend ton-provider` and every `push` both print which provider
+  was selected (uptime + rating from the same registry query), so the choice is
+  at least visible.
+  There is no network-level replication or endowment behind it, same as `ton`.
+- **Not free, unlike `ton`'s "your box's running cost is the cost."** A
+  StorageV1 deploy spends real TON, gated the same way arweave/turbo's spend is
+  (`estimate` preview + `--yes`/`CYPHER_BRAIN_YES` + a spend cap,
+  `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND`) — but that payment is NOT the one-time,
+  network-guaranteed permanence Arweave's payment buys; it funds one provider's
+  commitment to keep renewing.
+- **Never unattended.** The deploy is signed via a Tonkeeper deeplink — a human
+  must be present to approve it, unlike arweave/turbo's locally-held JWK
+  wallet — so this backend does not (yet) support `schedule install`.
+- **In the 3-2-1 framing**, treat `ton-provider` the way `ton` is treated
+  above: useful redundancy alongside `turbo`'s permanence, never a substitute
+  for it. Between `ton` and `ton-provider` themselves, neither substitutes for
+  the other either — one trades "your own always-on box" for "a market
+  provider's uptime," not for stronger guarantees.
 
 ## Recommended model: Arweave is the mainline
 

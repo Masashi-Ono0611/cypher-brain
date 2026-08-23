@@ -31,11 +31,23 @@
 // fundamentally an interactive command: it refuses immediately (requireTTY) if stdin
 // is not a TTY — the same non-interactive-safety posture promptHidden already has —
 // rather than hanging or behaving unpredictably under a CI/pipe invocation.
-import { text, confirm, isCancel } from '@clack/prompts';
-import { readFile, writeFile, rm, stat } from 'node:fs/promises';
+import { text, confirm, select, isCancel } from '@clack/prompts';
+import { readFile, writeFile, rm, stat, access } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, userInfo } from 'node:os';
-import { HOME, CONFIG_FILE_PATH, IDENTITY, RECIPIENT, SIGN_IDENTITY, SIGN_RECIPIENT, readEnv } from './config.js';
+import {
+  HOME,
+  CONFIG_FILE_PATH,
+  IDENTITY,
+  RECIPIENT,
+  SIGN_IDENTITY,
+  SIGN_RECIPIENT,
+  TON_PROVIDER_OWNER,
+  TON_PROVIDER_MAX_SPEND,
+  TON_PROVIDER_NOTIFY_BIN,
+  readEnv,
+} from './config.js';
 import { keygen, keygenAt } from './keys.js';
 import { askNewPassphrase, wrapIdentity } from './crypt.js';
 import { keygenSignAt } from './minisign.js';
@@ -145,6 +157,45 @@ async function askYesNo(question: string, def: boolean): Promise<boolean> {
   if (isCancel(answer)) throw new InitCancelledError();
   return answer;
 }
+
+// #396 Phase B: the backend prompt below used to be free-text (askLine), which let a
+// typo slip past this wizard's own validation with a confusing "unknown backend"
+// re-throw AFTER the identity/backup-key steps had already run (#161's whole point was
+// catching THIS class of late failure for the wallet check; the prompt itself was still
+// exposed to it). clack's select() makes an invalid answer structurally impossible — the
+// return type is one of the option `value`s, never arbitrary text — so the manual
+// `BACKEND_NAMES.includes(backend)` guard that used to follow this prompt is gone too;
+// there is nothing left for it to catch.
+// Not generic over the option's value type (a `<T extends string>` wrapper around
+// clack's own `select<Value>` does not typecheck here — @clack/prompts' `Option<Value>`
+// is a CONDITIONAL type keyed on `Value extends Primitive`, and TS cannot resolve that
+// branch against a still-generic `T`, only a concrete type). Callers narrow the
+// returned string back to their own literal-union type themselves (safe: clack's
+// select() can only return one of the `value`s it was given).
+async function askSelect(
+  question: string,
+  options: { value: string; label: string; hint?: string }[],
+  initialValue: string,
+): Promise<string> {
+  const answer = await select({ message: question, options, initialValue });
+  if (isCancel(answer)) throw new InitCancelledError();
+  return answer;
+}
+
+// One-line hints shown next to each BACKEND_NAMES choice in the select() prompt below
+// (#396 Phase B — the acceptance criterion is a `select()` prompt with a hint per
+// choice). Order matches BACKEND_NAMES (backends/index.ts); kept local to the wizard
+// since --help/README already carry the fuller mechanical description elsewhere (cli.ts,
+// README.md "## Backends") — this is UI prose, not a second copy of that reference.
+// Keeping it a Record keyed by BACKEND_NAMES's own element type means a future backend
+// added to BACKEND_NAMES without a matching entry here is a TYPE ERROR, not a silent
+// "hint: undefined" in the prompt.
+const BACKEND_HINTS: Record<(typeof BACKEND_NAMES)[number], string> = {
+  turbo: 'Arweave via Turbo — pay once, permanent, ETH/USDC — recommended for most users',
+  arweave: 'Arweave L1 direct — pay once, permanent, small files only (~10 MiB cap)',
+  'ton-provider': 'TON Storage, pay a live provider — availability depends on it renewing, see docs/durability.md',
+  file: 'local only — free, NOT reachable from another machine (not offsite)',
+};
 
 // BackupKey/SigningKey/KitInputs and buildRecoveryKit() moved to
 // src/lib/recoverykit.ts (#364) so `init` and the standalone
@@ -544,23 +595,72 @@ export async function init(_o: CliOptions): Promise<void> {
 
       // ---------- 7. initial snapshot + push ----------
       console.log('\n== 7/7: first snapshot + push ==');
-      console.log(`Storage backends: ${BACKEND_NAMES.join(', ')}. arweave/turbo are PAID, permanent stores.`);
-      const backend = await askLine(`Backend [${BACKEND_NAMES.join('/')}] (default file)`, 'file');
-      if (!(BACKEND_NAMES as readonly string[]).includes(backend)) {
-        throw new Error(`unknown backend "${backend}" — valid choices: ${BACKEND_NAMES.join(', ')}`);
+      console.log('Pick where the encrypted snapshot goes — see the hint next to each choice for the tradeoff.');
+      // Cast is safe: select() can only return one of the `value`s it was given, and
+      // every one of those came from BACKEND_NAMES itself (see askSelect's own doc
+      // comment for why the helper cannot be generic over this literal-union type).
+      const backend = (await askSelect(
+        'Choose a backend',
+        BACKEND_NAMES.map((name) => ({ value: name, label: name, hint: BACKEND_HINTS[name] })),
+        'file', // the cursor starts on the free/local choice regardless of list order — see BACKEND_NAMES's own doc comment
+      )) as (typeof BACKEND_NAMES)[number];
+      const paid = backend === 'arweave' || backend === 'turbo' || backend === 'ton-provider';
+      // #161: check the backend's OWN prerequisites are present BEFORE the "spends real
+      // funds" consent prompt below, not after. Without this, a user who picks a paid
+      // backend with its prerequisites unset sails past that consent prompt, then fails
+      // deep inside push() — pushSucceeded stays false, and the catch block below rolls
+      // back the identity/backup key/recipient pin this same run just spent five steps
+      // setting up: the worst possible first-run experience. Neither check can confirm
+      // the funds are actually SUFFICIENT (that needs a network call) — only that the
+      // prerequisite is set at all; an actual shortfall remains push's own
+      // estimate/consent (arweave/turbo, issue #160) or advisory funds-check
+      // (ton-provider, backends/ton-provider.ts) job, unchanged here.
+      // NOTIFY_BIN is checked here too (multi-model review finding), not just OWNER/
+      // MAX_SPEND: put() also requires it before it will push (ton-provider.ts checks
+      // both presence AND executability, X_OK, before spending anything) — omitting it
+      // from this precheck would let a run with owner+max-spend set but no built
+      // scripts/go/storage-v1-client binary sail past this guard and fail deep inside
+      // push() anyway, the exact bad UX #161 (and this precheck) exists to avoid. Only
+      // evaluated when ton-provider was actually chosen — same lazy, backend-gated shape
+      // walletConfigured() already has below, so an unrelated backend's run never pays
+      // for an fs.access() call it has no use for.
+      let tonProviderReady = false;
+      if (backend === 'ton-provider') {
+        let notifyBinReady = false;
+        if (TON_PROVIDER_NOTIFY_BIN) {
+          try {
+            await access(TON_PROVIDER_NOTIFY_BIN, fsConstants.X_OK);
+            notifyBinReady = true;
+          } catch {
+            notifyBinReady = false;
+          }
+        }
+        tonProviderReady = Boolean(TON_PROVIDER_OWNER) && TON_PROVIDER_MAX_SPEND > 0n && notifyBinReady;
       }
-      const paid = backend === 'arweave' || backend === 'turbo';
-      // #161: check a wallet FILE is present BEFORE the "spends real funds" consent
-      // prompt below, not after. Without this, a user who picks
-      // arweave/turbo with no CYPHER_BRAIN_AR_WALLET set sails past that consent
-      // prompt, then fails deep inside push() ("arweave put needs
-      // CYPHER_BRAIN_AR_WALLET ...") — pushSucceeded stays false, and the catch
-      // block below rolls back the identity/backup key/recipient pin this same run
-      // just spent five steps setting up: the worst possible first-run experience.
-      // walletConfigured() only checks presence (set + file on disk) — an actual
-      // funding shortfall still can't be known without a network call, and remains
-      // push's own estimate/consent job (issue #160), unchanged here.
-      if (paid && !(await walletConfigured())) {
+      if (paid && backend === 'ton-provider' && !tonProviderReady) {
+        console.log(
+          `\n${backend} needs CYPHER_BRAIN_TON_PROVIDER_OWNER (the TON wallet address that will own the ` +
+            'deployed StorageV1 contract) and CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (a nanoTON spend cap) set — ' +
+            'a StorageV1 deploy spends real funds, so there is no safe default amount to let through uncapped.',
+        );
+        console.log(
+          'It also needs a locally built scripts/go/storage-v1-client binary at ' +
+            'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (checked for presence AND executability) and a HUMAN present ' +
+            'to sign a Tonkeeper deeplink at push time — see "cypher-brain push --help" for the full ' +
+            'prerequisite list.',
+        );
+        console.log(
+          `\nEverything this run already set up — primary identity (${IDENTITY})` +
+            `${backup ? `, backup identity (${backup.identityPath})` : ''}, and any choices above — is` +
+            ' untouched; nothing has been rolled back. Set the env vars above, then drive snapshot + push by hand',
+        );
+        console.log(
+          `(see MANAGEMENT.md) — "cypher-brain init" cannot be re-run, since it refuses whenever an identity` +
+            ` already exists at ${IDENTITY}.`,
+        );
+        return;
+      }
+      if (paid && backend !== 'ton-provider' && !(await walletConfigured())) {
         console.log(
           `\n${backend} needs a funded wallet to push, and CYPHER_BRAIN_AR_WALLET is not set to an existing wallet file.`,
         );
@@ -602,8 +702,20 @@ export async function init(_o: CliOptions): Promise<void> {
         const est = await estimateCost(backend, sizeBytes);
         console.log(`\n${backend}: cost estimate for this snapshot:`);
         for (const line of formatEstimate(est)) console.log(`  ${line}`);
+        // ton-provider is PAID but NOT permanent the way arweave/turbo are (durability
+        // depends on the chosen provider continuing to renew/serve the contract, see
+        // docs/durability.md) — the consent wording must not claim a guarantee this
+        // backend does not make. It also blocks on a human signature (up to 20 minutes),
+        // unlike arweave/turbo's automatic JWK signing — said here so the wait itself
+        // isn't mistaken for a hang once "Proceed?" is answered.
         const consent = await askYesNo(
-          `${backend} is a PAID, PERMANENT store — uploading spends real funds and cannot be undone. Proceed?`,
+          backend === 'ton-provider'
+            ? `${backend} is a PAID store — deploying spends real funds and cannot be undone. Unlike arweave/turbo ` +
+                'it is availability-based, not permanent: durability depends on the chosen provider continuing to ' +
+                'renew/serve the contract (see docs/durability.md). It also requires a HUMAN to sign a Tonkeeper ' +
+                'deeplink once the deploy is built (up to 20 minutes) — this prompt will not return until that ' +
+                'happens. Proceed?'
+            : `${backend} is a PAID, PERMANENT store — uploading spends real funds and cannot be undone. Proceed?`,
           false,
         );
         if (!consent) {
