@@ -77,7 +77,7 @@ checked in any future assessment.
 
 - Discovery (2026-08-23, `POST https://mytonprovider.org/api/v1/providers/search`):
   **77 registered providers (76 third-party + our own, added 2026-08-23),
-  20+ with uptime >90%**. The top-rated operator
+  21 with uptime >90%**. The top-rated operator
   (Dallas, uptime 99.2%, 370 days of continuous operation) **self-reports
   2,263 GB used of 2,700 GB offered** via registry telemetry — a strong demand
   signal, but allocation/usage as REPORTED, not yet an independently verified
@@ -98,14 +98,18 @@ checked in any future assessment.
   (resolved via DHT) after deploying. The other two call sites
   (`startup_wallet_scan.go`, `stopped_reconciler.go`) only re-confirm
   contracts that already had at least one accepted proof — they cannot
-  discover a brand-new contract. **Practical consequence: on-chain deploy +
-  fund alone will never be noticed by the provider; the client must also send
-  the RLDP query.**
+  discover a brand-new contract. **Practical consequence, scoped to the
+  inspected commits (`tonutils-storage-provider` @ `e624ea4`) — not confirmed
+  as a protocol guarantee across all versions: on-chain deploy + fund alone
+  will not be noticed by this daemon implementation; the client must also
+  send the RLDP query.**
 - The `price` field in the mytonprovider.org registry response is **not**
-  the on-chain `rate_per_mb_day` — the registry backend derives it as
-  `rate_per_mb_day × 1024 × 200 × 30` ("cost to store 200 GB for 30 days").
-  Using it directly as a contract rate overshoots by ~6.1M×; divide back down,
-  or query the provider's live ADNL rate directly.
+  the on-chain `rate_per_mb_day` — both are nanoTON-denominated (confirmed
+  from the `dearjohndoe/mytonprovider-backend` SQL source comment: `p.rate_
+  per_mb_per_day * 1024 * 200 * 30 as price, -- NanoTON per 200GB per month`).
+  Using `price` directly as a contract rate overshoots by ~6.1M×; recover the
+  real rate via `rate_per_mb_day = price / (1024 × 200 × 30)`, or query the
+  provider's live ADNL rate directly.
 - The production client is **mytonstorage.org** (TON Connect + upload +
   provider choice + contract management) — still the only *browser* path.
   Re-uploading a 481 MB file through it is impractical from a remote laptop,
@@ -153,16 +157,23 @@ checked in any future assessment.
 
 ## Our own droplet as a Go provider (mainnet: registered; testnet: standing twin)
 
-- **Mainnet (2026-08-23): registered and confirmed live.** The 0.01 TON
-  `tsp-<pubkey>` registration transfer (to the shared TON Storage registration
-  address `0:7777…7777`, verified against the `igroman787/mytonprovider`
-  tooling source — not a placeholder) was sent and independently confirmed via
-  `POST https://mytonprovider.org/api/v1/providers/search`: pubkey
+- **Mainnet (2026-08-23): registration transaction confirmed recorded.** The
+  0.01 TON `tsp-<pubkey>` registration transfer (to the shared TON Storage
+  registration address `0:7777…7777`, verified against the
+  `igroman787/mytonprovider` tooling source — not a placeholder) was sent, and
+  a separate query (run from this session, not taking the sender's word for
+  it) confirmed the registry now lists it: `POST
+  https://mytonprovider.org/api/v1/providers/search` → pubkey
   `f5f603c7a2d1719a834e153c27b4fad4fa9da0d532d6ac5f013547cafc91fb0b`,
   `address: EQAwUvvYnPpImBfrKl3-KRYh05aNrUKTGgcarTB_yzhAt1eh`, `uptime: 100`,
-  `reg_time` matching the day of registration. No paid contracts received
-  yet (expected — registration alone doesn't generate demand). Its wallet
-  needs topping up beyond 0.1 TON if real contracts arrive (0.05 TON/proof).
+  `reg_time` matching the day of registration. **Scope of this confirmation**:
+  it proves the self-reported registration was recorded by mytonprovider.org
+  — the same registry the transaction targets — not that the provider daemon
+  is independently reachable or functioning (uptime/telemetry in this
+  registry are also self-reported by the same daemon). No paid contracts
+  received yet (expected — registration alone doesn't generate demand). Its
+  wallet needs topping up beyond 0.1 TON if real contracts arrive (0.05
+  TON/proof).
 - **Testnet: standing twin, unchanged.** tonutils-storage-provider v0.4.3 +
   its own testnet tonutils-storage, running as transient systemd units on the
   droplet (isolated under `/opt/tsp/testnet-*`, mainnet services untouched);
@@ -192,10 +203,13 @@ Arweave (~$28/GB one-time, measured via turbo) vs provider contracts
 (listed floor ~0.73 TON/GB/yr): as of 2026-08-23 and assuming ~$3/TON,
 breakeven at the floor rate is over a decade, mid-tier listed rates 2–9 years — and the market behind those listed rates is, per
 above, mostly not real IN THE LEGACY LANE — the live Go lane (mytonprovider)
-does carry real paid usage; its pricing surfaces as a `price` field per
-provider (see the unit-conversion note above — divide by 1024×200×30 to get
-back to nanoTON/MB/day before comparing). Self-hosted TON is cheap because
-you are the storage; it buys availability, not permanence.
+reports usage consistent with real paid demand (2,263/2,700 GB self-reported
+by the top operator), though this is telemetry the provider's own daemon
+reports about itself, not yet independently verified against an actual paid
+contract; its pricing surfaces as a `price` field per provider (see the
+unit-conversion note above — divide by 1024×200×30 to get back to
+nanoTON/MB/day before comparing). Self-hosted TON is cheap because you are
+the storage; it buys availability, not permanence.
 
 ## Operational inventory (what exists where, as of 2026-08-23)
 
