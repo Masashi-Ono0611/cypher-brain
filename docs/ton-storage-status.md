@@ -27,7 +27,7 @@ binaries.
 | **Our droplet as a paid provider** | testnet | standing twin (same Go binaries, isolated units) — controlled environment, no real earnings expected |
 | **We pay a legacy C++ provider** (spends — fabric-contract ecosystem) | mainnet | **GRAVEYARD** (115 listed, 0 active ≤7d, 94 silent >1y) — not pursuing |
 | **We pay a legacy C++ provider** | testnet | **DEAD DAEMONS, live contracts** (2026-08-22 experiment) |
-| **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **WORKS through discovery + fetch, proof-reward payout not yet observed** (2026-08-23) — `scripts/go/storage-v1-client` (deploy/notify/status/update-providers) deployed and funded a StorageV1 contract for masabrain (481 MB) against our own registered droplet-as-provider, and the provider self-reported the full bag downloaded. Getting there required one real-money field-mapping bug (fixed by an in-place repair, not a re-deploy) — see below |
+| **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **WORKS end to end, including a confirmed proof-reward payout** (2026-08-23) — `scripts/go/storage-v1-client` (deploy/notify/status/update-providers) deployed and funded a StorageV1 contract for masabrain (481 MB) against our own registered droplet-as-provider, the provider self-reported the full bag downloaded, and a `storage_reward_withdrawal` (op `0xa91baf56`) transaction of 0.119662827 TON from the contract to the provider's registered wallet followed shortly after. Getting there required one real-money field-mapping bug (fixed by an in-place repair, not a re-deploy) — see below |
 | **We pay a live Go provider** | testnet | not attempted (mainnet-first, per operator decision — the registry itself is a mainnet market) |
 
 **The single most important 2026-08-23 correction**: the provider market is TWO
@@ -170,10 +170,9 @@ checked in any future assessment.
   never touches the StateInit that determines the contract's address (added
   `update-providers`, a bare `modify_providers`-only repair subcommand, for
   exactly this). Real transactions involved: 0.374 TON initial deploy,
-  0.05 TON repair message — both against the operator's own droplet, so IF
-  the provider daemon goes on to submit successful proofs, those payouts
-  would net back to the operator's own provider wallet — not yet observed at
-  the time of writing (see the next bullet for what *is* confirmed).
+  0.05 TON repair message — both against the operator's own droplet, so a
+  successful proof payout nets back to the operator's own provider wallet
+  (see the next two bullets for what *is* confirmed, including that payout).
 - **Confirmed working: contract deploy, on-chain landing, RLDP discovery, and
   provider fetch (2026-08-23)**: after the repair,
   `notify --provider-pubkey f5f603c7… --contract 0:465347a9…` returned
@@ -186,6 +185,19 @@ checked in any future assessment.
   it is the first real evidence the whole pipeline — deploy → on-chain
   landing → RLDP discovery → provider fetch — works end to end against the
   live Go ecosystem.
+- **Confirmed working: proof-reward payout (2026-08-23)**: shortly after the
+  repair, tx `eeb27bd1a40046a8878cd4b1f1e06ec83b811471be2eb7138217d4a6020e27b1`
+  (2026-08-23 05:21:22 UTC) shows the masabrain contract
+  (`0:465347a9…`) sending 0.119662827 TON to the provider's registered wallet
+  (`UQCCrKrQHLpB75vvrd5js78eB7qK6v7Cpz4WJpV2DoZnY-GC`) with `op_code
+  0xa91baf56`, decoded by tonapi as `storage_reward_withdrawal` — the same
+  opcode used in #376 to detect proof activity. Independently confirmed by
+  fetching that transaction directly from tonapi (source/destination/opcode/
+  amount/timestamp all match). The amount is about 62% above the theoretical
+  ~0.074 TON estimate (rate × size × elapsed span); the reason for the
+  discrepancy has not been determined — but the withdrawal itself, and that
+  it lands back in the operator's own wallet as expected, is now real,
+  observed, on-chain evidence, not a projection.
 
 ## Testnet — third-party providers (C++ lane)
 
@@ -365,8 +377,8 @@ the storage; it buys availability, not permanence.
   (the droplet only runs prebuilt Go binaries, it doesn't compile).
 - `scripts/go/storage-v1-client` (local, not deployed anywhere — a laptop
   CLI): `deploy`/`notify`/`status`/`update-providers`, 49 tests, contract
-  deployment + provider discovery/fetch confirmed working end to end (see
-  above; proof-reward payout not yet observed). Its one live mainnet contract:
+  deployment + provider discovery/fetch confirmed working end to end,
+  including a confirmed proof-reward payout (see above). Its one live mainnet contract:
   `0:465347a9b5152bf6f69e1bc47ce82c537aee5ae4e3d00437d4a514f0e9cc452a` —
   masabrain (481 MB), rate 800 nanoTON/MB/day, span 192 days, provider
   pubkey `f5f603c7…` (our own droplet), balance ~0.42 TON.
