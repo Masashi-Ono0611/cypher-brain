@@ -62,13 +62,26 @@
 //     accepted — they are not a new-contract discovery path, and they are
 //     unexported `internal/` code this program cannot import anyway). The
 //     only new-contract discovery path is the ADNL push `notify` sends.
-//   - A provider's identity is a single 32-byte ed25519 public key, used
-//     BOTH as its on-chain ProviderV1.Address (workchain 0, address.Data() ==
-//     the pubkey — see tonutils-storage cli/main.go:
-//     address.NewAddress(0, 0, prv)) AND as the DHT/ADNL lookup key for
-//     `notify`. --provider therefore takes a raw workchain-0 TON address and
-//     this program extracts its Data() bytes for the ADNL side itself —
-//     there is only one value to supply, not two.
+//   - CORRECTION (2026-08-23, found before any real deploy — see the fix
+//     commit): a provider has TWO DIFFERENT 32-byte identifiers, not one.
+//     `deploy`'s --provider is the provider's TON WALLET address (its
+//     ProviderV1.Address; ActiveProviders is keyed by address.Data(), the
+//     32-byte hash inside that address — pkg/contract/v1.go
+//     PrepareV1DeployData). `notify`'s --provider-pubkey is the provider's
+//     ADNL/Ed25519 PUBLIC KEY (wrapped as keys.PublicKeyED25519{Key:...} and
+//     hashed to build the DHT lookup key — pkg/transport/client.go
+//     connect()). These are DIFFERENT values in general: a provider's own
+//     ADNL identity key is independent from whatever TON wallet it chooses
+//     to receive payment at, and there is no protocol rule forcing them to
+//     match. Confirmed empirically against two real mytonprovider.org
+//     registry entries: decoding each entry's own `address` field down to
+//     its 32-byte hash never equaled that same entry's `pubkey` field. (An
+//     earlier version of this comment claimed they were always the same
+//     value, generalizing from what tonutils-storage cli/main.go's
+//     address.NewAddress(0, 0, prv) does for a SELF-registration
+//     convenience default — not a guarantee about arbitrary providers.)
+//     mytonprovider.org's registry exposes both fields directly: use
+//     `address` for --provider, `pubkey` for --provider-pubkey.
 //   - mytonprovider.org's registry `price` field is NOT the raw
 //     rate_per_mb_day the contract wants — it is
 //     rate_per_mb_day * 1024 * 200 * 30 (a 200 GB/30-day cost estimate).
@@ -103,7 +116,7 @@ Usage:
       --rate-nano-per-mb-day <int> --span-days <int> --owner <raw-addr> \
       [--size-bytes <n> --piece-size <n> --merkle-hash <64hex>] \
       [--mainnet] [--max-spend-ton 0.5]
-  storage-v1-client notify --provider <raw-addr> --contract <raw-addr> \
+  storage-v1-client notify --provider-pubkey <64hex> --contract <raw-addr> \
       [--mainnet] [--byte-to-proof <uint64>] [--timeout <seconds>]
   storage-v1-client status --contract <raw-addr> [--mainnet]
   storage-v1-client --help
@@ -119,10 +132,12 @@ Tonkeeper deeplink. Refuses (exit 2) if the computed amount exceeds
                              64-hex value as a cypher-brain "ton:v1:<hex>"
                              locator's suffix.
   --provider <raw-addr>     required. Raw workchain-0 TON address
-                             ("0:<64hex>") of the target provider — this is
-                             also the provider's 32-byte ADNL public key
-                             (see main.go field notes); workchain -1 is
-                             refused.
+                             ("0:<64hex>") of the target provider's TON
+                             WALLET — mytonprovider.org's registry 'address'
+                             field, NOT its 'pubkey' field (see main.go field
+                             notes; the ADNL/RLDP query 'notify' sends uses a
+                             SEPARATE identifier, --provider-pubkey, on that
+                             subcommand). workchain -1 is refused.
   --owner <raw-addr>        required. Raw TON address ("0:<64hex>" or
                              "-1:<64hex>") that will own the contract
                              (StorageV1.OwnerAddr) — normally your own wallet.
@@ -177,9 +192,13 @@ proceeds. Run this ONLY after --contract has actually landed on-chain from a
 signed 'deploy' deeplink — querying too early wastes the round trip and this
 program cannot distinguish "not yet confirmed" from "never happened".
 
-  --provider <raw-addr>     required. Same address used for 'deploy'
-                             --provider — its Data() bytes are used as the
-                             ADNL lookup key.
+  --provider-pubkey <64hex> required. The provider's ADNL/Ed25519 public key
+                             — mytonprovider.org's registry 'pubkey' field.
+                             This is a DIFFERENT value from 'deploy'
+                             --provider (which takes the provider's TON
+                             wallet 'address' field instead) — see main.go
+                             field notes for why they are not the same
+                             32 bytes.
   --contract <raw-addr>     required. The deployed StorageV1 contract address
                              (printed by 'deploy', or found in your wallet
                              history / tonviewer after signing).
@@ -197,9 +216,14 @@ program cannot distinguish "not yet confirmed" from "never happened".
   exercised; the actual network round trip is not.
 
 status: queries tonapi for --contract's on-chain account state. Read-only,
-informational, always exits 0 — mirrors scripts/ton-provider-experiment.mjs's
-'status' subcommand. Does NOT decode whether a provider accepted the
-contract, only whether it exists on-chain and its balance.
+informational — mirrors scripts/ton-provider-experiment.mjs's 'status'
+subcommand, EXCEPT it exits 1 (not 0) if the tonapi query itself fails
+(timeout/HTTP error/malformed response), so an automated caller checking
+only the exit code cannot mistake "could not check" for "checked, looks
+fine". The on-chain STATE ITSELF is still never judged pass/fail — a
+successfully-observed 'nonexist'/'uninit'/'frozen' state still exits 0. Does
+NOT decode whether a provider accepted the contract, only whether it exists
+on-chain and its balance.
 
   --contract <raw-addr>     required.
   --mainnet                 opt in to mainnet. Default: testnet.

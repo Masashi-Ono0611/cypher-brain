@@ -9,7 +9,7 @@ import (
 func TestParseNotifyFlagsHappyPath(t *testing.T) {
 	hex64 := strings.Repeat("b", 64)
 	p, err := parseNotifyFlags([]string{
-		"--provider", "0:" + hex64,
+		"--provider-pubkey", hex64,
 		"--contract", "0:" + strings.Repeat("c", 64),
 		"--byte-to-proof", "42",
 		"--timeout", "10",
@@ -17,8 +17,8 @@ func TestParseNotifyFlagsHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if p.provider.Workchain() != 0 {
-		t.Fatalf("provider workchain = %d, want 0", p.provider.Workchain())
+	if len(p.providerPubkey) != 32 {
+		t.Fatalf("providerPubkey length = %d, want 32", len(p.providerPubkey))
 	}
 	if p.byteToProof != 42 {
 		t.Fatalf("byteToProof = %d, want 42", p.byteToProof)
@@ -33,7 +33,7 @@ func TestParseNotifyFlagsHappyPath(t *testing.T) {
 
 func TestParseNotifyFlagsDefaults(t *testing.T) {
 	p, err := parseNotifyFlags([]string{
-		"--provider", "0:" + strings.Repeat("b", 64),
+		"--provider-pubkey", strings.Repeat("b", 64),
 		"--contract", "0:" + strings.Repeat("c", 64),
 	})
 	if err != nil {
@@ -49,7 +49,7 @@ func TestParseNotifyFlagsDefaults(t *testing.T) {
 
 func TestParseNotifyFlagsMainnet(t *testing.T) {
 	p, err := parseNotifyFlags([]string{
-		"--provider", "0:" + strings.Repeat("b", 64),
+		"--provider-pubkey", strings.Repeat("b", 64),
 		"--contract", "0:" + strings.Repeat("c", 64),
 		"--mainnet",
 	})
@@ -67,13 +67,14 @@ func TestParseNotifyFlagsErrors(t *testing.T) {
 		name string
 		args []string
 	}{
-		{"missing provider", []string{"--contract", "0:" + strings.Repeat("c", 64)}},
-		{"missing contract", []string{"--provider", "0:" + hex64}},
-		{"provider workchain -1", []string{"--provider", "-1:" + hex64, "--contract", "0:" + strings.Repeat("c", 64)}},
-		{"contract not raw addr", []string{"--provider", "0:" + hex64, "--contract", "not-an-address"}},
-		{"timeout zero", []string{"--provider", "0:" + hex64, "--contract", "0:" + strings.Repeat("c", 64), "--timeout", "0"}},
-		{"timeout too large", []string{"--provider", "0:" + hex64, "--contract", "0:" + strings.Repeat("c", 64), "--timeout", "601"}},
-		{"extra args", []string{"--provider", "0:" + hex64, "--contract", "0:" + strings.Repeat("c", 64), "extra"}},
+		{"missing provider-pubkey", []string{"--contract", "0:" + strings.Repeat("c", 64)}},
+		{"missing contract", []string{"--provider-pubkey", hex64}},
+		{"provider-pubkey too short", []string{"--provider-pubkey", "bb", "--contract", "0:" + strings.Repeat("c", 64)}},
+		{"provider-pubkey not hex", []string{"--provider-pubkey", strings.Repeat("z", 64), "--contract", "0:" + strings.Repeat("c", 64)}},
+		{"contract not raw addr", []string{"--provider-pubkey", hex64, "--contract", "not-an-address"}},
+		{"timeout zero", []string{"--provider-pubkey", hex64, "--contract", "0:" + strings.Repeat("c", 64), "--timeout", "0"}},
+		{"timeout too large", []string{"--provider-pubkey", hex64, "--contract", "0:" + strings.Repeat("c", 64), "--timeout", "601"}},
+		{"extra args", []string{"--provider-pubkey", hex64, "--contract", "0:" + strings.Repeat("c", 64), "extra"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

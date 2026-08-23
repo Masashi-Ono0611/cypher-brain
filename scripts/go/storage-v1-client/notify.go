@@ -73,17 +73,32 @@ func notifyProvider(ctx context.Context, providerKey []byte, contractAddr *addre
 
 // notifyParams / parseNotifyFlags is the pure (network-free) argument
 // parsing half of `notify`, unit-testable without touching the network.
+//
+// providerPubkey is deliberately a raw 32-byte key, NOT an *address.Address:
+// verified against xssnick/tonutils-storage-provider@v0.4.3 pkg/transport/
+// client.go connect() — RequestStorageInfo's `provider []byte` parameter is
+// wrapped as keys.PublicKeyED25519{Key: providerKey} and hashed to build the
+// DHT lookup key. This is the provider's ADNL/Ed25519 public key, which
+// mytonprovider.org's registry exposes as its own `pubkey` field — a
+// DIFFERENT 32 bytes from the provider's TON wallet `address` field (used by
+// `deploy`'s --provider instead; see main.go field notes and deploy.go).
+// Confirmed empirically (2026-08-23): decoding two real registry entries'
+// friendly `address` down to its 32-byte hash never matched that same
+// entry's `pubkey`. An earlier version of this program conflated the two
+// under one --provider flag and derived the notify key via
+// (*address.Address).Data() on it, which is silently wrong for both possible
+// choices of what to pass there — see the fix commit for detail.
 type notifyParams struct {
-	provider    *address.Address
-	contract    *address.Address
-	byteToProof uint64
-	timeout     time.Duration
-	testnet     bool
+	providerPubkey []byte
+	contract       *address.Address
+	byteToProof    uint64
+	timeout        time.Duration
+	testnet        bool
 }
 
 func parseNotifyFlags(args []string) (*notifyParams, error) {
 	fs := newFlagSet("notify")
-	providerRaw := fs.String("provider", "", "raw workchain-0 provider address (required)")
+	providerPubkeyRaw := fs.String("provider-pubkey", "", "provider's ADNL/Ed25519 public key, 64 hex chars — mytonprovider.org's registry 'pubkey' field, NOT its 'address' field (required)")
 	contractRaw := fs.String("contract", "", "deployed StorageV1 contract address (required)")
 	byteToProofRaw := fs.Uint64("byte-to-proof", 0, "byte offset to ask the provider to prove")
 	timeoutSeconds := fs.Uint64("timeout", 20, "ADNL/DHT operation timeout, in seconds")
@@ -94,10 +109,10 @@ func parseNotifyFlags(args []string) (*notifyParams, error) {
 	if fs.NArg() > 0 {
 		return nil, fmt.Errorf("unexpected extra arguments: %v", fs.Args())
 	}
-	if *providerRaw == "" {
-		return nil, fmt.Errorf("notify requires --provider <raw-addr>")
+	if *providerPubkeyRaw == "" {
+		return nil, fmt.Errorf("notify requires --provider-pubkey <64hex>")
 	}
-	provider, err := parseRawAddr("--provider", *providerRaw, 0)
+	providerPubkey, err := parseHex32("--provider-pubkey", *providerPubkeyRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -113,11 +128,11 @@ func parseNotifyFlags(args []string) (*notifyParams, error) {
 	}
 
 	return &notifyParams{
-		provider:    provider,
-		contract:    contractAddr,
-		byteToProof: *byteToProofRaw,
-		timeout:     time.Duration(*timeoutSeconds) * time.Second,
-		testnet:     !*mainnet,
+		providerPubkey: providerPubkey,
+		contract:       contractAddr,
+		byteToProof:    *byteToProofRaw,
+		timeout:        time.Duration(*timeoutSeconds) * time.Second,
+		testnet:        !*mainnet,
 	}, nil
 }
 
@@ -153,10 +168,10 @@ func runNotify(ctx context.Context, args []string, stdout io.Writer) error {
 		fmt.Fprintln(stdout, "  proceeding anyway in case tonapi's index is just lagging the signed transaction.")
 	}
 
-	fmt.Fprintf(stdout, "sending storageProvider.storageRequest to provider %s (byte_to_proof=%d, timeout=%s) ...\n",
-		p.provider.StringRaw(), p.byteToProof, p.timeout)
+	fmt.Fprintf(stdout, "sending storageProvider.storageRequest to provider %x (byte_to_proof=%d, timeout=%s) ...\n",
+		p.providerPubkey, p.byteToProof, p.timeout)
 
-	resp, err := notifyProvider(ctx, p.provider.Data(), p.contract, p.byteToProof, globalConfigURL(p.testnet), p.timeout)
+	resp, err := notifyProvider(ctx, p.providerPubkey, p.contract, p.byteToProof, globalConfigURL(p.testnet), p.timeout)
 	if err != nil {
 		return err
 	}
