@@ -339,8 +339,10 @@ const SNAPSHOT_NOW_TOOL: Tool = {
   description:
     '⚠ CAN SPEND MONEY (only tool in this server that can). Take an encrypted age snapshot of ' +
     'directories and/or a Postgres database, and optionally push the ciphertext to a storage ' +
-    'backend. Backend "file" is free; "arweave" and "turbo" are PAID, PERMANENT ' +
-    'stores — pushing to them REQUIRES confirm_paid=true (the MCP equivalent of the CLI --yes ' +
+    'backend. Backend "file" is free; "arweave" and "turbo" are PAID, PERMANENT stores; ' +
+    '"ton-provider" (only listed when a local TON wallet is configured — see BACKENDS above) is ' +
+    'also PAID, but weaker-durability than arweave/turbo (depends on a live provider continuing ' +
+    'to renew/serve the contract) — pushing to any of these REQUIRES confirm_paid=true (the MCP equivalent of the CLI --yes ' +
     'guard; the CYPHER_BRAIN_YES env escape hatch is NOT honored here, so nothing can be spent ' +
     'without an explicit confirm_paid in the call). Snapshotting itself needs only the PUBLIC ' +
     'recipient key(s); storage only ever sees ciphertext. Pass idempotency_key to make a RETRY ' +
@@ -374,7 +376,8 @@ const SNAPSHOT_NOW_TOOL: Tool = {
       backend: {
         type: 'string',
         enum: BACKENDS,
-        description: 'When given, push the snapshot: file (free) or arweave|turbo (PAID — needs confirm_paid).',
+        description:
+          'When given, push the snapshot: file (free) or arweave|turbo|ton-provider (PAID — needs confirm_paid; ton-provider only appears when a local TON wallet is configured).',
       },
       locator_file: {
         type: 'string',
@@ -383,7 +386,8 @@ const SNAPSHOT_NOW_TOOL: Tool = {
       },
       confirm_paid: {
         type: 'boolean',
-        description: 'REQUIRED true to push to arweave/turbo. Confirms you accept an irreversible, real-money upload.',
+        description:
+          'REQUIRED true to push to a PAID backend (arweave/turbo/ton-provider). Confirms you accept an irreversible, real-money upload.',
       },
       scan_secrets: {
         type: 'string',
@@ -613,8 +617,10 @@ const ESTIMATE_COST_TOOL: Tool = {
     'Read-only, spends nothing (price queries only). Estimate what pushing a payload of the ' +
     'given size to a backend would cost: turbo → Turbo upload cost in winc via @ardrive/turbo-sdk ' +
     '(<100KB is free; a clear note is returned when that optional dependency is not installed); ' +
-    'arweave → network price in winston from the gateway /price endpoint; file → free ' +
-    '(local disk), returned with a zero-cost note. All seven fields (backend, size_bytes, cost, ' +
+    'arweave → network price in winston from the gateway /price endpoint; ton-provider → nanoTON ' +
+    'cost from a real priced query against the live mytonprovider.org registry (only listed when a ' +
+    'local TON wallet is configured — the estimate itself never spends, but the underlying push ' +
+    'would); file → free (local disk), returned with a zero-cost note. All seven fields (backend, size_bytes, cost, ' +
     'unit, approx_ar, usd_estimate, note) are ALWAYS present — null, never absent, where they do ' +
     'not apply (#268), so do not test for a key to decide whether a value exists. For ' +
     'turbo/arweave, usd_estimate carries an approximate USD figure when a USD/AR rate is ' +
@@ -654,7 +660,11 @@ const SCHEDULE_INSTALL_TOOL: Tool = {
     "CLI's `schedule install`). A PAID backend (arweave/turbo) gets CYPHER_BRAIN_YES=1 baked into " +
     'the generated runner for unattended consent, so it ALSO REQUIRES max_spend (a positive integer ' +
     'cap in native units — winston for arweave, winc for turbo): an uncapped unattended spender is ' +
-    'refused, same as the CLI. Requires confirm_install=true before ANY work happens — the MCP ' +
+    'refused, same as the CLI. backend=ton-provider (only listed when a local TON wallet is ' +
+    'configured) is ALSO paid and unattended-capable, but its spend cap is a SEPARATE, env-only ' +
+    'mechanism (CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND, in nanoTON — must already be set in the ' +
+    "environment before this call; this tool's own max_spend argument does not apply to it and is " +
+    'refused if passed for it, matching the CLI). Requires confirm_install=true before ANY work happens — the MCP ' +
     'equivalent of consenting to both the real-system-file write and (for a paid backend) the ' +
     'ongoing capped spend risk every future unattended run carries; there is no environment escape ' +
     'hatch honored here. Only ONE schedule can be installed at a time; re-calling replaces the prior ' +
@@ -666,7 +676,10 @@ const SCHEDULE_INSTALL_TOOL: Tool = {
       backend: {
         type: 'string',
         enum: BACKENDS,
-        description: 'Where the nightly push goes: file (free) or arweave|turbo (PAID — requires max_spend).',
+        description:
+          'Where the nightly push goes: file (free), arweave|turbo (PAID — requires max_spend), or ' +
+          'ton-provider (PAID — requires CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND set in the environment ' +
+          'instead, not the max_spend argument; only listed when a local TON wallet is configured).',
       },
       dirs: {
         type: 'array',
@@ -689,7 +702,8 @@ const SCHEDULE_INSTALL_TOOL: Tool = {
         type: 'string',
         description:
           'REQUIRED for backend arweave|turbo: a positive integer cap (native units — winston/winc) on ' +
-          "EVERY unattended run's spend. Not allowed for backend file (nothing to cap).",
+          "EVERY unattended run's spend. Not allowed for backend file (nothing to cap) or backend " +
+          'ton-provider (its own env-only CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND applies instead — see the tool description).',
       },
       no_load: {
         type: 'boolean',
