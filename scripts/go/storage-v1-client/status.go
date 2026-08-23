@@ -112,6 +112,7 @@ func parseStatusFlags(args []string) (*statusParams, error) {
 func runStatus(ctx context.Context, args []string, stdout io.Writer) error {
 	p, err := parseStatusFlags(args)
 	if errIsHelp(err) {
+		fmt.Fprint(stdout, helpText)
 		return nil
 	}
 	if err != nil {

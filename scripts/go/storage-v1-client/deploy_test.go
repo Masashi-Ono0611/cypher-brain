@@ -224,7 +224,7 @@ func TestRunDeployOffline(t *testing.T) {
 		"contract addr:",
 		"deeplink:       ton://transfer/",
 		"storage-v1-client status --contract",
-		"storage-v1-client notify --provider",
+		"storage-v1-client notify --provider-pubkey <64hex> --contract",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("runDeploy output missing %q; full output:\n%s", want, out)
