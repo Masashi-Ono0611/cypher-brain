@@ -55,13 +55,18 @@ func buildDeploy(p deployParams) (*deployResult, error) {
 	}
 
 	const uint32Max = uint64(^uint32(0))
-	spanSeconds := p.spanDays * 86400
 	if p.spanDays == 0 {
 		return nil, fmt.Errorf("span-days must be positive, got 0")
 	}
-	if spanSeconds > uint32Max {
-		return nil, fmt.Errorf("span-days %d (%d seconds) exceeds the uint32 max_span range", p.spanDays, spanSeconds)
+	// Codex review finding (Critical): check the pre-multiplication bound first —
+	// p.spanDays * 86400 can overflow uint64 for a large enough spanDays, wrapping
+	// to a small value that would then pass a post-multiplication uint32Max check
+	// and silently produce a MaxSpan that doesn't match the operator's intent
+	// (while the cost estimate below still uses the original, un-wrapped spanDays).
+	if p.spanDays > uint32Max/86400 {
+		return nil, fmt.Errorf("span-days %d exceeds the uint32 max_span range (max %d days)", p.spanDays, uint32Max/86400)
 	}
+	spanSeconds := p.spanDays * 86400
 	if p.rateNanoPerMB == 0 {
 		return nil, fmt.Errorf("rate-nano-per-mb-day must be positive, got 0")
 	}

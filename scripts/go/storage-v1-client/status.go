@@ -67,7 +67,10 @@ func fetchAccountState(ctx context.Context, addr *address.Address, testnet bool)
 		return nil, fmt.Errorf("GET %s: %w", url, err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return nil, fmt.Errorf("GET %s: reading response body: %w", url, readErr)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s -> HTTP %d: %s", url, resp.StatusCode, truncate(string(body), 200))
 	}
@@ -121,10 +124,18 @@ func runStatus(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "== status: %s (%s) ==\n", p.contract.StringRaw(), network)
 
+	// Codex review finding (Warning): a genuine fetch failure (timeout, HTTP
+	// error, malformed response) must be distinguishable from a successful
+	// check by exit code, not just by the "[BLOCKED]" text — an automated
+	// caller that only looks at the exit code must not be able to mistake
+	// "could not determine the on-chain state" for "checked, and it looks
+	// fine" (both would otherwise exit 0). The on-chain STATE ITSELF is still
+	// never judged pass/fail here (see stateVerdict) — only the ability to
+	// observe it at all is what gates the exit code.
 	acc, err := fetchAccountState(ctx, p.contract, p.testnet)
 	if err != nil {
 		fmt.Fprintf(stdout, "  [BLOCKED] could not fetch account state from tonapi: %v\n", err)
-		return nil
+		return fmt.Errorf("could not fetch account state: %w", err)
 	}
 	fmt.Fprintf(stdout, "  status:   %s\n", acc.Status)
 	fmt.Fprintf(stdout, "  verdict:  %s\n", stateVerdict(acc.Status))

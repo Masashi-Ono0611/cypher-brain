@@ -145,9 +145,13 @@ Tonkeeper deeplink. Refuses (exit 2) if the computed amount exceeds
                              field inside that cell). Must be given together
                              with --size-bytes and --piece-size, or not at all.
   --mainnet                 opt in to mainnet (REAL FUNDS). Default: testnet.
-  --max-spend-ton <float>   refuse (exit 2) if the suggested amount would
-                             exceed this. Default 0.5. Compared as nanoTON
-                             (big.Int), never as a float.
+  --max-spend-ton <float>   refuse (exit 2) if the suggested CONTRACT-DEPLOY
+                             TRANSFER amount would exceed this. Default 0.5.
+                             Compared as nanoTON (big.Int), never as a float.
+                             Does NOT include wallet/network gas fees, which
+                             your wallet app adds on top when you sign — the
+                             actual amount your wallet debits will be
+                             somewhat higher than this cap.
 
   When --size-bytes/--piece-size/--merkle-hash are NOT all three given, this
   program resolves them by asking cypher-brain's own seeder (the same

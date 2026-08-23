@@ -79,9 +79,18 @@ func fetchSeederDetails(ctx context.Context, bagIDHex string) (*seederDetails, e
 	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "ssh", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Codex review finding (Warning): bound how much of stdout/stderr we buffer.
+	// A remote curl call that returns far more than the expected small JSON body
+	// (a misbehaving or compromised seeder) would otherwise be read fully into
+	// memory before any validation runs. 1 MiB is generous for a details JSON
+	// response but rules out an unbounded read; readCloser.N reaching 0 makes
+	// Read return io.EOF, which json.Unmarshal/truncate below handle as
+	// ordinary (too-short/non-JSON) output, not a crash.
+	const maxCaptureBytes = 1 << 20
+	stdout := &limitedBuffer{limit: maxCaptureBytes}
+	stderr := &limitedBuffer{limit: maxCaptureBytes}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	if runErr := cmd.Run(); runErr != nil {
 		return nil, fmt.Errorf("ssh failed: %w: %s", runErr, truncate(stderr.String(), 2000))
 	}
@@ -117,6 +126,33 @@ func fetchSeederDetails(ctx context.Context, bagIDHex string) (*seederDetails, e
 		MerkleHash:   merkleHash,
 	}, nil
 }
+
+// limitedBuffer is an io.Writer that stops accepting bytes past limit instead
+// of growing unbounded (bytes.Buffer has no such cap) — see the Codex review
+// finding at its call site in fetchSeederDetails. Write always reports success
+// for the full input (matching io.Writer's contract that a writer must not
+// return an error just because it discarded trailing bytes it chose not to
+// keep) so exec.Cmd doesn't treat a truncation as a process I/O failure; the
+// truncation itself is surfaced to the caller via truncate()'s own 200/2000
+// byte re-truncation of whatever was captured.
+type limitedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	remaining := l.limit - l.buf.Len()
+	if remaining > 0 {
+		if remaining > len(p) {
+			remaining = len(p)
+		}
+		l.buf.Write(p[:remaining])
+	}
+	return len(p), nil
+}
+
+func (l *limitedBuffer) Bytes() []byte  { return l.buf.Bytes() }
+func (l *limitedBuffer) String() string { return l.buf.String() }
 
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)
