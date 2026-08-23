@@ -3,7 +3,15 @@
 // own pre-flight cost estimate (src/lib/backends/{arweave,turbo}.ts, via arUsdRate/
 // usdApprox) — one home so this math is never re-implemented per surface (#159).
 import { stat } from 'node:fs/promises';
-import { AR_HOST, AR_PORT, AR_PROTOCOL, AR_HTTP_TIMEOUT_MS, AR_USD_RATE_URL, AR_TURBO_RATES_URL } from './config.js';
+import {
+  AR_HOST,
+  AR_PORT,
+  AR_PROTOCOL,
+  AR_HTTP_TIMEOUT_MS,
+  AR_USD_RATE_URL,
+  AR_TURBO_RATES_URL,
+  TON_TONAPI_URL,
+} from './config.js';
 import { requireFile, errMsg, fmtBytes, sdkImportAdvice } from './util.js';
 import { printJson } from './ui.js';
 import type { CliOptions } from './types.js';
@@ -103,6 +111,27 @@ export async function turboUsdRate(): Promise<{ ratePer1e12Winc: number; usdPerG
   }
 }
 
+// Current USD price of 1 TON, via tonapi's public rates endpoint — the SAME host
+// ton-provider.ts's own on-chain status polling already talks to (TON_TONAPI_URL,
+// overridable together with it for tests), so this needs no dedicated new config
+// variable the way arUsdRate()'s AR_USD_RATE_URL does (Arweave's USD rate and
+// gateway host are genuinely different services; tonapi.io serves both account
+// state AND rates). Same never-throw/timeout/positive-finite-only contract as
+// arUsdRate()/turboUsdRate(): a dead or malformed rate response degrades the
+// ton-provider estimate to "no USD line", never to a failed estimate.
+export async function tonUsdRate(): Promise<number | null> {
+  try {
+    const ctl = AbortSignal.timeout(AR_HTTP_TIMEOUT_MS);
+    const res = await fetch(`${TON_TONAPI_URL}/v2/rates?tokens=ton&currencies=usd`, { signal: ctl });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { rates?: { TON?: { prices?: { USD?: unknown } } } } | null;
+    const rate = Number(body?.rates?.TON?.prices?.USD);
+    return Number.isFinite(rate) && rate > 0 ? rate : null;
+  } catch {
+    return null;
+  }
+}
+
 // Estimate what pushing `sizeBytes` to `backend` would cost, WITHOUT uploading
 // anything (price queries only). `backend` must be one of file|arweave|turbo|rclone|ton|ton-provider —
 // any other value is a caller bug (mcp.ts validates via requireBackend before calling
@@ -165,11 +194,18 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
     try {
       const { estimateTonProviderCost } = await import('./backends/ton-provider.js');
       const est = await estimateTonProviderCost(sizeBytes);
+      // usd_estimate is OPTIONAL, same posture as the arweave/turbo branches below: a
+      // dead/unusable tonapi rates response must drop only this one line, never the
+      // (still useful) native nanoTON estimate. nanoTON is 1e9-per-TON (NOT the
+      // 1e12-per-AR winston/winc convention arweave/turbo use below) — TON's own
+      // "nano" prefix, same as Ethereum's gwei.
+      const rate = await tonUsdRate();
       return {
         backend,
         size_bytes: sizeBytes,
         cost: est.amountNano.toString(),
         unit: 'nanoTON',
+        ...(rate !== null ? { usd_estimate: Number(((Number(est.amountNano) / 1e9) * rate).toFixed(6)) } : {}),
         note:
           `ton-provider backend pays a live mytonprovider.org provider (pubkey ${est.provider.pubkey}, ` +
           `rating ${est.provider.rating.toFixed(2)}) to hold the bag for ${est.spanDays} day(s) ` +
