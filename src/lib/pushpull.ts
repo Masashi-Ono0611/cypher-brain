@@ -9,6 +9,7 @@ import { exists, requireFile, sleep, sha256, readHead, errMsg, RetryableError } 
 import { backendFor } from './backends/index.js';
 import { estimateCost, formatEstimate } from './estimate.js';
 import { signatureKeyIdHex } from './minisign.js';
+import { tonWalletConfigured } from './wallet.js';
 import type { CliOptions } from './types.js';
 
 // The plaintext content digest for the artifact being pushed: an explicit --digest
@@ -293,10 +294,13 @@ export async function push(o: CliOptions): Promise<boolean> {
     );
   }
   if (o.backend === 'ton-provider' && !yes) {
+    const autoSigns = await tonWalletConfigured();
     throw new Error(
       `ton-provider: deploying a TON Storage contract to a paid provider spends real funds — ` +
         `re-run push with --yes or set CYPHER_BRAIN_YES=1 in the environment to confirm ` +
-        `(a human must still sign the resulting Tonkeeper deeplink — this does not run unattended yet)`,
+        (autoSigns
+          ? '(CYPHER_BRAIN_TON_WALLET is configured — this will auto-sign and broadcast without a human)'
+          : '(a human must still sign the resulting Tonkeeper deeplink — set CYPHER_BRAIN_TON_WALLET to auto-sign instead)'),
     );
   }
   const backend = await backendFor(o.backend);

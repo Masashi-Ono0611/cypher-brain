@@ -33,7 +33,16 @@ import { realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
 import { join, resolve, dirname, basename } from 'node:path';
-import { HOME, SCHEDULE_DIR, LAUNCHD_DIR, CONFIG_FILE, readEnv, type EnvName } from './config.js';
+import {
+  HOME,
+  SCHEDULE_DIR,
+  LAUNCHD_DIR,
+  CONFIG_FILE,
+  readEnv,
+  type EnvName,
+  TON_PROVIDER_MAX_SPEND,
+  TON_PROVIDER_NOTIFY_BIN,
+} from './config.js';
 import {
   SCAN_SECRETS_INSTALL_HINT,
   SCAN_SECRETS_MODES,
@@ -43,6 +52,7 @@ import {
 import { exists } from './util.js';
 import { printJson } from './ui.js';
 import { assertExportRequiresO2bProfile } from './profiles.js';
+import { tonWalletConfigured } from './wallet.js';
 import type { CliOptions } from './types.js';
 
 // LABEL/CRON_MARKER are scoped to CYPHER_BRAIN_HOME (#114) so a second `install` under a
@@ -71,7 +81,22 @@ const SNAPS_DIR = join(SCHEDULE_DIR, 'snapshots');
 const PLIST = join(LAUNCHD_DIR, `${LABEL}.plist`);
 const CRON_ENTRY_FILE = join(SCHEDULE_DIR, 'cron.entry'); // Linux: the exact registered line, kept as an artifact for status/uninstall
 
-const BACKENDS = new Set(['file', 'arweave', 'turbo']); // rclone, ton, and ton-provider (#396) are excluded from unattended scheduling: rclone/ton need operator-side setup a launchd/cron job can't collect, and ton-provider additionally requires a human to sign a Tonkeeper deeplink mid-push, which an unattended run has no way to wait for
+// rclone and the self-hosted `ton` backend stay excluded from unattended scheduling —
+// both need operator-side setup (--remote / a configured seeder box) a launchd/cron job
+// can't collect. `ton-provider` used to be excluded too, for the separate reason that
+// every deploy needed a HUMAN to sign a Tonkeeper deeplink mid-push, something an
+// unattended run has no way to wait for. PR2 (issue #396) added a local TON wallet
+// (wallet.ts's `wallet create --chain ton`) that lets put() auto-sign instead — so this
+// is now computed FRESH at each `schedule install` call (not a frozen module constant:
+// unlike mcp.ts's long-running server process, install() is a one-shot CLI invocation,
+// so there is no "stale until restart" tradeoff to accept) via the exact same
+// presence-check arweave/turbo's own wallet already uses. `install` bakes whatever is
+// in effect AT INSTALL TIME into the generated runner (see the file's own header) — a
+// wallet created afterward needs a re-`install` to be picked up by the nightly runner,
+// same as any other setting.
+async function scheduleableBackends(): Promise<Set<string>> {
+  return new Set(['file', 'arweave', 'turbo', ...((await tonWalletConfigured()) ? ['ton-provider'] : [])]);
+}
 const PAID = new Set(['arweave', 'turbo']);
 
 // Every CYPHER_BRAIN_* var a snapshot+push run could need that this runner does NOT
@@ -101,6 +126,20 @@ const ENV_CAPTURE_VARS: readonly EnvName[] = [
   // is reached only from arweave's get(), and this runner only snapshots and pushes.
   'CYPHER_BRAIN_AR_USD_RATE_URL',
   'CYPHER_BRAIN_PIPE_TIMEOUT',
+  // ton-provider (#396 PR2): install() below REQUIRES CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND
+  // and CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN to be set before allowing this backend to be
+  // scheduled — but requiring them at install time is worthless if they are not ALSO
+  // captured here, since the runner's own environment is otherwise bare. Without this
+  // list entry every scheduled push would fail nightly with the exact "must be set"
+  // errors install() exists to catch up front (Codex review, xhigh pass).
+  'CYPHER_BRAIN_TON_WALLET',
+  'CYPHER_BRAIN_TON_PROVIDER_OWNER',
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND',
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN',
+  'CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL',
+  'CYPHER_BRAIN_TON_BIN',
+  'CYPHER_BRAIN_TON_NETWORK_CONFIG',
+  'CYPHER_BRAIN_TON_TONAPI_URL',
 ];
 
 // Of ENV_CAPTURE_VARS, the ones config.ts documents as naming a filesystem path (a
@@ -113,6 +152,9 @@ const PATH_ENV_VARS = new Set([
   'CYPHER_BRAIN_FILE_DIR', // config.ts: "file backend object store"
   'CYPHER_BRAIN_PG_BIN', // config.ts: "dir holding pg_dump/pg_restore"
   'CYPHER_BRAIN_AR_WALLET', // config.ts: "path to a JWK key file"
+  'CYPHER_BRAIN_TON_WALLET', // wallet.ts: "path to a local TON wallet mnemonic file" (#396 PR2)
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN', // config.ts: "path to a locally-built scripts/go/storage-v1-client binary"
+  'CYPHER_BRAIN_TON_NETWORK_CONFIG', // config.ts: "path to a TON global config JSON for testnet"
 ]);
 
 // Vars that may hold EITHER a path or a bare value, so resolve() must be conditional on
@@ -121,6 +163,7 @@ const PATH_ENV_VARS = new Set([
 const MAYBE_PATH_ENV_VARS = new Set([
   'CYPHER_BRAIN_PIN_RECIPIENTS', // a recipients FILE or an inline age1... list
   'CYPHER_BRAIN_GITLEAKS_BIN', // a binary PATH or a bare name resolved via PATH (#307)
+  'CYPHER_BRAIN_TON_BIN', // config.ts: "local binary for the ephemeral P2P download daemon" — a PATH or a bare name resolved via PATH, same shape as gitleaks
 ]);
 
 // Snapshot + resolve, at install time, every ENV_CAPTURE_VARS value that is actually set —
@@ -550,7 +593,9 @@ async function readOwnCronEntry(): Promise<string | null> {
 
 async function install(o: CliOptions): Promise<void> {
   if (!o.backend) throw new Error('--backend <file|arweave|turbo> required');
-  if (!BACKENDS.has(o.backend)) throw new Error(`unknown backend: ${o.backend} (expected file|arweave|turbo)`);
+  const backends = await scheduleableBackends();
+  if (!backends.has(o.backend))
+    throw new Error(`unknown backend: ${o.backend} (expected one of ${[...backends].join('|')})`);
   // #206/multi-model review: install() bakes cfg.export into the runner's snapshot line
   // unconditionally (below) — it never calls resolveProfilePaths() itself, so an --export
   // given without --profile o2b would install cleanly and only turn out to be a no-op
@@ -680,7 +725,38 @@ async function install(o: CliOptions): Promise<void> {
       throw new Error(`--max-spend must be a positive integer (native units), got: ${o.max_spend}`);
     }
   } else if (o.max_spend) {
-    throw new Error(`--max-spend only applies to the paid backends (arweave|turbo); --backend ${o.backend} is free`);
+    throw new Error(
+      `--max-spend only applies to arweave/turbo (native units: winc/winston); --backend ${o.backend} either is free ` +
+        'or (ton-provider) uses its own CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) instead — see below',
+    );
+  }
+  // ton-provider (#396 PR2) has its OWN spend-cap variable — CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND
+  // (nanoTON), a different variable and unit from --max-spend/PAID above (winc/winston) — so
+  // it gets a parallel, separate required-config check rather than being folded into PAID
+  // (which would wrongly imply --max-spend is the right knob for it, and break the "free
+  // backend" branch's error message above). scheduleableBackends() already guarantees
+  // CYPHER_BRAIN_TON_WALLET is configured by the time backend==='ton-provider' reaches here
+  // (that Set only ever contains 'ton-provider' when tonWalletConfigured() is true) — this
+  // additionally requires the deploy spend cap AND the notify binary, the other two things
+  // put() itself throws on if missing, so a scheduled install fails now with actionable
+  // guidance instead of every night at push time (Codex review, xhigh pass: the original cut
+  // of this PR made ton-provider "schedule install"-eligible without ALSO requiring or
+  // carrying forward what a nightly run actually needs to succeed).
+  if (o.backend === 'ton-provider') {
+    if (TON_PROVIDER_MAX_SPEND <= 0n) {
+      throw new Error(
+        'ton-provider is a paid store: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) must be set in the ' +
+          'environment before install — a StorageV1 deploy spends real funds, so there is no safe default ' +
+          'to let an unattended schedule run uncapped through',
+      );
+    }
+    if (!TON_PROVIDER_NOTIFY_BIN) {
+      throw new Error(
+        'ton-provider requires CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (a locally built ' +
+          'scripts/go/storage-v1-client binary) set in the environment before install — otherwise every ' +
+          'scheduled push would fail at the notify step',
+      );
+    }
   }
   // --ping-url-fail (issue #202) only makes sense as an override of the success URL's
   // implied /fail sibling — refuse it standalone rather than silently pinging a failure

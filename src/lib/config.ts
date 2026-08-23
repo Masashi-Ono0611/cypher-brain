@@ -59,6 +59,7 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL',
   'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS', // test-only override (scripts/selftest-ton-provider.sh) — a real push waits on the 10-minute default
   'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS', // test-only override, same reason
+  'CYPHER_BRAIN_TON_WALLET', // PR2: local TON wallet mnemonic file — when set, ton-provider auto-signs (no Tonkeeper deeplink) and derives `owner` from this wallet
   'CYPHER_BRAIN_YES',
   'CYPHER_BRAIN_MAX_SPEND',
   'CYPHER_BRAIN_SKIP_FUNDS_CHECK', // #342: one-run bypass of the turbo pre-upload funds check (stale balance reads)
@@ -458,6 +459,13 @@ export const TON_PROVIDER_NOTIFY_INTERVAL_MS = parsePositiveMsOverride(
   15_000,
   'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS',
 );
+// PR2 (auto-signing): path to a local TON wallet mnemonic file (`wallet create --chain ton`,
+// src/lib/wallet.ts). When set AND present on disk, ton-provider.ts's put() signs and
+// broadcasts the StorageV1 deploy itself instead of printing a Tonkeeper deeplink for a
+// human to sign — the SAME "presence-checkable capability" pattern AR_WALLET already
+// uses for arweave/turbo. Mirrors AR_WALLET exactly; kept as its own variable (not reused)
+// because it names a DIFFERENT credential (a TON mnemonic, not a JWK) for a different chain.
+export const TON_WALLET = readEnv('CYPHER_BRAIN_TON_WALLET') || '';
 export const AR_HOST = readEnv('CYPHER_BRAIN_AR_HOST') || 'arweave.net';
 export const AR_PORT = Number(readEnv('CYPHER_BRAIN_AR_PORT') || 443);
 export const AR_PROTOCOL = readEnv('CYPHER_BRAIN_AR_PROTOCOL') || 'https';

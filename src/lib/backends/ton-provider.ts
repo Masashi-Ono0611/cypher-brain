@@ -7,24 +7,31 @@
 // same "pay once, don't operate infrastructure yourself" shape arweave/turbo already
 // have, not a self-hosted "sovereignty lane" (that stays ton.ts's job).
 //
-// PR1 scope (issue #396 Phase A) — what this still does NOT do:
-//   - No local TON wallet: the StorageV1 deploy is signed via a Tonkeeper deeplink,
-//     same as this project's own dogfooding (docs/ton-storage-status.md). Unlike
-//     arweave/turbo's wallet.ts (a locally-held JWK signs with no human in the loop,
-//     which is what lets THOSE backends run under `schedule install`), push()ing this
-//     backend requires an interactive human present to approve in their wallet app.
-//     Fully automated signing (a TON-side wallet.ts equivalent) is a separate PR.
-//   - Provider-payment mode only: the self-hosted ton.ts backend is unchanged and
-//     stays the "sovereignty" path for operators who want to run their own seeder.
+// PR1 (issue #396 Phase A) shipped Tonkeeper-deeplink signing only: a human had to
+// approve every deploy in their own wallet app, which is why this backend originally
+// stayed out of `schedule install` and MCP (both need to run with nobody watching).
 //
-// Phase B (issue #396) landed in a follow-up PR: the `init` wizard now offers this
-// backend via a select() prompt (src/lib/wizard.ts), --help/estimate/README present it
-// with the same structural weight as arweave/turbo (see push's --help section below and
-// README's "## Backends"), estimate carries a USD line (tonUsdRate() below), and put()
-// runs an advisory pre-deploy funds check plus a shared-module progress line during the
-// notify-until-full wait (mirroring turbo.ts's own funds check/progress reporting) — so
-// the "no wizard/--help/estimate/README symmetry work yet" note that used to sit here is
-// no longer accurate; only the two bullets above remain genuinely unfinished.
+// PR2 closed that gap: `wallet create --chain ton` (src/lib/wallet.ts) generates a
+// locally-held TON wallet, and put() below auto-signs and broadcasts the deploy itself
+// — no Tonkeeper, no human — whenever CYPHER_BRAIN_TON_WALLET is configured (see
+// autoSignAndBroadcastDeploy() below). Absent that, the original Tonkeeper-deeplink
+// path still runs unchanged, so an operator with no local wallet is unaffected. This is
+// now the SAME "presence-checkable capability" shape arweave/turbo's wallet.ts already
+// established (wizard.ts's `ton-provider` inclusion used this precedent even before PR2
+// existed) — which is also what makes MCP/`schedule install` exposure safe to turn on
+// (see mcp.ts/schedule.ts): both only ever list this backend when a wallet is actually
+// configured, so an unattended caller never gets stuck waiting on a Tonkeeper signature
+// nobody is there to give.
+//
+// Phase B (issue #396) landed the wizard select() prompt (src/lib/wizard.ts),
+// --help/estimate/README structural parity with arweave/turbo (see push's --help
+// section below and README's "## Backends"), a USD line on estimate (tonUsdRate()
+// below), and put()'s advisory pre-deploy funds check plus a shared-module progress
+// line during the notify-until-full wait (mirroring turbo.ts's own funds
+// check/progress reporting).
+//
+// Provider-payment mode only, still: the self-hosted ton.ts backend is unchanged and
+// stays the "sovereignty" path for operators who want to run their own seeder.
 //
 // Cell-encoding correctness: the StorageV1 data-cell layout and the modify_providers
 // deploy-message body below were cross-verified, byte-for-byte, against
@@ -62,7 +69,13 @@ import { randomBytes } from 'node:crypto';
 // arweave backend from an isolated dir with no optional SDKs installed at all.
 // Type-only imports are erased at compile time and never touch the module at runtime,
 // so the TYPES below stay a plain top-level import.
-import type { Builder as TonBuilder, Slice as TonSlice, Address as TonAddress, Cell as TonCell } from '@ton/ton';
+import type {
+  Builder as TonBuilder,
+  Slice as TonSlice,
+  Address as TonAddress,
+  Cell as TonCell,
+  WalletContractV4 as TonWalletContractV4,
+} from '@ton/ton';
 import {
   TON_PROVIDER_OWNER,
   TON_PROVIDER_MAX_SPEND,
@@ -73,6 +86,7 @@ import {
   TON_TONAPI_URL,
   TON_BIN,
   TON_NETWORK_CONFIG,
+  TON_WALLET,
   SKIP_FUNDS_CHECK,
 } from '../config.js';
 import { run } from '../proc.js';
@@ -81,6 +95,7 @@ import { warn } from '../warn.js';
 import { tonApi, startLocalTonDaemon, type TonBagDetails, type LocalTonDaemon } from './ton-client.js';
 import { p2pFetch, entryNameFor } from './ton.js';
 import { progressReporter } from '../progress.js';
+import { tonWalletConfigured, loadTonWallet } from '../wallet.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 // Lazy loader for @ton/ton's VALUE exports (beginCell/Cell/Dictionary/Address/
@@ -403,6 +418,141 @@ async function fetchAccountState(addr: TonAddress): Promise<AccountState> {
   return (await res.json()) as AccountState;
 }
 
+// ---------- PR2: local auto-signing (issue #396) ----------
+// Everything below signs and broadcasts a deploy with a LOCALLY-HELD TON wallet
+// (wallet.ts's `wallet create --chain ton`) instead of printing a Tonkeeper deeplink for
+// a human to approve — the alternative put() picks between depending on whether
+// CYPHER_BRAIN_TON_WALLET is configured (tonWalletConfigured(), checked in put() below).
+//
+// Design proven end-to-end against real testnet (wallet generated -> local sign ->
+// broadcast -> StorageV1 contract observed `active` on-chain via tonapi, zero Tonkeeper
+// involvement) and reviewed with a second model (masa-codex/agmsg) before landing here;
+// see the PR description for the exact exchange. Two deliberate departures from that
+// review's suggestion, both because this session's OWN real-Tonkeeper dogfooding already
+// proved the actual on-chain behavior directly, which outranks a general suggestion:
+//   - bounce:true (not the reviewer's suggested false): a real mainnet Tonkeeper deploy
+//     with a mismatched owner was observed to correctly BOUNCE the value back (minus
+//     fees) when modify_providers' authorization check failed, rather than stranding it
+//     in a half-deployed, provider-less contract. Deploy (stateInit application) still
+//     succeeds regardless of bounce — also directly observed then.
+//   - the StorageV1 StateInit/address round-trip gets an explicit assert
+//     (contractAddress(0, parsedInit).equals(deploy.contractAddress)) before any funds
+//     move, catching a loadStateInit()/storeStateInit() mismatch before it becomes an
+//     on-chain mistake instead of after.
+
+// tonapi's TVM get-method endpoint for a wallet's own seqno (distinct from
+// fetchAccountState's plain account-state read above). Only ever called when
+// fetchAccountState already reported the wallet 'active' — calling it on an
+// uninitialized wallet (the normal case for a BRAND NEW auto-sign wallet's first
+// deploy) returns `{"error":"entity not found"}`, not a decodable seqno (checked
+// directly against tonapi before relying on this), so callers must gate on status
+// first rather than treat this as a self-contained "get seqno or 0" helper.
+async function fetchWalletSeqno(addr: TonAddress): Promise<number> {
+  const url = `${TON_TONAPI_URL}/v2/blockchain/accounts/${addr.toRawString()}/methods/seqno`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`ton-provider backend: GET ${url} -> HTTP ${res.status}`);
+  const body = (await res.json()) as { success?: unknown; decoded?: { state?: unknown } };
+  const seqno = Number(body.decoded?.state);
+  if (body.success !== true || !Number.isInteger(seqno) || seqno < 0) {
+    throw new Error(`ton-provider backend: unexpected seqno response from tonapi for ${addr.toRawString()}`);
+  }
+  return seqno;
+}
+
+// Signs the deploy with `wallet`/`secretKey` (loaded by wallet.ts's loadTonWallet) and
+// broadcasts it — no Tonkeeper, no human. Caller (put() below) still runs
+// waitForContractActive() afterward, unchanged: a 200 here means "tonapi accepted the
+// broadcast", never "the deploy succeeded on-chain" (masa-codex review; also directly
+// observed in the testnet PoC — the wallet's balance had already moved by the time the
+// client-side response parsing failed on an unrelated bug, proving the two are separate
+// events).
+//
+// KNOWN LIMITATIONS (Codex review, xhigh pass — accepted as-is, not fixed here):
+// - No cross-process seqno lock: two overlapping pushes against the SAME wallet (a manual
+//   CLI run racing a cron-fired schedule, or two concurrent MCP calls) can read the same
+//   seqno and race to broadcast. TON's own seqno-replay-protection bounds the blast
+//   radius — the SECOND external message to actually land on-chain is rejected outright
+//   (wrong seqno), not silently double-spent or misdirected — so the worst case is "one of
+//   the two pushes fails and needs a retry," not fund loss. A file lock would close this
+//   gap but adds real complexity for a rare edge case with a self-healing failure mode;
+//   left as a documented limitation rather than implemented speculatively.
+// - CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND caps `deploy.amountNano` (the internal transfer
+//   value), not literally every nanoTON the wallet's balance drops by: SendMode.PAY_GAS_SEPARATELY
+//   means the wallet's own forward/network fee (observed ~0.001 TON in real dogfooding,
+//   negligible next to a multi-0.1-TON deploy) is debited ADDITIONALLY, same as Tonkeeper's
+//   own UI already shows the "Fee" line separately from the transfer amount for the
+//   human-signed path. Pre-existing PR1 semantics (MAX_SPEND was never a hard ceiling on
+//   Tonkeeper's total wallet debit either) — not a gap PR2 introduces or worsens.
+async function autoSignAndBroadcastDeploy(
+  wallet: TonWalletContractV4,
+  secretKey: Buffer,
+  deploy: BuildDeployResult,
+): Promise<void> {
+  const { beginCell, contractAddress, external, internal, loadStateInit, SendMode, storeMessage } = await getTon();
+
+  const parsedInit = loadStateInit(deploy.stateInit.beginParse());
+  if (!contractAddress(0, parsedInit).equals(deploy.contractAddress)) {
+    throw new Error(
+      'ton-provider backend: StorageV1 StateInit/address mismatch after loadStateInit() round-trip — ' +
+        'auto-sign aborted before spending anything',
+    );
+  }
+
+  const walletState = await fetchAccountState(wallet.address).catch(() => null);
+  if (walletState?.status === 'frozen') {
+    throw new Error(
+      `ton-provider backend: local wallet ${wallet.address.toRawString()} is frozen on-chain — cannot auto-sign`,
+    );
+  }
+  const walletActive = walletState?.status === 'active';
+  const seqno = walletActive ? await fetchWalletSeqno(wallet.address) : 0;
+
+  const transferBody = wallet.createTransfer({
+    seqno,
+    secretKey,
+    timeout: Math.floor(Date.now() / 1000) + 300, // 5min — the createTransfer default (60s) is tight against network/API latency
+    sendMode: SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS,
+    messages: [
+      internal({
+        to: deploy.contractAddress,
+        value: deploy.amountNano,
+        bounce: true, // see file-header note above — proven safety net, kept deliberately
+        init: parsedInit,
+        body: deploy.body,
+      }),
+    ],
+  });
+  // The signature is already computed and embedded in transferBody — secretKey is no
+  // longer needed past this point. Zeroed IN PLACE (Codex review, xhigh pass), not just
+  // dropped: this Buffer is the SAME object put() below still holds a reference to
+  // (autoSignWallet.secretKey) for the duration of the subsequent up-to-20-minute
+  // waitForContractActive() wait, so zeroing here also clears what that reference sees —
+  // shrinking the in-memory exposure window to "while signing", not "until push returns".
+  secretKey.fill(0);
+
+  const extMsg = external({
+    to: wallet.address,
+    // A wallet not yet active on-chain (seqno===0, no code deployed yet) must carry its
+    // OWN init in this external message — once it has sent >=1 transaction, it is active
+    // and init is omitted (attaching it again would be a wasted/rejected no-op).
+    init: walletActive ? undefined : wallet.init,
+    body: transferBody,
+  });
+  const boc = beginCell().store(storeMessage(extMsg)).endCell().toBoc({ idx: false, crc32: true });
+
+  const url = `${TON_TONAPI_URL}/v2/blockchain/message`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ boc: boc.toString('base64') }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`ton-provider backend: broadcast POST ${url} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
+  }
+}
+
 const DEPLOY_CONFIRM_TIMEOUT_MS = 20 * 60_000; // human has to open their wallet and approve — generous
 const DEPLOY_POLL_INTERVAL_MS = 5_000;
 
@@ -593,20 +743,61 @@ async function notifyProviderWithRetry(
 export function tonProviderBackend(): StorageBackend {
   return {
     async put(file: string, _opts: PutOpts = {}): Promise<string> {
-      if (!TON_PROVIDER_OWNER) {
-        throw new Error(
-          'ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_OWNER (the TON wallet address that will own the ' +
-            'deployed contract) is required to push',
-        );
-      }
       const { Address } = await getTon();
+      // PR2: when a local TON wallet is configured, IT is the owner — auto-signing
+      // requires sender===owner (storage-contract.fc's modify_providers throws
+      // error::unauthorized otherwise, an exact bug this session hit and fixed with a
+      // real mainnet Tonkeeper deploy: CYPHER_BRAIN_TON_PROVIDER_OWNER pointed at a
+      // DIFFERENT address than the wallet that actually signed). Deriving owner from the
+      // wallet, rather than trusting a separately-set env var, removes that mismatch
+      // class structurally instead of just documenting it.
+      //
+      // A LEFTOVER, DISAGREEING CYPHER_BRAIN_TON_PROVIDER_OWNER is a HARD ERROR, not a
+      // warning (Codex review, xhigh pass): this push is reachable unattended now (MCP,
+      // `schedule install`, #396 PR2) — nobody may be watching stderr for a warning that
+      // silently overrides what the operator's config says the owner should be. The
+      // wallet's own address is cryptographically the only one that COULD sign here, so
+      // this is never "the wrong wallet spends" (only one wallet ever can) — but a stale
+      // TON_PROVIDER_OWNER left over from a pre-PR2 Tonkeeper-only setup is exactly the
+      // kind of drift that deserves a stop, not a silent proceed: unset it, or fix it to
+      // match, before this backend spends anything.
       let owner: TonAddress;
-      try {
-        owner = Address.parse(TON_PROVIDER_OWNER);
-      } catch {
-        throw new Error(
-          `ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_OWNER is not a valid TON address: ${TON_PROVIDER_OWNER}`,
-        );
+      let autoSignWallet: { wallet: TonWalletContractV4; secretKey: Buffer } | null = null;
+      if (await tonWalletConfigured()) {
+        autoSignWallet = await loadTonWallet(TON_WALLET, 'ton-provider push');
+        owner = autoSignWallet.wallet.address;
+        if (TON_PROVIDER_OWNER) {
+          let explicit: TonAddress | null = null;
+          try {
+            explicit = Address.parse(TON_PROVIDER_OWNER);
+          } catch {
+            /* invalid value — the mismatch error below covers this too, no separate message needed */
+          }
+          if (explicit === null || !explicit.equals(owner)) {
+            throw new Error(
+              `ton-provider: CYPHER_BRAIN_TON_PROVIDER_OWNER (${TON_PROVIDER_OWNER}) is set but does not match ` +
+                `the configured CYPHER_BRAIN_TON_WALLET's own address (${owner.toString({ bounceable: true })}) — ` +
+                'refusing to proceed with an ambiguous owner. Auto-signing requires sender===owner, so this can ' +
+                "only ever deploy as the wallet's own address; unset CYPHER_BRAIN_TON_PROVIDER_OWNER (it is not " +
+                'needed when a wallet is configured) or fix it to match, then re-run.',
+            );
+          }
+        }
+      } else {
+        if (!TON_PROVIDER_OWNER) {
+          throw new Error(
+            'ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_OWNER (the TON wallet address that will own the ' +
+              'deployed contract) is required to push — or set CYPHER_BRAIN_TON_WALLET to a local wallet ' +
+              '(`wallet create --chain ton`) to auto-sign without one',
+          );
+        }
+        try {
+          owner = Address.parse(TON_PROVIDER_OWNER);
+        } catch {
+          throw new Error(
+            `ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_OWNER is not a valid TON address: ${TON_PROVIDER_OWNER}`,
+          );
+        }
       }
       if (TON_PROVIDER_MAX_SPEND <= 0n) {
         throw new Error(
@@ -681,20 +872,18 @@ export function tonProviderBackend(): StorageBackend {
           `ton-provider: storage cost ${deploy.costNano} nanoTON + ${DEPLOY_BUFFER_NANO} nanoTON deploy buffer = ${deploy.amountNano} nanoTON`,
         );
         // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
-        // signer balance, #342) — WARN only, never abort: unlike turbo's locally-held
-        // JWK signer, this deploy is always signed by a HUMAN in their own Tonkeeper app
-        // (see header), so an actual shortfall already gets its own unambiguous feedback
-        // there (the wallet app refuses the transaction) — this exists only to save that
-        // human the trip through waitForContractActive()'s up-to-20-minute wait on a
-        // signature that was always going to fail. Same availability posture as turbo's
-        // check: a balance read that fails or looks unusable must never block a push, and
-        // CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences it for one run (the same flag, not a
-        // ton-provider-specific one — same shortfall-with-no-freshness-guarantee shape).
-        // Both lines go through warn() (#347), not a raw console.error — the same
-        // chokepoint turbo.ts's own funds check already uses — so an agent-driven push
-        // carries this in the MCP result's warnings[] array and the CLI's end-of-run
-        // summary, instead of it only ever landing in a background log (multi-model
-        // review finding: the plain console.error version bypassed both surfaces).
+        // signer balance, #342) — WARN only, never abort, for BOTH signing paths: a
+        // balance read has no freshness guarantee, so it must never be what blocks a
+        // push (same posture turbo.ts uses for its non-TTY/unattended callers, now that
+        // ton-provider can ALSO run unattended via auto-signing, #396 PR2). Whichever
+        // path actually sends the transaction gives its own unambiguous refusal on a
+        // real shortfall — a human's Tonkeeper app, or the auto-sign broadcast/on-chain
+        // processing itself — so this exists only to save the wait through
+        // waitForContractActive() on a spend that was always going to fail.
+        // CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences it for one run (shared with turbo's
+        // check, not a ton-provider-specific flag). Both lines go through warn() (#347),
+        // not a raw console.error, so an agent-driven push (MCP) carries this in the
+        // result's warnings[] array instead of only ever landing in a background log.
         if (!SKIP_FUNDS_CHECK) {
           try {
             const ownerState = await fetchAccountState(owner);
@@ -703,9 +892,10 @@ export function tonProviderBackend(): StorageBackend {
             }
             if (ownerState.balance < Number(deploy.amountNano)) {
               warn(
-                `ton-provider: owner ${TON_PROVIDER_OWNER}'s on-chain balance (${ownerState.balance} ` +
-                  `nanoTON) looks lower than the ${deploy.amountNano} nanoTON this deploy needs; the Tonkeeper ` +
-                  'signature below may be rejected for insufficient funds. Fund the wallet first, or set ' +
+                `ton-provider: owner ${owner.toString({ bounceable: true })}'s on-chain balance ` +
+                  `(${ownerState.balance} nanoTON) looks lower than the ${deploy.amountNano} nanoTON this deploy ` +
+                  `needs; the ${autoSignWallet ? 'auto-sign broadcast' : 'Tonkeeper signature'} below may be ` +
+                  'rejected for insufficient funds. Fund the wallet first, or set ' +
                   'CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 to silence this check.',
               );
             }
@@ -713,8 +903,16 @@ export function tonProviderBackend(): StorageBackend {
             warn(`ton-provider: could not pre-check the owner's balance (${errMsg(e)}); proceeding`);
           }
         }
-        console.error(`ton-provider: sign this to deploy the contract (bag stays seeded locally while you do):`);
-        console.error(`  ${deploy.deeplink}`);
+        if (autoSignWallet) {
+          console.error(
+            `ton-provider: auto-signing with local wallet ${owner.toString({ bounceable: true })} ` +
+              '(CYPHER_BRAIN_TON_WALLET) — no Tonkeeper deeplink needed',
+          );
+          await autoSignAndBroadcastDeploy(autoSignWallet.wallet, autoSignWallet.secretKey, deploy);
+        } else {
+          console.error(`ton-provider: sign this to deploy the contract (bag stays seeded locally while you do):`);
+          console.error(`  ${deploy.deeplink}`);
+        }
 
         await waitForContractActive(deploy.contractAddress);
         console.error(`ton-provider: contract ${deploy.contractAddress.toRawString()} is active on-chain`);

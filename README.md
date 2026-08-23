@@ -501,37 +501,53 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       "minisign -V -p sign-recipient.pub"). --passphrase/--force apply to it the same way
       they do to the age identity above; --wrap-in-place does not (age-only).
 
-  cypher-brain wallet create [--out <path>] [--force]
-      Generate a fresh Arweave JWK for the arweave/turbo storage backends (needs the
-      'arweave' package — a peerDependency, same as those backends). Defaults to
-      $CYPHER_BRAIN_HOME/wallet.json; --out picks a different path. Prints the wallet
-      path (PRIVATE) and its derived address (PUBLIC — fund THIS one). Refuses to
-      overwrite an existing wallet file (same no-clobber posture as keygen); --force to
-      replace it. Written 0600, same fail-closed handling as the age identity.
+  cypher-brain wallet create [--out <path>] [--force] [--chain arweave|ton]
+      Generate a fresh signing credential. --chain arweave (default) generates an
+      Arweave JWK for the arweave/turbo storage backends (needs the 'arweave' package —
+      a peerDependency, same as those backends). Defaults to $CYPHER_BRAIN_HOME/wallet.json;
+      --out picks a different path. Prints the wallet path (PRIVATE) and its derived
+      address (PUBLIC — fund THIS one). Refuses to overwrite an existing wallet file
+      (same no-clobber posture as keygen); --force to replace it. Written 0600, same
+      fail-closed handling as the age identity.
+      --chain ton generates a TON wallet (a 24-word BIP39 mnemonic, WalletContractV4 —
+      needs the '@ton/ton'/'@ton/crypto' packages, both optionalDependencies) for the
+      ton-provider backend's auto-signing mode (issue #396 PR2). Defaults to
+      $CYPHER_BRAIN_HOME/ton-wallet.json; same --out/--force/0600 posture as the arweave
+      form. Set CYPHER_BRAIN_TON_WALLET to the written path afterward so 'push --backend
+      ton-provider' signs and broadcasts deploys itself instead of printing a Tonkeeper
+      deeplink for a human to approve — see push's --backend ton-provider section below.
 
-  cypher-brain wallet address [--wallet <path>]
-      Derive and print the Arweave address a JWK spends from, without uploading
-      anything. --wallet defaults to CYPHER_BRAIN_AR_WALLET, then to
-      $CYPHER_BRAIN_HOME/wallet.json (the same default 'wallet create' writes to). Use
-      this to confirm you are funding the SAME wallet cypher-brain will sign uploads
-      with.
+  cypher-brain wallet address [--wallet <path>] [--chain arweave|ton]
+      Derive and print the address a wallet spends from, without uploading/deploying
+      anything. --wallet defaults to CYPHER_BRAIN_AR_WALLET (--chain arweave, the
+      default) or CYPHER_BRAIN_TON_WALLET (--chain ton), then to the matching 'wallet
+      create' default path. Use this to confirm you are funding the SAME wallet
+      cypher-brain will sign with (for --chain ton, this is also the address that
+      becomes the StorageV1 contract's owner — see push's --backend ton-provider
+      section).
 
-  cypher-brain wallet balance [--wallet <path>] [--address <addr>] [--json]
-      Print what an address can actually spend on the turbo backend: its OWN Turbo
-      Credit balance, its SPENDABLE balance (own + Credit Share Approvals delegated to
-      it), and every approval received/given with the winc remaining on it and when it
-      expires. Answers the three questions a top-up asks — did my purchase land, did the
-      share to this wallet land, how much is left — which otherwise need a hand-written
-      @ardrive/turbo-sdk script. A plain unauthenticated GET against the payment service
-      keyed on a PUBLIC address: no '@ardrive/turbo-sdk' install, no signature.
-      --address queries ANY address without a key or wallet file (this is how you check
-      the browser/MetaMask wallet you bought credits on — the one whose JWK this machine
-      by definition does not have). Without it, the address is derived from the JWK, with
-      the same --wallet / CYPHER_BRAIN_AR_WALLET / $CYPHER_BRAIN_HOME/wallet.json
-      fallback 'wallet address' uses. Warns when a received approval exists but
-      CYPHER_BRAIN_AR_PAID_BY does not name its payer — a push cannot draw on an
-      approval it is not told about, so credits that look spendable here would not be.
-      --json prints the same fields as one JSON line on stdout instead.
+  cypher-brain wallet balance [--wallet <path>] [--address <addr>] [--json] [--chain arweave|ton]
+      --chain arweave (default): print what an address can actually spend on the turbo
+      backend: its OWN Turbo Credit balance, its SPENDABLE balance (own + Credit Share
+      Approvals delegated to it), and every approval received/given with the winc
+      remaining on it and when it expires. Answers the three questions a top-up asks —
+      did my purchase land, did the share to this wallet land, how much is left — which
+      otherwise need a hand-written @ardrive/turbo-sdk script. A plain unauthenticated
+      GET against the payment service keyed on a PUBLIC address: no '@ardrive/turbo-sdk'
+      install, no signature. --address queries ANY address without a key or wallet file
+      (this is how you check the browser/MetaMask wallet you bought credits on — the one
+      whose JWK this machine by definition does not have). Without it, the address is
+      derived from the JWK, with the same --wallet / CYPHER_BRAIN_AR_WALLET /
+      $CYPHER_BRAIN_HOME/wallet.json fallback 'wallet address' uses. Warns when a
+      received approval exists but CYPHER_BRAIN_AR_PAID_BY does not name its payer — a
+      push cannot draw on an approval it is not told about, so credits that look
+      spendable here would not be. --json prints the same fields as one JSON line on
+      stdout instead.
+      --chain ton: print the address's on-chain nanoTON balance (tonapi, no key needed
+      with --address) plus an approximate USD line (tonUsdRate). --json emits
+      {address, balance_nanoton, status} as one JSON line instead — nanoTON only, no USD
+      figure (the human-readable form's USD line is a display-time convenience, not a
+      persisted field).
 
   cypher-brain doctor [--json]
       Read-only environment health check (#201): inspects the EXISTING setup for the
@@ -788,18 +804,26 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       --backend ton-provider pays a LIVE THIRD-PARTY provider (self-registered on
       mytonprovider.org, the current Go/StorageV1 scheme) to hold the bag instead of
       seeding it yourself — no always-on box of your own required. Requires
-      CYPHER_BRAIN_TON_PROVIDER_OWNER (the TON wallet address that will own the
-      contract) and CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (a nanoTON spend cap; a
-      StorageV1 deploy spends real funds, same posture as arweave/turbo's spend cap).
-      Before printing the deeplink it runs an advisory pre-deploy funds check against
-      the owner address's own on-chain balance (see Spend below) — a WARNING only,
-      never a refusal: unlike arweave/turbo's automatic JWK signer, this deploy is
-      always signed by a human in their own wallet app, which already refuses an
-      underfunded transaction on its own; this just saves the trip through the wait
-      below on a signature that was always going to fail. Prints a Tonkeeper deeplink
-      and waits for a HUMAN to sign it — unlike arweave/turbo this does not run
-      unattended yet (no local TON wallet exists to sign automatically). Notifying the
-      chosen provider shells out to a locally built scripts/go/storage-v1-client binary
+      CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (a nanoTON spend cap; a StorageV1 deploy
+      spends real funds, same posture as arweave/turbo's spend cap). The contract's
+      owner comes from ONE of two places: if CYPHER_BRAIN_TON_WALLET is configured (a
+      local TON wallet — 'wallet create --chain ton', issue #396 PR2), that wallet's own
+      address is used and it auto-signs+broadcasts the deploy itself, no human involved
+      — the same "runs unattended" shape arweave/turbo's JWK signer already has, which
+      is what lets this run under 'schedule install' and MCP too. Otherwise
+      CYPHER_BRAIN_TON_PROVIDER_OWNER (a plain address, no local key) is required, and
+      push prints a Tonkeeper deeplink for a HUMAN to sign in their own wallet app
+      instead. (If BOTH are set and disagree, push REFUSES outright rather than picking
+      one silently — auto-signing requires sender==owner on-chain, so there is no safe
+      way to guess which address the operator actually meant; unset
+      CYPHER_BRAIN_TON_PROVIDER_OWNER, or fix it to match the wallet's own address, and
+      re-run.) Before signing/printing the deeplink it runs an advisory pre-deploy
+      funds check against the owner address's own on-chain balance (see Spend below) —
+      a WARNING only, never a refusal, for either path: whichever one actually spends —
+      the human's wallet app, or the auto-sign broadcast itself — already gives its own
+      unambiguous refusal on a real shortfall; this just saves the trip through the wait
+      below on a spend that was always going to fail. Notifying the chosen provider
+      shells out to a locally built scripts/go/storage-v1-client binary
       (CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN) — an ADNL/RLDP query with no mature
       TypeScript implementation — and the wait for it to report a full download is what
       the Transfer progress paragraph above covers. The locator is
@@ -1038,8 +1062,8 @@ Storage: CYPHER_BRAIN_FILE_DIR (file);
          turbo: CYPHER_BRAIN_AR_WALLET (JWK signer) + optional CYPHER_BRAIN_AR_PAID_BY (an address sharing Turbo Credits to that signer); needs '@ardrive/turbo-sdk' to PUSH (a pull reuses the arweave gateway read, no SDK). Funding/credit-share details: docs/arweave-upload-runbook.md.
          rclone: CYPHER_BRAIN_RCLONE_BIN (path to the rclone binary; default 'rclone' on PATH) — the remote itself is whatever --remote <name>:<path> names in your own 'rclone config'.
          ton: CYPHER_BRAIN_TON_SSH_HOST (user@host of your seeder box running tonutils-storage — required to PUSH; also the pull fallback), CYPHER_BRAIN_TON_SSH_KEY (optional ssh -i identity file), CYPHER_BRAIN_TON_REMOTE_DIR (seeder-side layout root; default 'cypher-brain-ton' in the SSH user's home — plain relative or absolute path, a literal ~ is refused), CYPHER_BRAIN_TON_REMOTE_API (the seeder daemon's API address as seen FROM the seeder itself; default '127.0.0.1:9955' — it stays loopback-bound there, reached via ssh, never exposed), CYPHER_BRAIN_TON_BIN (local tonutils-storage binary for the P2P pull; default 'tonutils-storage' on PATH), CYPHER_BRAIN_TON_HTTP_TIMEOUT (ms; default 30000), CYPHER_BRAIN_TON_NO_FALLBACK=1 (strictly '1': forbid the seeder fallback on pull, so a success PROVES P2P availability — use for verify --level remote when you want that proof), CYPHER_BRAIN_TON_NETWORK_CONFIG (path to a TON global config JSON for testnet; default mainnet), CYPHER_BRAIN_TON_TONAPI_URL (tonapi.io base URL 'publish-latest' resolves a .ton domain's NFT address and polls its DNS record against; default 'https://tonapi.io').
-         ton-provider: CYPHER_BRAIN_TON_PROVIDER_OWNER (TON wallet address that will own the deployed StorageV1 contract — required to PUSH), CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON spend cap — required to PUSH, a deploy spends real funds), CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (path to a locally built scripts/go/storage-v1-client binary — required to PUSH, notifying a provider needs an ADNL/RLDP query this project has no TypeScript implementation for), CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL (provider registry base URL; default 'https://mytonprovider.org'). Also uses CYPHER_BRAIN_TON_BIN/CYPHER_BRAIN_TON_NETWORK_CONFIG (the local ephemeral daemon that hashes and temporarily seeds the bag) and CYPHER_BRAIN_TON_TONAPI_URL (polling the deploy for on-chain confirmation, AND the approximate-USD line's rate source — tonapi's own public rates endpoint, no separate URL setting needed) from the ton settings above.
-Spend: arweave/turbo PUSH needs --yes or CYPHER_BRAIN_YES=1 (paid, permanent); CYPHER_BRAIN_MAX_SPEND caps the arweave/turbo cost estimate (winston/winc). ton-provider PUSH needs --yes or CYPHER_BRAIN_YES=1 too, plus CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) — and still requires a human to sign the resulting Tonkeeper deeplink; it does not run unattended. A turbo push also runs a funds check BEFORE signing: when the estimated cost exceeds even the reachable credit (the signer's own balance + the live approvals CYPHER_BRAIN_AR_PAID_BY selects), the spend is headed for a payment-service refusal that would otherwise arrive only after minutes of signing. On a TTY (a human watching) it aborts with the funding steps spelled out, after confirming the shortfall on a second balance read so a top-up landing that same moment is not blocked; without a TTY (a nightly runner, an MCP host) it only WARNS and proceeds — a balance read has no freshness guarantee, and it must never be what blocks an unattended backup. Skipped entirely when the balance cannot be read at all; CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 (strictly '1') bypasses it for one run. A ton-provider push runs the SAME kind of pre-deploy funds check (querying the owner address's own on-chain balance via tonapi), but only ever WARNS, never aborts — every ton-provider deploy is already signed by a human in their own wallet app (there is no unattended path to protect the way turbo's TTY-detection branch protects one), so an underfunded transaction gets its own unambiguous refusal there regardless; this check exists only to save the trip through the up-to-20-minute signature wait first. Shares CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 with turbo's check above (not a separate ton-provider-specific flag).
+         ton-provider: CYPHER_BRAIN_TON_WALLET (path to a local TON wallet mnemonic — 'wallet create --chain ton' — issue #396 PR2; when set, its own address becomes the contract owner and PUSH auto-signs+broadcasts with no human involved, which is also what makes this backend reachable via 'schedule install'/MCP), CYPHER_BRAIN_TON_PROVIDER_OWNER (TON wallet address that will own the deployed StorageV1 contract — required to PUSH only when CYPHER_BRAIN_TON_WALLET is NOT set; PUSH refuses outright, rather than silently overriding it, if both are set and disagree), CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON spend cap — required to PUSH either way, a deploy spends real funds), CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (path to a locally built scripts/go/storage-v1-client binary — required to PUSH, notifying a provider needs an ADNL/RLDP query this project has no TypeScript implementation for), CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL (provider registry base URL; default 'https://mytonprovider.org'). Also uses CYPHER_BRAIN_TON_BIN/CYPHER_BRAIN_TON_NETWORK_CONFIG (the local ephemeral daemon that hashes and temporarily seeds the bag) and CYPHER_BRAIN_TON_TONAPI_URL (polling the deploy for on-chain confirmation, AND the approximate-USD line's rate source — tonapi's own public rates endpoint, no separate URL setting needed; auto-sign's broadcast and seqno lookup use this same URL too) from the ton settings above.
+Spend: arweave/turbo PUSH needs --yes or CYPHER_BRAIN_YES=1 (paid, permanent); CYPHER_BRAIN_MAX_SPEND caps the arweave/turbo cost estimate (winston/winc). ton-provider PUSH needs --yes or CYPHER_BRAIN_YES=1 too, plus CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) — signed either by a human in Tonkeeper (no CYPHER_BRAIN_TON_WALLET configured) or auto-signed by a local wallet (CYPHER_BRAIN_TON_WALLET set — issue #396 PR2, the same "runs unattended" shape as arweave/turbo's JWK signer, which is what lets it run under 'schedule install'/MCP too). A turbo push also runs a funds check BEFORE signing: when the estimated cost exceeds even the reachable credit (the signer's own balance + the live approvals CYPHER_BRAIN_AR_PAID_BY selects), the spend is headed for a payment-service refusal that would otherwise arrive only after minutes of signing. On a TTY (a human watching) it aborts with the funding steps spelled out, after confirming the shortfall on a second balance read so a top-up landing that same moment is not blocked; without a TTY (a nightly runner, an MCP host) it only WARNS and proceeds — a balance read has no freshness guarantee, and it must never be what blocks an unattended backup. Skipped entirely when the balance cannot be read at all; CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 (strictly '1') bypasses it for one run. A ton-provider push runs the SAME kind of pre-deploy funds check (querying the owner address's own on-chain balance via tonapi), but only ever WARNS, never aborts — whichever mechanism actually spends (the human's Tonkeeper app, or the auto-sign broadcast itself) already gives its own unambiguous refusal on a real shortfall, so this check exists only to save the trip through the up-to-20-minute wait-for-active-contract poll first. Shares CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 with turbo's check above (not a separate ton-provider-specific flag).
 Consent: restore --pg (pg_restore --clean --if-exists, irreversible) needs --yes or CYPHER_BRAIN_YES=1.
 Permanence: there is NO delete, at any granularity (#301). cypher-brain has no forget/prune/delete
      command and will not grow one: arweave/turbo are write-once, and destroying your identity does

@@ -102,6 +102,7 @@
   },
   "optionalDependencies": {
     "@ardrive/turbo-sdk": "^1.42.0",
+    "@ton/crypto": "^3.2.0",
     "@ton/ton": "^16.3.0"
   },
   "devDependencies": {

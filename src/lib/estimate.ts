@@ -11,8 +11,9 @@ import {
   AR_USD_RATE_URL,
   AR_TURBO_RATES_URL,
   TON_TONAPI_URL,
+  TON_WALLET,
 } from './config.js';
-import { requireFile, errMsg, fmtBytes, sdkImportAdvice } from './util.js';
+import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists } from './util.js';
 import { printJson } from './ui.js';
 import type { CliOptions } from './types.js';
 
@@ -200,6 +201,11 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
       // 1e12-per-AR winston/winc convention arweave/turbo use below) — TON's own
       // "nano" prefix, same as Ethereum's gwei.
       const rate = await tonUsdRate();
+      // Inlined rather than importing wallet.ts's tonWalletConfigured() — wallet.ts
+      // already imports tonUsdRate FROM this module, so the reverse import would be a
+      // circular dependency. The check itself is one line; not worth restructuring
+      // either module to share it.
+      const autoSigns = !!TON_WALLET && (await exists(TON_WALLET));
       return {
         backend,
         size_bytes: sizeBytes,
@@ -211,8 +217,10 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
           `rating ${est.provider.rating.toFixed(2)}) to hold the bag for ${est.spanDays} day(s) ` +
           `(cost ${est.costNano} nanoTON + ${est.amountNano - est.costNano} nanoTON deploy buffer). ` +
           'Durability depends on that provider continuing to renew/serve the contract — weaker than ' +
-          "Arweave's one-time, network-guaranteed permanence (see docs/durability.md). This mode requires " +
-          'a human to sign a Tonkeeper deeplink at push time; it does not run unattended yet.',
+          "Arweave's one-time, network-guaranteed permanence (see docs/durability.md). " +
+          (autoSigns
+            ? 'CYPHER_BRAIN_TON_WALLET is configured — this push will auto-sign and broadcast the deploy itself, no human needed.'
+            : 'This mode requires a human to sign a Tonkeeper deeplink at push time (set CYPHER_BRAIN_TON_WALLET to auto-sign instead).'),
       };
     } catch (e) {
       return {

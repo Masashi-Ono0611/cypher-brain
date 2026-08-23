@@ -35,6 +35,10 @@ trap cleanup EXIT
 export CYPHER_BRAIN_HOME="$TMP/keys"
 export MOCK_TON_STORE="$TMP/store"
 mkdir -p "$MOCK_TON_STORE"
+# Isolates the schedule-eligibility positive controls below (#396 PR2) from the real
+# system launchd/cron — same isolation scripts/selftest-schedule.sh uses.
+export CYPHER_BRAIN_SCHEDULE_DIR="$TMP/sched"
+export CYPHER_BRAIN_LAUNCHD_DIR="$TMP/launchagents"
 
 cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
@@ -107,10 +111,13 @@ export CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL="http://127.0.0.1:$MYTONPROVI
 # keeps returning the generous fixed balance, so that polling path is unaffected.
 cat > "$TMP/mock-tonapi.mjs" <<'MOCKEOF'
 import { createServer } from 'node:http';
-import { existsSync } from 'node:fs';
+import { existsSync, appendFileSync, readFileSync } from 'node:fs';
 const port = Number(process.argv[2]);
 const ownerAddr = process.argv[3];
 const lowBalanceFlagPath = process.argv[4];
+const frozenAddrFlagPath = process.argv[5]; // if present, its CONTENTS name an address to report 'frozen' for
+const seqnoFilePath = process.argv[6]; // if present, its CONTENTS are the seqno to answer /methods/seqno with (default 0)
+const broadcastLogPath = process.argv[7]; // every accepted POST /v2/blockchain/message body is appended here, one BOC per line
 createServer((req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (url.pathname === '/v2/rates') {
@@ -118,13 +125,35 @@ createServer((req, res) => {
     res.end(JSON.stringify({ rates: { TON: { prices: { USD: 3.5 } } } }));
     return;
   }
+  if (req.method === 'POST' && url.pathname === '/v2/blockchain/message') {
+    let body = '';
+    req.on('data', (d) => (body += d));
+    req.on('end', () => {
+      if (broadcastLogPath) appendFileSync(broadcastLogPath, `${body}\n`);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({}));
+    });
+    return;
+  }
+  const seqnoMatch = url.pathname.match(/^\/v2\/blockchain\/accounts\/([^/]+)\/methods\/seqno$/);
+  if (seqnoMatch) {
+    const seqno = seqnoFilePath && existsSync(seqnoFilePath) ? readFileSync(seqnoFilePath, 'utf8').trim() : '0';
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ success: true, exit_code: 0, decoded: { state: Number(seqno) } }));
+    return;
+  }
+  const frozenAddr = frozenAddrFlagPath && existsSync(frozenAddrFlagPath) ? readFileSync(frozenAddrFlagPath, 'utf8').trim() : null;
+  const isFrozenTarget = frozenAddr && url.pathname.includes(frozenAddr);
   const lowBalance = lowBalanceFlagPath && existsSync(lowBalanceFlagPath) && url.pathname.includes(ownerAddr);
   res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ status: 'active', balance: lowBalance ? 1 : 5000000000 }));
+  res.end(JSON.stringify({ status: isFrozenTarget ? 'frozen' : 'active', balance: lowBalance ? 1 : 5000000000 }));
 }).listen(port, '127.0.0.1');
 MOCKEOF
+FROZEN_ADDR_FLAG="$TMP/frozen-addr-flag"
+SEQNO_FILE="$TMP/seqno-value"
+BROADCAST_LOG="$TMP/broadcast-log"
 TONAPI_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" &
+node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" &
 TONAPI_PID=$!
 export CYPHER_BRAIN_TON_TONAPI_URL="http://127.0.0.1:$TONAPI_PORT"
 
@@ -309,5 +338,132 @@ if grep -q 'balance.*looks lower than' "$TMP/low-balance-skip.err"; then
 fi
 rm -f "$LOW_BALANCE_FLAG"
 echo "[PASS] CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences the ton-provider funds-check warning too"
+
+# ========================================================================
+# PR2 (issue #396): local auto-signing — no Tonkeeper, no human. Everything
+# below shares the same mock tonapi/mytonprovider/tonutils-storage/notify
+# infrastructure above; only /v2/blockchain/message (broadcast),
+# /methods/seqno, and a per-address 'frozen' override are new (see the mock
+# tonapi source above).
+# ========================================================================
+
+echo "== wallet create/address/balance --chain ton =="
+cb wallet create --chain ton --out "$TMP/ton-wallet.json" > "$TMP/ton-wallet-create.out"
+TON_WALLET_ADDR=$(cb wallet address --chain ton --wallet "$TMP/ton-wallet.json")
+grep -q "$TON_WALLET_ADDR" "$TMP/ton-wallet-create.out" || { echo "[FAIL] wallet create/address --chain ton disagree on the derived address"; exit 1; }
+echo "[PASS] wallet create --chain ton writes a mnemonic file; wallet address derives the SAME address"
+
+# Codex review, xhigh pass: prove the REFUSED create left the original mnemonic byte-for-byte
+# untouched, not just that it exited non-zero with the right message (a "write then fail"
+# clobber would still pass a message-only check).
+ORIG_WALLET_SHA=$(sha "$TMP/ton-wallet.json")
+if cb wallet create --chain ton --out "$TMP/ton-wallet.json" 2>"$TMP/ton-wallet-clobber.err"; then
+  echo "[FAIL] wallet create --chain ton clobbered an existing wallet without --force"; exit 1
+fi
+grep -q 'already exists' "$TMP/ton-wallet-clobber.err" || { echo "[FAIL] wrong TON wallet no-clobber message"; exit 1; }
+[ "$(sha "$TMP/ton-wallet.json")" = "$ORIG_WALLET_SHA" ] || { echo "[FAIL] the refused create modified the existing wallet file"; exit 1; }
+echo "[PASS] wallet create --chain ton no-clobber guard fired, original mnemonic byte-identical after the refusal"
+
+BAL=$(cb wallet balance --chain ton --wallet "$TMP/ton-wallet.json" --json)
+echo "$BAL" | grep -q '"balance_nanoton":5000000000' || { echo "[FAIL] wallet balance --chain ton did not read the mock tonapi balance: $BAL"; exit 1; }
+echo "[PASS] wallet balance --chain ton reads the (mocked) on-chain balance"
+
+# Raw "workchain:hex" form — what ton-provider.ts's fetchAccountState()/fetchWalletSeqno()
+# key their tonapi URLs on (Address#toRawString()) — needed to target the frozen-wallet
+# mock below with the SAME address the real code will query. Decoded by hand (base64url
+# tag(1) + workchain(1, signed) + hash(32) + crc16(2), TEP-2) instead of importing
+# @ton/ton: a script under $TMP has no node_modules ancestry to resolve it from (the same
+# "run from inside the worktree" constraint ton-provider.ts's own header documents), and
+# this format is simple/stable enough not to need the dependency just to invert it.
+cat > "$TMP/to-raw-addr.mjs" <<'MOCKEOF'
+const buf = Buffer.from(process.argv[2], 'base64url');
+const workchain = buf.readInt8(1);
+const hash = buf.subarray(2, 34).toString('hex');
+console.log(`${workchain}:${hash}`);
+MOCKEOF
+TON_WALLET_ADDR_RAW=$(node "$TMP/to-raw-addr.mjs" "$TON_WALLET_ADDR")
+
+echo "== auto-sign: a configured CYPHER_BRAIN_TON_WALLET signs+broadcasts, no Tonkeeper deeplink =="
+: > "$BROADCAST_LOG"
+AUTO_LOC=$(CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/autosign.err")
+printf '%s' "$AUTO_LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' || { echo "[FAIL] auto-sign locator shape: $AUTO_LOC"; exit 1; }
+grep -q "auto-signing with local wallet $TON_WALLET_ADDR" "$TMP/autosign.err" || { echo "[FAIL] did not report auto-signing with the wallet's own address"; cat "$TMP/autosign.err"; exit 1; }
+if grep -q 'sign this to deploy the contract' "$TMP/autosign.err"; then
+  echo "[FAIL] a Tonkeeper deeplink was printed despite CYPHER_BRAIN_TON_WALLET being configured"; exit 1
+fi
+# Codex review, xhigh pass: a non-empty log only proves SOME POST landed — check the body
+# looks like a real signed BOC (a JSON {"boc":"<base64>"} with a plausible length), not an
+# empty/garbage payload the mock would accept just as happily.
+grep -Eq '"boc":"[A-Za-z0-9+/=]{200,}"' "$BROADCAST_LOG" || {
+  echo "[FAIL] auto-sign's broadcast body doesn't look like a real signed BOC"; cat "$BROADCAST_LOG"; exit 1
+}
+echo "[PASS] auto-sign path: owner derived from the wallet, deploy broadcast (no deeplink, no human)"
+
+echo "== auto-sign: a mismatched CYPHER_BRAIN_TON_PROVIDER_OWNER is a HARD ERROR, not a silent override (Codex review, xhigh pass: unattended reachability means nobody may be watching a warning) =="
+MISMATCHED_OWNER="0:0000000000000000000000000000000000000000000000000000000000000002"
+: > "$BROADCAST_LOG"
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER="$MISMATCHED_OWNER" \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/mismatch.err" >/dev/null; then
+  echo "[FAIL] push succeeded despite a mismatched CYPHER_BRAIN_TON_PROVIDER_OWNER — it must refuse, not silently override"; cat "$TMP/mismatch.err"; exit 1
+fi
+grep -q "CYPHER_BRAIN_TON_PROVIDER_OWNER ($MISMATCHED_OWNER) is set but does not match" "$TMP/mismatch.err" || { echo "[FAIL] mismatch error did not fire"; cat "$TMP/mismatch.err"; exit 1; }
+[ -s "$BROADCAST_LOG" ] && { echo "[FAIL] mismatched-owner push reached broadcast despite being refused"; exit 1; }
+echo "[PASS] owner-mismatch guard: refuses to proceed with an ambiguous owner (no silent override, no broadcast)"
+
+echo "== auto-sign: unsetting the stale CYPHER_BRAIN_TON_PROVIDER_OWNER lets the SAME push succeed (the operator-facing fix the error message above points at) =="
+: > "$BROADCAST_LOG"
+CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/mismatch-fixed.err" >/dev/null \
+  || { echo "[FAIL] push failed after unsetting the stale owner"; cat "$TMP/mismatch-fixed.err"; exit 1; }
+grep -q "auto-signing with local wallet $TON_WALLET_ADDR" "$TMP/mismatch-fixed.err" || { echo "[FAIL] did not auto-sign as the wallet's own address"; cat "$TMP/mismatch-fixed.err"; exit 1; }
+[ -s "$BROADCAST_LOG" ] || { echo "[FAIL] push never reached broadcast after unsetting the stale owner"; exit 1; }
+echo "[PASS] unsetting CYPHER_BRAIN_TON_PROVIDER_OWNER resolves the ambiguity and lets auto-sign proceed"
+
+echo "== auto-sign: a frozen local wallet refuses to sign (no silent spend attempt from a wallet that cannot act) =="
+printf '%s' "$TON_WALLET_ADDR_RAW" > "$FROZEN_ADDR_FLAG"
+: > "$BROADCAST_LOG" # Codex review, xhigh pass: prove the refusal happens BEFORE broadcast, not just that push exits non-zero
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/frozen.err"; then
+  echo "[FAIL] push succeeded despite the local wallet being frozen on-chain"; exit 1
+fi
+grep -q 'is frozen on-chain' "$TMP/frozen.err" || { echo "[FAIL] wrong frozen-wallet message"; cat "$TMP/frozen.err"; exit 1; }
+[ -s "$BROADCAST_LOG" ] && { echo "[FAIL] a frozen wallet still reached broadcast before being refused"; exit 1; }
+rm -f "$FROZEN_ADDR_FLAG"
+echo "[PASS] frozen-wallet guard fired before any broadcast attempt"
+
+echo "== schedule install --backend ton-provider is eligible ONLY when a TON wallet is configured (#396 PR2) =="
+if CYPHER_BRAIN_TON_WALLET= cb schedule install --backend ton-provider --dir "$SRC" --no-load \
+  > "$TMP/schedule-no-wallet.out" 2>"$TMP/schedule-no-wallet.err"; then
+  echo "[FAIL] schedule install accepted ton-provider with no TON wallet configured"; exit 1
+fi
+grep -q 'unknown backend' "$TMP/schedule-no-wallet.err" || { echo "[FAIL] wrong rejection for schedule install without a wallet"; cat "$TMP/schedule-no-wallet.err"; exit 1; }
+echo "[PASS] schedule install rejects ton-provider with no TON wallet configured"
+CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" cb schedule install --backend ton-provider --dir "$SRC" --no-load \
+  > "$TMP/schedule-with-wallet.out" 2>"$TMP/schedule-with-wallet.err" \
+  || { echo "[FAIL] schedule install refused ton-provider WITH a TON wallet configured"; cat "$TMP/schedule-with-wallet.err"; exit 1; }
+echo "[PASS] schedule install accepts ton-provider once a TON wallet is configured"
+
+echo "== schedule install --backend ton-provider ALSO requires its own spend cap + notify binary (Codex review, xhigh pass) =="
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND= \
+  cb schedule install --backend ton-provider --dir "$SRC" --no-load 2>"$TMP/schedule-no-cap.err"; then
+  echo "[FAIL] schedule install accepted ton-provider with no CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND"; exit 1
+fi
+grep -q 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND' "$TMP/schedule-no-cap.err" || { echo "[FAIL] wrong rejection for schedule install with no spend cap"; cat "$TMP/schedule-no-cap.err"; exit 1; }
+echo "[PASS] schedule install rejects ton-provider with no spend cap configured"
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN= \
+  cb schedule install --backend ton-provider --dir "$SRC" --no-load 2>"$TMP/schedule-no-notify.err"; then
+  echo "[FAIL] schedule install accepted ton-provider with no CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN"; exit 1
+fi
+grep -q 'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN' "$TMP/schedule-no-notify.err" || { echo "[FAIL] wrong rejection for schedule install with no notify binary"; cat "$TMP/schedule-no-notify.err"; exit 1; }
+echo "[PASS] schedule install rejects ton-provider with no notify binary configured"
+
+echo "== the installed runner actually CARRIES the ton-provider env vars a nightly push needs (Codex review: install-time checks are worthless if the runner doesn't also get what it checked for) =="
+RUNNER="$CYPHER_BRAIN_SCHEDULE_DIR/nightly.sh"
+[ -f "$RUNNER" ] || { echo "[FAIL] no runner script found at $RUNNER after schedule install"; exit 1; }
+for needle in 'CYPHER_BRAIN_TON_WALLET=' 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND=' 'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN='; do
+  grep -q "$needle" "$RUNNER" || { echo "[FAIL] generated runner is missing $needle"; cat "$RUNNER"; exit 1; }
+done
+echo "[PASS] the generated nightly runner carries CYPHER_BRAIN_TON_WALLET/_MAX_SPEND/_NOTIFY_BIN"
 
 echo "ALL PASS"
