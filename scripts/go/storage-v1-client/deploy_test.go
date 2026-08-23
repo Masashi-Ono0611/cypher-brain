@@ -14,16 +14,16 @@ import (
 func fixedDeployParams(t *testing.T) deployParams {
 	t.Helper()
 	return deployParams{
-		bagID:         bytes.Repeat([]byte{0xaa}, 32),
-		merkleHash:    bytes.Repeat([]byte{0xdd}, 32),
-		dataSizeBytes: 500_000_000,
-		pieceSize:     131072,
-		owner:         address.NewAddress(0, 0, bytes.Repeat([]byte{0xcc}, 32)),
-		provider:      address.NewAddress(0, 0, bytes.Repeat([]byte{0xbb}, 32)),
-		rateNanoPerMB: 1000,
-		spanDays:      7,
-		maxSpendNano:  big.NewInt(1_000_000_000), // 1 TON — plenty of headroom
-		testnet:       true,
+		bagID:          bytes.Repeat([]byte{0xaa}, 32),
+		merkleHash:     bytes.Repeat([]byte{0xdd}, 32),
+		dataSizeBytes:  500_000_000,
+		pieceSize:      131072,
+		owner:          address.NewAddress(0, 0, bytes.Repeat([]byte{0xcc}, 32)),
+		providerPubkey: bytes.Repeat([]byte{0xbb}, 32),
+		rateNanoPerMB:  1000,
+		spanDays:       7,
+		maxSpendNano:   big.NewInt(1_000_000_000), // 1 TON — plenty of headroom
+		testnet:        true,
 	}
 }
 
@@ -50,16 +50,18 @@ func TestBuildDeployDeterministic(t *testing.T) {
 // into contract.PrepareV1DeployData (the actual upstream function — see
 // main.go header): the contract address must change when any STATE field
 // (bag id / merkle hash / data size / piece size / owner) changes, and must
-// NOT change when only the modify_providers BODY fields (provider address,
+// NOT change when only the modify_providers BODY fields (provider pubkey,
 // rate, span) change — since those live in the deploy message body, not in
 // the StateInit data cell that determines the address (verified by reading
 // xssnick/tonutils-storage-provider pkg/contract/v1.go PrepareV1DeployData:
 // ActiveProviders is never set in `data`, and contractAddr is derived from
-// `data` + code only). Getting this positional-argument mapping wrong (e.g.
-// swapping dataSize/pieceSize, or torrentHash/merkleHash) is exactly the
-// class of bug this test is designed to catch, since such a swap would
-// either change addresses that should stay fixed, or fail to change ones
-// that should move.
+// `data` + code only — confirmed 2026-08-23 by a real repair incident: the
+// SAME live contract address stayed valid after correcting the provider
+// list, since providers never touched the address in the first place).
+// Getting this positional-argument mapping wrong (e.g. swapping dataSize/
+// pieceSize, or torrentHash/merkleHash) is exactly the class of bug this
+// test is designed to catch, since such a swap would either change addresses
+// that should stay fixed, or fail to change ones that should move.
 func TestBuildDeployAddressDependsOnStateFieldsOnly(t *testing.T) {
 	base := fixedDeployParams(t)
 	baseRes, err := buildDeploy(base)
@@ -100,7 +102,7 @@ func TestBuildDeployAddressDependsOnStateFieldsOnly(t *testing.T) {
 		}
 	}
 
-	mustMatch("provider", func(p *deployParams) { p.provider = address.NewAddress(0, 0, bytes.Repeat([]byte{0x22}, 32)) })
+	mustMatch("providerPubkey", func(p *deployParams) { p.providerPubkey = bytes.Repeat([]byte{0x22}, 32) })
 	mustMatch("rateNanoPerMB", func(p *deployParams) { p.rateNanoPerMB = 99999 })
 	mustMatch("spanDays", func(p *deployParams) { p.spanDays = 1 })
 }
@@ -124,9 +126,7 @@ func TestBuildDeployValidation(t *testing.T) {
 	}{
 		{"short bagID", func(p *deployParams) { p.bagID = p.bagID[:31] }},
 		{"short merkleHash", func(p *deployParams) { p.merkleHash = p.merkleHash[:31] }},
-		{"provider workchain -1", func(p *deployParams) {
-			p.provider = address.NewAddress(0, 255 /* -1 as byte */, bytes.Repeat([]byte{0xbb}, 32))
-		}},
+		{"short providerPubkey", func(p *deployParams) { p.providerPubkey = p.providerPubkey[:31] }},
 		{"zero rate", func(p *deployParams) { p.rateNanoPerMB = 0 }},
 		{"zero span", func(p *deployParams) { p.spanDays = 0 }},
 		{"zero size", func(p *deployParams) { p.dataSizeBytes = 0 }},
@@ -150,15 +150,15 @@ func TestBuildDeployValidation(t *testing.T) {
 func TestResolveDeployParamsRequiredFlags(t *testing.T) {
 	full := func() *deployFlags {
 		return &deployFlags{
-			bagIDHex:      strings.Repeat("a", 64),
-			providerRaw:   "0:" + strings.Repeat("b", 64),
-			ownerRaw:      "0:" + strings.Repeat("c", 64),
-			rateRaw:       "1000",
-			spanDaysRaw:   "7",
-			sizeBytesRaw:  "500000000",
-			pieceSizeRaw:  "131072",
-			merkleHashRaw: strings.Repeat("d", 64),
-			maxSpendTon:   "0.5",
+			bagIDHex:          strings.Repeat("a", 64),
+			providerPubkeyRaw: strings.Repeat("b", 64),
+			ownerRaw:          "0:" + strings.Repeat("c", 64),
+			rateRaw:           "1000",
+			spanDaysRaw:       "7",
+			sizeBytesRaw:      "500000000",
+			pieceSizeRaw:      "131072",
+			merkleHashRaw:     strings.Repeat("d", 64),
+			maxSpendTon:       "0.5",
 		}
 	}
 
@@ -167,12 +167,13 @@ func TestResolveDeployParamsRequiredFlags(t *testing.T) {
 		mutate func(f *deployFlags)
 	}{
 		{"missing bag-id", func(f *deployFlags) { f.bagIDHex = "" }},
-		{"missing provider", func(f *deployFlags) { f.providerRaw = "" }},
+		{"missing provider-pubkey", func(f *deployFlags) { f.providerPubkeyRaw = "" }},
 		{"missing owner", func(f *deployFlags) { f.ownerRaw = "" }},
 		{"missing rate", func(f *deployFlags) { f.rateRaw = "" }},
 		{"missing span-days", func(f *deployFlags) { f.spanDaysRaw = "" }},
 		{"invalid bag-id", func(f *deployFlags) { f.bagIDHex = "not-hex" }},
-		{"provider workchain -1", func(f *deployFlags) { f.providerRaw = "-1:" + strings.Repeat("b", 64) }},
+		{"provider-pubkey too short", func(f *deployFlags) { f.providerPubkeyRaw = "bb" }},
+		{"provider-pubkey not hex", func(f *deployFlags) { f.providerPubkeyRaw = strings.Repeat("z", 64) }},
 		{"only size-bytes given", func(f *deployFlags) { f.pieceSizeRaw = ""; f.merkleHashRaw = "" }},
 		{"only piece-size given", func(f *deployFlags) { f.sizeBytesRaw = ""; f.merkleHashRaw = "" }},
 		{"invalid max-spend-ton", func(f *deployFlags) { f.maxSpendTon = "not-a-number" }},
@@ -200,7 +201,7 @@ func TestResolveDeployParamsRequiredFlags(t *testing.T) {
 func TestRunDeployOffline(t *testing.T) {
 	args := []string{
 		"--bag-id", strings.Repeat("a", 64),
-		"--provider", "0:" + strings.Repeat("b", 64),
+		"--provider-pubkey", strings.Repeat("b", 64),
 		"--owner", "0:" + strings.Repeat("c", 64),
 		"--rate-nano-per-mb-day", "1000",
 		"--span-days", "7",
@@ -219,12 +220,13 @@ func TestRunDeployOffline(t *testing.T) {
 	}
 
 	out := stdout.String()
+	wantProviderPubkey := "storage-v1-client notify --provider-pubkey " + strings.Repeat("b", 64) + " --contract"
 	for _, want := range []string{
 		"== deploy ==",
 		"contract addr:",
 		"deeplink:       ton://transfer/",
 		"storage-v1-client status --contract",
-		"storage-v1-client notify --provider-pubkey <64hex> --contract",
+		wantProviderPubkey,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("runDeploy output missing %q; full output:\n%s", want, out)
@@ -235,7 +237,7 @@ func TestRunDeployOffline(t *testing.T) {
 func TestRunDeployOfflineGuardExitsAsGuardError(t *testing.T) {
 	args := []string{
 		"--bag-id", strings.Repeat("a", 64),
-		"--provider", "0:" + strings.Repeat("b", 64),
+		"--provider-pubkey", strings.Repeat("b", 64),
 		"--owner", "0:" + strings.Repeat("c", 64),
 		"--rate-nano-per-mb-day", "1000",
 		"--span-days", "7",

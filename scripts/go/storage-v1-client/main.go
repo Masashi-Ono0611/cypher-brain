@@ -55,33 +55,56 @@
 //     instead carried in the SEPARATE modify_providers (0x3dc680ae) message
 //     BODY sent alongside the deploy in the same external message; the
 //     contract merges it into ActiveProviders when it first runs. `deploy`
-//     always includes exactly the one --provider given.
+//     always includes exactly the one --provider-pubkey given.
 //   - Funding + deploying on-chain does NOT by itself make a provider daemon
 //     aware of the contract (internal/service/startup_wallet_scan.go and
 //     stopped_reconciler.go only re-check contracts a provider ALREADY
 //     accepted — they are not a new-contract discovery path, and they are
 //     unexported `internal/` code this program cannot import anyway). The
 //     only new-contract discovery path is the ADNL push `notify` sends.
-//   - CORRECTION (2026-08-23, found before any real deploy — see the fix
-//     commit): a provider has TWO DIFFERENT 32-byte identifiers, not one.
-//     `deploy`'s --provider is the provider's TON WALLET address (its
-//     ProviderV1.Address; ActiveProviders is keyed by address.Data(), the
-//     32-byte hash inside that address — pkg/contract/v1.go
-//     PrepareV1DeployData). `notify`'s --provider-pubkey is the provider's
-//     ADNL/Ed25519 PUBLIC KEY (wrapped as keys.PublicKeyED25519{Key:...} and
-//     hashed to build the DHT lookup key — pkg/transport/client.go
-//     connect()). These are DIFFERENT values in general: a provider's own
-//     ADNL identity key is independent from whatever TON wallet it chooses
-//     to receive payment at, and there is no protocol rule forcing them to
-//     match. Confirmed empirically against two real mytonprovider.org
-//     registry entries: decoding each entry's own `address` field down to
-//     its 32-byte hash never equaled that same entry's `pubkey` field. (An
-//     earlier version of this comment claimed they were always the same
-//     value, generalizing from what tonutils-storage cli/main.go's
-//     address.NewAddress(0, 0, prv) does for a SELF-registration
-//     convenience default — not a guarantee about arbitrary providers.)
-//     mytonprovider.org's registry exposes both fields directly: use
-//     `address` for --provider, `pubkey` for --provider-pubkey.
+//   - SECOND CORRECTION (2026-08-23, this one found via a REAL mainnet
+//     incident — a live deploy + notify against a real provider; see the fix
+//     commit and docs/ton-storage-status.md for the full account): the FIRST
+//     correction above (which split --provider into a wallet address for
+//     deploy vs. a pubkey for notify) was ITSELF wrong. `ProviderV1.Address`
+//     is not a real TON wallet at all — `address.NewAddress(0, 0, pubkey)` is
+//     just how the Go SDK's dict-key API wants the type shaped; only
+//     `.Data()` (the raw pubkey bytes) is ever serialized on-chain
+//     (pkg/contract/v1.go PrepareV1DeployData: `providersDict.SetIntKey(new(
+//     big.Int).SetBytes(provider.Address.Data()), ...)`). Proof: the
+//     contract's proof_storage handler runs `check_signature(...,
+//     signature, key)` against that same dict key — a wallet address (a
+//     StateInit hash) cannot satisfy an Ed25519 signature check; only the
+//     signing key's own public half can. The daemon looks itself up via
+//     `s.key.Public()` (its ProviderKey, internal/service/service.go
+//     FetchStorageInfo), and the reference CLI (tonutils-storage cli/main.go
+//     rentStorage) passes the SAME pubkey bytes to both the ADNL rate query
+//     and the on-chain Address field — never a wallet address. A wallet IS
+//     derived from the same ProviderKey (`wallet.FromPrivateKey(api,
+//     cfg.ProviderKey, wallet.V3R2)`, cmd/main.go), which is why the two
+//     32-byte values can look related without being identical — that
+//     wallet exists to send proof transactions and receive payouts, and is
+//     unrelated to the on-chain dict key. **Both `deploy --provider-pubkey`
+//     and `notify --provider-pubkey` therefore take the SAME value:
+//     mytonprovider.org's registry `pubkey` field** (not its `address`
+//     field). No official TON.org doc states this in prose; it is
+//     established by the contract's own signature check plus consistent
+//     reference-CLI and daemon behavior, which a from-scratch web+source
+//     review (2026-08-23) called "effectively definitive" despite the
+//     absence of an explicit written spec.
+//   - Money-safety note from the same incident: getting this field wrong
+//     does NOT lose funds. StorageV1 pays proof rewards to whichever address
+//     SENDS a valid signed proof message, not to the dictionary key itself —
+//     a contract with the wrong key installed just sits inert (the intended
+//     provider daemon can never find itself, so it never proves, so it never
+//     gets paid, but the contract's balance stays put under the owner's
+//     control). It is also repairable in place: `providers` never touches
+//     the StateInit `data` cell (only bagID/merkleHash/dataSize/pieceSize/
+//     ownerAddr do — see PrepareV1DeployData above), so re-deriving the
+//     contract address with a corrected provider list reproduces the exact
+//     same live address. `update-providers` (updateproviders.go) sends a
+//     bare modify_providers message to that existing address to fix it,
+//     without a new deploy.
 //   - mytonprovider.org's registry `price` field is NOT the raw
 //     rate_per_mb_day the contract wants — it is
 //     rate_per_mb_day * 1024 * 200 * 30 (a 200 GB/30-day cost estimate).
@@ -120,32 +143,34 @@ read-only — it sends a real ADNL request a live provider daemon acts on (see
 the top-of-file comment for detail on its own throwaway session key).
 
 Usage:
-  storage-v1-client deploy --bag-id <64hex> --provider <raw-addr> \
+  storage-v1-client deploy --bag-id <64hex> --provider-pubkey <64hex> \
       --rate-nano-per-mb-day <int> --span-days <int> --owner <raw-addr> \
       [--size-bytes <n> --piece-size <n> --merkle-hash <64hex>] \
       [--mainnet] [--max-spend-ton 0.5]
   storage-v1-client notify --provider-pubkey <64hex> --contract <raw-addr> \
       [--mainnet] [--byte-to-proof <uint64>] [--timeout <seconds>]
   storage-v1-client status --contract <raw-addr> [--mainnet]
+  storage-v1-client update-providers --contract <raw-addr> \
+      --provider-pubkey <64hex> --rate-nano-per-mb-day <int> --span-days <int> \
+      [--gas-ton 0.05] [--mainnet] [--max-spend-ton 0.1]
   storage-v1-client --help
 
 deploy: derives the StorageV1 contract address, builds its StateInit + the
-modify_providers deploy body (with --provider already included — see the
-"field notes" in main.go), computes a suggested funding amount, and prints a
-Tonkeeper deeplink. Refuses (exit 2) if the computed amount exceeds
+modify_providers deploy body (with --provider-pubkey already included — see
+the "field notes" in main.go), computes a suggested funding amount, and
+prints a Tonkeeper deeplink. Refuses (exit 2) if the computed amount exceeds
 --max-spend-ton.
 
   --bag-id <64hex>          required. The bag's TON Storage torrent hash
                              (== StorageV1.TorrentHash). This is the same
                              64-hex value as a cypher-brain "ton:v1:<hex>"
                              locator's suffix.
-  --provider <raw-addr>     required. Raw workchain-0 TON address
-                             ("0:<64hex>") of the target provider's TON
-                             WALLET — mytonprovider.org's registry 'address'
-                             field, NOT its 'pubkey' field (see main.go field
-                             notes; the ADNL/RLDP query 'notify' sends uses a
-                             SEPARATE identifier, --provider-pubkey, on that
-                             subcommand). workchain -1 is refused.
+  --provider-pubkey <64hex> required. The provider's ADNL/Ed25519 public key
+                             — mytonprovider.org's registry 'pubkey' field
+                             (NOT its 'address' field — see main.go field
+                             notes: this is the same value 'notify' below
+                             takes, not a TON wallet address, despite
+                             ProviderV1.Address's Go type name).
   --owner <raw-addr>        required. Raw TON address ("0:<64hex>" or
                              "-1:<64hex>") that will own the contract
                              (StorageV1.OwnerAddr) — normally your own wallet.
@@ -202,11 +227,8 @@ program cannot distinguish "not yet confirmed" from "never happened".
 
   --provider-pubkey <64hex> required. The provider's ADNL/Ed25519 public key
                              — mytonprovider.org's registry 'pubkey' field.
-                             This is a DIFFERENT value from 'deploy'
-                             --provider (which takes the provider's TON
-                             wallet 'address' field instead) — see main.go
-                             field notes for why they are not the same
-                             32 bytes.
+                             Same value 'deploy' and 'update-providers' take
+                             (see main.go field notes).
   --contract <raw-addr>     required. The deployed StorageV1 contract address
                              (printed by 'deploy', or found in your wallet
                              history / tonviewer after signing).
@@ -235,6 +257,35 @@ on-chain and its balance.
 
   --contract <raw-addr>     required.
   --mainnet                 opt in to mainnet. Default: testnet.
+
+update-providers: REPAIR path for an ALREADY-DEPLOYED contract whose provider
+list is wrong or needs changing — sends a bare modify_providers message (no
+StateInit, same contract address, existing balance untouched) instead of a
+new deploy. Added 2026-08-23 after a real incident: 'deploy' (before that
+fix) accepted a provider's TON wallet address instead of its pubkey, so the
+provider daemon could never find itself in the contract. Confirmed the
+contract's data cell (which determines its address) never depends on the
+provider list, so this repairs in place — see main.go field notes.
+REFUSES (exit 2) if --contract is 'nonexist' (use 'deploy' for a new
+contract instead).
+
+  IMPORTANT: this REPLACES the entire on-chain provider list with the single
+  entry given here, not a merge — any other providers already on the
+  contract would be dropped by this call.
+
+  --contract <raw-addr>         required. The EXISTING contract's address.
+  --provider-pubkey <64hex>     required. Same semantics as 'deploy'/'notify'
+                                 above.
+  --rate-nano-per-mb-day <int>  required. See 'deploy' — same conversion note
+                                 applies for mytonprovider.org's 'price' field.
+  --span-days <int>             required. See 'deploy'.
+  --gas-ton <float>              TON attached for message-processing gas only
+                                 — NOT a re-funding of the storage budget (the
+                                 contract keeps its existing balance). Default
+                                 0.05.
+  --max-spend-ton <float>       refuse (exit 2) if --gas-ton would exceed
+                                 this. Default 0.1.
+  --mainnet                     opt in to mainnet (REAL FUNDS). Default: testnet.
 `
 
 func main() {
@@ -262,6 +313,8 @@ func run(args []string, stdout, stderr *os.File) int {
 		err = runNotify(ctx, rest, stdout)
 	case "status":
 		err = runStatus(ctx, rest, stdout)
+	case "update-providers":
+		err = runUpdateProviders(ctx, rest, stdout)
 	default:
 		fmt.Fprintf(stderr, "storage-v1-client: unknown subcommand %q\n\n", sub)
 		fmt.Fprint(stdout, helpText)
