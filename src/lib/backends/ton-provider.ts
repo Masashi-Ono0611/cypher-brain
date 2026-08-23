@@ -77,6 +77,7 @@ import {
 } from '../config.js';
 import { run } from '../proc.js';
 import { sleep, rmrf, errMsg, SdkMissingError, sdkImportAdvice } from '../util.js';
+import { warn } from '../warn.js';
 import { tonApi, startLocalTonDaemon, type TonBagDetails, type LocalTonDaemon } from './ton-client.js';
 import { p2pFetch, entryNameFor } from './ton.js';
 import { progressReporter } from '../progress.js';
@@ -689,6 +690,11 @@ export function tonProviderBackend(): StorageBackend {
         // check: a balance read that fails or looks unusable must never block a push, and
         // CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences it for one run (the same flag, not a
         // ton-provider-specific one — same shortfall-with-no-freshness-guarantee shape).
+        // Both lines go through warn() (#347), not a raw console.error — the same
+        // chokepoint turbo.ts's own funds check already uses — so an agent-driven push
+        // carries this in the MCP result's warnings[] array and the CLI's end-of-run
+        // summary, instead of it only ever landing in a background log (multi-model
+        // review finding: the plain console.error version bypassed both surfaces).
         if (!SKIP_FUNDS_CHECK) {
           try {
             const ownerState = await fetchAccountState(owner);
@@ -696,15 +702,15 @@ export function tonProviderBackend(): StorageBackend {
               throw new Error(`tonapi returned a non-numeric balance: ${JSON.stringify(ownerState.balance)}`);
             }
             if (ownerState.balance < Number(deploy.amountNano)) {
-              console.error(
-                `ton-provider: WARNING — owner ${TON_PROVIDER_OWNER}'s on-chain balance (${ownerState.balance} ` +
+              warn(
+                `ton-provider: owner ${TON_PROVIDER_OWNER}'s on-chain balance (${ownerState.balance} ` +
                   `nanoTON) looks lower than the ${deploy.amountNano} nanoTON this deploy needs; the Tonkeeper ` +
                   'signature below may be rejected for insufficient funds. Fund the wallet first, or set ' +
                   'CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 to silence this check.',
               );
             }
           } catch (e) {
-            console.error(`ton-provider: could not pre-check the owner's balance (${errMsg(e)}); proceeding`);
+            warn(`ton-provider: could not pre-check the owner's balance (${errMsg(e)}); proceeding`);
           }
         }
         console.error(`ton-provider: sign this to deploy the contract (bag stays seeded locally while you do):`);

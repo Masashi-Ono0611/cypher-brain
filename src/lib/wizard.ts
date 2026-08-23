@@ -32,7 +32,8 @@
 // is not a TTY — the same non-interactive-safety posture promptHidden already has —
 // rather than hanging or behaving unpredictably under a CI/pipe invocation.
 import { text, confirm, select, isCancel } from '@clack/prompts';
-import { readFile, writeFile, rm, stat } from 'node:fs/promises';
+import { readFile, writeFile, rm, stat, access } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import {
@@ -44,6 +45,7 @@ import {
   SIGN_RECIPIENT,
   TON_PROVIDER_OWNER,
   TON_PROVIDER_MAX_SPEND,
+  TON_PROVIDER_NOTIFY_BIN,
   readEnv,
 } from './config.js';
 import { keygen, keygenAt } from './keys.js';
@@ -613,7 +615,22 @@ export async function init(_o: CliOptions): Promise<void> {
       // prerequisite is set at all; an actual shortfall remains push's own
       // estimate/consent (arweave/turbo, issue #160) or advisory funds-check
       // (ton-provider, backends/ton-provider.ts) job, unchanged here.
-      const tonProviderReady = Boolean(TON_PROVIDER_OWNER) && TON_PROVIDER_MAX_SPEND > 0n;
+      // NOTIFY_BIN is checked here too (multi-model review finding), not just OWNER/
+      // MAX_SPEND: put() also requires it before it will push (ton-provider.ts checks
+      // both presence AND executability, X_OK, before spending anything) — omitting it
+      // from this precheck would let a run with owner+max-spend set but no built
+      // scripts/go/storage-v1-client binary sail past this guard and fail deep inside
+      // push() anyway, the exact bad UX #161 (and this precheck) exists to avoid.
+      let tonProviderNotifyBinReady = false;
+      if (TON_PROVIDER_NOTIFY_BIN) {
+        try {
+          await access(TON_PROVIDER_NOTIFY_BIN, fsConstants.X_OK);
+          tonProviderNotifyBinReady = true;
+        } catch {
+          tonProviderNotifyBinReady = false;
+        }
+      }
+      const tonProviderReady = Boolean(TON_PROVIDER_OWNER) && TON_PROVIDER_MAX_SPEND > 0n && tonProviderNotifyBinReady;
       if (paid && backend === 'ton-provider' && !tonProviderReady) {
         console.log(
           `\n${backend} needs CYPHER_BRAIN_TON_PROVIDER_OWNER (the TON wallet address that will own the ` +
@@ -621,9 +638,10 @@ export async function init(_o: CliOptions): Promise<void> {
             'a StorageV1 deploy spends real funds, so there is no safe default amount to let through uncapped.',
         );
         console.log(
-          'It also needs a locally built scripts/go/storage-v1-client binary ' +
-            '(CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN) and a HUMAN present to sign a Tonkeeper deeplink at push ' +
-            'time — see "cypher-brain push --help" for the full prerequisite list.',
+          'It also needs a locally built scripts/go/storage-v1-client binary at ' +
+            'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (checked for presence AND executability) and a HUMAN present ' +
+            'to sign a Tonkeeper deeplink at push time — see "cypher-brain push --help" for the full ' +
+            'prerequisite list.',
         );
         console.log(
           `\nEverything this run already set up — primary identity (${IDENTITY})` +
