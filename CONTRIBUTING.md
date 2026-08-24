@@ -108,9 +108,9 @@ slower, more careful review than a typical docs or CLI-ergonomics change:
 - Identity/recipient generation, storage, or file permissions
   (`~/.cypher-brain/*`).
 - The age/typage encryption or decryption call paths.
-- Any storage backend (`file`, `arweave`/`turbo`, `rclone`) — anything that
-  could let ciphertext-only guarantees slip, or that touches wallet/JWK
-  handling.
+- Any storage backend (`file`, `arweave`/`turbo`, `rclone`, `ton`,
+  `ton-provider`) — anything that could let ciphertext-only guarantees slip,
+  or that touches wallet/JWK/TON-wallet handling.
 - The MCP server contract (`src/mcp.ts`) — its tool surface is a public API
   surface for agents.
 - Signal handling (SIGINT/SIGTERM/SIGHUP) and atomic write paths, where a

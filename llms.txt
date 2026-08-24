@@ -2,9 +2,11 @@
 
 > Encrypt a growing second-brain snapshot (gbrain, Claude Code memory, an Obsidian
 > vault, a ChatGPT export) client-side with age (X25519 + ChaCha20-Poly1305), then
-> park the ciphertext permanently on Arweave. Storage backends only ever see
-> ciphertext. Recovery needs just the identity file and a locator — no wallet, no
-> npm package, to pull the bytes back.
+> push the ciphertext to a pluggable storage backend — permanently on Arweave
+> (recommended), or on TON Storage (self-hosted `ton`, or provider-paid
+> `ton-provider`). Storage backends only ever see ciphertext. Recovery needs
+> just the identity file and a locator — no wallet, no npm package, to pull the
+> bytes back.
 
 ## Quickstart
 
@@ -48,7 +50,11 @@ stderr is load-bearing, not decoration. If you run cypher-brain on a human's beh
   whatever your own cloud contract charges), `ton` (TON Storage seeded from
   your OWN always-on box over SSH; pull is a credential-less P2P download by
   bag id, with a loud fallback to the seeder — free per upload, but NOT
-  permanent: retrievable only while a reachable seeder retains the bag).
+  permanent: retrievable only while a reachable seeder retains the bag),
+  `ton-provider` (TON Storage paid to a live third-party provider from
+  mytonprovider.org instead of a seeder box you run yourself — signed via a
+  Tonkeeper deeplink by default, or auto-signed with a local TON wallet;
+  also NOT permanent — depends on the chosen provider staying up).
   `publish-latest` is a separate, opt-in command that points a .ton DNS domain's
   storage record at the latest ton bag (never run automatically) — the CLI
   never signs; it only prints a Tonkeeper deeplink for the operator to approve.
@@ -56,10 +62,11 @@ stderr is load-bearing, not decoration. If you run cypher-brain on a human's beh
   (raw, not passphrase-wrapped — keep the kit itself physically secure), the
   latest locator, and restore steps. Kit-only recovery on a fresh machine needs
   both the backup key (`init` defaults to generating one, but it can be
-  declined) and a portable backend (`turbo`/`arweave`/`ton` — `file` locators are
-  machine-local). After later pushes, the CLI-only `cypher-brain recovery-kit`
-  regenerates it against the current locator (no MCP tool on purpose: the kit
-  can embed private key blocks, which must never enter agent context).
+  declined) and a portable backend (`turbo`/`arweave`/`ton`/`ton-provider` —
+  `file` locators are machine-local). After later pushes, the CLI-only
+  `cypher-brain recovery-kit` regenerates it against the current locator (no
+  MCP tool on purpose: the kit can embed private key blocks, which must never
+  enter agent context).
 - **signing keypair** (optional, `keygen --sign`) — age gives confidentiality +
   tamper detection but not *authenticity* (a recipient's public key is not a
   secret, so anyone holding it can forge decryptable ciphertext). A separate

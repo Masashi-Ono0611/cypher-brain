@@ -684,7 +684,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       CLI-only by design: no MCP tool exposes this (the kit can embed PRIVATE key blocks,
       which must never land in an agent's tool-result context or logs).
 
-  cypher-brain schedule install --backend <file|arweave|turbo> [--at HH:MM] [--max-spend <n>] [--no-load]
+  cypher-brain schedule install --backend <file|arweave|turbo|ton-provider> [--at HH:MM] [--max-spend <n>] [--no-load]
                                 [--profile <name>] [--pg <conn>] [--pg-table <t>]...
                                 [--pg-filter <file>] [--pg-exclude-table-data <t>]... [--dir <path>]...
                                 [--recipient <pubkey|file>]... [--vault <path>] [--zip <path>] [--export <path>]

@@ -118,9 +118,12 @@ above — worth stating plainly rather than glossing over:
   `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND`) — but that payment is NOT the one-time,
   network-guaranteed permanence Arweave's payment buys; it funds one provider's
   commitment to keep renewing.
-- **Never unattended.** The deploy is signed via a Tonkeeper deeplink — a human
-  must be present to approve it, unlike arweave/turbo's locally-held JWK
-  wallet — so this backend does not (yet) support `schedule install`.
+- **Unattended only with a local wallet.** By default the deploy is signed via
+  a Tonkeeper deeplink — a human must be present to approve it. Configuring a
+  local TON wallet (`wallet create --chain ton`, `CYPHER_BRAIN_TON_WALLET`)
+  makes signing automatic instead, the same locally-held-key posture
+  arweave/turbo's JWK has, and is what makes this backend `schedule
+  install`-eligible.
 - **In the 3-2-1 framing**, treat `ton-provider` the way `ton` is treated
   above: useful redundancy alongside `turbo`'s permanence, never a substitute
   for it. Between `ton` and `ton-provider` themselves, neither substitutes for
