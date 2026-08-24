@@ -64,6 +64,7 @@ const pubkey = process.argv[3];
 const address = process.argv[4];
 const emptyFlagPath = process.argv[5]; // if this file exists, respond with zero candidates
 const badSpanFlagPath = process.argv[6]; // if this file exists, min_span rounds up past max_span
+const highPriceFlagPath = process.argv[7]; // if this file exists, price -> a rate that clears the #403 bounty floor for the high-price test payload
 createServer((req, res) => {
   let body = '';
   req.on('data', (d) => (body += d));
@@ -71,6 +72,7 @@ createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     const empty = emptyFlagPath && existsSync(emptyFlagPath);
     const badSpan = badSpanFlagPath && existsSync(badSpanFlagPath);
+    const highPrice = highPriceFlagPath && existsSync(highPriceFlagPath);
     res.end(
       JSON.stringify({
         providers: empty
@@ -81,7 +83,11 @@ createServer((req, res) => {
                 address,
                 uptime: 99.5,
                 rating: 20.5,
-                price: 4915200000, // -> rate 800 nanoTON/MB/day (price / (1024*200*30))
+                // -> rate 800 nanoTON/MB/day (price / (1024*200*30)); the high-price
+                // control (#403) uses -> rate 2e8 nanoTON/MB/day instead, comfortably
+                // clearing the provider-side bounty floor for that test's ~50KB payload
+                // (see estimatedBountyNano()'s comment for the real formula this mirrors).
+                price: highPrice ? 1228800000000000 : 4915200000,
                 // Normal case: min_span=7 days exactly, well under max_span. Bad-span
                 // case: min_span rounds UP to 2 days (ceil(90000/86400)) but max_span is
                 // only 1.5 days — exercises spanDaysFor()'s own guard.
@@ -97,7 +103,7 @@ createServer((req, res) => {
 }).listen(port, '127.0.0.1');
 MOCKEOF
 MYTONPROVIDER_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-mytonprovider.mjs" "$MYTONPROVIDER_PORT" "$PROVIDER_PUBKEY" "$PROVIDER_WALLET" "$TMP/empty-providers-flag" "$TMP/bad-span-flag" &
+node "$TMP/mock-mytonprovider.mjs" "$MYTONPROVIDER_PORT" "$PROVIDER_PUBKEY" "$PROVIDER_WALLET" "$TMP/empty-providers-flag" "$TMP/bad-span-flag" "$TMP/high-price-flag" &
 MYTONPROVIDER_PID=$!
 export CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL="http://127.0.0.1:$MYTONPROVIDER_PORT"
 
@@ -185,9 +191,13 @@ cat > "$SHIM/fake-notify" <<EOF
 # "wait until fully downloaded" retry loop can be exercised deterministically (see the
 # partial-then-full positive control below) instead of only ever answering "done" once.
 STATE="$TMP/notify-downloaded"
+REASON_FILE="$TMP/notify-reason-override"
+# issue #404: records the args THIS call received, overwriting each time — the
+# network-selection positive controls below check the MOST RECENT call only.
+printf '%s\n' "\$@" > "$TMP/notify-args.log"
 echo "== notify response =="
 echo "  status:     active"
-echo "  reason:     ok"
+echo "  reason:     \$(cat "\$REASON_FILE" 2>/dev/null || echo ok)"
 echo "  downloaded: \$(cat "\$STATE" 2>/dev/null || echo 0) bytes"
 EOF
 chmod +x "$SHIM/fake-notify"
@@ -234,6 +244,61 @@ if grep -q 'balance.*looks lower than' "$TMP/push.err"; then
   echo "[FAIL] the funds-check warning fired despite a sufficient mock balance"; cat "$TMP/push.err"; exit 1
 fi
 echo "[PASS] the pre-deploy funds check stays silent when the owner's balance is sufficient"
+
+# issue #403: the mock registry's default 800 nanoTON/MB/day rate against this tiny
+# test snapshot computes a bounty far below the provider-side floor — the SAME real
+# math a live tonutils-storage-provider enforces (verified against its own source,
+# see estimatedBountyNano()'s comment). This is the FIRST push above, not a separate
+# run — proving the warning fires on an already-exercised, realistic scenario rather
+# than one contrived just to trip it.
+grep -q 'looks BELOW the' "$TMP/push.err" || { echo "[FAIL] the bounty-floor warning did not fire despite a computed bounty far under 0.05 TON"; cat "$TMP/push.err"; exit 1; }
+echo "[PASS] push warns when the computed bounty looks below the provider-side floor (#403)"
+
+echo "== positive control: the bounty-floor warning stays silent when the computed bounty clears the floor =="
+mkdir -p "$TMP/high-price-src"
+# Padded to ~80KB of RANDOM bytes (not zeros — `cb snapshot` tar.gz's its source before
+# encrypting, and gzip crushes a run of zeros down to a few hundred bytes, silently
+# undermining the size this test's bounty math depends on) so the #403 bounty math
+# clears the floor at a modest rate instead of needing an extreme one that would also
+# blow the deploy's own CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND cap (bounty and deploy cost
+# both scale with rate).
+head -c 80000 /dev/urandom | base64 > "$TMP/high-price-src/note.txt"
+cb snapshot --dir "$TMP/high-price-src" --out "$TMP/high-price.age"
+HP_SIZE=$(stat -f%z "$TMP/high-price.age" 2>/dev/null || stat -c%s "$TMP/high-price.age")
+echo "$HP_SIZE" > "$TMP/notify-downloaded"
+touch "$TMP/high-price-flag"
+CYPHER_BRAIN_YES=1 cb push --in "$TMP/high-price.age" --backend ton-provider 2>"$TMP/high-bounty.err" >/dev/null \
+  || { echo "[FAIL] push failed under the high-price mock"; cat "$TMP/high-bounty.err"; exit 1; }
+if grep -q 'looks BELOW the' "$TMP/high-bounty.err"; then
+  echo "[FAIL] the bounty-floor warning fired despite a comfortably-above-floor rate"; cat "$TMP/high-bounty.err"; exit 1
+fi
+echo "[PASS] the bounty-floor warning stays silent once the computed bounty clears the floor"
+
+echo "== estimate --backend ton-provider also carries the bounty-floor warning when under-floor (#403) =="
+rm -f "$TMP/high-price-flag" # back to the default (low) rate so this estimate is under-floor
+EST2=$(cb estimate --in "$TMP/high-price.age" --backend ton-provider --json)
+echo "$EST2" | grep -q 'looks below the ~0.05 TON floor' || { echo "[FAIL] estimate's note did not carry the bounty-floor warning: $EST2"; exit 1; }
+echo "[PASS] estimate warns about an under-floor bounty before any funds move"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore for the pull test below
+
+echo "== notify uses --mainnet by default (issue #404, no CYPHER_BRAIN_TON_NETWORK_CONFIG set) =="
+grep -qx -- '--mainnet' "$TMP/notify-args.log" || { echo "[FAIL] the default (unset TON_NETWORK_CONFIG) push did not pass --mainnet to notify"; cat "$TMP/notify-args.log"; exit 1; }
+echo "[PASS] notify defaults to --mainnet, matching every prior push in this script"
+
+echo "== positive control: CYPHER_BRAIN_TON_NETWORK_CONFIG set -> notify omits --mainnet (issue #404) =="
+mkdir -p "$TMP/testnet-src"
+printf 'ton-provider testnet-network-selection test payload\n' > "$TMP/testnet-src/note.txt"
+cb snapshot --dir "$TMP/testnet-src" --out "$TMP/testnet.age"
+TN_SIZE=$(stat -f%z "$TMP/testnet.age" 2>/dev/null || stat -c%s "$TMP/testnet.age")
+echo "$TN_SIZE" > "$TMP/notify-downloaded"
+CYPHER_BRAIN_TON_NETWORK_CONFIG="$TMP/fake-testnet-global.config.json" CYPHER_BRAIN_YES=1 \
+  cb push --in "$TMP/testnet.age" --backend ton-provider 2>"$TMP/testnet-push.err" >/dev/null \
+  || { echo "[FAIL] push failed with CYPHER_BRAIN_TON_NETWORK_CONFIG set"; cat "$TMP/testnet-push.err"; exit 1; }
+if grep -qx -- '--mainnet' "$TMP/notify-args.log"; then
+  echo "[FAIL] notify still received --mainnet despite CYPHER_BRAIN_TON_NETWORK_CONFIG being set"; cat "$TMP/notify-args.log"; exit 1
+fi
+echo "[PASS] notify omits --mainnet once CYPHER_BRAIN_TON_NETWORK_CONFIG points at a (mock) testnet config, matching startLocalTonDaemon()'s own signal"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore for the pull test below
 
 echo "== pull over the (mock) P2P path =="
 rm -f "$TMP/snap.age"
@@ -321,6 +386,28 @@ grep -q 'ton-provider notify:' "$TMP/partial.err" || { echo "[FAIL] push did not
 grep -Eq 'did not (finish fetching the bag|report a full download)' "$TMP/partial.err" || { echo "[FAIL] push did not time out with the expected message"; exit 1; }
 echo "$SIZE" > "$TMP/notify-downloaded" # restore for any later runs
 echo "[PASS] push correctly waits on a partial provider download instead of declaring success early"
+
+echo "== positive control: the provider's own notify 'reason' is surfaced immediately, not discarded until timeout (#403) =="
+echo "1" > "$TMP/notify-downloaded" # partial again, so the retry loop actually runs
+printf 'bounty should be at least 0.05 TON to cover fees' > "$TMP/notify-reason-override"
+if CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS=2000 CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS=500 \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/reason-surfaced.err"; then
+  echo "[FAIL] push returned despite a partial download"; exit 1
+fi
+grep -q 'notify response so far.*bounty should be at least 0.05 TON to cover fees' "$TMP/reason-surfaced.err" \
+  || { echo "[FAIL] the provider's own refusal reason was not surfaced in the retry loop"; cat "$TMP/reason-surfaced.err"; exit 1; }
+# dedup check (#403): an UNCHANGED reason across ~4 retries (2000ms/500ms) must print
+# ONCE live, not every attempt — a loop that repeats the identical line for the full
+# 10min default window in real usage is exactly the noise this fix must not
+# reintroduce. Expected count is 2, not 1: warn() (#347) also reprints every recorded
+# warning verbatim in the end-of-run "run summary" block, so one live occurrence plus
+# one summary occurrence is the CORRECT total — this also incidentally confirms the
+# reason warning flows through the same #347 summary mechanism as every other warning.
+REASON_COUNT=$(grep -c 'notify response so far.*bounty should be at least 0.05 TON to cover fees' "$TMP/reason-surfaced.err")
+[ "$REASON_COUNT" = "2" ] || { echo "[FAIL] the reason line appeared $REASON_COUNT time(s), expected exactly 2 (1 live + 1 run-summary) — dedup or the #347 summary broke"; cat "$TMP/reason-surfaced.err"; exit 1; }
+rm -f "$TMP/notify-reason-override"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore for any later runs
+echo "[PASS] the provider's stated reason is surfaced once, immediately, and not repeated while unchanged"
 
 echo "== positive control: an insufficient owner balance WARNS but does not abort the push (advisory funds check, #396 Phase B) =="
 touch "$LOW_BALANCE_FLAG"

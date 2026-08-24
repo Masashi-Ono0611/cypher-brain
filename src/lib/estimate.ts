@@ -218,6 +218,11 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
           `(cost ${est.costNano} nanoTON + ${est.amountNano - est.costNano} nanoTON deploy buffer). ` +
           'Durability depends on that provider continuing to renew/serve the contract — weaker than ' +
           "Arweave's one-time, network-guaranteed permanence (see docs/durability.md). " +
+          (est.belowBountyFloor
+            ? `⚠ computed bounty (${est.bountyNano} nanoTON) looks below the ~0.05 TON floor providers built on ` +
+              "tonutils-storage-provider enforce — this provider's notify may refuse to ever fetch the bag even " +
+              'though the deploy itself would still succeed and be paid for (issue #403). '
+            : '') +
           (autoSigns
             ? 'CYPHER_BRAIN_TON_WALLET is configured — this push will auto-sign and broadcast the deploy itself, no human needed.'
             : 'This mode requires a human to sign a Tonkeeper deeplink at push time (set CYPHER_BRAIN_TON_WALLET to auto-sign instead).'),
