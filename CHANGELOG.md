@@ -68,5 +68,7 @@ project's major milestones so far, from the initial proof-of-concept to today.
 
 - Bumped the Node floor to `>=22` (LTS) and moved CI to `actions/checkout`
   and `actions/setup-node` v5.
-- Repositioned documentation to be Arweave-first (Turbo mainline, TON
-  storage experimental, later removed).
+- Repositioned documentation to be Arweave-first (Turbo mainline) at the time
+  this entry was written. TON Storage was reintroduced afterward as two
+  full backends — self-hosted `ton` and provider-paid `ton-provider` — see
+  the Backends section of README.md.

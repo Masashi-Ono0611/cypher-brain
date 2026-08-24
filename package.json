@@ -8,6 +8,8 @@
     "encryption",
     "backup",
     "arweave",
+    "ton",
+    "ton-storage",
     "mcp",
     "second-brain",
     "permanent-storage",
