@@ -374,6 +374,47 @@ been exercised against a real testnet provider, not just mainnet.
   providers now known and reachable, testing against a real third party
   (see the section above) largely supersedes this twin for that goal — it
   stays standing as a controlled environment.
+- **Registration address bug, and a re-registration mistake it caused
+  (2026-08-24/25).** The original mainnet registration above (pubkey
+  `f5f603c7…`) turned out to have been submitted from the operator's personal
+  Tonkeeper wallet rather than the provider's own operating wallet. The
+  registry backend's `AddProviders` does `ON CONFLICT DO NOTHING` on
+  `public_key`, so that `address` is now permanently fixed for that pubkey —
+  it can never be corrected by re-sending, and `status`/`location` can never
+  populate for it (the backend's status/location workers scan the registered
+  `address` for activity, not the real provider wallet). A second pubkey
+  (`4c9f6003…`), registered correctly this time (send from the provider's own
+  wallet), landed on-chain successfully but never appeared in
+  `/api/v1/providers/search` after 9+ hours — reported as
+  [dearjohndoe/mytonprovider-backend#21](https://github.com/dearjohndoe/mytonprovider-backend/issues/21),
+  still unexplained, abandoned as a dead end. A third attempt (pubkey
+  `3a7fe754…`) initially failed for an unrelated, self-inflicted reason: the
+  registration transaction was sent with `bounce: true` to the shared
+  registration address (`0:7777…7777`), which is deliberately `uninit`
+  (no code deployed) — TON's standard behavior for a bounceable message to an
+  uninit account is to skip the compute phase and bounce the funds back to
+  the sender, so the message never reached the registry at all. This was
+  initially — and wrongly — reported to the same upstream issue as a second
+  instance of the backend problem; the mistake was found by re-deriving the
+  destination address from the actual tx (it wasn't `0:7777…7777` at all —
+  the sender had mis-identified a wallet-to-wallet funding transfer as the
+  registration tx) and corrected in the issue thread. **Root cause, confirmed
+  by reading both client implementations**: `xssnick/tonutils-go`'s
+  `wallet.SimpleMessage()` hardcodes `Bounce: true` — a footgun for exactly
+  this case — whereas the official Python registration tool
+  (`igroman787/mytonprovider`, via `pytoniq`) passes the destination as a raw
+  `workchain:hex` string, and `pytoniq_core`'s `Address` class only sets
+  `is_bounceable = True` when parsing the base64 (user-friendly) form — a raw
+  address always leaves it at its `False` default — so the official tool
+  sends `bounce=false` without anyone having to think about it. Re-sent with
+  `wallet.TransferNoBounce()` (the dedicated non-bounceable transfer method);
+  confirmed on-chain (`bounce: false`, `bounced: false`, `success: true`).
+  **Operational rule going forward**: any future registration send (key
+  rotation, additional provider identities) should either use the official
+  `igroman787/mytonprovider` `register` command directly, or, if scripted
+  against `tonutils-go`, always use `TransferNoBounce` (or an explicit
+  `.Bounce(false)`) — never `SimpleMessage` — for a send to the shared
+  registration address.
 - Two findings from source (xssnick/tonutils-storage-provider), still valid:
   1. The Go provider **never self-deploys a contract** — deployment is always
      client-initiated; the daemon answers ADNL rate queries and reacts to a
