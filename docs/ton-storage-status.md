@@ -423,6 +423,92 @@ been exercised against a real testnet provider, not just mainnet.
   directly, or, if scripted against `tonutils-go`, always use
   `TransferNoBounce` (or an explicit `.Bounce(false)`) — never
   `SimpleMessage` — for a send to the shared registration address.
+- **Registry listing needs more than a successful registration tx — a live
+  daemon answering the same probe the backend makes (2026-08-25).** After
+  pubkey `3a7fe754…` registered successfully on-chain, it still did not
+  appear in `/api/v1/providers/search`. Reading
+  `dearjohndoe/mytonprovider-backend`'s `pkg/workers/providersMaster/worker.go`
+  showed why: `UpdateKnownProviders` polls every known pubkey with the same
+  `transport.Client.GetStorageRates` ADNL/RLDP call this repo's own
+  `storage-v1-client` uses, and only flips `is_initialized` to `true` on a
+  successful response; the search query itself additionally requires
+  `rating`/`uptime` populated by separate periodic workers
+  (`is_initialized AND rating IS NOT NULL AND uptime IS NOT NULL`). The
+  droplet's actual running daemon (`/opt/tsp/config.json`) still had the
+  *old* pubkey's `ProviderKey` loaded — the newly-registered pubkeys had no
+  daemon answering for them at all, so the backend's probe could never
+  succeed. This was **not a backend defect**; it was our own sequencing
+  ("register, then switch the daemon" instead of "run the daemon under the
+  new identity, then register"). Verified independently from an external
+  machine (not the droplet) with a standalone program built against the same
+  `xssnick/tonutils-go` + `xssnick/tonutils-storage-provider` libraries the
+  backend uses — `GetStorageRates` succeeded for `3a7fe754…` once the daemon
+  was actually running under that key, and a positive control against the
+  old, known-working pubkey confirmed the test method itself wasn't a false
+  positive. Registration appeared in the registry **28 minutes** after daemon
+  startup (not the "one day+" first reported — that was a same-day/UTC-date
+  mixup, corrected before being acted on). Reported to
+  [dearjohndoe/mytonprovider-backend#21](https://github.com/dearjohndoe/mytonprovider-backend/issues/21)
+  as a root-cause writeup and closed (no backend fix needed).
+- **Parallel canary, not in-place rotation — and a real near-miss found in
+  time (2026-08-25).** The safe way to move masabrain onto a corrected
+  identity is NOT to overwrite the running provider's config in place: doing
+  so risks the live daemon (still actively serving the real `f5f603c7…`
+  contract) going dark mid-migration with nothing to fall back to. Instead, a
+  second `tonutils-storage-provider` instance was run side by side — separate
+  systemd unit (`tsp-canary.service`), separate `config.json`/db directory
+  (`/opt/tsp-canary/`), separate UDP port (`18557`, picked only after
+  confirming `18556` was already in live use by the unrelated testnet
+  experiment twin) — so the old daemon was never touched until the new one
+  was independently verified end to end.
+  A second, more serious near-miss surfaced at the deploy step itself:
+  reusing the *same* bag + *same* owner address as the original masabrain
+  contract to "redeploy" for the new provider pubkey produced the **identical
+  contract address** — StorageV1's address is `hash(StateInit)`, which
+  depends only on `(TorrentHash, MerkleHash, DataSize, PieceSize, OwnerAddr)`;
+  the provider pubkey isn't part of it at all (it only enters via a separate
+  `modify_providers` message body). Signing that deeplink would not have
+  deployed an independent canary — `modify_providers` **replaces the entire
+  on-chain provider set** with whatever dict is in the message body (verified
+  against `xssnick/tonutils-contracts`' `storage-contract.fc`, and consistent
+  with this repo's own `update-providers` warning that it "REPLACES the
+  entire on-chain provider list"). A single-provider deploy body would have
+  silently dropped the old, real, actively-serving provider and swapped in
+  the new one in-place — exactly the risky in-place rotation this whole
+  exercise was trying to avoid, with real money already moving. Caught before
+  signing by asking a second model to check the deeplink's simulated effect
+  against the contract source, not by observation alone. Fixed by using a
+  **different owner wallet** for the canary deploy, which (correctly)
+  produces a distinct contract address — confirmed by offline address
+  recomputation before any funds moved.
+  A second, unrelated near-miss happened at the signing step: Tonkeeper's
+  pre-sign simulation showed the `Call contract` step as `Failed`. Root cause
+  was mundane — the wallet actually selected/active in the Tonkeeper app at
+  that moment wasn't the new owner wallet the deploy was built for, so the
+  contract's `equal_slices(sender_address, owner)` check in
+  `modify_providers` would have rejected the call. Re-selecting the correct
+  account in Tonkeeper before opening the deeplink again produced a clean
+  simulation and a successful send. (The `EQ…`/`UQ…` address prefixes shown
+  in that same Tonkeeper screen are not different accounts — they're the
+  same raw address in bounceable vs. non-bounceable friendly-address form,
+  same 32-byte account ID.)
+  Once deployed to the independent contract (`0:ebf4e8cb…`), the full cycle
+  was verified end to end before touching the old daemon: `notify` succeeded
+  (provider self-reported the full 481 MB bag, corroborated by the seeder's
+  own log line acknowledging the same bag as already fully held — no
+  separate re-download needed, since provider and seeder share the same
+  underlying bag storage on this droplet); a real `proof_storage` →
+  `storage_reward_withdrawal` cycle completed on-chain (0.1197 TON payout,
+  matching the original contract's payout amount exactly, as expected for an
+  identical bag/rate/span); the canary daemon was restarted twice and
+  self-recovered cleanly each time (re-discovered the contract, re-verified
+  the bag, resumed). Only after all of that — and confirming the old
+  contract had no overdue proof obligation at the time — was the old
+  provider daemon (`tonutils-storage-provider.service`, pubkey `f5f603c7…`)
+  stopped and disabled. Its contract (`0:465347a9…`, ~0.35 TON balance) is
+  now orphaned but not unrecoverable: `xssnick/tonutils-storage-provider`'s
+  `pkg/contract.PrepareWithdrawalRequest` gives the owner a withdrawal path,
+  just not yet wired into this repo's tooling.
 - Two findings from source (xssnick/tonutils-storage-provider), still valid:
   1. The Go provider **never self-deploys a contract** — deployment is always
      client-initiated; the daemon answers ADNL rate queries and reacts to a
