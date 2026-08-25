@@ -445,11 +445,12 @@ been exercised against a real testnet provider, not just mainnet.
   backend uses — `GetStorageRates` succeeded for `3a7fe754…` once the daemon
   was actually running under that key, and a positive control against the
   old, known-working pubkey confirmed the test method itself wasn't a false
-  positive. Registration appeared in the registry **28 minutes** after daemon
+  positive. The provider appeared in the registry **28 minutes** after daemon
   startup (not the "one day+" first reported — that was a same-day/UTC-date
   mixup, corrected before being acted on). Reported to
   [dearjohndoe/mytonprovider-backend#21](https://github.com/dearjohndoe/mytonprovider-backend/issues/21)
   as a root-cause writeup and closed (no backend fix needed).
+
 - **Parallel canary, not in-place rotation — and a real near-miss found in
   time (2026-08-25).** The safe way to move masabrain onto a corrected
   identity is NOT to overwrite the running provider's config in place: doing
@@ -461,11 +462,13 @@ been exercised against a real testnet provider, not just mainnet.
   confirming `18556` was already in live use by the unrelated testnet
   experiment twin) — so the old daemon was never touched until the new one
   was independently verified end to end.
+
   A second, more serious near-miss surfaced at the deploy step itself:
   reusing the *same* bag + *same* owner address as the original masabrain
   contract to "redeploy" for the new provider pubkey produced the **identical
-  contract address** — StorageV1's address is `hash(StateInit)`, which
-  depends only on `(TorrentHash, MerkleHash, DataSize, PieceSize, OwnerAddr)`;
+  contract address** — StorageV1's address is `hash(StateInit)`, which for a
+  fixed contract code and workchain depends only on
+  `(TorrentHash, MerkleHash, DataSize, PieceSize, OwnerAddr)`;
   the provider pubkey isn't part of it at all (it only enters via a separate
   `modify_providers` message body). Signing that deeplink would not have
   deployed an independent canary — `modify_providers` **replaces the entire
@@ -481,6 +484,7 @@ been exercised against a real testnet provider, not just mainnet.
   **different owner wallet** for the canary deploy, which (correctly)
   produces a distinct contract address — confirmed by offline address
   recomputation before any funds moved.
+
   A second, unrelated near-miss happened at the signing step: Tonkeeper's
   pre-sign simulation showed the `Call contract` step as `Failed`. Root cause
   was mundane — the wallet actually selected/active in the Tonkeeper app at
@@ -492,6 +496,7 @@ been exercised against a real testnet provider, not just mainnet.
   in that same Tonkeeper screen are not different accounts — they're the
   same raw address in bounceable vs. non-bounceable friendly-address form,
   same 32-byte account ID.)
+
   Once deployed to the independent contract (`0:ebf4e8cb…`), the full cycle
   was verified end to end before touching the old daemon: `notify` succeeded
   (provider self-reported the full 481 MB bag, corroborated by the seeder's
