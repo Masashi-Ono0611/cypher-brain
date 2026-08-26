@@ -294,11 +294,12 @@ async function walletAddress(o: CliOptions): Promise<void> {
 // different wallet than what was reviewed. Returns null (never throws) when nothing is
 // configured or the configured credential cannot be read: a plan can still be built
 // and applied without a payer bound (e.g. planning before a wallet is funded), it
-// just cannot detect a payer swap in that case. Callers reach this via a DYNAMIC
-// import (see estimate.ts's `estimate()`), not a static one, for the same reason
-// estimate.ts already inlines tonWalletConfigured() rather than importing it: this
-// module statically imports estimate.ts's rate functions, so a static reverse import
-// would be circular.
+// just cannot detect a payer swap in that case. estimate.ts's `estimate()` reaches
+// this via a DYNAMIC import specifically — this module statically imports estimate.ts's
+// rate functions, so a static import back from estimate.ts would be circular (the same
+// reason estimate.ts already inlines tonWalletConfigured() rather than importing it).
+// pushpull.ts has no such cycle (it does not export anything wallet.ts imports), so it
+// imports payerAddressFor statically like any other function here.
 export async function payerAddressFor(backend: string, o: CliOptions): Promise<string | null> {
   if (backend === 'arweave' || backend === 'turbo') {
     const walletPath = o.wallet || AR_WALLET || WALLET_DEFAULT_PATH;

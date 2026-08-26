@@ -64,11 +64,17 @@ fi
 grep -q 'is for backend "file"' "$TMP/backend-mismatch.err" || { echo "[FAIL] wrong backend-mismatch message"; cat "$TMP/backend-mismatch.err"; exit 1; }
 echo "[PASS] backend-mismatch guard fired"
 
-# positive control: expired plan
+# positive control: expired plan (created_at/expires_at kept internally CONSISTENT —
+# both pushed into the past by the same 15-minute TTL — so this exercises the expiry
+# check specifically, not the tamper-consistency check below)
 python3 -c "
 import json
+from datetime import datetime, timedelta, timezone
 p = json.load(open('$TMP/plan.json'))
-p['expires_at'] = '2020-01-01T00:00:00.000Z'
+created = datetime(2020, 1, 1, tzinfo=timezone.utc)
+p['created_at'] = created.strftime('%Y-%m-%dT%H:%M:%S.') + f'{created.microsecond // 1000:03d}Z'
+expires = created + timedelta(milliseconds=900000)
+p['expires_at'] = expires.strftime('%Y-%m-%dT%H:%M:%S.') + f'{expires.microsecond // 1000:03d}Z'
 json.dump(p, open('$TMP/plan-expired.json', 'w'))
 "
 if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan-expired.json" >"$TMP/expired.out" 2>"$TMP/expired.err"; then
@@ -76,6 +82,36 @@ if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend fil
 fi
 grep -q "plan expired at" "$TMP/expired.err" || { echo "[FAIL] wrong expired-plan message"; cat "$TMP/expired.err"; exit 1; }
 echo "[PASS] expired-plan guard fired"
+
+# positive control: tampered plan — ONLY expires_at bumped, created_at left alone, so
+# the created_at+TTL relationship no longer holds (a naive attempt to extend a plan's
+# deadline without regenerating it). Refused as malformed, distinct from the ordinary
+# expiry check above.
+python3 -c "
+import json
+p = json.load(open('$TMP/plan.json'))
+p['expires_at'] = '2099-01-01T00:00:00.000Z'
+json.dump(p, open('$TMP/plan-tampered.json', 'w'))
+"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan-tampered.json" >"$TMP/tampered.out" 2>"$TMP/tampered.err"; then
+  echo "[FAIL] push --plan accepted a plan with expires_at extended independently of created_at"; exit 1
+fi
+grep -q "created_at/expires_at are inconsistent" "$TMP/tampered.err" || { echo "[FAIL] wrong tampered-expiry message"; cat "$TMP/tampered.err"; exit 1; }
+echo "[PASS] tampered-expiry guard fired"
+
+# positive control: a plan with a non-numeric cost string (hand-edited or malformed) is
+# refused cleanly instead of crashing on BigInt() parsing it
+python3 -c "
+import json
+p = json.load(open('$TMP/plan.json'))
+p['estimate']['cost'] = '12abc'
+json.dump(p, open('$TMP/plan-bad-cost.json', 'w'))
+"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan-bad-cost.json" >"$TMP/badcost.out" 2>"$TMP/badcost.err"; then
+  echo "[FAIL] push --plan accepted a plan with a non-numeric cost"; exit 1
+fi
+grep -q "not a plain non-negative integer" "$TMP/badcost.err" || { echo "[FAIL] wrong bad-cost message (or a crash)"; cat "$TMP/badcost.err"; exit 1; }
+echo "[PASS] malformed-cost guard fired (refused cleanly, did not crash)"
 
 # positive control: malformed plan JSON
 echo "not json" > "$TMP/bad-plan.json"
@@ -187,5 +223,49 @@ fi
 grep -q "was built for payer" "$TMP/payer-same.err" && { echo "[FAIL] same payer wallet wrongly triggered the payer-swap guard"; exit 1; }
 grep -q "spends real funds" "$TMP/payer-same.err" || { echo "[FAIL] unexpected refusal reason for the matching-payer case"; cat "$TMP/payer-same.err"; exit 1; }
 echo "[PASS] matching payer wallet does not trigger the payer guard"
+
+# positive control: payer null -> non-null crossing — plan built with NO wallet
+# configured (planning before funding one), then pushed with a wallet NOW configured.
+# The original logic only compared when BOTH sides were non-null, so this crossing
+# silently passed with zero scrutiny (Codex review finding — a real bypass, fixed).
+unset CYPHER_BRAIN_AR_WALLET
+cb estimate --in "$TMP/snap.age" --backend arweave --out "$TMP/ar-plan-nopayer.json" >"$TMP/ar-estimate-nopayer.out" 2>"$TMP/ar-estimate-nopayer.err"
+grep -q '"payer_address": null' "$TMP/ar-plan-nopayer.json" || {
+  echo "[FAIL] plan built with no wallet configured should record payer_address: null"; cat "$TMP/ar-plan-nopayer.json"; exit 1
+}
+export CYPHER_BRAIN_AR_WALLET="$TMP/wallet-a.json"
+if cb push --in "$TMP/snap.age" --backend arweave --plan "$TMP/ar-plan-nopayer.json" >"$TMP/payer-null-to-addr.out" 2>"$TMP/payer-null-to-addr.err"; then
+  echo "[FAIL] push accepted a plan with no payer against a NOW-configured wallet"; exit 1
+fi
+grep -q "plan was built with no payer configured" "$TMP/payer-null-to-addr.err" || {
+  echo "[FAIL] wrong payer null->address message"; cat "$TMP/payer-null-to-addr.err"; exit 1
+}
+echo "[PASS] payer null->address crossing guard fired"
+
+# positive control: payer non-null -> null crossing — the reverse direction. Plan built
+# WITH a wallet configured, pushed with none configured.
+unset CYPHER_BRAIN_AR_WALLET
+if cb push --in "$TMP/snap.age" --backend arweave --plan "$TMP/ar-plan.json" >"$TMP/payer-addr-to-null.out" 2>"$TMP/payer-addr-to-null.err"; then
+  echo "[FAIL] push accepted a plan with a payer against a NOW-unconfigured wallet"; exit 1
+fi
+grep -q "current push has no payer configured" "$TMP/payer-addr-to-null.err" || {
+  echo "[FAIL] wrong payer address->null message"; cat "$TMP/payer-addr-to-null.err"; exit 1
+}
+echo "[PASS] payer address->null crossing guard fired"
+export CYPHER_BRAIN_AR_WALLET="$TMP/wallet-a.json"
+
+# positive control: --remote pinning (rclone) — only the backend NAME was pinned
+# before this fix, so a plan validated for one rclone destination could silently apply
+# against a completely different one (Codex review finding, fixed).
+mkdir -p "$TMP/remote-a" "$TMP/remote-b"
+cb estimate --in "$TMP/snap.age" --backend rclone --remote ":local:$TMP/remote-a" --out "$TMP/rclone-plan.json" >"$TMP/rclone-estimate.out" 2>"$TMP/rclone-estimate.err"
+grep -q "\"remote\": \":local:$TMP/remote-a\"" "$TMP/rclone-plan.json" || {
+  echo "[FAIL] plan.json did not record --remote"; cat "$TMP/rclone-plan.json"; exit 1
+}
+if cb push --in "$TMP/snap.age" --backend rclone --remote ":local:$TMP/remote-b" --plan "$TMP/rclone-plan.json" >"$TMP/remote-mismatch.out" 2>"$TMP/remote-mismatch.err"; then
+  echo "[FAIL] push --plan accepted a plan built for a DIFFERENT --remote"; exit 1
+fi
+grep -q "plan was built for --remote" "$TMP/remote-mismatch.err" || { echo "[FAIL] wrong remote-mismatch message"; cat "$TMP/remote-mismatch.err"; exit 1; }
+echo "[PASS] remote-mismatch guard fired"
 
 echo "== plan/apply selftest: ALL PASS =="

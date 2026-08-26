@@ -1,11 +1,25 @@
 // Terraform-style plan/apply for paid pushes (#231): `estimate --out <plan.json>`
-// pins down what a push would cost and against what artifact/backend/payer, and
+// pins down what a push would cost and against what artifact/backend/payer/remote, and
 // `push --plan <plan.json>` re-validates that plan against the CURRENT state before
-// proceeding — so what an operator (or an unattended CI/MCP caller) reviewed is
-// provably the same thing that executes, even if time passed and the price moved in
-// between. This is an ADDITIONAL gate, not a replacement for the existing --yes/
+// proceeding — refusing on a mismatch instead of silently spending against stale
+// numbers. This is an ADDITIONAL gate, not a replacement for the existing --yes/
 // CYPHER_BRAIN_YES consent check: a validated plan still has to clear that gate too,
 // exactly as an unplanned push does (pushpull.ts's own consent logic is untouched).
+//
+// Two honest limits on what this guarantees (Codex review, #231):
+// 1. Trust boundary: a plan.json is a plain, unsigned local file — anyone who can edit
+//    it (or skip --plan and push unplanned) has the same access as the operator's own
+//    wallet/identity key files already sitting on disk. This is a strict-CONSISTENCY
+//    check against accidental drift (an old plan, a moved artifact, a price swing, a
+//    changed wallet), not a cryptographic authenticity guarantee against a local
+//    attacker who can already read those keys.
+// 2. TOCTOU: validation happens once, right before push()'s own paid-backend estimate
+//    display and the --yes/CYPHER_BRAIN_YES check — both effectively instantaneous, no
+//    interactive wait — but backend.put() (arweave.ts/turbo.ts) still runs its OWN
+//    independent, authoritative price query moments later, same as it always has.
+//    CYPHER_BRAIN_MAX_SPEND, enforced INSIDE put(), remains the sole hard cap on actual
+//    spend (#105) — --plan narrows what price/identity was reviewed, it does not
+//    replace that final backstop.
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -61,6 +75,13 @@ export interface PushPlan {
   // Best-effort: the wallet/address that would pay, if one was configured when the
   // plan was built (null when none was — e.g. planning before funding a wallet).
   payer_address: string | null;
+  // The backend-specific execution target, when the backend has one (rclone's --remote
+  // <name>:<path>; null for every other backend — none of them take a destination
+  // selector). Only the backend NAME is meaningful to compare for file/arweave/turbo/
+  // ton/ton-provider (Codex review, #231): without this field, a plan validated for
+  // one rclone remote could silently apply against a DIFFERENT one — same backend name,
+  // different execution target than what was reviewed.
+  remote: string | null;
   estimate: CostEstimate;
   created_at: string; // ISO 8601
   expires_at: string; // ISO 8601, created_at + PLAN_DEFAULT_TTL_MS
@@ -72,6 +93,7 @@ export function buildPlan(args: {
   sizeBytes: number;
   recipientsFingerprint: string | null;
   payerAddress: string | null;
+  remote: string | null;
   estimate: CostEstimate;
   now?: Date; // test hook — real callers omit this and get the actual clock
 }): PushPlan {
@@ -83,6 +105,7 @@ export function buildPlan(args: {
     size_bytes: args.sizeBytes,
     recipients_fingerprint: args.recipientsFingerprint,
     payer_address: args.payerAddress,
+    remote: args.remote,
     estimate: args.estimate,
     created_at: now.toISOString(),
     expires_at: new Date(now.getTime() + PLAN_DEFAULT_TTL_MS).toISOString(),
@@ -138,6 +161,17 @@ export async function readPlanFile(path: string): Promise<PushPlan> {
         `missing or wrong-typed required field(s)`,
     );
   }
+  // Internal consistency, not tamper-proofing (plan.ts's header comment documents the
+  // real trust boundary): expires_at must be exactly created_at + PLAN_DEFAULT_TTL_MS,
+  // the same relationship buildPlan() always produces. This catches a naive edit (only
+  // expires_at bumped to push the deadline out) without requiring signing — Codex review.
+  const expectedExpiry = new Date(new Date(p.created_at).getTime() + PLAN_DEFAULT_TTL_MS).toISOString();
+  if (Number.isNaN(new Date(p.created_at).getTime()) || p.expires_at !== expectedExpiry) {
+    throw new Error(
+      `--plan ${path}: created_at/expires_at are inconsistent (expected expires_at = created_at + ${PLAN_DEFAULT_TTL_MS}ms) — ` +
+        `this plan was not produced by "estimate --out" or has been edited, re-run "estimate --out" for a fresh one`,
+    );
+  }
   return {
     cypher_brain_plan_version: PLAN_VERSION,
     backend: p.backend,
@@ -145,6 +179,7 @@ export async function readPlanFile(path: string): Promise<PushPlan> {
     size_bytes: p.size_bytes,
     recipients_fingerprint: typeof p.recipients_fingerprint === 'string' ? p.recipients_fingerprint : null,
     payer_address: typeof p.payer_address === 'string' ? p.payer_address : null,
+    remote: typeof p.remote === 'string' ? p.remote : null,
     estimate: p.estimate as CostEstimate,
     created_at: p.created_at,
     expires_at: p.expires_at,
@@ -158,6 +193,15 @@ export type PlanValidation = { ok: true } | { ok: false; reason: string };
 // --plan is a stricter guarantee than the existing --yes gate, so "probably still
 // fine" is not good enough. Returns a reason string rather than throwing so the
 // caller (push()) can format it consistently with its other refusal messages.
+// Every CostEstimate.cost this codebase ever produces is either null ("unavailable",
+// an estimate.ts *_estimate: never a deliberate "free" signal — file/rclone/ton all use
+// the literal string "0") or a plain non-negative base-10 integer string (estimate.ts's
+// arweave branch regex-validates its own; ton-provider's is a bigint's .toString();
+// turbo's comes from the SDK unvalidated). validatePlan defends against BOTH a
+// hand-edited plan.json AND an SDK quirk producing something BigInt() can't parse —
+// Codex review: an uncaught throw here would crash push() instead of cleanly refusing.
+const COST_PATTERN = /^\d+$/;
+
 export function validatePlan(
   plan: PushPlan,
   current: {
@@ -165,6 +209,7 @@ export function validatePlan(
     artifactSha256: string;
     freshEstimate: CostEstimate;
     payerAddress: string | null;
+    remote: string | null;
     now?: Date; // test hook
   },
 ): PlanValidation {
@@ -182,7 +227,10 @@ export function validatePlan(
   }
   const now = current.now ?? new Date();
   const expiresAt = new Date(plan.expires_at);
-  if (Number.isNaN(expiresAt.getTime()) || now.getTime() > expiresAt.getTime()) {
+  // >= (not >): a plan is treated as expired AT its exact expiry instant, not one
+  // moment after (Codex review — a boundary nit, but "strictly" only holds if the
+  // boundary itself is closed).
+  if (Number.isNaN(expiresAt.getTime()) || now.getTime() >= expiresAt.getTime()) {
     return {
       ok: false,
       reason: `plan expired at ${plan.expires_at} (now: ${now.toISOString()}) — re-run "estimate --out" for a fresh one`,
@@ -194,6 +242,20 @@ export function validatePlan(
       reason:
         'cannot confirm the price has not drifted — the plan or the current cost estimate is unavailable ' +
         `(planned: ${plan.estimate.cost ?? 'unavailable'}, current: ${current.freshEstimate.cost ?? 'unavailable'})`,
+    };
+  }
+  if (!COST_PATTERN.test(plan.estimate.cost) || !COST_PATTERN.test(current.freshEstimate.cost)) {
+    return {
+      ok: false,
+      reason:
+        'cannot confirm the price has not drifted — a recorded cost is not a plain non-negative integer ' +
+        `(planned: ${JSON.stringify(plan.estimate.cost)}, current: ${JSON.stringify(current.freshEstimate.cost)})`,
+    };
+  }
+  if (plan.estimate.unit !== current.freshEstimate.unit) {
+    return {
+      ok: false,
+      reason: `plan's cost unit "${plan.estimate.unit}" does not match the current unit "${current.freshEstimate.unit}" — re-run "estimate --out"`,
     };
   }
   const planned = BigInt(plan.estimate.cost);
@@ -224,6 +286,24 @@ export function validatePlan(
       reason: `plan was for a free push (cost 0), current cost is ${current.freshEstimate.cost} ${current.freshEstimate.unit ?? ''} — re-run "estimate --out" for a fresh plan`,
     };
   }
+  // Every combination except "both null" (never configured, either time — nothing to
+  // compare) and "both non-null and equal" is a refusal. Comparing ONLY when both sides
+  // are non-null (the original logic) let either direction of null<->address silently
+  // pass — including a plan built with NO payer configured being applied against a
+  // NOW-configured wallet with zero scrutiny, while still printing a success message
+  // that claimed the payer matched (Codex review — a real bypass, not just a nit).
+  if (plan.payer_address === null && current.payerAddress !== null) {
+    return {
+      ok: false,
+      reason: `plan was built with no payer configured, the current push has payer ${current.payerAddress} — re-run "estimate --out" with that wallet configured so the plan actually reviews it`,
+    };
+  }
+  if (plan.payer_address !== null && current.payerAddress === null) {
+    return {
+      ok: false,
+      reason: `plan was built for payer ${plan.payer_address}, the current push has no payer configured — re-run "estimate --out" (or reconfigure the wallet you intend to pay from)`,
+    };
+  }
   if (
     plan.payer_address !== null &&
     current.payerAddress !== null &&
@@ -232,6 +312,16 @@ export function validatePlan(
     return {
       ok: false,
       reason: `plan was built for payer ${plan.payer_address}, the current configured payer is ${current.payerAddress} — re-run "estimate --out" with the wallet you actually intend to pay from`,
+    };
+  }
+  // Same null-handling philosophy as payer_address above, but a plain string-equality
+  // compare (remote is an opaque rclone destination string, not a wallet address with
+  // case-folding rules) — Codex review: only the backend NAME was pinned before this,
+  // so a plan validated for one rclone --remote could silently apply against another.
+  if (plan.remote !== current.remote) {
+    return {
+      ok: false,
+      reason: `plan was built for --remote ${JSON.stringify(plan.remote)}, this push targets ${JSON.stringify(current.remote)} — re-run "estimate --out" for the remote you actually intend to push to`,
     };
   }
   return { ok: true };
