@@ -105,14 +105,34 @@ async function getTracer(): Promise<TracerHandle | null> {
         ],
       });
       provider.register();
-      return { api, tracer: api.trace.getTracer('cypher-brain'), provider };
+      // provider.getTracer(), NOT api.trace.getTracer() (Codex review, #226 part 3):
+      // register() sets the GLOBAL provider only if none is already registered — a
+      // process that preloaded its own OTel auto-instrumentation (e.g. via
+      // NODE_OPTIONS --require) could already have one, in which case
+      // api.trace.getTracer() would silently hand back a tracer backed by THAT
+      // provider while boundedFlush() below keeps flushing the (now orphaned, unused)
+      // one just constructed here — spans would be created but never exported, and
+      // never warned about either. Getting the tracer directly off the provider
+      // instance this function just built makes the flushed provider and the one
+      // actually producing spans always the same object, regardless of what else may
+      // already be registered globally.
+      return { api, tracer: provider.getTracer('cypher-brain'), provider };
     } catch (e) {
+      // sdkImportAdvice() only classifies import-resolution failures (absent/broken
+      // package) — for anything else (e.g. NodeTracerProvider/OTLPTraceExporter
+      // construction throwing on a malformed OTEL_EXPORTER_OTLP_ENDPOINT value) it
+      // returns null, and `problem` stays undefined. Framing that case as "packages
+      // are not available" would be actively misleading (Codex review, #226 part 3) —
+      // the packages loaded fine; something else about this run's config didn't.
       const problem = sdkImportAdvice(e, '@opentelemetry/sdk-trace-node');
       if (!warnedOnce) {
         warnedOnce = true;
         warn(
-          `OTEL_EXPORTER_OTLP_ENDPOINT is set but the OpenTelemetry packages are not available ` +
-            `(${problem?.advice ?? errMsg(e)}) — tracing disabled for this run, everything else proceeds normally`,
+          problem
+            ? `OTEL_EXPORTER_OTLP_ENDPOINT is set but the OpenTelemetry packages are not available ` +
+                `(${problem.advice}) — tracing disabled for this run, everything else proceeds normally`
+            : `OTEL_EXPORTER_OTLP_ENDPOINT is set but tracing failed to initialize (${errMsg(e)}) — ` +
+                `tracing disabled for this run, everything else proceeds normally`,
         );
       }
       return null;

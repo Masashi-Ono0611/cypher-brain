@@ -74,10 +74,22 @@ function runDoctor(env, timeoutMs) {
     child.stdout.on('data', (c) => (stdout += c.toString()));
     child.stderr.on('data', (c) => (stderr += c.toString()));
     const killer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
-    child.on('exit', (code) => {
+    // 'close', not 'exit' (Codex review, #226 part 3): 'exit' can fire before the
+    // stdio pipes finish draining, so `stderr`/`stdout` above could still be missing
+    // trailing data (e.g. check 4's warning line) at the moment this resolves — 'close'
+    // fires only once every stdio stream is fully done.
+    child.on('close', (code) => {
       clearTimeout(killer);
       rmSync(home, { recursive: true, force: true });
       resolve({ code, stdout, stderr, elapsedMs: Date.now() - t0 });
+    });
+    // A failure to spawn `node` at all (e.g. PATH corruption) would otherwise leave this
+    // Promise pending until `killer` fires (SIGKILL on a process that was never running,
+    // a no-op), reporting a misleading "gating"/timeout failure instead of the real cause.
+    child.on('error', (err) => {
+      clearTimeout(killer);
+      rmSync(home, { recursive: true, force: true });
+      resolve({ code: 'SPAWN_ERROR', stdout, stderr: String(err), elapsedMs: Date.now() - t0 });
     });
   });
 }
@@ -188,10 +200,18 @@ function runDoctor(env, timeoutMs) {
       child.stdout.on('data', (c) => (stdout += c.toString()));
       child.stderr.on('data', (c) => (stderr += c.toString()));
       const killer = setTimeout(() => child.kill('SIGKILL'), 15000);
-      child.on('exit', (code) => {
+      // 'close', not 'exit' — see the comment on runDoctor()'s own child.on('close', ...)
+      // above; this is the exact scenario it protects against (this check's whole
+      // assertion is a stderr warning line, so a stderr race here is not hypothetical).
+      child.on('close', (code) => {
         clearTimeout(killer);
         rmSync(home, { recursive: true, force: true });
         resolve({ code, stdout, stderr, elapsedMs: Date.now() - t0 });
+      });
+      child.on('error', (err) => {
+        clearTimeout(killer);
+        rmSync(home, { recursive: true, force: true });
+        resolve({ code: 'SPAWN_ERROR', stdout, stderr: String(err), elapsedMs: Date.now() - t0 });
       });
     });
     // Asserts otel.ts's OWN wrapper message + fallback behavior, not sdkImportAdvice()'s
