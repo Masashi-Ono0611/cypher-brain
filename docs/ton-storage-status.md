@@ -23,11 +23,11 @@ binaries.
 |---|---|---|
 | **Self-hosted seeder** — droplet seeds our own bags directly, no payment | mainnet | **WORKS, in production** (2026-08-22) |
 | **Self-hosted seeder** | testnet | dogfood only; not used for real backups |
-| **Our droplet as a paid provider** (earns — discoverable by other users) | mainnet | **registered, live, econ params fixed, and has now processed one real contract** — but it's our own (see "We pay a live Go provider" row below): mytonprovider.org registry (pubkey `f5f603c7…`, uptime 100%, rating 17.9, telemetry on, wallet funded ~1 TON); no THIRD-PARTY-originated paid contract yet, so "does this provider earn from strangers" is still unproven |
+| **Our droplet as a paid provider** (earns — discoverable by other users) | mainnet | **registered, live, econ params fixed, and has now processed one real contract** — but it's our own (see "We pay a live Go provider" row below): mytonprovider.org registry, now under pubkey `3a7fe754…` (`tsp-canary.service`), telemetry on — the original pubkey `f5f603c7…` daemon (`tonutils-storage-provider.service`) was stopped and disabled 2026-08-25 after a parallel-canary migration (see the bounce=true root-cause and migration writeup below); no THIRD-PARTY-originated paid contract yet, so "does this provider earn from strangers" is still unproven |
 | **Our droplet as a paid provider** | testnet | standing twin (same Go binaries, isolated units) — controlled environment, no real earnings expected |
 | **We pay a legacy C++ provider** (spends — fabric-contract ecosystem) | mainnet | **GRAVEYARD** (115 listed, 0 active ≤7d, 94 silent >1y) — not pursuing |
 | **We pay a legacy C++ provider** | testnet | **DEAD DAEMONS, live contracts** (2026-08-22 experiment) |
-| **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **WORKS end to end, including a confirmed proof-reward payout** (2026-08-23) — `scripts/go/storage-v1-client` (deploy/notify/status/update-providers) deployed and funded a StorageV1 contract for masabrain (481 MB) against our own registered droplet-as-provider, the provider self-reported the full bag downloaded, and a `storage_reward_withdrawal` (op `0xa91baf56`) transaction of 0.119662827 TON from the contract to the provider's registered wallet followed shortly after. Getting there required one real-money field-mapping bug (fixed by an in-place repair, not a re-deploy) — see below |
+| **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **WORKS end to end, including a confirmed proof-reward payout** (2026-08-23) — `scripts/go/storage-v1-client` (deploy/notify/status/update-providers/withdraw) deployed and funded a StorageV1 contract for masabrain (481 MB) against our own registered droplet-as-provider, the provider self-reported the full bag downloaded, and a `storage_reward_withdrawal` (op `0xa91baf56`) transaction of 0.119662827 TON from the contract to the provider's registered wallet followed shortly after. Getting there required one real-money field-mapping bug (fixed by an in-place repair, not a re-deploy) — see below. That original contract (pubkey `f5f603c7…`) is now orphaned by the 2026-08-25 canary migration (see below); `withdraw` (added 2026-08-26) implements its recovery path but has not yet been run |
 | **We pay a live Go provider** | testnet | **WORKS end to end** (2026-08-23) — `scripts/go/storage-v1-client` deployed and funded a StorageV1 contract for a throwaway 71-byte bag against our own droplet's testnet standing twin, notified it, and the provider fetched the bag; content verified byte-identical via sha256 on both sides. No public testnet registry exists (mytonprovider.org is mainnet-only — see below), so this is dev-only, not an OSS-facing feature — see below |
 
 **The single most important 2026-08-23 correction**: the provider market is TWO
@@ -543,15 +543,19 @@ unit-conversion note above — divide by 1024×200×30 to get back to
 nanoTON/MB/day before comparing). Self-hosted TON is cheap because you are
 the storage; it buys availability, not permanence.
 
-## Operational inventory (what exists where, as of 2026-08-23)
+## Operational inventory (what exists where, as of 2026-08-26)
 
-- Droplet (mainnet, production): `tonutils-storage.service` +
-  `tonutils-storage-provider.service` (long-standing, binary refreshed to
-  clean v0.4.3 2026-08-22 — was `v0.4.3-dirty`), the cypher-brain bag layout
-  under `~/cypher-brain-ton/`, healthcheck pinned to the live brain bag. The
-  provider service is now also registered in the mytonprovider.org registry
-  (see above) — same binary, two roles (seeds our bag for free; separately,
-  discoverable as a paid provider for others). `tsp-telemetry.service` +
+- Droplet (mainnet, production): `tonutils-storage.service` (seeder, unchanged)
+  plus `tsp-canary.service` (provider role, pubkey `3a7fe754…`, udp 18557,
+  `/opt/tsp-canary/`) — the live provider identity since the 2026-08-25
+  parallel-canary migration (see above). `tonutils-storage-provider.service`
+  (the original provider role, pubkey `f5f603c7…`) was stopped and disabled
+  the same day and is no longer running; its contract is orphaned (see the
+  `storage-v1-client` bullet below). The cypher-brain bag layout lives under
+  `~/cypher-brain-ton/`, healthcheck pinned to the live brain bag. The
+  provider service is registered in the mytonprovider.org registry (see
+  above) — same binary as the seeder, two roles (seeds our bag for free;
+  separately, discoverable as a paid provider for others). `tsp-telemetry.service` +
   `tsp-telemetry.timer` (added 2026-08-23, 15 min interval) run independently
   alongside it to report registry telemetry — see the telemetry bullet above.
 - Droplet (testnet, experiment, transient systemd units — disposable):
@@ -568,9 +572,20 @@ the storage; it buys availability, not permanence.
   StorageV1 client program described above; **not installed on the droplet**
   (the droplet only runs prebuilt Go binaries, it doesn't compile).
 - `scripts/go/storage-v1-client` (local, not deployed anywhere — a laptop
-  CLI): `deploy`/`notify`/`status`/`update-providers`, 49 tests, contract
-  deployment + provider discovery/fetch confirmed working end to end,
-  including a confirmed proof-reward payout (see above). Its one live mainnet contract:
+  CLI): `deploy`/`notify`/`status`/`update-providers`/`withdraw` (the last
+  added 2026-08-26), 44 tests, contract deployment + provider
+  discovery/fetch confirmed working end to end, including a confirmed
+  proof-reward payout (see above). Its original mainnet contract,
   `0:465347a9b5152bf6f69e1bc47ce82c537aee5ae4e3d00437d4a514f0e9cc452a` —
   masabrain (481 MB), rate 800 nanoTON/MB/day, span 192 days, provider
-  pubkey `f5f603c7…` (our own droplet), balance ~0.42 TON.
+  pubkey `f5f603c7…` (our own droplet) — is now orphaned by the 2026-08-25
+  canary migration. Balance was directly observed at ~0.42 TON on
+  2026-08-23 (this snapshot's original figure) and ~0.35 TON at the
+  2026-08-25 migration (see above); the latter is the more recent
+  observation, but this log has not established why the two differ (e.g.
+  further proof/reward activity on the old contract in the interim is
+  plausible but unconfirmed here). `withdraw` implements its documented
+  recovery path but has not yet been run. The live provider
+  identity going forward is the canary contract `0:ebf4e8cb…` deployed
+  under pubkey `3a7fe754…` (see above for the migration detail; full
+  address/balance not yet recorded in this log).
