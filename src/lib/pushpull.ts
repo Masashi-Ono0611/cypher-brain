@@ -9,7 +9,8 @@ import { exists, requireFile, sleep, sha256, readHead, errMsg, RetryableError } 
 import { backendFor } from './backends/index.js';
 import { estimateCost, formatEstimate } from './estimate.js';
 import { signatureKeyIdHex } from './minisign.js';
-import { tonWalletConfigured } from './wallet.js';
+import { tonWalletConfigured, payerAddressFor } from './wallet.js';
+import { readPlanFile, validatePlan } from './plan.js';
 import type { CliOptions } from './types.js';
 
 // The plaintext content digest for the artifact being pushed: an explicit --digest
@@ -254,6 +255,32 @@ export async function push(o: CliOptions): Promise<boolean> {
         return false;
       }
     }
+  }
+  // --plan <path.json> (#231): re-validate a plan written by "estimate --out" against
+  // the state THIS push is about to act on — refuses BEFORE the estimate display and
+  // consent gate below if the artifact, backend, price (within tolerance) or payer no
+  // longer match what was reviewed. Additive: a validated plan still has to clear the
+  // ordinary --yes/CYPHER_BRAIN_YES gate below too, same as an unplanned push — this
+  // is a stricter guarantee bolted on top, not a replacement for that gate. Runs its
+  // own fresh estimateCost() query rather than sharing the paid-backend-only display
+  // block a few lines down (which only runs for arweave/turbo/ton-provider, while a
+  // plan can be built and validated for ANY backend) — a second price query only when
+  // --plan is actually used, traded deliberately for leaving that existing, carefully-
+  // tuned display block completely untouched.
+  if (o.plan) {
+    const plan = await readPlanFile(o.plan);
+    const { size: sizeBytes } = await stat(o.in);
+    const [artifactSha256, freshEstimate, payerAddress] = await Promise.all([
+      sha256(o.in),
+      estimateCost(o.backend, sizeBytes),
+      payerAddressFor(o.backend, o),
+    ]);
+    const result = validatePlan(plan, { backend: o.backend, artifactSha256, freshEstimate, payerAddress });
+    if (!result.ok) throw new Error(`--plan ${o.plan}: ${result.reason}`);
+    console.error(
+      `--plan ${o.plan}: validated (artifact, backend and price within tolerance` +
+        `${payerAddress ? ', payer' : ''} all match the plan)`,
+    );
   }
   // arweave and turbo are paid, permanent stores. #160: the cost estimate must be
   // VISIBLE in the SAME terminal output the --yes/CYPHER_BRAIN_YES consent decision is

@@ -13,8 +13,9 @@ import {
   TON_TONAPI_URL,
   TON_WALLET,
 } from './config.js';
-import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists } from './util.js';
+import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists, sha256 } from './util.js';
 import { printJson } from './ui.js';
+import { buildPlan, writePlanFile, readRecipientsFingerprint } from './plan.js';
 import type { CliOptions } from './types.js';
 
 // Every field is REQUIRED and nullable rather than optional (#268): a `--json`
@@ -390,4 +391,28 @@ export async function estimate(o: CliOptions): Promise<void> {
   const result = await estimateCost(o.backend, st.size);
   if (o.json) printJson(result);
   else for (const line of formatEstimate(result)) console.log(line);
+  // --out <path.json> (#231): ALSO write a plan file pinning this estimate to the
+  // exact artifact/backend/payer it was computed against, for "push --plan <path>" to
+  // re-validate later. Additive to the normal report above — --out never suppresses
+  // it. A dynamic import for the payer-address lookup only, not the whole module: see
+  // wallet.ts's payerAddressFor doc comment for why a static one here would be
+  // circular (wallet.ts statically imports this module's own rate functions).
+  if (o.out) {
+    const { payerAddressFor } = await import('./wallet.js');
+    const [artifactSha256, recipientsFingerprint, payerAddress] = await Promise.all([
+      sha256(o.in),
+      readRecipientsFingerprint(o.in),
+      payerAddressFor(o.backend, o),
+    ]);
+    const plan = buildPlan({
+      backend: o.backend,
+      artifactSha256,
+      sizeBytes: st.size,
+      recipientsFingerprint,
+      payerAddress,
+      estimate: result,
+    });
+    await writePlanFile(o.out, plan);
+    console.error(`plan saved -> ${o.out} (valid until ${plan.expires_at})`);
+  }
 }

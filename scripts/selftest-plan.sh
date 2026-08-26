@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# Proof for #231 — Terraform-style plan/apply: `estimate --out <path.json>` pins an
+# estimate to an artifact/backend/payer, and `push --plan <path.json>` re-validates it
+# against the CURRENT state before proceeding. CI-safe: the arweave price query is a
+# local mock HTTP server (same PATH-shim-free style as the ton-provider mock — a real
+# gateway/URL substitution via CYPHER_BRAIN_AR_HOST/_PORT/_PROTOCOL, so the REAL
+# estimate.ts/plan.ts code runs its real fetch, just against a server this script
+# controls). The file backend (free, no network) covers the artifact/backend/expiry/
+# malformed-plan checks; the mocked arweave backend covers price drift and payer
+# binding, which need a real (mocked) priced query and a real (throwaway) JWK wallet.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$ROOT/bin/cypher-brain.mjs"
+source "$ROOT/scripts/dev-node-flags.sh"
+
+TMP="$(mktemp -d)"
+MOCK_PID=""
+cleanup() {
+  [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+export CYPHER_BRAIN_HOME="$TMP/home"
+mkdir -p "$CYPHER_BRAIN_HOME" "$TMP/src" "$TMP/store"
+
+cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
+sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+
+echo "hello plan/apply" > "$TMP/src/hello.txt"
+cb keygen >/dev/null
+cb snapshot --dir "$TMP/src" --out "$TMP/snap.age" >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------
+# Part 1: file backend (free, no network) — artifact/backend/expiry/malformed checks
+# ---------------------------------------------------------------------------
+
+CYPHER_BRAIN_FILE_DIR="$TMP/store" cb estimate --in "$TMP/snap.age" --backend file --out "$TMP/plan.json" >"$TMP/estimate.out" 2>"$TMP/estimate.err"
+grep -q '"cypher_brain_plan_version": 1' "$TMP/plan.json" || { echo "[FAIL] plan.json missing/wrong version field"; exit 1; }
+grep -q "\"artifact_sha256\": \"$(sha "$TMP/snap.age")\"" "$TMP/plan.json" || { echo "[FAIL] plan.json artifact_sha256 does not match --in"; exit 1; }
+grep -q '"backend": "file"' "$TMP/plan.json" || { echo "[FAIL] plan.json backend field wrong"; exit 1; }
+grep -q "plan saved -> $TMP/plan.json" "$TMP/estimate.err" || { echo "[FAIL] estimate --out did not report where it saved the plan"; exit 1; }
+echo "[PASS] estimate --out writes a plan.json with the expected shape"
+
+CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan.json" >"$TMP/push.out" 2>"$TMP/push.err"
+grep -q "validated" "$TMP/push.err" || { echo "[FAIL] push --plan did not report validation"; cat "$TMP/push.err"; exit 1; }
+[ -s "$TMP/push.out" ] || { echo "[FAIL] push --plan produced no locator on stdout"; exit 1; }
+echo "[PASS] push --plan happy path: validates and proceeds to a normal (free) push"
+
+# positive control: a DIFFERENT artifact than the plan was built for is refused
+echo "different content entirely" > "$TMP/src/hello2.txt"
+CYPHER_BRAIN_FILE_DIR="$TMP/store" cb snapshot --dir "$TMP/src" --out "$TMP/snap3.age" >/dev/null 2>&1
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap3.age" --backend file --plan "$TMP/plan.json" >"$TMP/mismatch.out" 2>"$TMP/mismatch.err"; then
+  echo "[FAIL] push --plan accepted a plan built for a DIFFERENT artifact"; exit 1
+fi
+grep -q "different artifact" "$TMP/mismatch.err" || { echo "[FAIL] wrong artifact-mismatch message"; cat "$TMP/mismatch.err"; exit 1; }
+echo "[PASS] artifact-mismatch guard fired"
+
+# positive control: backend mismatch (plan says file, push targets a different backend)
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend rclone --remote ":local:$TMP/store2" --plan "$TMP/plan.json" >"$TMP/backend-mismatch.out" 2>"$TMP/backend-mismatch.err"; then
+  echo "[FAIL] push --plan accepted a plan built for a DIFFERENT backend"; exit 1
+fi
+grep -q 'is for backend "file"' "$TMP/backend-mismatch.err" || { echo "[FAIL] wrong backend-mismatch message"; cat "$TMP/backend-mismatch.err"; exit 1; }
+echo "[PASS] backend-mismatch guard fired"
+
+# positive control: expired plan
+python3 -c "
+import json
+p = json.load(open('$TMP/plan.json'))
+p['expires_at'] = '2020-01-01T00:00:00.000Z'
+json.dump(p, open('$TMP/plan-expired.json', 'w'))
+"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan-expired.json" >"$TMP/expired.out" 2>"$TMP/expired.err"; then
+  echo "[FAIL] push --plan accepted an expired plan"; exit 1
+fi
+grep -q "plan expired at" "$TMP/expired.err" || { echo "[FAIL] wrong expired-plan message"; cat "$TMP/expired.err"; exit 1; }
+echo "[PASS] expired-plan guard fired"
+
+# positive control: malformed plan JSON
+echo "not json" > "$TMP/bad-plan.json"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/bad-plan.json" >"$TMP/badjson.out" 2>"$TMP/badjson.err"; then
+  echo "[FAIL] push --plan accepted malformed JSON"; exit 1
+fi
+grep -q "not valid JSON" "$TMP/badjson.err" || { echo "[FAIL] wrong malformed-JSON message"; cat "$TMP/badjson.err"; exit 1; }
+echo "[PASS] malformed-plan-JSON guard fired"
+
+# positive control: a plan missing required fields (right shape of JSON, wrong content)
+echo '{"cypher_brain_plan_version": 1, "backend": "file"}' > "$TMP/incomplete-plan.json"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/incomplete-plan.json" >"$TMP/incomplete.out" 2>"$TMP/incomplete.err"; then
+  echo "[FAIL] push --plan accepted a plan missing required fields"; exit 1
+fi
+grep -q "does not look like a cypher-brain plan file" "$TMP/incomplete.err" || { echo "[FAIL] wrong incomplete-plan message"; cat "$TMP/incomplete.err"; exit 1; }
+echo "[PASS] incomplete-plan-shape guard fired"
+
+# positive control: nonexistent plan file
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/no-such-plan.json" >"$TMP/noexist.out" 2>"$TMP/noexist.err"; then
+  echo "[FAIL] push --plan accepted a nonexistent plan path"; exit 1
+fi
+grep -q "cannot read plan file" "$TMP/noexist.err" || { echo "[FAIL] wrong missing-plan-file message"; cat "$TMP/noexist.err"; exit 1; }
+echo "[PASS] missing-plan-file guard fired"
+
+# ---------------------------------------------------------------------------
+# Part 2: mocked arweave backend — price drift + payer-address binding
+# ---------------------------------------------------------------------------
+
+PRICE_FILE="$TMP/mock-price.txt"
+echo "1000000000000" > "$PRICE_FILE" # 1e12 winston, arbitrary baseline
+
+cat > "$TMP/mock-arweave.mjs" <<MOCKEOF
+import { createServer } from 'node:http';
+import { readFileSync } from 'node:fs';
+const priceFile = process.env.PRICE_FILE;
+const server = createServer((req, res) => {
+  if (req.url && req.url.startsWith('/price/')) {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end(readFileSync(priceFile, 'utf8').trim());
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
+server.listen(Number(process.env.MOCK_PORT), '127.0.0.1', () => {
+  process.stdout.write('READY\n');
+});
+MOCKEOF
+
+MOCK_PORT=18765
+PRICE_FILE="$PRICE_FILE" MOCK_PORT="$MOCK_PORT" node "$TMP/mock-arweave.mjs" >"$TMP/mock.log" 2>&1 &
+MOCK_PID=$!
+READY=0
+for _ in $(seq 1 50); do
+  grep -q READY "$TMP/mock.log" 2>/dev/null && { READY=1; break; }
+  sleep 0.1
+done
+[ "$READY" = 1 ] || { echo "[FAIL] mock arweave price server did not come up"; cat "$TMP/mock.log"; exit 1; }
+
+export CYPHER_BRAIN_AR_HOST=127.0.0.1
+export CYPHER_BRAIN_AR_PORT="$MOCK_PORT"
+export CYPHER_BRAIN_AR_PROTOCOL=http
+
+cb wallet create --chain arweave --out "$TMP/wallet-a.json" >/dev/null 2>&1
+cb wallet create --chain arweave --out "$TMP/wallet-b.json" >/dev/null 2>&1
+WALLET_A_ADDR=$(cb wallet address --wallet "$TMP/wallet-a.json")
+
+export CYPHER_BRAIN_AR_WALLET="$TMP/wallet-a.json"
+cb estimate --in "$TMP/snap.age" --backend arweave --out "$TMP/ar-plan.json" >"$TMP/ar-estimate.out" 2>"$TMP/ar-estimate.err"
+grep -q "\"payer_address\": \"$WALLET_A_ADDR\"" "$TMP/ar-plan.json" || {
+  echo "[FAIL] plan.json did not record the configured wallet's payer_address"; cat "$TMP/ar-plan.json"; exit 1
+}
+echo "[PASS] estimate --out records payer_address from the configured wallet"
+
+# positive control: price within tolerance (+5%) — plan validates, push still stops at
+# the ordinary --yes consent gate (proves plan validation ran and passed FIRST)
+echo "1050000000000" > "$PRICE_FILE"
+if cb push --in "$TMP/snap.age" --backend arweave --plan "$TMP/ar-plan.json" >"$TMP/drift-ok.out" 2>"$TMP/drift-ok.err"; then
+  echo "[FAIL] push without --yes unexpectedly succeeded"; exit 1
+fi
+grep -q "validated" "$TMP/drift-ok.err" || { echo "[FAIL] 5% drift: plan was not validated before the consent gate"; cat "$TMP/drift-ok.err"; exit 1; }
+grep -q "spends real funds" "$TMP/drift-ok.err" || { echo "[FAIL] 5% drift: did not reach the normal --yes consent gate"; cat "$TMP/drift-ok.err"; exit 1; }
+echo "[PASS] price drift within the 10% tolerance still validates (refused only by the separate --yes gate)"
+
+# positive control: price drift beyond tolerance (+50%) — refused for drift, BEFORE
+# the --yes gate (no 'spends real funds' text should appear)
+echo "1500000000000" > "$PRICE_FILE"
+if cb push --in "$TMP/snap.age" --backend arweave --plan "$TMP/ar-plan.json" >"$TMP/drift-bad.out" 2>"$TMP/drift-bad.err"; then
+  echo "[FAIL] push with 50% price drift unexpectedly succeeded"; exit 1
+fi
+grep -q "price drifted" "$TMP/drift-bad.err" || { echo "[FAIL] 50% drift was not refused for drift"; cat "$TMP/drift-bad.err"; exit 1; }
+grep -q "spends real funds" "$TMP/drift-bad.err" && { echo "[FAIL] 50% drift reached the --yes gate — should have refused earlier"; exit 1; }
+echo "[PASS] price drift beyond the 10% tolerance is refused before the consent gate"
+
+# positive control: payer swap — same artifact/backend/price, different configured wallet
+echo "1000000000000" > "$PRICE_FILE"
+export CYPHER_BRAIN_AR_WALLET="$TMP/wallet-b.json"
+if cb push --in "$TMP/snap.age" --backend arweave --plan "$TMP/ar-plan.json" >"$TMP/payer-swap.out" 2>"$TMP/payer-swap.err"; then
+  echo "[FAIL] push with a swapped payer wallet unexpectedly succeeded"; exit 1
+fi
+grep -q "was built for payer" "$TMP/payer-swap.err" || { echo "[FAIL] wrong payer-swap message"; cat "$TMP/payer-swap.err"; exit 1; }
+echo "[PASS] payer-address-swap guard fired"
+
+# positive control: same payer wallet — no payer refusal, proceeds to the --yes gate
+export CYPHER_BRAIN_AR_WALLET="$TMP/wallet-a.json"
+if cb push --in "$TMP/snap.age" --backend arweave --plan "$TMP/ar-plan.json" >"$TMP/payer-same.out" 2>"$TMP/payer-same.err"; then
+  echo "[FAIL] push without --yes unexpectedly succeeded"; exit 1
+fi
+grep -q "was built for payer" "$TMP/payer-same.err" && { echo "[FAIL] same payer wallet wrongly triggered the payer-swap guard"; exit 1; }
+grep -q "spends real funds" "$TMP/payer-same.err" || { echo "[FAIL] unexpected refusal reason for the matching-payer case"; cat "$TMP/payer-same.err"; exit 1; }
+echo "[PASS] matching payer wallet does not trigger the payer guard"
+
+echo "== plan/apply selftest: ALL PASS =="
