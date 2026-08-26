@@ -873,8 +873,8 @@ Tracing: OTEL_EXPORTER_OTLP_ENDPOINT (opt-in, #226 part 3 — a THIRD-PARTY stan
      var, not a CYPHER_BRAIN_* name, so it is NOT also read under CIPHER_BRAIN_* and has
      no config.env entry, and it is a BASE endpoint — the '/v1/traces' path is appended
      automatically, matching the OTel spec: 'http://localhost:4318', not
-     'http://localhost:4318/v1/traces'). When set, every CLI command and MCP tool call
-     becomes an OpenTelemetry span exported there via '@opentelemetry/api' +
+     'http://localhost:4318/v1/traces'). When set, every DISPATCHED CLI command and MCP
+     tool call becomes an OpenTelemetry span exported there via '@opentelemetry/api' +
      'sdk-trace-node' + 'exporter-trace-otlp-http' — optionalDependencies (like
      '@ardrive/turbo-sdk' above: a normal registry or from-source install already
      carries them; only an install run with --omit=optional skips them). A missing or
@@ -1155,11 +1155,15 @@ async function main(): Promise<void> {
   // even if parseArgs() is ever changed to validate/throw on bad input
   //.
   if (rest.includes('--help') || rest.includes('-h')) {
+    // Deliberately outside tracing's scope (Codex review, #226 part 3): --help/-h never
+    // reaches dispatchCommand() and has no side effects to observe, the same reason
+    // the audit trail (#419, part 2 of this same issue) also only records
+    // push/restore/verify — not every invocation of the binary.
     printMascot('neutral');
     console.log((cmd !== undefined && helpForCommand(cmd)) || HELP);
     return;
   }
-  // #226: each command becomes an OTel span when active (see otel.ts's withSpan() —
+  // #226: each dispatched command becomes an OTel span when active (see otel.ts's withSpan() —
   // a pure passthrough when OTEL_EXPORTER_OTLP_ENDPOINT is unset, the default). Wraps
   // arg parsing/validation TOO, not just dispatchCommand() — an invalid-flag refusal is
   // still a real command invocation and observability that only ever sees successful

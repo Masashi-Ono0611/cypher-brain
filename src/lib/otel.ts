@@ -124,14 +124,30 @@ async function getTracer(): Promise<TracerHandle | null> {
 // Wraps `fn()` in a span named `name` when OTel is active; otherwise a pure
 // passthrough. Transparent either way: `fn()`'s return value/thrown error propagates
 // unchanged — this function only OBSERVES, it never alters what the caller sees.
-export async function withSpan<T>(name: string, fn: () => Promise<T>): Promise<T> {
+//
+// `opts.isError` is for callers whose success/failure is a normal RETURN value rather
+// than a thrown exception — mcp.ts's tool handlers never throw on a refused call, they
+// return a CallToolResult with `isError: true` (structuredErr()). Without this, every
+// such refusal would record span status OK (Codex review, #226 part 3) — a rejected
+// unknown-tool or invalid-arg call reading as a successful one, working against #226's
+// own "what actually happened" motivation. cli.ts's commands (which DO throw) simply
+// omit `opts` and get the exception-only behavior unchanged.
+export async function withSpan<T>(
+  name: string,
+  fn: () => Promise<T>,
+  opts?: { isError?: (result: T) => boolean },
+): Promise<T> {
   const handle = await getTracer();
   if (!handle) return fn();
   const { api, tracer, provider } = handle;
   return tracer.startActiveSpan(name, async (span) => {
     try {
       const result = await fn();
-      span.setStatus({ code: api.SpanStatusCode.OK });
+      span.setStatus(
+        opts?.isError?.(result)
+          ? { code: api.SpanStatusCode.ERROR, message: 'the call completed but returned a logical error result' }
+          : { code: api.SpanStatusCode.OK },
+      );
       return result;
     } catch (e) {
       span.setStatus({ code: api.SpanStatusCode.ERROR, message: errMsg(e) });

@@ -1154,8 +1154,8 @@ Tracing: OTEL_EXPORTER_OTLP_ENDPOINT (opt-in, #226 part 3 — a THIRD-PARTY stan
      var, not a CYPHER_BRAIN_* name, so it is NOT also read under CIPHER_BRAIN_* and has
      no config.env entry, and it is a BASE endpoint — the '/v1/traces' path is appended
      automatically, matching the OTel spec: 'http://localhost:4318', not
-     'http://localhost:4318/v1/traces'). When set, every CLI command and MCP tool call
-     becomes an OpenTelemetry span exported there via '@opentelemetry/api' +
+     'http://localhost:4318/v1/traces'). When set, every DISPATCHED CLI command and MCP
+     tool call becomes an OpenTelemetry span exported there via '@opentelemetry/api' +
      'sdk-trace-node' + 'exporter-trace-otlp-http' — optionalDependencies (like
      '@ardrive/turbo-sdk' above: a normal registry or from-source install already
      carries them; only an install run with --omit=optional skips them). A missing or
