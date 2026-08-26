@@ -13,8 +13,9 @@ import {
   TON_TONAPI_URL,
   TON_WALLET,
 } from './config.js';
-import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists } from './util.js';
+import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists, sha256 } from './util.js';
 import { printJson } from './ui.js';
+import { buildPlan, writePlanFile, readRecipientsFingerprint } from './plan.js';
 import type { CliOptions } from './types.js';
 
 // Every field is REQUIRED and nullable rather than optional (#268): a `--json`
@@ -390,4 +391,38 @@ export async function estimate(o: CliOptions): Promise<void> {
   const result = await estimateCost(o.backend, st.size);
   if (o.json) printJson(result);
   else for (const line of formatEstimate(result)) console.log(line);
+  // --out <path.json> (#231): ALSO write a plan file pinning this estimate to the
+  // exact artifact/backend/payer/remote it was computed against, for "push --plan
+  // <path>" to re-validate later. Additive to the normal report above — --out never
+  // suppresses it. A dynamic import for the payer-address lookup only, not the whole
+  // module: see wallet.ts's payerAddressFor doc comment for why a static one here
+  // would be circular (wallet.ts statically imports this module's own rate functions).
+  if (o.out) {
+    const { payerAddressFor } = await import('./wallet.js');
+    // Re-stat here (not the earlier `st` above) rather than reuse it: `st` was read
+    // before estimateCost()'s network-bound price query, which can take real wall-clock
+    // time — a file that changed during that query would otherwise pair a NOW-stale
+    // size with a fresh sha256, describing two different file states in one plan
+    // (Codex review). Re-statting immediately alongside the sha256 read narrows that
+    // window to this Promise.all, not the whole preceding estimateCost() call — it does
+    // not make the pairing atomic (two separate syscalls can still race with a
+    // concurrent write), only meaningfully smaller.
+    const [outStat, artifactSha256, recipientsFingerprint, payerAddress] = await Promise.all([
+      stat(o.in),
+      sha256(o.in),
+      readRecipientsFingerprint(o.in),
+      payerAddressFor(o.backend, o),
+    ]);
+    const plan = buildPlan({
+      backend: o.backend,
+      artifactSha256,
+      sizeBytes: outStat.size,
+      recipientsFingerprint,
+      payerAddress,
+      remote: o.remote ?? null,
+      estimate: result,
+    });
+    await writePlanFile(o.out, plan);
+    console.error(`plan saved -> ${o.out} (valid until ${plan.expires_at})`);
+  }
 }

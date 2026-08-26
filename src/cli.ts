@@ -105,6 +105,7 @@ const VALUE_FLAGS = new Set([
   'ping_url_fail',
   'domain',
   'chain',
+  'plan',
 ]);
 
 function parseArgs(argv: string[]): CliOptions {
@@ -480,7 +481,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       has to fall back to scraping stderr; "code" is the CB-E0xx identifier when the failure
       matches a known one (MANAGEMENT.md#error-codes), null otherwise.
 
-  cypher-brain push --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--remote <name>:<path>] [--yes] [--save-locator <path>] [--skip-unchanged] [--digest <hex>] [--force]
+  cypher-brain push --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--remote <name>:<path>] [--yes] [--plan <path.json>] [--save-locator <path>] [--skip-unchanged] [--digest <hex>] [--force]
       Upload ciphertext to storage. Prints ONLY the locator to stdout
       (file: store path; arweave: tx id; turbo: ANS-104 data item id; rclone: the
       --remote value itself; ton: "ton:v1:<bag-id>"; ton-provider: "ton-provider:v1:<bag-id>").
@@ -499,6 +500,19 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       approximate USD line when a USD/AR rate is fetchable — a rate failure drops that
       line only, never the native estimate. Preview the same estimate beforehand
       without pushing anything via "cypher-brain estimate".
+      --plan <path.json> (#231): re-validate a plan file written by "estimate --out"
+      against the CURRENT state before proceeding — refuses (before any consent prompt)
+      if the artifact (sha256), backend, --remote, price (beyond a 10% drift tolerance),
+      or the configured payer address no longer match what was reviewed when the plan
+      was made, or if the plan has expired (15 minutes after creation, not
+      configurable). ADDITIVE to --yes/CYPHER_BRAIN_YES, not a replacement — a validated
+      plan still has to clear that consent gate too, and CYPHER_BRAIN_MAX_SPEND (#105),
+      enforced separately inside the upload itself, remains the actual cap on spend.
+      A plan.json is a plain local file, not cryptographically signed — the same trust
+      boundary as the wallet/identity key files already on disk, not a defense against
+      someone who already has access to those. Works with any --backend (free backends
+      just validate artifact/backend/remote/expiry; there is no price to drift). See
+      "estimate" below for how a plan is created.
       --backend rclone --remote <rclone-remote-name>:<path> shells out to the
       rclone binary (rclone copyto <in> <remote>), delegating auth/protocol for
       any of rclone's 70+ supported providers to your own rclone config — cypher-
@@ -579,7 +593,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       when unchanged. (The digest is plaintext-side by necessity: age's ephemeral file
       key makes identical content encrypt to different ciphertext bytes every run.)
 
-  cypher-brain estimate --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--json]
+  cypher-brain estimate --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--json] [--out <path.json>]
       Read-only preview: print what pushing --in to --backend would cost WITHOUT
       uploading anything. turbo/arweave show the native unit (winc/winston) plus
       an approximate USD line when a USD/AR rate is fetchable; ton-provider shows
@@ -599,6 +613,16 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       unit, or a query that could not run, reports null rather than dropping the key,
       so the object shape does not depend on which backend was asked about. On an
       ERROR, stdout carries {error, code, exit_code} instead (#270 — see verify).
+      --out <path.json> (#231): ALSO write a "plan" pinning this exact estimate to the
+      artifact (sha256 of --in), --backend, --remote (rclone only, null otherwise), the
+      configured payer address (if any wallet is set up for this backend — null
+      otherwise), and an expiry 15 minutes from now. Additive to the normal report
+      above (stdout/exit code unchanged either way). Feed the path to
+      "push --plan <path.json>" to have push refuse instead of proceeding if the
+      artifact, backend, remote, price, or payer drifted since the plan was made — the
+      Terraform plan/apply pattern, binding what push actually validates before its
+      consent gate to what "estimate --out" reviewed (see "push --plan" above for what
+      that guarantee does and does not cover).
 
   cypher-brain pull (--locator <id> --backend <…> | --remote <name>:<path> --backend rclone | --from-locator-file <path>) --out <file.age> [--wait <seconds>] [--sha256 <hex>] [--sig-locator <id>] [--force]
       Fetch ciphertext by locator into --out. --from-locator-file reads the locator, its

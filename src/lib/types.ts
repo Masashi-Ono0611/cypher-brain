@@ -68,6 +68,7 @@ export interface CliOptions {
   ping_url_fail?: string; // schedule install: failure ping override (defaults to `${ping_url}/fail`)
   domain?: string; // publish-latest --domain <name>.ton: the operator's .ton domain to point at the latest ton bag
   chain?: string; // wallet create/address/balance --chain arweave|ton (default arweave, #396 PR2): which credential type wallet.ts operates on
+  plan?: string; // push --plan <path.json>: re-validate a plan file written by "estimate --out" before proceeding (#231)
 }
 
 /**

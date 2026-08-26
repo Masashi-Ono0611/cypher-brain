@@ -15,7 +15,7 @@
 // arweave/turbo backends that consume the resulting file.
 import { mkdir, chmod, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { HOME, AR_WALLET, AR_PAID_BY, TON_WALLET, TON_TONAPI_URL } from './config.js';
+import { HOME, AR_WALLET, AR_PAID_BY, TON_WALLET, TON_TONAPI_URL, TON_PROVIDER_OWNER } from './config.js';
 import { writeKeyFile } from './keys.js';
 import {
   exists,
@@ -286,6 +286,41 @@ async function addressFromWallet(o: CliOptions, what: string): Promise<string> {
 
 async function walletAddress(o: CliOptions): Promise<void> {
   console.log(await addressFromWallet(o, 'wallet address'));
+}
+
+// Best-effort payer address for a backend — used by the plan/apply flow (#231, plan.ts)
+// to bind a plan to the identity that will actually spend, so a payer swap between
+// `estimate --out` and `push --plan` is caught rather than silently paid from a
+// different wallet than what was reviewed. Returns null (never throws) when nothing is
+// configured or the configured credential cannot be read: a plan can still be built
+// and applied without a payer bound (e.g. planning before a wallet is funded), it
+// just cannot detect a payer swap in that case. estimate.ts's `estimate()` reaches
+// this via a DYNAMIC import specifically — this module statically imports estimate.ts's
+// rate functions, so a static import back from estimate.ts would be circular (the same
+// reason estimate.ts already inlines tonWalletConfigured() rather than importing it).
+// pushpull.ts has no such cycle (it does not export anything wallet.ts imports), so it
+// imports payerAddressFor statically like any other function here.
+export async function payerAddressFor(backend: string, o: CliOptions): Promise<string | null> {
+  if (backend === 'arweave' || backend === 'turbo') {
+    const walletPath = o.wallet || AR_WALLET || WALLET_DEFAULT_PATH;
+    if (!(await walletConfigured(walletPath))) return null;
+    try {
+      return await addressFromWallet(o, 'estimate --out');
+    } catch {
+      return null;
+    }
+  }
+  if (backend === 'ton-provider') {
+    if (TON_WALLET) {
+      try {
+        return await addressFromTonWallet(o, 'estimate --out');
+      } catch {
+        return null;
+      }
+    }
+    return TON_PROVIDER_OWNER || null;
+  }
+  return null; // file/rclone/ton: no payer concept
 }
 
 // "expires 2026-08-11T14:05:07Z (in 6 days)" — the relative part is the one that
