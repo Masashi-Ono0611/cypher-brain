@@ -172,6 +172,54 @@ Before opening a PR:
   honestly, including the "Architecture impact" and "Regression / behaviour"
   sections — they tell the reviewer where to look first.
 
+## How PRs get triaged
+
+This is written down so triage is consistent — the goal is that two similar
+PRs get similar treatment, and that being closed comes with a clear reason
+rather than feeling arbitrary (issue #331). It applies to PRs adding a
+**new feature surface** specifically; small fixes, docs, and scoped
+quality-of-life changes aren't held to it.
+
+- **The default bar for a new-feature PR**: does it fix an existing promise
+  that's currently broken, or close a gap that's genuinely blocking users —
+  not just adding a new surface? Is the diff the smallest one that achieves
+  that? Does it hold up against edge cases and hostile input the way this
+  project's own selftests probe for? A PR that doesn't clear this bar is
+  likely to be closed by default, even as a Draft — Draft status doesn't
+  exempt a PR from it. These are judgment questions a maintainer answers,
+  not a checklist a bot enforces.
+- **"Superseded with credit"**: if a PR's diagnosis of a bug is correct and
+  well-evidenced but its implementation is stale, conflicting, or needs a
+  different shape, the fix may get rebased in directly (e.g. via a takeover
+  branch built from the same commits, or an explicit co-author/credit line
+  in the merge) rather than iterated further on the original branch — with
+  the contributor's authorship called out either way. This isn't a
+  rejection of the contribution; it's how a correct diagnosis with a
+  hard-to-land implementation still gets credited.
+- **Diagnosis quality and the merge decision are separate**, and closing
+  comments say so explicitly. A PR can be closed for being out of scope or
+  against the default bar above while its diagnosis is called out as
+  correct and well-reasoned — those are two different judgments, and
+  conflating them (silence reading as "your analysis was wrong") is what
+  this section exists to avoid.
+- **Any automated triage support stays advisory, never decisive.** If this
+  project ever adds tooling to help triage (surfacing whether a PR has a
+  test, touches a public contract, duplicates an open PR, etc.), that
+  tooling's job is to gather evidence for a human to read — not to
+  auto-close or auto-reject. A gate whose own infrastructure failure (an
+  outage, a permission error) shows up as a red X against the contributor
+  is a bug in the gate, not a judgment on the contribution, and gets fixed
+  as one.
+- **Evidence over process.** The PR template's "paste what the change
+  actually printed" section (see [PR #369](https://github.com/Masashi-Ono0611/cypher-brain/pull/369))
+  is the cheap version of "prove it works": for most changes it asks for
+  little more than what a good-faith contributor was already doing to
+  convince themselves it worked. This project deliberately does not
+  require a separately-authored intent paragraph or a screenshot as a hard
+  gate on top of that — that kind of requirement is expensive for
+  contributors and has a poor track record
+  elsewhere once the enforcement around it needs its own maintenance.
+
 ## Response time
 
 This is a single-maintainer project maintained outside of working hours, so
