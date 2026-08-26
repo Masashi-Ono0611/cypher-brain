@@ -164,6 +164,9 @@ Usage:
   storage-v1-client update-providers --contract <raw-addr> \
       --provider-pubkey <64hex> --rate-nano-per-mb-day <int> --span-days <int> \
       [--gas-ton 0.05] [--mainnet] [--max-spend-ton 0.1]
+  storage-v1-client withdraw --contract <raw-addr> --bag-id <64hex> \
+      --merkle-hash <64hex> --size-bytes <n> --piece-size <n> --owner <raw-addr> \
+      [--gas-ton 0.05] [--mainnet] [--max-spend-ton 0.1]
   storage-v1-client --help
 
 deploy: derives the StorageV1 contract address, builds its StateInit + the
@@ -300,6 +303,43 @@ contract instead).
   --max-spend-ton <float>       refuse (exit 2) if --gas-ton would exceed
                                  this. Default 0.1.
   --mainnet                     opt in to mainnet (REAL FUNDS). Default: testnet.
+
+withdraw: sends withdraw_owner (op 0x61fff683, contract.PrepareWithdrawalRequest
+— the exact upstream function) to an ALREADY-DEPLOYED StorageV1 contract.
+PERMANENTLY ends the contract's proof cycle: the on-chain handler checks
+sender == OwnerAddr, then sends the contract's ENTIRE remaining balance
+(minus a small storage-fee reserve) back to the owner along with
+storage_contract_terminated. There is no partial withdrawal and no undo —
+any provider currently serving this bag under this contract stops being
+paid for it the moment this lands.
+
+  The four bag-shape flags (--bag-id/--merkle-hash/--size-bytes/--piece-size)
+  plus --owner must EXACTLY match what this contract was originally deployed
+  with (see 'deploy's own printed values for this contract) — they are used
+  to independently re-derive the contract address as a cross-check, and this
+  REFUSES (exit 2) if the derived address doesn't match --contract, rather
+  than building a deeplink against the wrong account.
+
+  --contract <raw-addr>         required. The EXISTING contract's address.
+  --bag-id <64hex>               required. Must match this contract's deploy.
+  --merkle-hash <64hex>          required. Must match this contract's deploy.
+  --size-bytes <n>               required. Must match this contract's deploy.
+  --piece-size <n>               required. Must match this contract's deploy.
+  --owner <raw-addr>             required. Must be the contract's actual
+                                 OwnerAddr AND the wallet actually
+                                 selected/active in Tonkeeper when signing —
+                                 a mismatch on the latter is an on-chain
+                                 'unauthorized' rejection, not a local error
+                                 this program can catch (same failure mode
+                                 'deploy' hit in a real incident — see
+                                 docs/ton-storage-status.md 2026-08-25).
+  --gas-ton <float>              TON attached for message-processing gas only
+                                 — the contract's existing balance is what
+                                 gets returned, this is separate spend on top.
+                                 Default 0.05.
+  --max-spend-ton <float>       refuse (exit 2) if --gas-ton would exceed
+                                 this. Default 0.1.
+  --mainnet                     opt in to mainnet (REAL FUNDS). Default: testnet.
 `
 
 func main() {
@@ -329,6 +369,8 @@ func run(args []string, stdout, stderr *os.File) int {
 		err = runStatus(ctx, rest, stdout)
 	case "update-providers":
 		err = runUpdateProviders(ctx, rest, stdout)
+	case "withdraw":
+		err = runWithdraw(ctx, rest, stdout)
 	default:
 		fmt.Fprintf(stderr, "storage-v1-client: unknown subcommand %q\n\n", sub)
 		fmt.Fprint(stdout, helpText)
