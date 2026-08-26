@@ -221,7 +221,7 @@ grep -Fq "cypher-brain <command> --help" "$TMP/unknown-cmd.err" \
 # reordering HELP's sections is not a false failure; `\b` is avoided since word-boundary
 # support differs between GNU and BSD grep (multi-model review finding).
 LISTED=$(sed -n 's/^valid commands: //p' "$TMP/unknown-cmd.err" | tr ',' '\n' | tr -d ' ' | sort | tr '\n' ' ')
-EXPECTED=$(printf '%s\n' init keygen wallet snapshot restore verify push pull publish-latest estimate recovery-kit schedule doctor ledger | sort | tr '\n' ' ')
+EXPECTED=$(printf '%s\n' init keygen wallet snapshot restore verify push pull publish-latest estimate recovery-kit schedule doctor ledger audit | sort | tr '\n' ' ')
 [ "$LISTED" = "$EXPECTED" ] \
   || { echo "[FAIL] valid-commands list is [$LISTED], expected [$EXPECTED]"; cat "$TMP/unknown-cmd.err"; exit 1; }
 UNKNOWN_LINES=$(wc -l < "$TMP/unknown-cmd.err" | tr -d ' ')

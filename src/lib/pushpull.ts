@@ -12,6 +12,7 @@ import { signatureKeyIdHex } from './minisign.js';
 import { tonWalletConfigured, payerAddressFor } from './wallet.js';
 import { readPlanFile, validatePlan } from './plan.js';
 import { appendReceipt } from './receipt.js';
+import { recordAudit } from './audit.js';
 import { warn } from './warn.js';
 import type { CliOptions } from './types.js';
 
@@ -171,8 +172,12 @@ export async function readSavedLocatorLine(path: string): Promise<SavedLocator |
 // early return below (nothing was pushed), true once backend.put() has really
 // run. cli.ts uses this (not the raw --backend flag alone) to decide whether a
 // push actually reached a paid backend — issue #195: a SKIPPED push must never
-// be treated as "an upload succeeded".
-export async function push(o: CliOptions): Promise<boolean> {
+// be treated as "an upload succeeded". Also returns the locator (null on a SKIPPED
+// push) so the public push() wrapper below can record it in the audit trail (#226)
+// without re-parsing stdout or depending on --save-locator having been passed.
+async function pushCore(
+  o: CliOptions,
+): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
   if (!o.in) throw new Error('--in <file.age> required');
   if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton> required'); // no silent default
   await requireFile(o.in); // #267: one shared check/wording across every command
@@ -254,7 +259,7 @@ export async function push(o: CliOptions): Promise<boolean> {
           `SKIPPED: content, recipients and signing unchanged (digest ${cur}) — already pushed to ${o.backend} as ${prev.locator} (--force to push anyway)`,
         );
         console.log(prev.locator); // stdout contract unchanged: a script still captures a valid locator
-        return false;
+        return { success: false, locator: prev.locator, sigLocator: prev.sigLocator ?? null };
       }
     }
   }
@@ -514,7 +519,37 @@ export async function push(o: CliOptions): Promise<boolean> {
     }
   }
   console.log(locator); // stdout = locator ONLY, so a script can capture it
-  return true;
+  return { success: true, locator, sigLocator: sigLocator ?? null };
+}
+
+// #226: the public entry point (unchanged signature — every existing caller, cli.ts/
+// mcp.ts/wizard.ts, is unaffected). Records an audit-trail entry (src/lib/audit.ts)
+// AFTER pushCore() settles, whether it succeeded or threw — never before, and never in
+// a way that changes what pushCore() itself did. On failure, the caught error is
+// rethrown UNCHANGED (`throw e`, not a new Error wrapping it): PushPartialSuccessError
+// instances must survive this wrapper intact, since both wizard.ts's push()-caller and
+// mcp.ts's idempotency-replay path do their own `instanceof PushPartialSuccessError`
+// checks on whatever push() throws. Audit recording itself is advisory (recordAudit()/
+// appendAuditEntry() never throw — see audit.ts) and never delays returning/rethrowing
+// pushCore()'s own outcome by more than the recording call itself takes.
+export async function push(o: CliOptions): Promise<boolean> {
+  const startedAt = Date.now();
+  try {
+    const result = await pushCore(o);
+    await recordAudit({
+      command: 'push',
+      o,
+      backend: o.backend ?? null,
+      locator: result.locator,
+      exitCode: 0,
+      startedAt,
+    });
+    return result.success;
+  } catch (e) {
+    const locator = e instanceof PushPartialSuccessError ? e.locator : null;
+    await recordAudit({ command: 'push', o, backend: o.backend ?? null, locator, exitCode: 1, startedAt });
+    throw e;
+  }
 }
 
 // Used only by cypher-brain-mcp's idempotency-key replay path (#220, multi-model review

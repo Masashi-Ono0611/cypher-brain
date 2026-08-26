@@ -38,6 +38,7 @@ import { wallet } from './lib/wallet.js';
 import { estimate } from './lib/estimate.js';
 import { doctor } from './lib/doctor.js';
 import { ledger } from './lib/ledger.js';
+import { audit } from './lib/audit.js';
 import { init } from './lib/wizard.js';
 import { errMsg } from './lib/util.js';
 import { annotateErrorMessage, matchErrorCode } from './lib/errors.js';
@@ -334,6 +335,35 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       --csv prints one row per receipt (timestamp, backend, locator, artifact_sha256,
       size_bytes, payer_address, cost, unit, raw — RFC 4180 minimal quoting) instead of
       an aggregate — wins over --json if both are given (a raw export, not a summary).
+
+  cypher-brain audit [--json]
+      Read-only hash-chain verification (#226): every "push"/"restore"/"verify" run
+      (success OR failure) appends an entry to $CYPHER_BRAIN_HOME/audit-log.jsonl (or
+      CYPHER_BRAIN_AUDIT_LOG — an append-only JSONL file), each entry's hash bound to the
+      PREVIOUS entry's hash. This is a local integrity check against accidental or casual
+      tampering, not a cryptographically authenticated log — same trust boundary as any
+      other file under $CYPHER_BRAIN_HOME (the identity key included): someone who can
+      already write there can also rewrite the whole chain consistently. It is a
+      different concept from both the MCP idempotency log (replay detection) and "ledger"
+      above (cost data, paid backends only) — this one covers every command, records no
+      cost, and never mutates or drops a past entry on its own. This command recomputes
+      and checks the chain; it never writes to the log itself. With no entries yet,
+      prints one line saying so (exit 0 — a fresh machine has an empty, valid,
+      trivially-passing chain).
+      A log line that cannot be read at all (malformed/wrong-shape/future-version, or a
+      field whose type doesn't match what this version writes) is skipped, WARNS on
+      stderr with a count, and — unlike "ledger"'s own unreadable-line handling — makes
+      the OVERALL verdict FAIL: an unreadable line is exactly what deleting or badly
+      corrupting an entry looks like, so it is treated as a possible tamper, never a
+      benign gap to silently subtract from the total.
+      Human report (default): total entry count, the last entry's timestamp/command/
+      exit code, and VERDICT: PASS or FAIL (exit code 1 on FAIL, naming the reason —
+      a broken chain link and/or unreadable lines, either one alone is sufficient to fail).
+      --json prints one object ({total_entries, chain_valid, broken_at_index,
+      skipped_lines, last_entry}) — chain_valid reflects ONLY whether the entries that
+      COULD be read form a valid chain among themselves; combine it with skipped_lines
+      yourself for the same overall PASS/FAIL the human report and exit code use
+      (chain_valid && skipped_lines === 0).
 
   cypher-brain snapshot --out <file.age> [--profile <name>] [--pg <conn>] [--pg-table <t>]...
                          [--pg-filter <file>] [--pg-exclude-table-data <t>]... [--dir <path>]...
@@ -831,6 +861,7 @@ Env: CYPHER_BRAIN_HOME (default ~/.cypher-brain; an existing ~/.cipher-brain is 
      CYPHER_BRAIN_PIN_RECIPIENTS (snapshot: allowlist of age1… pubkeys, inline or a file — refuse to encrypt to any other recipient).
      CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 (init: bypass its TTY requirement — automation/CI only, e.g. this repo's own selftest; a human just runs init directly in a terminal).
 Storage: CYPHER_BRAIN_RECEIPT_LEDGER (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl — every arweave/turbo push's actual-cost receipt, #232; see 'ledger' above).
+         CYPHER_BRAIN_AUDIT_LOG (default $CYPHER_BRAIN_HOME/audit-log.jsonl — hash-chained record of every push/restore/verify run, #226; see 'audit' above).
          CYPHER_BRAIN_FILE_DIR (file);
          CYPHER_BRAIN_AR_{HOST,PORT,PROTOCOL,WALLET,GATEWAY,GATEWAYS,HTTP_TIMEOUT,USD_RATE_URL,TURBO_RATES_URL,BALANCE_URL} (arweave; CYPHER_BRAIN_AR_WALLET is a path to a JWK key file — 'cypher-brain wallet create' generates one, 'wallet address' shows what to fund; the 'arweave' npm package is needed only to PUSH or for the rare L1 chunk fallback — a gateway pull needs none; the approximate-USD lines price each backend in its own truthful unit: the raw arweave L1 backend at AR SPOT (CYPHER_BRAIN_AR_USD_RATE_URL — the spend is real AR at market value), the turbo backend and 'wallet balance' at Turbo's own credit rate, fees included (CYPHER_BRAIN_AR_TURBO_RATES_URL — a turbo upload spends credits, and credits sell at Turbo's price, not AR spot; pricing them at spot understated a real push's cost by ~35%), falling back to labeled AR spot only when that price sheet is unavailable or unusable; a dead rate endpoint just omits the USD line, it never blocks a push; CYPHER_BRAIN_AR_BALANCE_URL overrides the payment-service account endpoint 'wallet balance' queries as '<url>?address=<addr>');
          turbo: CYPHER_BRAIN_AR_WALLET (JWK signer) + optional CYPHER_BRAIN_AR_PAID_BY (an address sharing Turbo Credits to that signer); needs '@ardrive/turbo-sdk' to PUSH (a pull reuses the arweave gateway read, no SDK). Funding/credit-share details: docs/arweave-upload-runbook.md.
@@ -1045,6 +1076,9 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   // writes nothing; every other flag another command takes (--in, --backend, --out, ...)
   // is meaningless here, same posture doctor's own entry above takes.
   ledger: [],
+  // audit() reads only o.json — it inspects audit-log.jsonl in place and writes
+  // nothing; same posture doctor's/ledger's own entries above take.
+  audit: [],
   // Reached through the same switch, so the source-level guard in cli-smoke expects an
   // answer from them too. They take no flags and produce no side effects, which is the
   // answer — recorded rather than special-cased, so a future route that DOES take flags
@@ -1172,6 +1206,8 @@ async function main(): Promise<void> {
       return doctor(o);
     case 'ledger':
       return ledger(o);
+    case 'audit':
+      return audit(o);
     // mascot on stderr (decoration only, EPIPE-safe — see printMascot in
     // ui.ts), HELP text stays on stdout so `cypher-brain --help | grep …`
     // still sees only the HELP text on its stdin.
