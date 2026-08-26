@@ -871,14 +871,18 @@ Storage: CYPHER_BRAIN_RECEIPT_LEDGER (default $CYPHER_BRAIN_HOME/receipt-ledger.
          ton-provider: CYPHER_BRAIN_TON_WALLET (path to a local TON wallet mnemonic — 'wallet create --chain ton' — issue #396 PR2; when set, its own address becomes the contract owner and PUSH auto-signs+broadcasts with no human involved, which is also what makes this backend reachable via 'schedule install'/MCP), CYPHER_BRAIN_TON_PROVIDER_OWNER (TON wallet address that will own the deployed StorageV1 contract — required to PUSH only when CYPHER_BRAIN_TON_WALLET is NOT set; PUSH refuses outright, rather than silently overriding it, if both are set and disagree), CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON spend cap — required to PUSH either way, a deploy spends real funds), CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN (path to a locally built scripts/go/storage-v1-client binary — required to PUSH, notifying a provider needs an ADNL/RLDP query this project has no TypeScript implementation for), CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL (provider registry base URL; default 'https://mytonprovider.org'). Also uses CYPHER_BRAIN_TON_BIN/CYPHER_BRAIN_TON_NETWORK_CONFIG (the local ephemeral daemon that hashes and temporarily seeds the bag) and CYPHER_BRAIN_TON_TONAPI_URL (polling the deploy for on-chain confirmation, AND the approximate-USD line's rate source — tonapi's own public rates endpoint, no separate URL setting needed; auto-sign's broadcast and seqno lookup use this same URL too) from the ton settings above.
 Tracing: OTEL_EXPORTER_OTLP_ENDPOINT (opt-in, #226 part 3 — a THIRD-PARTY standard env
      var, not a CYPHER_BRAIN_* name, so it is NOT also read under CIPHER_BRAIN_* and has
-     no config.env entry. When set, every CLI command and MCP tool call becomes an
-     OpenTelemetry span exported to this OTLP/HTTP endpoint via '@opentelemetry/api' +
-     'sdk-trace-node' + 'exporter-trace-otlp-http' — optional dependencies, not
-     installed by default; a missing or broken package WARNS once on stderr and falls
-     back to a no-op, since tracing must never gate a real push/restore/verify the way a
-     missing SDK gates an actual paid upload elsewhere. Unset (the default): a pure
-     passthrough — no OTel package is even imported, so a machine that has never heard
-     of OTel pays nothing for this feature existing.
+     no config.env entry, and it is a BASE endpoint — the '/v1/traces' path is appended
+     automatically, matching the OTel spec: 'http://localhost:4318', not
+     'http://localhost:4318/v1/traces'). When set, every CLI command and MCP tool call
+     becomes an OpenTelemetry span exported there via '@opentelemetry/api' +
+     'sdk-trace-node' + 'exporter-trace-otlp-http' — optionalDependencies (like
+     '@ardrive/turbo-sdk' above: a normal registry or from-source install already
+     carries them; only an install run with --omit=optional skips them). A missing or
+     broken package WARNS once on stderr and falls back to a no-op, since tracing must
+     never gate a real push/restore/verify the way a missing SDK gates an actual paid
+     upload elsewhere. Unset (the default): a pure passthrough — no OTel package is even
+     imported, so a machine that has never heard of OTel pays nothing for this feature
+     existing.
 Spend: arweave/turbo PUSH needs --yes or CYPHER_BRAIN_YES=1 (paid, permanent); CYPHER_BRAIN_MAX_SPEND caps the arweave/turbo cost estimate (winston/winc). ton-provider PUSH needs --yes or CYPHER_BRAIN_YES=1 too, plus CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) — signed either by a human in Tonkeeper (no CYPHER_BRAIN_TON_WALLET configured) or auto-signed by a local wallet (CYPHER_BRAIN_TON_WALLET set — issue #396 PR2, the same "runs unattended" shape as arweave/turbo's JWK signer, which is what lets it run under 'schedule install'/MCP too). A turbo push also runs a funds check BEFORE signing: when the estimated cost exceeds even the reachable credit (the signer's own balance + the live approvals CYPHER_BRAIN_AR_PAID_BY selects), the spend is headed for a payment-service refusal that would otherwise arrive only after minutes of signing. On a TTY (a human watching) it aborts with the funding steps spelled out, after confirming the shortfall on a second balance read so a top-up landing that same moment is not blocked; without a TTY (a nightly runner, an MCP host) it only WARNS and proceeds — a balance read has no freshness guarantee, and it must never be what blocks an unattended backup. Skipped entirely when the balance cannot be read at all; CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 (strictly '1') bypasses it for one run. A ton-provider push runs the SAME kind of pre-deploy funds check (querying the owner address's own on-chain balance via tonapi), but only ever WARNS, never aborts — whichever mechanism actually spends (the human's Tonkeeper app, or the auto-sign broadcast itself) already gives its own unambiguous refusal on a real shortfall, so this check exists only to save the trip through the up-to-20-minute wait-for-active-contract poll first. Shares CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 with turbo's check above (not a separate ton-provider-specific flag). PUSH also WARNS (never aborts, same reasoning) before signing if the deploy's computed "bounty" looks below the ~0.05 TON floor providers built on tonutils-storage-provider enforce (issue #403) — a real deploy can otherwise succeed and be paid for, then have the provider's own notify refuse to ever fetch the bag, discovered only after the full notify retry window; ESTIMATE shows the same warning ahead of time.
 Consent: restore --pg (pg_restore --clean --if-exists, irreversible) needs --yes or CYPHER_BRAIN_YES=1.
 Permanence: there is NO delete, at any granularity (#301). cypher-brain has no forget/prune/delete
@@ -1155,15 +1159,18 @@ async function main(): Promise<void> {
     console.log((cmd !== undefined && helpForCommand(cmd)) || HELP);
     return;
   }
-  const o = parseArgs(rest);
-  assertFlagsDeclared(cmd);
-  assertFlagsRelevant(cmd, o);
   // #226: each command becomes an OTel span when active (see otel.ts's withSpan() —
-  // a pure passthrough when OTEL_EXPORTER_OTLP_ENDPOINT is unset, the default). One
-  // wrapping point around the whole dispatch, rather than editing every case arm
-  // individually — dispatchCommand()'s body below is byte-for-byte the switch this
-  // replaced, just lifted into its own function so this call can wrap it.
-  return withSpan(cmd ?? 'help', () => dispatchCommand(cmd, o));
+  // a pure passthrough when OTEL_EXPORTER_OTLP_ENDPOINT is unset, the default). Wraps
+  // arg parsing/validation TOO, not just dispatchCommand() — an invalid-flag refusal is
+  // still a real command invocation and observability that only ever sees successful
+  // dispatch would miss every rejected one (Codex review, #226 part 3). `cmd` is known
+  // before parseArgs() can throw, so the span name doesn't depend on parsing succeeding.
+  return withSpan(cmd ?? 'help', async () => {
+    const o = parseArgs(rest);
+    assertFlagsDeclared(cmd);
+    assertFlagsRelevant(cmd, o);
+    return dispatchCommand(cmd, o);
+  });
 }
 
 async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<void> {

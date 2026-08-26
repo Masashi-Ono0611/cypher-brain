@@ -53,13 +53,21 @@ function isoHome() {
 // would block this process's event loop for the child's entire lifetime, starving the
 // receiver of the chance to service any request until after the child already exited
 // (see header comment — the exact mistake the first draft of this test made).
+//
+// Base env deliberately DROPS this runner's own OTEL_EXPORTER_OTLP_ENDPOINT (Codex
+// review, #226 part 3): a naive `{...process.env, ...env}` would let check 1's `{}`
+// silently inherit whatever ambient value happens to be set (an operator's own shell,
+// a CI runner with org-wide tracing exported) and stop testing the unset/default-off
+// path at all — passing for the wrong reason. Callers that DO want it set pass it
+// explicitly via `env`, which still wins (spread order).
 function runDoctor(env, timeoutMs) {
   const home = isoHome();
+  const { OTEL_EXPORTER_OTLP_ENDPOINT: _unused, ...baseEnv } = process.env;
   return new Promise((resolve) => {
     const t0 = Date.now();
     const child = spawn('node', [...DEV_ARGS, BIN, 'doctor'], {
       cwd: ROOT,
-      env: { ...process.env, CYPHER_BRAIN_HOME: home, ...env },
+      env: { ...baseEnv, CYPHER_BRAIN_HOME: home, ...env },
     });
     let stdout = '';
     let stderr = '';
@@ -88,6 +96,17 @@ function runDoctor(env, timeoutMs) {
 
 // check 2: endpoint set + reachable — the span must actually be exported, not merely
 // constructed. A real local OTLP/HTTP receiver counts the requests it gets.
+//
+// OTEL_EXPORTER_OTLP_ENDPOINT is set to the BASE endpoint (no /v1/traces suffix)
+// DELIBERATELY, not as a simplification — per the OTel spec this var is a base
+// endpoint, and the exporter itself appends the per-signal path ('v1/traces')
+// automatically. otel.ts's exporter construction passes no `url` option so that
+// SDK-native env resolution does this (Codex review, #226 part 3: the first draft
+// passed `url: endpoint` directly, which bypasses that resolution and would have
+// posted to the wrong path for any base-endpoint value like this one — the original
+// version of THIS test masked that bug by including /v1/traces in the env var
+// itself). The receiver asserting exactly `/v1/traces` below is what actually proves
+// the auto-append happened, not just that some request arrived.
 {
   let requests = 0;
   const server = createServer((req, res) => {
@@ -100,12 +119,17 @@ function runDoctor(env, timeoutMs) {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
-  const r = await runDoctor({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}/v1/traces` }, 15000);
+  const r = await runDoctor({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` }, 15000);
   server.close();
   if (r.code !== 0) fail(`check 2 (reachable endpoint): doctor exited ${r.code}: ${r.stderr.slice(0, 300)}`);
   else if (requests !== 1)
-    fail(`check 2 (reachable endpoint): receiver got ${requests} POST(s) to /v1/traces, expected exactly 1`);
-  else pass(`check 2: a reachable OTEL_EXPORTER_OTLP_ENDPOINT actually receives the span before the process exits`);
+    fail(
+      `check 2 (reachable endpoint): receiver got ${requests} request(s) to exactly /v1/traces (auto-appended from a base endpoint), expected exactly 1`,
+    );
+  else
+    pass(
+      `check 2: a reachable base OTEL_EXPORTER_OTLP_ENDPOINT gets the /v1/traces path auto-appended and the span is received before the process exits`,
+    );
 }
 
 // check 3: endpoint set + unreachable (accepts the connection, never responds) — must
@@ -120,7 +144,7 @@ function runDoctor(env, timeoutMs) {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
-  const r = await runDoctor({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}/v1/traces` }, 8000);
+  const r = await runDoctor({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` }, 8000);
   server.close();
   if (r.code === null)
     fail(`check 3 (unreachable endpoint): doctor did not exit within 8000ms — tracing is gating the command`);

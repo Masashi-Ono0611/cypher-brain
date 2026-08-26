@@ -77,8 +77,9 @@ let providerPromise: Promise<TracerHandle | null> | null = null;
 let warnedOnce = false;
 
 async function getTracer(): Promise<TracerHandle | null> {
-  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
-  if (!endpoint) return null;
+  // Gate ONLY — never passed to the exporter as its `url` (see the header comment on
+  // the exporter constructor below for why).
+  if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT) return null;
   if (providerPromise) return providerPromise;
   providerPromise = (async (): Promise<TracerHandle | null> => {
     try {
@@ -86,9 +87,19 @@ async function getTracer(): Promise<TracerHandle | null> {
       const { NodeTracerProvider } = await import('@opentelemetry/sdk-trace-node');
       const { BatchSpanProcessor } = await import('@opentelemetry/sdk-trace-base');
       const { OTLPTraceExporter } = await import('@opentelemetry/exporter-trace-otlp-http');
+      // No `url` option here — deliberately. Per the OTel spec, OTEL_EXPORTER_OTLP_ENDPOINT
+      // is a BASE endpoint, and the SDK itself is responsible for appending the per-signal
+      // path ('v1/traces' for this exporter) when resolving it. Passing `url` explicitly
+      // bypasses that resolution entirely (verified against this checkout's installed
+      // otlp-exporter-base: an explicit `url` wins outright over its own env-derived
+      // fallback config in mergeOtlpHttpConfigurationWithDefaults, so the signal path is
+      // never appended) — a value like 'http://collector:4318' (a valid, spec-conformant
+      // base endpoint with no path) would have posted to the WRONG path with `url` set
+      // explicitly. Passing nothing lets the exporter's own env resolution do this
+      // correctly, using the exact same OTEL_EXPORTER_OTLP_ENDPOINT this gate already read.
       const provider = new NodeTracerProvider({
         spanProcessors: [
-          new BatchSpanProcessor(new OTLPTraceExporter({ url: endpoint, timeoutMillis: FLUSH_TIMEOUT_MS }), {
+          new BatchSpanProcessor(new OTLPTraceExporter({ timeoutMillis: FLUSH_TIMEOUT_MS }), {
             exportTimeoutMillis: FLUSH_TIMEOUT_MS,
           }),
         ],
