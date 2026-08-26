@@ -53,6 +53,7 @@ import { restoreRunbook } from './lib/runbook.js';
 import { drainWarnings } from './lib/warn.js';
 import { snapshot } from './lib/snapshot.js';
 import { restore, verify } from './lib/restore.js';
+import { withSpan } from './lib/otel.js';
 import {
   push,
   pull,
@@ -2209,34 +2210,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToo
     // undeclared or out-of-enum is wrong on its own terms, and should be reported that way
     // rather than as irrelevant.
     assertBranchRelevance(name, args);
-    switch (name) {
-      case 'snapshot_now':
-        return await handleSnapshotNow(args);
-      case 'last_snapshot_status':
-        return await handleLastSnapshotStatus(args);
-      case 'verify_restore':
-        return await handleVerifyRestore(args);
-      case 'restore_now':
-        return await handleRestoreNow(args);
-      case 'estimate_cost':
-        return await handleEstimateCost(args);
-      case 'schedule_install':
-        return await handleScheduleInstall(args);
-      case 'schedule_status':
-        return await handleScheduleStatus();
-      case 'keygen':
-        return await handleKeygen(args);
-      case 'wallet_create':
-        return await handleWalletCreate(args);
-      case 'wallet_address':
-        return await handleWalletAddress(args);
-      // Unreachable via the guard above for any name outside ALL_TOOLS; what lands here
-      // is a tool this server ADVERTISES and cannot dispatch, which is a wiring bug on
-      // our side rather than a caller mistake — and ERR_INTERNAL is the honest way to
-      // say so. scripts/mcp-smoke.mjs calls every advertised tool, so it fires in CI.
-      default:
-        return structuredErr(new ToolError('ERR_INTERNAL', `${name} is advertised in tools/list but not dispatched`));
-    }
+    // #226: each MCP tool call becomes an OTel span when active (see otel.ts's
+    // withSpan() — a pure passthrough when OTEL_EXPORTER_OTLP_ENDPOINT is unset, the
+    // default). One wrapping point around the whole switch, matching cli.ts's own
+    // dispatchCommand() wrapping — the switch's own cases are byte-for-byte
+    // unchanged, just lifted into this arrow function's body.
+    return await withSpan(name, async (): Promise<CallToolResult> => {
+      switch (name) {
+        case 'snapshot_now':
+          return await handleSnapshotNow(args);
+        case 'last_snapshot_status':
+          return await handleLastSnapshotStatus(args);
+        case 'verify_restore':
+          return await handleVerifyRestore(args);
+        case 'restore_now':
+          return await handleRestoreNow(args);
+        case 'estimate_cost':
+          return await handleEstimateCost(args);
+        case 'schedule_install':
+          return await handleScheduleInstall(args);
+        case 'schedule_status':
+          return await handleScheduleStatus();
+        case 'keygen':
+          return await handleKeygen(args);
+        case 'wallet_create':
+          return await handleWalletCreate(args);
+        case 'wallet_address':
+          return await handleWalletAddress(args);
+        // Unreachable via the guard above for any name outside ALL_TOOLS; what lands
+        // here is a tool this server ADVERTISES and cannot dispatch, which is a wiring
+        // bug on our side rather than a caller mistake — and ERR_INTERNAL is the
+        // honest way to say so. scripts/mcp-smoke.mjs calls every advertised tool, so
+        // it fires in CI.
+        default:
+          return structuredErr(new ToolError('ERR_INTERNAL', `${name} is advertised in tools/list but not dispatched`));
+      }
+    });
   } catch (err) {
     return structuredErr(err);
   }
