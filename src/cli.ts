@@ -340,20 +340,30 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       Read-only hash-chain verification (#226): every "push"/"restore"/"verify" run
       (success OR failure) appends an entry to $CYPHER_BRAIN_HOME/audit-log.jsonl (or
       CYPHER_BRAIN_AUDIT_LOG — an append-only JSONL file), each entry's hash bound to the
-      PREVIOUS entry's hash (Certificate-Transparency-style tamper evidence, not a
-      replay-detection log like the MCP idempotency log, and not a cost record like
-      "ledger" above — a different concept from both, covering every command whether or
-      not it spent money). This command recomputes and checks that chain; it never
-      writes to the log itself. With no entries yet, prints one line saying so (exit 0 —
-      a fresh machine has an empty, valid, trivially-passing chain). A log line that
-      cannot be read at all (malformed/wrong-shape/future-version) is skipped and WARNS
-      on stderr with a count, same posture "ledger" takes toward its own unreadable
-      lines — never silently treated as "no history".
+      PREVIOUS entry's hash. This is a local integrity check against accidental or casual
+      tampering, not a cryptographically authenticated log — same trust boundary as any
+      other file under $CYPHER_BRAIN_HOME (the identity key included): someone who can
+      already write there can also rewrite the whole chain consistently. It is a
+      different concept from both the MCP idempotency log (replay detection) and "ledger"
+      above (cost data, paid backends only) — this one covers every command, records no
+      cost, and never mutates or drops a past entry on its own. This command recomputes
+      and checks the chain; it never writes to the log itself. With no entries yet,
+      prints one line saying so (exit 0 — a fresh machine has an empty, valid,
+      trivially-passing chain).
+      A log line that cannot be read at all (malformed/wrong-shape/future-version, or a
+      field whose type doesn't match what this version writes) is skipped, WARNS on
+      stderr with a count, and — unlike "ledger"'s own unreadable-line handling — makes
+      the OVERALL verdict FAIL: an unreadable line is exactly what deleting or badly
+      corrupting an entry looks like, so it is treated as a possible tamper, never a
+      benign gap to silently subtract from the total.
       Human report (default): total entry count, the last entry's timestamp/command/
-      exit code, and VERDICT: PASS or FAIL (exit code 1 on FAIL, naming the first
-      broken entry's index).
+      exit code, and VERDICT: PASS or FAIL (exit code 1 on FAIL, naming the reason —
+      a broken chain link and/or unreadable lines, either one alone is sufficient to fail).
       --json prints one object ({total_entries, chain_valid, broken_at_index,
-      skipped_lines, last_entry}) — the same computation as the human report.
+      skipped_lines, last_entry}) — chain_valid reflects ONLY whether the entries that
+      COULD be read form a valid chain among themselves; combine it with skipped_lines
+      yourself for the same overall PASS/FAIL the human report and exit code use
+      (chain_valid && skipped_lines === 0).
 
   cypher-brain snapshot --out <file.age> [--profile <name>] [--pg <conn>] [--pg-table <t>]...
                          [--pg-filter <file>] [--pg-exclude-table-data <t>]... [--dir <path>]...

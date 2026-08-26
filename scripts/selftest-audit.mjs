@@ -45,7 +45,7 @@ try {
   // (the exact bug selftest-receipt.mjs's own header comment documents hitting and
   // fixing in #232 — avoided here from the start).
   process.env.CYPHER_BRAIN_HOME = tmpA;
-  const { appendAuditEntry, readAuditLog, verifyAuditChain } = await import('../src/lib/audit.ts');
+  const { appendAuditEntry, readAuditLog, verifyAuditChain, computeHash } = await import('../src/lib/audit.ts');
 
   // ENOENT case FIRST, before anything is ever appended: a pristine tmpA has no
   // audit-log.jsonl yet, so this is the real "no log file exists at all" state, not
@@ -103,11 +103,20 @@ try {
     JSON.stringify(contentResult),
   );
 
-  // Positive control 2: a DIFFERENT kind of break — the entry's own hash is still
-  // internally consistent with its content, but its prev_hash no longer points at
-  // its actual predecessor (as if a line were deleted/reordered/spliced in). Must
-  // ALSO be detected, and detected as a distinct failure mode from control 1.
-  const tamperedLink = entries.map((e, i) => (i === 1 ? { ...e, prev_hash: 'deadbeef'.repeat(8) } : e));
+  // Positive control 2: a DIFFERENT kind of break — the entry's own hash IS internally
+  // consistent with its content (recomputed here with the real algorithm, via the
+  // exported computeHash — Codex review: an earlier version of this test changed
+  // prev_hash WITHOUT recomputing the entry's own hash, so it accidentally exercised
+  // the SAME content-mismatch branch positive control 1 already covers, not the
+  // distinct link-mismatch branch this control is meant to isolate), but its prev_hash
+  // no longer points at its actual predecessor (as if a line were deleted/reordered/
+  // spliced in). Must ALSO be detected, and detected as a distinct failure mode from
+  // control 1.
+  const badPrevHash = 'deadbeef'.repeat(8);
+  const relinkedEntry = { ...entries[1], prev_hash: badPrevHash };
+  const { hash: _oldHash, ...relinkedWithoutHash } = relinkedEntry;
+  const recomputedEntry = { ...relinkedWithoutHash, hash: computeHash(relinkedWithoutHash) };
+  const tamperedLink = entries.map((e, i) => (i === 1 ? recomputedEntry : e));
   const linkResult = verifyAuditChain(tamperedLink);
   check(
     'positive control: an entry whose prev_hash points at the wrong predecessor IS detected',
@@ -130,6 +139,22 @@ try {
     'readAuditLog: a malformed line and a wrong-shape line are both skipped, not fatal',
     afterGarbage.entries.length === 3 && afterGarbage.skippedLines === 2,
     `${JSON.stringify(afterGarbage.entries.length)} ${afterGarbage.skippedLines}`,
+  );
+
+  // Positive control: a nullable field (entries[1] is "restore", whose `backend` is
+  // ALWAYS null) tampered to a non-null, non-string value must be REJECTED (the whole
+  // line skipped), not silently coerced back to null (Codex review, Critical — the
+  // original coercion logic let this exact tamper "launder" through unnoticed, since
+  // the reconstructed value matched the original null and the stored hash still
+  // verified). Appended as its own extra line so it does not disturb the 3-entry chain
+  // already established above.
+  const nullFieldTamperedRaw = JSON.stringify({ ...entries[1], backend: {} });
+  await appendFile(AUDIT_LOG, `${nullFieldTamperedRaw}\n`);
+  const afterNullFieldTamper = await readAuditLog();
+  check(
+    'readAuditLog: a nullable field tampered from null to a non-string value is rejected, not laundered back to null',
+    afterNullFieldTamper.entries.length === 3 && afterNullFieldTamper.skippedLines === 3,
+    `entries=${afterNullFieldTamper.entries.length} skipped=${afterNullFieldTamper.skippedLines}`,
   );
 } finally {
   delete process.env.CYPHER_BRAIN_HOME;
@@ -215,6 +240,39 @@ try {
 
   const humanReport = cbOk({}, 'audit');
   check('cypher-brain audit (human) reports VERDICT: PASS', /VERDICT: PASS/.test(humanReport), humanReport);
+
+  // Positive control: a DELETED/unreadable TRAILING entry, with the REMAINING entries
+  // still forming a perfectly valid chain among themselves — the exact "chain
+  // truncation" attack Codex review flagged (Warning): dropping the last entry
+  // entirely leaves nothing downstream to notice it is missing, so `verifyAuditChain()`
+  // alone reports `ok: true` on the survivors. `audit` must still fail overall, because
+  // an unreadable line is exactly what a deleted/corrupted entry looks like. Run on
+  // the CURRENT clean 3-entry log (backed up and restored afterward) — not after the
+  // later hand-corrupt test below, which leaves line 0's hash broken and would corrupt
+  // this test's own premise (an otherwise-VALID chain among the survivors).
+  const cleanLogBackup = await readFile(auditLogPath, 'utf8');
+  const linesForTruncation = cleanLogBackup.trim().split('\n');
+  linesForTruncation[linesForTruncation.length - 1] = 'not json at all — simulates a deleted/corrupted entry';
+  await writeFile(auditLogPath, `${linesForTruncation.join('\n')}\n`);
+  const truncatedJsonRun = cb({}, 'audit', '--json');
+  const truncatedJsonParsed = JSON.parse(truncatedJsonRun.stdout);
+  check(
+    'a chain-truncation (unreadable trailing line) reports chain_valid=true for the readable survivors...',
+    truncatedJsonParsed.chain_valid === true,
+    JSON.stringify(truncatedJsonParsed),
+  );
+  check(
+    '...but skipped_lines is 1, and the OVERALL --json exit code is still non-zero (not silently PASS)',
+    truncatedJsonParsed.skipped_lines === 1 && truncatedJsonRun.status === 1,
+    `status=${truncatedJsonRun.status} ${JSON.stringify(truncatedJsonParsed)}`,
+  );
+  const truncatedHuman = cb({}, 'audit');
+  check(
+    'cypher-brain audit (human) reports VERDICT: FAIL on a chain-truncation, not PASS',
+    truncatedHuman.status === 1 && /VERDICT: FAIL/.test(truncatedHuman.stdout),
+    `status=${truncatedHuman.status} stdout=${truncatedHuman.stdout}`,
+  );
+  await writeFile(auditLogPath, cleanLogBackup); // restore the clean 3-entry log for the tests below
 
   // Positive control: force restore to fail (a bad --identity path), confirm the
   // FAILURE path still records an entry, not just the success path.

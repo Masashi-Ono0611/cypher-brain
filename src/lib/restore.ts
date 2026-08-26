@@ -973,13 +973,16 @@ async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<
 // step at that point), but once drill decides to SKIP that step, r.verdict IS the final
 // answer and the promised "VERDICT: FAIL/PARTIAL" line was going unprinted entirely —
 // silently downgrading a documented contract to only an exit code (#209 review).
+// Returns the exit code it just read from process.exitCode (#226): verifyImpl()'s own
+// wrapper (verify(), below) needs this value WITHOUT re-reading the process-global
+// afterward — see verify()'s own doc comment for why a second read is not race-safe.
 function finishVerify(
   o: CliOptions,
   r: FileCheckResult,
   extra?: Record<string, unknown>,
   printVerdictLine = false,
-): void {
-  const exitCode = process.exitCode ?? 0;
+): number {
+  const exitCode = Number(process.exitCode ?? 0); // process.exitCode's declared type is string|number|undefined
   if (!o.json && printVerdictLine) printFileCheckVerdict(r.verdict);
   if (o.json) {
     printJson({
@@ -998,6 +1001,7 @@ function finishVerify(
   // corrupt the JSON on stdout, but a --json caller asked for machine-readable output
   // only, not ASCII-art decoration alongside it.
   if (!o.json) printMascot(moodForVerdict(r.verdict));
+  return exitCode;
 }
 
 // verify --level quick|remote|drill (issue #209): three progressively deeper checks that
@@ -1020,23 +1024,26 @@ function finishVerify(
 //           (pulled ciphertext + extracted plaintext) is always removed afterward, success
 //           or failure — this proves restorability, it does not perform a real restore.
 // #226: the public entry point. verify() reports its outcome via process.exitCode
-// (0 PASS / 1 FAIL / 2 PARTIAL — set at various points inside verifyImpl(), never
-// via a return value or a throw for a normal FAIL/PARTIAL verdict; a THROWN error
-// here means something genuinely unexpected happened, not an ordinary verify
-// failure). Reading process.exitCode immediately after verifyImpl(o) resolves, with
-// no other `await` in between, is safe both for direct CLI use and inside mcp.ts's
-// captureCall() (which snapshots/restores process.exitCode around the whole call —
-// this read happens fully inside that window).
+// (0 PASS / 1 FAIL / 2 PARTIAL — set at various points inside verifyImpl(), never via
+// a throw for a normal FAIL/PARTIAL verdict; a THROWN error here means something
+// genuinely unexpected happened, not an ordinary verify failure). verifyImpl() ALSO
+// returns that same code directly (Codex review): reading process.exitCode back out
+// after `await verifyImpl(o)` resolves is NOT race-safe — the microtask handoff at an
+// `await` boundary can let another in-process async task (e.g. a concurrent MCP
+// verify_restore call) overwrite the process-global before this line resumes, even
+// with no OTHER await in between. Using verifyImpl()'s own return value sidesteps
+// that race entirely; process.exitCode itself is left set exactly as before, for every
+// other existing caller/contract that reads it.
 export async function verify(o: CliOptions): Promise<void> {
   const startedAt = Date.now();
   try {
-    await verifyImpl(o);
+    const exitCode = await verifyImpl(o);
     await recordAudit({
       command: 'verify',
       o,
       backend: o.backend ?? null,
       locator: o.locator ?? null,
-      exitCode: Number(process.exitCode ?? 0), // process.exitCode's declared type is string|number|undefined
+      exitCode,
       startedAt,
     });
   } catch (e) {
@@ -1052,7 +1059,7 @@ export async function verify(o: CliOptions): Promise<void> {
   }
 }
 
-async function verifyImpl(o: CliOptions): Promise<void> {
+async function verifyImpl(o: CliOptions): Promise<number> {
   const level = o.level ?? 'quick';
   if (level !== 'quick' && level !== 'remote' && level !== 'drill') {
     throw new Error(`--level must be quick, remote or drill (got "${o.level}")`);
@@ -1067,8 +1074,7 @@ async function verifyImpl(o: CliOptions): Promise<void> {
       );
     }
     const r = await runFileChecks(o, true);
-    finishVerify(o, r);
-    return;
+    return finishVerify(o, r);
   }
 
   // remote and drill both start the same way: actually fetch the artifact. That fetch IS
@@ -1178,7 +1184,7 @@ async function verifyImpl(o: CliOptions): Promise<void> {
         });
       }
       if (!o.json) printMascot('sad');
-      return;
+      return 1;
     }
     // sig_locator is pull()'s own bookkeeping, filled in on `pullOpts` (the SAME object
     // reference passed to pull() above) when --from-locator-file recorded one — read
@@ -1210,8 +1216,7 @@ async function verifyImpl(o: CliOptions): Promise<void> {
     const r = await runFileChecks({ ...o, in: target, sha256: pullOpts.sha256 }, level === 'remote');
 
     if (level === 'remote') {
-      finishVerify(o, r, { level, pulled: pulledInfo });
-      return;
+      return finishVerify(o, r, { level, pulled: pulledInfo });
     }
 
     // drill only goes on to a real decrypt+extract once the checks above actually reached
@@ -1228,8 +1233,7 @@ async function verifyImpl(o: CliOptions): Promise<void> {
             : '[SKIP] full restore drill — the checks above already failed',
         );
       }
-      finishVerify(o, r, { level, pulled: pulledInfo, full_restore: 'skip' }, true);
-      return;
+      return finishVerify(o, r, { level, pulled: pulledInfo, full_restore: 'skip' }, true);
     }
 
     // restoreImpl(), NOT restore(): restore() prints its own mood mascot on success/failure
@@ -1278,7 +1282,8 @@ async function verifyImpl(o: CliOptions): Promise<void> {
     }
     const finalVerdict: 'PASS' | 'FAIL' = restoreOk ? 'PASS' : 'FAIL';
     if (!o.json) console.log(`\nVERDICT: ${finalVerdict}`);
-    process.exitCode = finalVerdict === 'PASS' ? 0 : 1;
+    const finalExitCode = finalVerdict === 'PASS' ? 0 : 1;
+    process.exitCode = finalExitCode;
     if (o.json) {
       printJson({
         level,
@@ -1287,10 +1292,14 @@ async function verifyImpl(o: CliOptions): Promise<void> {
         full_restore: restoreOk,
         ...(restoreErr ? { full_restore_error: restoreErr } : {}),
         verdict: finalVerdict,
-        exit_code: process.exitCode,
+        exit_code: finalExitCode,
       });
     }
     if (!o.json) printMascot(finalVerdict === 'PASS' ? 'happy' : 'sad');
+    // `finally` below still runs before this actually returns (JS/TS semantics: a
+    // `return` inside `try` executes the paired `finally` first, then yields this
+    // value) — the scratch-dir cleanup is not skipped by returning here.
+    return finalExitCode;
   } finally {
     // Best-effort, same posture as mcp.ts's own scratch-tmpdir cleanup (handleVerifyRestore/
     // handleRestoreNow) — always removed, whether the fetch, the checks, or the restore

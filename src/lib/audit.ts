@@ -1,12 +1,22 @@
 // Hash-chain audit trail (#226, parts 1+2 merged into one mechanism): one JSONL line
 // per push/restore/verify run (success OR failure), each line's hash binding it to the
-// PREVIOUS line's hash — a Certificate-Transparency-style tamper-evidence chain. This
-// is a DIFFERENT concept from receipt.ts (cost data, paid backends only) and from
-// idempotency.ts (replay detection, read-modify-rename under a lock). Closest
-// precedent is receipt.ts's pure-append shape: `appendFile(path, line, {flag:'a'})`,
-// a `{entries, skippedLines}` read contract, ENOENT-vs-other-errors distinguished
-// (readAuditLog() applies the SAME Critical-review fix receipt.ts's readReceipts()
-// needed in #232, from the start).
+// PREVIOUS line's hash. This is a LOCAL INTEGRITY check against accidental or casual
+// tampering, not a cryptographically authenticated log — there is no independent,
+// externally-anchored checkpoint, so a full local rewrite of the file (or a clean
+// truncation from the end) is undetectable by design: same trust boundary as any other
+// file under $CYPHER_BRAIN_HOME, the identity key included. What it DOES catch: an
+// in-place edit of an entry, or deleting/corrupting one from the MIDDLE of the log —
+// either breaks the hash chain for every entry after it. This is a DIFFERENT concept
+// from receipt.ts (cost data, paid backends only) and from idempotency.ts (replay
+// detection, read-modify-rename under a lock). Closest precedent is receipt.ts's
+// pure-append shape: `appendFile(path, line, {flag:'a'})`, a `{entries, skippedLines}`
+// read contract, ENOENT-vs-other-errors distinguished (readAuditLog() applies the SAME
+// Critical-review fix receipt.ts's readReceipts() needed in #232, from the start) —
+// PLUS a stricter shape check on nullable fields than receipt.ts's own (Codex review,
+// Critical: coercing a wrong-typed nullable field to `null` on read let a field that
+// was ALREADY `null` be tampered to any other value and silently launder back to the
+// SAME `null` the stored hash was computed against; every nullable field here must be
+// exactly `null` or a `string`, or the whole line is rejected).
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -32,7 +42,13 @@ export interface AuditEntry {
   exit_code: number;
   duration_ms: number;
   prev_hash: string | null; // null ONLY for the very first entry in the log
-  hash: string; // sha256(prev_hash + canonical-JSON of every OTHER field, fixed key order)
+  // sha256(canonical-JSON of every OTHER field, PREV_HASH INCLUDED, fixed key order —
+  // Codex review: an earlier version of this comment described a "prev_hash + JSON"
+  // string-concatenation form that does not match canonicalize()'s actual behavior,
+  // which serializes prev_hash as an ordinary field of the same JSON object rather
+  // than prefixing it separately; internal verification was never affected since the
+  // writer and reader agree, but the comment itself was wrong).
+  hash: string;
 }
 
 // Canonical = a FIXED key order every process writes in, so two processes hashing the
@@ -55,7 +71,13 @@ function canonicalize(e: Omit<AuditEntry, 'hash'>): string {
   });
 }
 
-function computeHash(e: Omit<AuditEntry, 'hash'>): string {
+// Exported (not just internal) so scripts/selftest-audit.mjs can build a tampered
+// entry with a CORRECT, recomputed hash — needed to isolate "the link to the
+// predecessor is wrong" from "this entry's own content changed" as two genuinely
+// distinct positive controls (Codex review, Suggestion — an earlier version of that
+// test changed prev_hash without recomputing the hash, so it exercised the
+// content-mismatch branch either way, not the link-mismatch branch specifically).
+export function computeHash(e: Omit<AuditEntry, 'hash'>): string {
   return createHash('sha256').update(canonicalize(e)).digest('hex');
 }
 
@@ -92,31 +114,49 @@ export async function readAuditLog(): Promise<ReadAuditLogResult> {
     if (!trimmed) continue;
     try {
       const parsed = JSON.parse(trimmed) as Partial<AuditEntry> | null;
+      // Every nullable field is checked as EXACTLY null-or-string here, not coerced —
+      // Codex review, Critical: the original version accepted ANY wrong-typed value
+      // for a nullable field (e.g. an object, or the key deleted entirely) and folded
+      // it down to `null` when rebuilding the entry. For a field that was ALREADY
+      // `null` in the original entry (restore/verify's `backend`, or any command's
+      // `locator`/`artifact_sha256`/`recipients_fingerprint` when unavailable), this
+      // let a tampered value launder back to the SAME `null` the stored hash was
+      // computed against — verifyAuditChain() then recomputed the identical hash and
+      // reported the tampered line as valid. Rejecting (skipping) anything that is
+      // not exactly `null` or a `string` closes that hole: a line altered this way is
+      // now unreadable rather than silently normalized, and audit()'s VERDICT below
+      // treats any skipped line as a possible tamper, not a benign gap.
       if (
         !parsed ||
         typeof parsed !== 'object' ||
         parsed.cypher_brain_audit_version !== AUDIT_VERSION ||
         typeof parsed.timestamp !== 'string' ||
         (parsed.command !== 'push' && parsed.command !== 'restore' && parsed.command !== 'verify') ||
+        (parsed.backend !== null && typeof parsed.backend !== 'string') ||
+        (parsed.locator !== null && typeof parsed.locator !== 'string') ||
+        (parsed.artifact_sha256 !== null && typeof parsed.artifact_sha256 !== 'string') ||
         typeof parsed.machine !== 'string' ||
+        (parsed.recipients_fingerprint !== null && typeof parsed.recipients_fingerprint !== 'string') ||
         typeof parsed.exit_code !== 'number' ||
         typeof parsed.duration_ms !== 'number' ||
         typeof parsed.hash !== 'string' ||
         (parsed.prev_hash !== null && typeof parsed.prev_hash !== 'string')
       ) {
-        skippedLines++; // wrong shape (foreign line, future version) — skip, don't crash a read
+        skippedLines++; // wrong shape (foreign line, future version, or a tampered field) — skip, don't crash a read
         continue;
       }
       entries.push({
         cypher_brain_audit_version: AUDIT_VERSION,
         timestamp: parsed.timestamp,
         command: parsed.command,
-        backend: typeof parsed.backend === 'string' ? parsed.backend : null,
-        locator: typeof parsed.locator === 'string' ? parsed.locator : null,
-        artifact_sha256: typeof parsed.artifact_sha256 === 'string' ? parsed.artifact_sha256 : null,
+        // `?? null` here is SAFE (not a normalization) only because the guard above
+        // already proved each of these is exactly `null` or a `string` — this is a
+        // type narrowing, not a coercion of a wrong-typed value.
+        backend: parsed.backend ?? null,
+        locator: parsed.locator ?? null,
+        artifact_sha256: parsed.artifact_sha256 ?? null,
         machine: parsed.machine,
-        recipients_fingerprint:
-          typeof parsed.recipients_fingerprint === 'string' ? parsed.recipients_fingerprint : null,
+        recipients_fingerprint: parsed.recipients_fingerprint ?? null,
         exit_code: parsed.exit_code,
         duration_ms: parsed.duration_ms,
         prev_hash: parsed.prev_hash ?? null,
@@ -187,9 +227,17 @@ export function verifyAuditChain(entries: AuditEntry[]): ChainVerifyResult {
 }
 
 // Shared helper push()/restore()/verify()'s own wrappers call — resolves
-// artifact_sha256/recipients_fingerprint best-effort (never throws: a hash/fingerprint
-// read failure degrades to null, same posture pushpull.ts's own sidecar readers take),
-// so a caller need only supply what it definitely knows.
+// artifact_sha256/recipients_fingerprint best-effort, so a caller need only supply
+// what it definitely knows. The WHOLE body is wrapped in try/catch (Codex review,
+// Critical): appendAuditEntry() alone being advisory-only is not sufficient —
+// sha256()/readRecipientsFingerprint() ran OUTSIDE that protection in an earlier
+// version, so if either ever threw (both are documented never-throw today, but that
+// is an implementation detail of two OTHER modules this function does not control),
+// recordAudit() itself would reject, and push()/restore()/verify()'s own wrapper
+// would then either replace a real thrown error with this one, or turn an otherwise-
+// successful run into a reported failure. This function's own contract — advisory
+// only, NEVER throws — is now guaranteed at its own boundary, not borrowed from
+// callees.
 export async function recordAudit(args: {
   command: AuditEntry['command'];
   o: CliOptions;
@@ -198,19 +246,25 @@ export async function recordAudit(args: {
   exitCode: number;
   startedAt: number;
 }): Promise<void> {
-  const artifactSha256 = args.o.in ? await sha256(args.o.in).catch(() => null) : null;
-  const recipientsFingerprint = args.o.in ? await readRecipientsFingerprint(args.o.in) : null;
-  await appendAuditEntry({
-    timestamp: new Date().toISOString(),
-    command: args.command,
-    backend: args.backend,
-    locator: args.locator,
-    artifact_sha256: artifactSha256,
-    machine: hostname(),
-    recipients_fingerprint: recipientsFingerprint,
-    exit_code: args.exitCode,
-    duration_ms: Date.now() - args.startedAt,
-  });
+  try {
+    const artifactSha256 = args.o.in ? await sha256(args.o.in).catch(() => null) : null;
+    const recipientsFingerprint = args.o.in ? await readRecipientsFingerprint(args.o.in) : null;
+    await appendAuditEntry({
+      timestamp: new Date().toISOString(),
+      command: args.command,
+      backend: args.backend,
+      locator: args.locator,
+      artifact_sha256: artifactSha256,
+      machine: hostname(),
+      recipients_fingerprint: recipientsFingerprint,
+      exit_code: args.exitCode,
+      duration_ms: Date.now() - args.startedAt,
+    });
+  } catch (e) {
+    warn(
+      `could not record an audit entry for ${args.command} (${errMsg(e)}) — the ${args.command} itself is unaffected`,
+    );
+  }
 }
 
 // CLI `audit [--json]`: read-only chain verification. Mirrors doctor.ts's PASS/FAIL/
@@ -221,6 +275,16 @@ export async function audit(o: CliOptions): Promise<void> {
     warn(`audit: ${skippedLines} line(s) in the audit log could not be read (malformed/wrong-shape/future-version)`);
   }
   const result = verifyAuditChain(entries);
+  // Codex review, Warning: a chain that verifies against the entries readAuditLog()
+  // COULD parse is not proof nothing is missing — deleting an entry outright, or
+  // corrupting it into an unreadable shape, makes it disappear from `entries`
+  // entirely rather than show up as a broken link, so `result.ok` alone used to stay
+  // true even when a line was silently dropped. Any skipped line is now treated as a
+  // POSSIBLE deletion/tamper, not a benign gap: the overall VERDICT/exit code fails
+  // whenever skippedLines > 0, even if the entries that WERE readable form a
+  // perfectly valid chain among themselves (`chain_valid` in --json output keeps its
+  // narrower, original meaning — that sub-result alone).
+  const overallOk = result.ok && skippedLines === 0;
   const lastEntry = entries.length > 0 ? entries[entries.length - 1] : null;
   if (o.json) {
     printJson({
@@ -230,7 +294,7 @@ export async function audit(o: CliOptions): Promise<void> {
       skipped_lines: skippedLines,
       last_entry: lastEntry,
     });
-    if (!result.ok) process.exitCode = 1;
+    if (!overallOk) process.exitCode = 1;
     return;
   }
   console.log('cypher-brain audit — hash-chain verification');
@@ -241,8 +305,9 @@ export async function audit(o: CliOptions): Promise<void> {
     console.log(`last entry: ${lastEntry.timestamp} ${lastEntry.command} (exit ${lastEntry.exit_code})`);
   }
   console.log('');
-  console.log(
-    `VERDICT: ${result.ok ? 'PASS' : 'FAIL'}${result.ok ? '' : ` — chain broken at entry index ${result.brokenAtIndex}`}`,
-  );
-  if (!result.ok) process.exitCode = 1;
+  const reasons: string[] = [];
+  if (!result.ok) reasons.push(`chain broken at entry index ${result.brokenAtIndex}`);
+  if (skippedLines > 0) reasons.push(`${skippedLines} unreadable line(s) could hide a deleted/altered entry`);
+  console.log(`VERDICT: ${overallOk ? 'PASS' : 'FAIL'}${reasons.length ? ` — ${reasons.join('; ')}` : ''}`);
+  if (!overallOk) process.exitCode = 1;
 }
