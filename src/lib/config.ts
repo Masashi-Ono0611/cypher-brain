@@ -31,6 +31,7 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_LAUNCHD_DIR',
   'CYPHER_BRAIN_FILE_DIR',
   'CYPHER_BRAIN_RECEIPT_LEDGER',
+  'CYPHER_BRAIN_AUDIT_LOG',
   'CYPHER_BRAIN_RCLONE_BIN',
   'CYPHER_BRAIN_GITLEAKS_BIN',
   'CYPHER_BRAIN_AR_HOST',
@@ -253,6 +254,15 @@ export const RECIPIENT = join(HOME, 'recipient.txt'); // public key — all snap
 // audit trail, not a replay-detection log, so a single malformed/truncated line is
 // skipped (src/lib/receipt.ts), never treated as fail-closed.
 export const RECEIPT_LEDGER = readEnv('CYPHER_BRAIN_RECEIPT_LEDGER') || join(HOME, 'receipt-ledger.jsonl');
+
+// #226: append-only, hash-chained JSONL audit trail — one line per push/restore/verify
+// run (success or failure), each line's hash binding it to the previous line's hash
+// (Certificate-Transparency-style tamper evidence). Same pure-append shape as
+// RECEIPT_LEDGER (src/lib/audit.ts), a DIFFERENT concept from both it (this covers
+// every push/restore/verify, not just paid ones, and carries no cost data) and
+// IDEMPOTENCY_LOG (that one detects REPLAYS; this one never mutates or drops a past
+// entry).
+export const AUDIT_LOG = readEnv('CYPHER_BRAIN_AUDIT_LOG') || join(HOME, 'audit-log.jsonl');
 
 // #220: cypher-brain-mcp's idempotency-key log for snapshot_now (the paid MCP tool) — an
 // AI agent's own retry after a network blip must not spend twice for what it believes is

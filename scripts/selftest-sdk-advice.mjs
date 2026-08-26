@@ -110,6 +110,13 @@ try {
     cwd: isoDir,
     encoding: 'utf8',
     timeout: 30000,
+    // CYPHER_BRAIN_HOME isolation (#226): this push always fails at the SDK-import
+    // stage (before ever reaching a real upload), but push() ALSO records an audit-
+    // trail entry (src/lib/audit.ts) on that failure — without an isolated HOME here,
+    // that entry landed in the operator's REAL $CYPHER_BRAIN_HOME/audit-log.jsonl
+    // (caught via a leaked file found outside any test tmp dir, the same class of bug
+    // #232's own selftest-receipt.mjs header comment documents hitting once already).
+    env: { ...process.env, CYPHER_BRAIN_HOME: join(tmp, 'home') },
   });
   if (r.status === 0) fail('push with a broken SDK exited 0');
   else if (!/exports do not match/.test(r.stderr) || !/isolated directory/.test(r.stderr))

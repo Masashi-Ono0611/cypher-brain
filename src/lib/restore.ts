@@ -27,6 +27,7 @@ import {
 import { didYouMean } from './suggest.js';
 import { moodForVerdict, printMascot, printJson } from './ui.js';
 import { pull, signatureGap } from './pushpull.js';
+import { recordAudit } from './audit.js';
 import type { CliOptions } from './types.js';
 
 // #228: this file's StrykerJS mutation run (`npm run mutation-test`) is deliberately
@@ -566,17 +567,25 @@ async function expandComponents(outDir: string): Promise<void> {
   for (const r of rows) console.log(`  ${r.dir}  <-  ${r.source}`);
 }
 
-// restore() itself (unlike push(), which is shared with the MCP server and the
-// init wizard) is called ONLY from cli.ts — no other caller reuses it — so it is
-// safe to print the mood mascot right here rather than at a dispatch call site:
-// happy on a clean return, sad on any thrown failure (issue #194). Decoration
-// only, on stderr (see printMascot in ui.ts), so it never touches the extracted
-// files or any machine-readable output.
+// restore() is shared by cli.ts AND mcp.ts's restore_now tool (mcp.ts calls it
+// directly, captured through captureCall() — the mascot decoration below is on
+// stderr, which mcp.ts's console-capture treats as ordinary progress output, so
+// this is harmless there; an earlier version of this comment claimed cli.ts was
+// the only caller, which stopped being true once restore_now was added and went
+// uncorrected — fixed here while touching this function for #226). happy on a
+// clean return, sad on any thrown failure (issue #194).
+//
+// #226: also records an audit-trail entry (src/lib/audit.ts) after restoreImpl()
+// settles, success or failure — advisory only (recordAudit() never throws), and the
+// caught error is rethrown UNCHANGED afterward so nothing about restoreImpl()'s own
+// outcome is altered by this wrapper.
 export async function restore(o: CliOptions): Promise<void> {
+  const startedAt = Date.now();
   try {
     await restoreImpl(o);
   } catch (e) {
     printMascot('sad');
+    await recordAudit({ command: 'restore', o, backend: null, locator: null, exitCode: 1, startedAt });
     throw e;
   }
   // Deliberately OUTSIDE the try: printMascot('happy') itself throwing (e.g. some
@@ -585,6 +594,7 @@ export async function restore(o: CliOptions): Promise<void> {
   // above and print 'sad' + rethrow over a restore that actually already
   // succeeded (multi-model review finding on PR #200).
   printMascot('happy');
+  await recordAudit({ command: 'restore', o, backend: null, locator: null, exitCode: 0, startedAt });
 }
 
 async function restoreImpl(o: CliOptions): Promise<void> {
@@ -1009,7 +1019,40 @@ function finishVerify(
 //           verification drill must not write to a live database. The scratch directory
 //           (pulled ciphertext + extracted plaintext) is always removed afterward, success
 //           or failure — this proves restorability, it does not perform a real restore.
+// #226: the public entry point. verify() reports its outcome via process.exitCode
+// (0 PASS / 1 FAIL / 2 PARTIAL — set at various points inside verifyImpl(), never
+// via a return value or a throw for a normal FAIL/PARTIAL verdict; a THROWN error
+// here means something genuinely unexpected happened, not an ordinary verify
+// failure). Reading process.exitCode immediately after verifyImpl(o) resolves, with
+// no other `await` in between, is safe both for direct CLI use and inside mcp.ts's
+// captureCall() (which snapshots/restores process.exitCode around the whole call —
+// this read happens fully inside that window).
 export async function verify(o: CliOptions): Promise<void> {
+  const startedAt = Date.now();
+  try {
+    await verifyImpl(o);
+    await recordAudit({
+      command: 'verify',
+      o,
+      backend: o.backend ?? null,
+      locator: o.locator ?? null,
+      exitCode: Number(process.exitCode ?? 0), // process.exitCode's declared type is string|number|undefined
+      startedAt,
+    });
+  } catch (e) {
+    await recordAudit({
+      command: 'verify',
+      o,
+      backend: o.backend ?? null,
+      locator: o.locator ?? null,
+      exitCode: 1,
+      startedAt,
+    });
+    throw e;
+  }
+}
+
+async function verifyImpl(o: CliOptions): Promise<void> {
   const level = o.level ?? 'quick';
   if (level !== 'quick' && level !== 'remote' && level !== 'drill') {
     throw new Error(`--level must be quick, remote or drill (got "${o.level}")`);
