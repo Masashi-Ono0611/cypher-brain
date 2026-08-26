@@ -90,33 +90,52 @@ try {
     cost: null,
     unit: null,
   });
+  // undated: a REAL priced cost, but a timestamp that isn't the canonical
+  // toISOString() shape appendReceipt() always produces (a hand-edited/foreign line) —
+  // must be counted in by_backend (it has a real cost), excluded from by_day/by_month
+  // (it cannot be safely bucketed), and counted as `undated_receipts`, NOT
+  // `unpriced_receipts` (Codex review — the two were conflated before this fix).
+  await appendReceipt({
+    ...base,
+    timestamp: '2026-08-20', // missing time-of-day — not ISO_UTC_PATTERN
+    backend: 'arweave',
+    locator: 'tx3',
+    cost: '500',
+    unit: 'winston',
+  });
   // a raw malformed JSON line — must be skipped, not fatal
   const { RECEIPT_LEDGER } = await import('../src/lib/config.ts');
   await appendFile(RECEIPT_LEDGER, 'not json at all\n');
   // a well-formed-JSON but wrong-shape line (missing required fields) — also skipped
   await appendFile(RECEIPT_LEDGER, `${JSON.stringify({ cypher_brain_receipt_version: 1, backend: 'turbo' })}\n`);
 
-  const receipts = await readReceipts();
+  const { receipts, skippedLines } = await readReceipts();
   check(
-    'readReceipts: 4 real entries survive, 2 malformed/wrong-shape lines are skipped',
-    receipts.length === 4,
+    'readReceipts: 5 real entries survive, 2 malformed/wrong-shape lines are skipped',
+    receipts.length === 5,
     `got ${receipts.length}`,
   );
+  check('readReceipts: skippedLines counts exactly the 2 unreadable lines', skippedLines === 2, `got ${skippedLines}`);
 
   const summary = summarizeLedger(receipts);
   check(
     'summarizeLedger: total_receipts counts every survived line',
-    summary.total_receipts === 4,
+    summary.total_receipts === 5,
     JSON.stringify(summary),
   );
   check(
-    'summarizeLedger: unpriced_receipts counts the null-cost entry, once',
+    'summarizeLedger: unpriced_receipts counts ONLY the null-cost entry (not the undated one)',
     summary.unpriced_receipts === 1,
     JSON.stringify(summary),
   );
   check(
-    'summarizeLedger: by_backend sums per unit, arweave = 100+250 winston',
-    summary.by_backend.arweave?.count === 2 && summary.by_backend.arweave?.cost.winston === '350',
+    'summarizeLedger: undated_receipts counts the bad-timestamp entry, separate from unpriced_receipts',
+    summary.undated_receipts === 1,
+    JSON.stringify(summary),
+  );
+  check(
+    'summarizeLedger: by_backend sums per unit, arweave = 100+250+500 winston (undated tx3 IS included — it has a real cost)',
+    summary.by_backend.arweave?.count === 3 && summary.by_backend.arweave?.cost.winston === '850',
     JSON.stringify(summary.by_backend.arweave),
   );
   check(
@@ -125,13 +144,18 @@ try {
     JSON.stringify(summary.by_backend.turbo),
   );
   check(
-    'summarizeLedger: by_month groups 2026-08 (two arweave entries) separately from 2026-09',
+    'summarizeLedger: by_month groups 2026-08 (two DATED arweave entries only, tx3 excluded) separately from 2026-09',
     summary.by_month['2026-08']?.winston === '350' && summary.by_month['2026-09']?.winc === '999999999999',
     JSON.stringify(summary.by_month),
   );
   check(
     'summarizeLedger: by_day keeps 2026-08-01 and 2026-08-15 as separate buckets, not merged into the month',
     summary.by_day['2026-08-01']?.winston === '100' && summary.by_day['2026-08-15']?.winston === '250',
+    JSON.stringify(summary.by_day),
+  );
+  check(
+    'summarizeLedger: the undated entry (tx3, cost 500) does not silently land in ANY by_day bucket',
+    !Object.values(summary.by_day).some((d) => d.winston === '500' || d.winston === '850'),
     JSON.stringify(summary.by_day),
   );
   check(
@@ -268,6 +292,40 @@ try {
 
     const csvReport = cbOk({}, 'ledger', '--csv');
     check('ledger --csv includes the locator', csvReport.includes(loc), csvReport);
+
+    // A SIGNED push to a paid backend is TWO separate uploads (ciphertext + .minisig
+    // sidecar) — each its own charge, so the ledger must record TWO receipts, not one
+    // (Codex review — the sidecar upload's cost was invisible to the ledger before this
+    // fix, understating the true total for every signed arweave/turbo push).
+    cbOk({}, 'keygen', '--sign');
+    const signedSnap = join(tmp, 'signed-snap.age');
+    cbOk({}, 'snapshot', '--dir', src, '--out', signedSnap, '--sign');
+    console.error('push --backend arweave (signed)...');
+    const signedLoc = cbOk({}, 'push', '--in', signedSnap, '--backend', 'arweave');
+    const entriesAfterSignedPush = await readReceiptsAt(ledgerPath);
+    check(
+      'a signed push appends TWO receipts (ciphertext + .minisig sidecar), not one',
+      entriesAfterSignedPush.length === entries.length + 2,
+      `had ${entries.length}, now ${entriesAfterSignedPush.length}`,
+    );
+    const newEntries = entriesAfterSignedPush.slice(entries.length);
+    const primaryReceipt = newEntries.find((e) => e.locator === signedLoc);
+    const sidecarReceipt = newEntries.find((e) => e.locator !== signedLoc);
+    check(
+      'the primary artifact receipt locator matches what push printed',
+      !!primaryReceipt,
+      JSON.stringify(newEntries),
+    );
+    check(
+      'the sidecar receipt has its OWN distinct locator and a real winston cost',
+      !!sidecarReceipt && sidecarReceipt.locator !== signedLoc && /^\d+$/.test(sidecarReceipt.cost ?? ''),
+      JSON.stringify(sidecarReceipt),
+    );
+    check(
+      "the sidecar receipt raw.tx_id matches its own locator, not the primary artifact's",
+      sidecarReceipt?.raw?.tx_id === sidecarReceipt?.locator,
+      JSON.stringify(sidecarReceipt),
+    );
 
     // receipt-write failure must not fail an already-successful (already-paid!) push:
     // point CYPHER_BRAIN_RECEIPT_LEDGER's directory AT an existing plain FILE, so
