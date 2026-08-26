@@ -27,7 +27,7 @@ binaries.
 | **Our droplet as a paid provider** | testnet | standing twin (same Go binaries, isolated units) — controlled environment, no real earnings expected |
 | **We pay a legacy C++ provider** (spends — fabric-contract ecosystem) | mainnet | **GRAVEYARD** (115 listed, 0 active ≤7d, 94 silent >1y) — not pursuing |
 | **We pay a legacy C++ provider** | testnet | **DEAD DAEMONS, live contracts** (2026-08-22 experiment) |
-| **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **WORKS end to end, including a confirmed proof-reward payout** (2026-08-23) — `scripts/go/storage-v1-client` (deploy/notify/status/update-providers/withdraw) deployed and funded a StorageV1 contract for masabrain (481 MB) against our own registered droplet-as-provider, the provider self-reported the full bag downloaded, and a `storage_reward_withdrawal` (op `0xa91baf56`) transaction of 0.119662827 TON from the contract to the provider's registered wallet followed shortly after. Getting there required one real-money field-mapping bug (fixed by an in-place repair, not a re-deploy) — see below. That original contract (pubkey `f5f603c7…`) is now orphaned by the 2026-08-25 canary migration (see below); `withdraw` (added 2026-08-26) implements its recovery path but has not yet been run |
+| **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **WORKS end to end, including a confirmed proof-reward payout** (2026-08-23) — `scripts/go/storage-v1-client` (deploy/notify/status/update-providers/withdraw) deployed and funded a StorageV1 contract for masabrain (481 MB) against our own registered droplet-as-provider, the provider self-reported the full bag downloaded, and a `storage_reward_withdrawal` (op `0xa91baf56`) transaction of 0.119662827 TON from the contract to the provider's registered wallet followed shortly after. Getting there required one real-money field-mapping bug (fixed by an in-place repair, not a re-deploy) — see below. That original contract (pubkey `f5f603c7…`) was orphaned by the 2026-08-25 canary migration, then drained via the new `withdraw` subcommand the next morning (see below) |
 | **We pay a live Go provider** | testnet | **WORKS end to end** (2026-08-23) — `scripts/go/storage-v1-client` deployed and funded a StorageV1 contract for a throwaway 71-byte bag against our own droplet's testnet standing twin, notified it, and the provider fetched the bag; content verified byte-identical via sha256 on both sides. No public testnet registry exists (mytonprovider.org is mainnet-only — see below), so this is dev-only, not an OSS-facing feature — see below |
 
 **The single most important 2026-08-23 correction**: the provider market is TWO
@@ -578,14 +578,25 @@ the storage; it buys availability, not permanence.
   proof-reward payout (see above). Its original mainnet contract,
   `0:465347a9b5152bf6f69e1bc47ce82c537aee5ae4e3d00437d4a514f0e9cc452a` —
   masabrain (481 MB), rate 800 nanoTON/MB/day, span 192 days, provider
-  pubkey `f5f603c7…` (our own droplet) — is now orphaned by the 2026-08-25
-  canary migration. Balance was directly observed at ~0.42 TON on
-  2026-08-23 (this snapshot's original figure) and ~0.35 TON at the
-  2026-08-25 migration (see above); the latter is the more recent
-  observation, but this log has not established why the two differ (e.g.
-  further proof/reward activity on the old contract in the interim is
-  plausible but unconfirmed here). `withdraw` implements its documented
-  recovery path but has not yet been run. The live provider
-  identity going forward is the canary contract `0:ebf4e8cb…` deployed
-  under pubkey `3a7fe754…` (see above for the migration detail; full
+  pubkey `f5f603c7…` (our own droplet) — was orphaned by the 2026-08-25
+  canary migration (~0.42 TON observed 2026-08-23, ~0.35 TON observed at
+  the 2026-08-25 migration; this log never established why those two
+  differed) and then **drained via `withdraw` on 2026-08-26 09:52:15
+  JST (2026-08-26 00:52:15 UTC)** — a `withdraw_owner` (op `0x61fff683`) message
+  from the owner wallet (`masashi-ono0611.ton`) landed on-chain, the
+  contract answered with `storage_contract_terminated` (op `0xb6236d63`)
+  and forwarded `0.397118779 TON` back to that same wallet (tx
+  `a683d5b2c5baef3b2ef6f6d26cc6b45eac322bfe171260ab0c0a3ea227d49c61`,
+  confirmed directly via `GET tonapi.io/v2/blockchain/accounts/<addr>/transactions`,
+  not from this repo's own logs). That withdrawn amount implies a
+  pre-withdrawal balance of ~0.402 TON — again not reconciled with the
+  ~0.35 TON figure observed the day before; this log has not established
+  why the balance apparently rose in the interim (or whether the ~0.35 TON
+  figure was simply imprecise). The contract remains on-chain
+  (`status: active`, not destroyed) with a residual balance of
+  ~0.005 TON — this log has not confirmed whether that is a StorageV1
+  protocol-mandated minimum or just what `withdraw_owner` happened to
+  leave. The live provider identity
+  going forward is the canary contract `0:ebf4e8cb…` deployed under
+  pubkey `3a7fe754…` (see above for the migration detail; full
   address/balance not yet recorded in this log).
