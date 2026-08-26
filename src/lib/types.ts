@@ -28,6 +28,7 @@ export interface CliOptions {
   no_expand_components?: boolean;
   dry_run?: boolean; // snapshot --dry-run: preview .cypherbrainignore include/exclude without writing anything (#216)
   json?: boolean; // verify/estimate/schedule status: machine-readable JSON on stdout instead of the human-readable report (issue #211)
+  csv?: boolean; // ledger --csv: one row per receipt on stdout instead of the aggregate report (#232)
   level?: string; // verify --level quick|remote|drill (issue #209) — validated in restore.ts (parseArgs can't know the enum), default 'quick' when absent
   sign?: boolean; // keygen --sign: generate a minisign-compatible Ed25519 signing keypair instead of an age identity (#214)
   no_sign?: boolean; // snapshot --no-sign: skip writing a <out>.minisig sidecar even when a signing identity is present (#214)
@@ -87,6 +88,15 @@ export type FetchShape = 'age' | 'minisig';
 export interface PutOpts {
   yes?: boolean;
   remote?: string; // rclone backend only: the "<remote>:<path>" destination (put() throws without it)
+  // #232: paid backends (arweave, turbo) call this, right after a successful upload,
+  // with their raw SDK/API response AS-IS (never reshaped — Turbo's own official
+  // receipt-persistence recommendation) and the actual native-unit cost that upload
+  // paid, if the backend can name one. pushpull.ts's push() uses it to persist a
+  // receipt (src/lib/receipt.ts) SEPARATE from estimate.ts's pre-flight forecast —
+  // never conflated. Backends with no concept of a paid receipt (file/rclone/ton)
+  // never call it, so no entry, cost, or unit field here is ever optional-but-lying:
+  // absence means "this backend has nothing to report", not "reporting failed".
+  onReceipt?: (raw: unknown, cost: { amount: string; unit: 'winston' | 'winc' } | null) => void;
 }
 
 export interface StorageBackend {

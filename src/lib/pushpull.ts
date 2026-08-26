@@ -11,6 +11,8 @@ import { estimateCost, formatEstimate } from './estimate.js';
 import { signatureKeyIdHex } from './minisign.js';
 import { tonWalletConfigured, payerAddressFor } from './wallet.js';
 import { readPlanFile, validatePlan } from './plan.js';
+import { appendReceipt } from './receipt.js';
+import { warn } from './warn.js';
 import type { CliOptions } from './types.js';
 
 // The plaintext content digest for the artifact being pushed: an explicit --digest
@@ -346,9 +348,55 @@ export async function push(o: CliOptions): Promise<boolean> {
   const backend = await backendFor(o.backend);
   // `remote` is only meaningful to the rclone backend (its --remote <name>:<path>
   // destination — types.ts's PutOpts) — every other backend's put() ignores it, same
-  // as `yes` is only meaningful to arweave/turbo.
-  const locator = await backend.put(o.in, { yes, remote: o.remote });
+  // as `yes` is only meaningful to arweave/turbo. `onReceipt` (#232) is likewise only
+  // ever called by arweave/turbo — `receipt` stays null for every other backend, and
+  // the append block below is then a no-op.
+  // A mutable PROPERTY, not a bare `let`: TS's control-flow narrowing sees no direct
+  // assignment to `receiptBox` itself outside the closure and so keeps its declared
+  // union type intact at the `if` check below — a bare `let receipt = null` reassigned
+  // only inside the onReceipt closure gets over-narrowed to the literal `null` (the sole
+  // assignment CFA can see in this function's own linear flow), making a later
+  // `if (receipt)` narrow to `never` rather than the non-null branch.
+  const receiptBox: {
+    value: { raw: unknown; cost: { amount: string; unit: 'winston' | 'winc' } | null } | null;
+  } = { value: null };
+  const locator = await backend.put(o.in, {
+    yes,
+    remote: o.remote,
+    onReceipt: (raw, cost) => {
+      receiptBox.value = { raw, cost };
+    },
+  });
   console.error(`pushed ${o.in} -> ${o.backend}:${locator}`);
+  // #232: persist a receipt for the ACTUAL cost a paid backend just charged, separate
+  // from estimate.ts's pre-flight forecast printed above. The upload already
+  // succeeded and already spent real funds by this point — a receipt-write failure
+  // (disk full, permissions) must NEVER retroactively fail an already-completed push
+  // (that would misrepresent a successful, paid upload as a failure a caller might
+  // retry, risking a double spend) — advisory only, same posture push()'s balance
+  // display already takes elsewhere in this file.
+  const capturedReceipt = receiptBox.value;
+  if (capturedReceipt) {
+    try {
+      const [artifactSha256, payerAddress] = await Promise.all([sha256(o.in), payerAddressFor(o.backend, o)]);
+      const { size: sizeBytes } = await stat(o.in);
+      await appendReceipt({
+        timestamp: new Date().toISOString(),
+        backend: o.backend,
+        locator,
+        artifact_sha256: artifactSha256,
+        size_bytes: sizeBytes,
+        payer_address: payerAddress,
+        cost: capturedReceipt.cost?.amount ?? null,
+        unit: capturedReceipt.cost?.unit ?? null,
+        raw: capturedReceipt.raw,
+      });
+    } catch (e) {
+      warn(
+        `${o.backend}: could not persist the upload receipt (${errMsg(e)}) — the push itself succeeded (locator ${locator} is real); cumulative-cost ledger will be missing this entry`,
+      );
+    }
+  }
   // Authenticity sidecar (#214): if snapshot() wrote a "<in>.minisig" next to the
   // ciphertext, upload it too — same backend, same already-granted consent (`yes`
   // covers the whole push() call, not a per-file re-prompt for a few-hundred-byte
