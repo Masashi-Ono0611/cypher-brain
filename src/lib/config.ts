@@ -30,6 +30,7 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_SCHEDULE_DIR',
   'CYPHER_BRAIN_LAUNCHD_DIR',
   'CYPHER_BRAIN_FILE_DIR',
+  'CYPHER_BRAIN_RECEIPT_LEDGER',
   'CYPHER_BRAIN_RCLONE_BIN',
   'CYPHER_BRAIN_GITLEAKS_BIN',
   'CYPHER_BRAIN_AR_HOST',
@@ -245,6 +246,13 @@ export const pgTool = (name: string): string => (PG_BIN ? join(PG_BIN, name) : n
 
 export const IDENTITY = join(HOME, 'identity.age'); // private key — required to restore
 export const RECIPIENT = join(HOME, 'recipient.txt'); // public key — all snapshot needs
+
+// #232: append-only JSONL ledger of ACTUAL storage-provider receipts (arweave/turbo
+// only — the paid backends), one line per completed paid push. Same append-only JSONL
+// shape as IDEMPOTENCY_LOG below, but a different consistency contract: this is an
+// audit trail, not a replay-detection log, so a single malformed/truncated line is
+// skipped (src/lib/receipt.ts), never treated as fail-closed.
+export const RECEIPT_LEDGER = readEnv('CYPHER_BRAIN_RECEIPT_LEDGER') || join(HOME, 'receipt-ledger.jsonl');
 
 // #220: cypher-brain-mcp's idempotency-key log for snapshot_now (the paid MCP tool) — an
 // AI agent's own retry after a network blip must not spend twice for what it believes is

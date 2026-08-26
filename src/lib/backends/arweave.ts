@@ -292,6 +292,9 @@ interface ArweaveClient {
 }
 interface ArweaveTransaction {
   id: string;
+  reward: string; // winston, the actual fee this tx was signed for — arweave-js always
+  // populates it (fetched internally when createTransaction was not given one), a tx
+  // cannot be validly signed without a reward. Read only for the receipt (#232).
   addTag(name: string, value: string): void;
 }
 
@@ -421,7 +424,7 @@ export async function arweaveBackend(): Promise<StorageBackend> {
     }
   };
   return {
-    async put(file: string, _opts: PutOpts = {}): Promise<string> {
+    async put(file: string, opts: PutOpts = {}): Promise<string> {
       // Fast size guard BEFORE buffering: the raw arweave backend posts the whole
       // artifact inline in ONE signed tx, and gateways reject single-tx bodies past
       // ~12 MiB — a brain-sized snapshot would buffer the lot and then fail with a bare
@@ -480,6 +483,16 @@ export async function arweaveBackend(): Promise<StorageBackend> {
       await ar.transactions.sign(tx, jwk);
       const res = await ar.transactions.post(tx);
       if (res.status !== 200 && res.status !== 208) throw new Error(describeArweavePostError(res.status, res.data));
+      // #232: tx.reward is the AUTHORITATIVE actual cost — set either from the pre-flight
+      // `reward` above (passed into createTransaction) or, if that estimate failed,
+      // fetched internally by createTransaction itself (arweave-js always populates it;
+      // a tx cannot be validly signed without one). Never the pre-flight estimate
+      // variable directly: if that fetch failed, `reward` is undefined here, but tx.reward
+      // is still the real, signed figure either way.
+      opts.onReceipt?.(
+        { tx_id: tx.id, reward: tx.reward, post_status: res.status },
+        { amount: tx.reward, unit: 'winston' },
+      );
       return tx.id; // 43-char base64url tx id
     },
     async get(locator: string, out: string, expect: FetchShape = 'age'): Promise<void> {

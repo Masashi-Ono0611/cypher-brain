@@ -18,7 +18,7 @@ import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 export function turboBackend(): StorageBackend {
   return {
-    async put(file: string, _opts: PutOpts = {}): Promise<string> {
+    async put(file: string, opts: PutOpts = {}): Promise<string> {
       // import + wallet load live HERE (not the constructor) so a turbo PULL needs
       // neither @ardrive/turbo-sdk nor a wallet — only an upload does.
       let TurboFactory: typeof import('@ardrive/turbo-sdk').TurboFactory;
@@ -269,6 +269,14 @@ export function turboBackend(): StorageBackend {
         events: { onProgress },
       });
       if (!res?.id) throw new Error(`turbo upload returned no data item id: ${JSON.stringify(res).slice(0, 200)}`);
+      // #232: persist Turbo's own upload response AS-IS (its official receipt-
+      // persistence recommendation — the SDK does not separately restate a
+      // "final amount charged" field). `uploadWinc` is the pre-flight estimate that
+      // actually gated this specific upload (the CYPHER_BRAIN_MAX_SPEND check above,
+      // moments before signing) — the closest thing to "actual cost" this response
+      // surfaces; null only if that estimate itself could not be obtained (an
+      // uncapped push proceeding despite a failed pre-flight query).
+      opts.onReceipt?.(res, uploadWinc !== null ? { amount: String(uploadWinc), unit: 'winc' } : null);
       return res.id; // 43-char data item id — retrievable like any bundled item
     },
     // reads are identical to the arweave backend (Turbo items are bundled). Pure

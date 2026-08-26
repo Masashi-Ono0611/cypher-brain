@@ -37,6 +37,7 @@ import { schedule } from './lib/schedule.js';
 import { wallet } from './lib/wallet.js';
 import { estimate } from './lib/estimate.js';
 import { doctor } from './lib/doctor.js';
+import { ledger } from './lib/ledger.js';
 import { init } from './lib/wizard.js';
 import { errMsg } from './lib/util.js';
 import { annotateErrorMessage, matchErrorCode } from './lib/errors.js';
@@ -63,6 +64,7 @@ const BOOL_FLAGS = new Set([
   'no_sign',
   'require_signature',
   'inline_identity',
+  'csv',
 ]); // flags that take no value
 
 // Value flags (always a string when passed) — kept in sync with CliOptions
@@ -299,6 +301,39 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       (checks: [{id, status, message, remediation?, marker, since?}], resolved: [...],
       health_score, new_count, carryover_count, verdict, state_path, state_saved) — the
       SAME computation as the human-readable report, never a re-implementation.
+
+  cypher-brain ledger [--json] [--csv]
+      Read-only cumulative-cost report (#232): every "push --backend arweave|turbo" that
+      actually spent money writes a RECEIPT ($CYPHER_BRAIN_HOME/receipt-ledger.jsonl, or
+      CYPHER_BRAIN_RECEIPT_LEDGER — an append-only JSONL file, one object per upload,
+      INCLUDING a separate entry for the .minisig signature sidecar upload when a signed
+      artifact is pushed — that is its own paid upload too) — the best available
+      native-unit cost figure alongside the backend's own response: for the raw arweave
+      L1 backend, the authoritative signed transaction reward; for turbo, the pre-flight
+      estimate that gated that specific upload (Turbo's SDK response has no separately-
+      confirmed charged-amount field to read back — not a confirmed post-hoc debit, the
+      best figure available). This is deliberately separate from "estimate"'s pre-flight
+      forecast (never conflated) — it answers "what did we actually spend" and "how much
+      cumulatively", not "what would this cost". file/rclone/ton/ton-provider pushes never
+      write a receipt (nothing paid, or no receipt object to persist) and so never appear
+      here. With no receipts yet, prints one line saying so (exit 0 — an empty ledger is
+      a normal state, not an error). A ledger line that cannot be read at all (malformed/
+      wrong-shape/future-version) is skipped and WARNS on stderr with a count — never
+      silently treated as "no receipts" (a genuinely missing/never-created ledger file
+      still reports zero receipts with no warning).
+      Human report (default): total receipt count, cost summed BY BACKEND, BY MONTH and
+      BY DAY (UTC, most recent 14 shown) — each sum kept separate PER NATIVE UNIT
+      (winston/winc are different currencies, never added together). A receipt with no
+      priceable cost is "unpriced" (excluded from every sum); one with a priced cost but
+      an unparseable timestamp is "undated" (still counted in by-backend, excluded only
+      from by-day/by-month) — the two are reported as distinct counts, never conflated.
+      --json prints one object ({total_receipts, unpriced_receipts, undated_receipts,
+      skipped_lines, by_backend, by_day, by_month, receipts: [...every receipt...]}) —
+      the same computation as the human report, plus the full receipt array for a script
+      to reprocess without a second call.
+      --csv prints one row per receipt (timestamp, backend, locator, artifact_sha256,
+      size_bytes, payer_address, cost, unit, raw — RFC 4180 minimal quoting) instead of
+      an aggregate — wins over --json if both are given (a raw export, not a summary).
 
   cypher-brain snapshot --out <file.age> [--profile <name>] [--pg <conn>] [--pg-table <t>]...
                          [--pg-filter <file>] [--pg-exclude-table-data <t>]... [--dir <path>]...
@@ -795,7 +830,8 @@ Env: CYPHER_BRAIN_HOME (default ~/.cypher-brain; an existing ~/.cipher-brain is 
      CYPHER_BRAIN_PASSPHRASE (non-interactive passphrase for a wrapped identity — automation/CI; otherwise prompted on the TTY).
      CYPHER_BRAIN_PIN_RECIPIENTS (snapshot: allowlist of age1… pubkeys, inline or a file — refuse to encrypt to any other recipient).
      CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 (init: bypass its TTY requirement — automation/CI only, e.g. this repo's own selftest; a human just runs init directly in a terminal).
-Storage: CYPHER_BRAIN_FILE_DIR (file);
+Storage: CYPHER_BRAIN_RECEIPT_LEDGER (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl — every arweave/turbo push's actual-cost receipt, #232; see 'ledger' above).
+         CYPHER_BRAIN_FILE_DIR (file);
          CYPHER_BRAIN_AR_{HOST,PORT,PROTOCOL,WALLET,GATEWAY,GATEWAYS,HTTP_TIMEOUT,USD_RATE_URL,TURBO_RATES_URL,BALANCE_URL} (arweave; CYPHER_BRAIN_AR_WALLET is a path to a JWK key file — 'cypher-brain wallet create' generates one, 'wallet address' shows what to fund; the 'arweave' npm package is needed only to PUSH or for the rare L1 chunk fallback — a gateway pull needs none; the approximate-USD lines price each backend in its own truthful unit: the raw arweave L1 backend at AR SPOT (CYPHER_BRAIN_AR_USD_RATE_URL — the spend is real AR at market value), the turbo backend and 'wallet balance' at Turbo's own credit rate, fees included (CYPHER_BRAIN_AR_TURBO_RATES_URL — a turbo upload spends credits, and credits sell at Turbo's price, not AR spot; pricing them at spot understated a real push's cost by ~35%), falling back to labeled AR spot only when that price sheet is unavailable or unusable; a dead rate endpoint just omits the USD line, it never blocks a push; CYPHER_BRAIN_AR_BALANCE_URL overrides the payment-service account endpoint 'wallet balance' queries as '<url>?address=<addr>');
          turbo: CYPHER_BRAIN_AR_WALLET (JWK signer) + optional CYPHER_BRAIN_AR_PAID_BY (an address sharing Turbo Credits to that signer); needs '@ardrive/turbo-sdk' to PUSH (a pull reuses the arweave gateway read, no SDK). Funding/credit-share details: docs/arweave-upload-runbook.md.
          rclone: CYPHER_BRAIN_RCLONE_BIN (path to the rclone binary; default 'rclone' on PATH) — the remote itself is whatever --remote <name>:<path> names in your own 'rclone config'.
@@ -1005,6 +1041,10 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   // --backend, ...) is meaningless here, but none is likely enough to be typed by
   // mistake to warrant naming individually (unlike restore's --out/--out-dir mix-up).
   doctor: [],
+  // ledger() reads only o.json/o.csv — it inspects receipt-ledger.jsonl in place and
+  // writes nothing; every other flag another command takes (--in, --backend, --out, ...)
+  // is meaningless here, same posture doctor's own entry above takes.
+  ledger: [],
   // Reached through the same switch, so the source-level guard in cli-smoke expects an
   // answer from them too. They take no flags and produce no side effects, which is the
   // answer — recorded rather than special-cased, so a future route that DOES take flags
@@ -1130,6 +1170,8 @@ async function main(): Promise<void> {
       return wallet(o);
     case 'doctor':
       return doctor(o);
+    case 'ledger':
+      return ledger(o);
     // mascot on stderr (decoration only, EPIPE-safe — see printMascot in
     // ui.ts), HELP text stays on stdout so `cypher-brain --help | grep …`
     // still sees only the HELP text on its stdin.

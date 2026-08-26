@@ -11,6 +11,8 @@ import { estimateCost, formatEstimate } from './estimate.js';
 import { signatureKeyIdHex } from './minisign.js';
 import { tonWalletConfigured, payerAddressFor } from './wallet.js';
 import { readPlanFile, validatePlan } from './plan.js';
+import { appendReceipt } from './receipt.js';
+import { warn } from './warn.js';
 import type { CliOptions } from './types.js';
 
 // The plaintext content digest for the artifact being pushed: an explicit --digest
@@ -344,11 +346,72 @@ export async function push(o: CliOptions): Promise<boolean> {
     );
   }
   const backend = await backendFor(o.backend);
+  type ReceiptBox = {
+    value: { raw: unknown; cost: { amount: string; unit: 'winston' | 'winc' } | null } | null;
+  };
+  // A mutable PROPERTY, not a bare `let`: TS's control-flow narrowing sees no direct
+  // assignment to a box's field itself outside the closure and so keeps its declared
+  // union type intact at the `if` check below — a bare `let receipt = null` reassigned
+  // only inside the onReceipt closure gets over-narrowed to the literal `null` (the sole
+  // assignment CFA can see in this function's own linear flow), making a later
+  // `if (receipt)` narrow to `never` rather than the non-null branch.
+  const newReceiptBox = (): ReceiptBox => ({ value: null });
+  // #232: persist a receipt for the ACTUAL cost a paid backend just charged for
+  // `uploadedPath`, separate from estimate.ts's pre-flight forecast printed above. The
+  // upload already succeeded and already spent real funds by the time this runs — a
+  // receipt-write failure (disk full, permissions) must NEVER retroactively fail an
+  // already-completed push (that would misrepresent a successful, paid upload as a
+  // failure a caller might retry, risking a double spend) — advisory only, same
+  // posture push()'s balance display already takes elsewhere in this file. Shared by
+  // both the primary artifact upload below AND the .minisig sidecar upload further
+  // down: a signed push to arweave/turbo makes TWO separate paid uploads, and the
+  // sidecar's cost was invisible to the ledger before this was factored out (Codex
+  // review — understated the total cost of every signed paid push).
+  // A plain local `const`, not `o.backend` accessed directly inside the closure below:
+  // TS does not carry the `if (!o.backend) throw` narrowing at the top of this function
+  // through into a nested arrow function's body (property-access narrowing on a
+  // captured object resets inside a closure), so `o.backend` alone reads back as
+  // `string | undefined` there even though it is provably a `string` by this point.
+  const backendName = o.backend;
+  const persistReceiptIfAny = async (uploadedPath: string, uploadedLocator: string, box: ReceiptBox): Promise<void> => {
+    const captured = box.value;
+    if (!captured) return;
+    try {
+      const [artifactSha256, payerAddress] = await Promise.all([sha256(uploadedPath), payerAddressFor(backendName, o)]);
+      const { size: sizeBytes } = await stat(uploadedPath);
+      await appendReceipt({
+        timestamp: new Date().toISOString(),
+        backend: backendName,
+        locator: uploadedLocator,
+        artifact_sha256: artifactSha256,
+        size_bytes: sizeBytes,
+        payer_address: payerAddress,
+        cost: captured.cost?.amount ?? null,
+        unit: captured.cost?.unit ?? null,
+        raw: captured.raw,
+      });
+    } catch (e) {
+      warn(
+        `${backendName}: could not persist the upload receipt (${errMsg(e)}) — the push itself succeeded (locator ${uploadedLocator} is real); cumulative-cost ledger will be missing this entry`,
+      );
+    }
+  };
+
   // `remote` is only meaningful to the rclone backend (its --remote <name>:<path>
   // destination — types.ts's PutOpts) — every other backend's put() ignores it, same
-  // as `yes` is only meaningful to arweave/turbo.
-  const locator = await backend.put(o.in, { yes, remote: o.remote });
+  // as `yes` is only meaningful to arweave/turbo. `onReceipt` (#232) is likewise only
+  // ever called by arweave/turbo — every other backend's receiptBox stays null, and
+  // persistReceiptIfAny() above is then a no-op for it.
+  const receiptBox = newReceiptBox();
+  const locator = await backend.put(o.in, {
+    yes,
+    remote: o.remote,
+    onReceipt: (raw, cost) => {
+      receiptBox.value = { raw, cost };
+    },
+  });
   console.error(`pushed ${o.in} -> ${o.backend}:${locator}`);
+  await persistReceiptIfAny(o.in, locator, receiptBox);
   // Authenticity sidecar (#214): if snapshot() wrote a "<in>.minisig" next to the
   // ciphertext, upload it too — same backend, same already-granted consent (`yes`
   // covers the whole push() call, not a per-file re-prompt for a few-hundred-byte
@@ -360,8 +423,20 @@ export async function push(o: CliOptions): Promise<boolean> {
   const sigPath = `${o.in}.minisig`;
   let sigLocator: string | undefined;
   if (await exists(sigPath)) {
+    const sigReceiptBox = newReceiptBox();
+    // A local `const`, typed plain `string`, not the outer `let sigLocator: string |
+    // undefined` — TS cannot narrow the outer variable to non-undefined here (its
+    // declaration and assignment sit across a try/catch boundary), and the outer
+    // variable is still assigned right below for --save-locator's own later use.
+    let justUploaded: string;
     try {
-      sigLocator = await backend.put(sigPath, { yes, remote: o.remote ? `${o.remote}.minisig` : undefined });
+      justUploaded = await backend.put(sigPath, {
+        yes,
+        remote: o.remote ? `${o.remote}.minisig` : undefined,
+        onReceipt: (raw, cost) => {
+          sigReceiptBox.value = { raw, cost };
+        },
+      });
     } catch (e) {
       // The ciphertext (above) already durably uploaded — see PushPartialSuccessError's
       // own doc comment for why this must never be reported the same way as an
@@ -370,7 +445,12 @@ export async function push(o: CliOptions): Promise<boolean> {
       // having spent, not treat a retry as the first attempt).
       throw new PushSignatureUploadError(locator, e);
     }
-    console.error(`pushed ${sigPath} -> ${o.backend}:${sigLocator}`);
+    sigLocator = justUploaded;
+    console.error(`pushed ${sigPath} -> ${o.backend}:${justUploaded}`);
+    // #232: a signed push to a paid backend is TWO separate uploads (ciphertext +
+    // sidecar), each its own charge — without this, the ledger silently understated
+    // every signed arweave/turbo push's true total cost (Codex review).
+    await persistReceiptIfAny(sigPath, justUploaded, sigReceiptBox);
   }
   // --save-locator <path>: persist the returned locator so operators can back it up
   // alongside their identity (the two things a fresh machine needs to restore).
