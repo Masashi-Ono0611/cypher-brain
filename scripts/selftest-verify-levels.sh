@@ -122,6 +122,29 @@ printf '%s' "$DJ" | grep -q '"full_restore":true' \
   && echo "[PASS] --level drill --json: one line, includes full_restore:true" \
   || { echo "[FAIL] --level drill --json missing full_restore:true"; echo "$DJ"; exit 1; }
 
+echo "== #436: --level drill's default console output omits the raw manifest.json dump; --verbose restores it =="
+cb verify --level drill --locator "$LOC" --backend file --sha256 "$ORIG" > "$TMP/drill-default.out" 2>&1
+grep -q '"schema"' "$TMP/drill-default.out" \
+  && { echo "[FAIL] --level drill (no --verbose) printed the raw manifest.json dump"; cat "$TMP/drill-default.out"; exit 1; }
+grep -q 'VERDICT: PASS' "$TMP/drill-default.out" \
+  || { echo "[FAIL] --level drill (no --verbose) lost its VERDICT line"; cat "$TMP/drill-default.out"; exit 1; }
+echo "[PASS] --level drill's default console output has no raw manifest.json dump, VERDICT still shown"
+
+cb verify --level drill --locator "$LOC" --backend file --sha256 "$ORIG" --verbose > "$TMP/drill-verbose.out" 2>&1
+grep -q '"schema"' "$TMP/drill-verbose.out" \
+  || { echo "[FAIL] --level drill --verbose did not print the raw manifest.json dump"; cat "$TMP/drill-verbose.out"; exit 1; }
+grep -q 'VERDICT: PASS' "$TMP/drill-verbose.out" \
+  || { echo "[FAIL] --level drill --verbose lost its VERDICT line"; cat "$TMP/drill-verbose.out"; exit 1; }
+echo "[PASS] --level drill --verbose prints the raw manifest.json dump alongside VERDICT"
+
+echo "== --level drill --json --verbose: --verbose has no effect on --json's single-line contract =="
+DJV=$(cb verify --level drill --locator "$LOC" --backend file --json --verbose); DJVRC=$?
+[ "$DJVRC" = "0" ] || { echo "[FAIL] --level drill --json --verbose exited $DJVRC"; echo "$DJV"; exit 1; }
+DJVLINES=$(printf '%s\n' "$DJV" | wc -l | tr -d ' ')
+[ "$DJVLINES" = "1" ] \
+  && echo "[PASS] --level drill --json --verbose still prints exactly one JSON line" \
+  || { echo "[FAIL] --level drill --json --verbose printed $DJVLINES stdout line(s), expected 1"; echo "$DJV"; exit 1; }
+
 echo "== --level drill refuses --pg (a drill must never touch a live database) =="
 set +e
 PG_ERR=$(cb verify --level drill --locator "$LOC" --backend file --pg "postgres://x/y" 2>&1); PG_RC=$?
