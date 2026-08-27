@@ -161,6 +161,47 @@ grep -Fq -- 'did you mean --dir?' "$TMP/unknown-bool-flag.log" \
 if [ -f "$TMP/unknown-bool.age" ]; then echo "[FAIL] snapshot with an unknown flag still wrote --out"; exit 1; fi
 echo "[PASS] dist snapshot --dirs (typo for --dir, plural): rejected with 'unknown flag: --dirs' + 'did you mean --dir?', no --out written"
 
+# (i cont. 2) #441: "--flag=value" is rejected as an unknown flag naming the WHOLE
+# token, with no hint that the flag itself (--dir) is real and just needs a space
+# instead of "=". A known VALUE flag ("--dir=docs") gets the space-form hint; a known
+# BOOL flag ("--pq=true", which takes no value at all) gets its own "drop the '='"
+# phrasing rather than a bogus "--pq true" suggestion; a token that merely CONTAINS
+# "=" but isn't a "known-flag=value" shape (--totallybogus=x) must NOT get a false hint.
+node "$DIST" snapshot --out "$TMP/eq-form.age" --dir="$CYPHER_BRAIN_HOME" > "$TMP/eq-value-flag.log" 2>&1
+if [ $? -eq 0 ]; then echo "[FAIL] snapshot with --dir=... exited 0, expected non-zero"; cat "$TMP/eq-value-flag.log"; exit 1; fi
+grep -Fq -- "unknown flag: --dir=$CYPHER_BRAIN_HOME" "$TMP/eq-value-flag.log" \
+  || { echo "[FAIL] '--dir=...' did not report 'unknown flag: --dir=...'"; cat "$TMP/eq-value-flag.log"; exit 1; }
+grep -Fq -- "did you mean '--dir $CYPHER_BRAIN_HOME' (space-separated, not '=')?" "$TMP/eq-value-flag.log" \
+  || { echo "[FAIL] '--dir=...' (known VALUE flag) did not get the space-separated-form hint"; cat "$TMP/eq-value-flag.log"; exit 1; }
+if [ -f "$TMP/eq-form.age" ]; then echo "[FAIL] snapshot with --dir=... still wrote --out"; exit 1; fi
+echo "[PASS] dist snapshot --dir=... (known VALUE flag with '='): rejected with a 'did you mean --dir <value> (space-separated)' hint, no --out written"
+
+node "$DIST" keygen --pq=true > "$TMP/eq-bool-flag.log" 2>&1
+if [ $? -eq 0 ]; then echo "[FAIL] keygen --pq=true exited 0, expected non-zero"; cat "$TMP/eq-bool-flag.log"; exit 1; fi
+grep -Fq -- "unknown flag: --pq=true" "$TMP/eq-bool-flag.log" \
+  || { echo "[FAIL] '--pq=true' did not report 'unknown flag: --pq=true'"; cat "$TMP/eq-bool-flag.log"; exit 1; }
+grep -Fq -- "did you mean '--pq' (it takes no value — drop the '=')?" "$TMP/eq-bool-flag.log" \
+  || { echo "[FAIL] '--pq=true' (known BOOL flag) did not get the 'drop the =' hint"; cat "$TMP/eq-bool-flag.log"; exit 1; }
+echo "[PASS] dist keygen --pq=true (known BOOL flag with '='): rejected with a 'did you mean --pq (drop the =)' hint, not a bogus '--pq true' suggestion"
+
+node "$DIST" snapshot --out "$TMP/eq-bogus.age" --totallybogus=x > "$TMP/eq-bogus-flag.log" 2>&1
+if [ $? -eq 0 ]; then echo "[FAIL] snapshot with --totallybogus=x exited 0, expected non-zero"; cat "$TMP/eq-bogus-flag.log"; exit 1; fi
+if grep -qi "did you mean" "$TMP/eq-bogus-flag.log"; then
+  echo "[FAIL] '--totallybogus=x' (contains '=' but not a known-flag=value shape) got a spurious hint"; cat "$TMP/eq-bogus-flag.log"; exit 1
+fi
+if [ -f "$TMP/eq-bogus.age" ]; then echo "[FAIL] snapshot with --totallybogus=x still wrote --out"; exit 1; fi
+echo "[PASS] dist snapshot --totallybogus=x (contains '=' but unrelated to any real flag): rejected with NO spurious hint, no --out written"
+
+# (i cont. 3) #441 hardening: an EMPTY value after "=" ("--dir=") must not produce a
+# fabricated "did you mean '--dir '" hint that reads as a valid correction when the
+# value is still missing (Codex review finding) — a "<value>" placeholder instead.
+node "$DIST" snapshot --out "$TMP/eq-empty.age" --dir= > "$TMP/eq-empty-value.log" 2>&1
+if [ $? -eq 0 ]; then echo "[FAIL] snapshot with --dir= exited 0, expected non-zero"; cat "$TMP/eq-empty-value.log"; exit 1; fi
+grep -Fq -- "did you mean '--dir <value>' (space-separated, not '=')?" "$TMP/eq-empty-value.log" \
+  || { echo "[FAIL] '--dir=' (empty value) did not get the '<value>' placeholder hint"; cat "$TMP/eq-empty-value.log"; exit 1; }
+if [ -f "$TMP/eq-empty.age" ]; then echo "[FAIL] snapshot with --dir= still wrote --out"; exit 1; fi
+echo "[PASS] dist snapshot --dir= (known VALUE flag, empty value after '='): hint uses a '<value>' placeholder, not a fabricated empty correction, no --out written"
+
 # a legitimate, fully-recognized flag set must still pass through untouched
 node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend file > "$TMP/known-flags.log" 2>&1 \
   || { echo "[FAIL] estimate with only recognized flags exited non-zero"; cat "$TMP/known-flags.log"; exit 1; }

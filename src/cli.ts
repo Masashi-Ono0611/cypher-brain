@@ -178,6 +178,30 @@ function parseArgs(argv: string[]): CliOptions {
       // on `o` and then just never read by any command — no error, just quiet
       // wrong behavior (the same bug class as #96/#101/#114). Refuse instead.
       if (!BOOL_FLAGS.has(key) && !VALUE_FLAGS.has(key)) {
+        // issue #441: every flag only accepts the space-separated form ("--dir docs"),
+        // so "--dir=docs" lands here rejected as an unknown flag naming the WHOLE
+        // token — with no hint that --dir itself is real and just needs a space
+        // instead of "=". Reusing #425's KNOWN_FLAG_NAMES (rather than the ordinary
+        // fuzzy nearestName() match below, which compares edit distance against the
+        // WHOLE "dir=docs" string and would rarely fire here — this is the right flag
+        // in the wrong syntax, not a typo): split on the FIRST "=" and check whether
+        // the part before it is a real flag name. --pq/--force/etc. take no value at
+        // all, so they get their own "drop the '='" phrasing rather than a bogus
+        // "--pq true" suggestion that isn't actually this parser's syntax either. An
+        // empty value ("--dir=") gets a "<value>" placeholder rather than the fabricated
+        // "did you mean '--dir '" a naive interpolation would produce — that would read
+        // as a valid correction when the value is still missing (Codex review finding).
+        const eq = a.indexOf('=');
+        const eqFlagName = eq > 2 ? a.slice(2, eq) : undefined;
+        if (eqFlagName !== undefined && KNOWN_FLAG_NAMES.includes(eqFlagName)) {
+          const eqValue = a.slice(eq + 1);
+          const spaceForm = BOOL_FLAGS.has(eqFlagName.replace(/-/g, '_'))
+            ? `'--${eqFlagName}' (it takes no value — drop the '=')`
+            : `'--${eqFlagName} ${eqValue.length > 0 ? eqValue : '<value>'}' (space-separated, not '=')`;
+          throw new Error(
+            `unknown flag: --${a.slice(2)} (${didYouMean(spaceForm)} — run 'cypher-brain --help' or '<command> --help' to see valid flags)`,
+          );
+        }
         const suggestion = nearestName(a.slice(2), KNOWN_FLAG_NAMES);
         throw new Error(
           `unknown flag: --${a.slice(2)} (${suggestion ? `${didYouMean(`--${suggestion}`)} — ` : ''}run 'cypher-brain --help' or '<command> --help' to see valid flags)`,
