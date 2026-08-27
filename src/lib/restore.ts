@@ -2,7 +2,7 @@
 import { rm, stat, readFile, writeFile, readdir, rename, lstat } from 'node:fs/promises';
 import { mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join, relative } from 'node:path';
+import { join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { Decrypter } from 'age-encryption';
 import {
@@ -304,6 +304,17 @@ export const SHORT_LABEL_MAX = 64;
 // path, then sanitized to a filesystem-safe fragment (drop anything that is not an ASCII
 // alnum/dot/dash/underscore) and capped at SHORT_LABEL_MAX.
 //
+// Deliberately does NOT use node:path's basename() (which only splits on the CURRENT
+// platform's separator) — this project runs on POSIX, but manifest.components[].source
+// is attacker-controlled data (see the block above) that could easily contain a
+// backslash-separated path (a forged/foreign manifest, or a snapshot taken elsewhere and
+// restored here); on POSIX, path.basename() would treat the whole thing as one segment
+// (no split) and hand it straight to the sanitize step below, degrading right back to
+// the old fully-encoded label this function exists to avoid. Splitting on the LAST
+// occurrence of either separator, regardless of host platform, keeps that a non-issue —
+// the same separator-agnostic treatment the old encodeSourcePath() (see #423 below) gave
+// every separator in the full path, kept here for just the one trailing segment.
+//
 // #423: this used to be encodeSourcePath(), which flattened the ENTIRE absolute path
 // (every separator replaced, truncated-and-hashed past 160 chars) into the directory
 // name itself, on the theory that the name needed to be collision-proof. It doesn't:
@@ -328,7 +339,13 @@ export const SHORT_LABEL_MAX = 64;
 // un-escapable directory-name segment out of it.
 // Stryker restore all
 export function shortSourceLabel(abs: string): string {
-  const safe = basename(abs).replace(/[^A-Za-z0-9._-]+/g, '_');
+  // Trim trailing separator(s) first so e.g. "/a/b/memory/" still yields "memory", not
+  // "" (the same reason node:path's own basename() trims a trailing separator before
+  // taking the last segment).
+  const trimmed = abs.replace(/[/\\]+$/, '');
+  const lastSep = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  const lastSegment = lastSep === -1 ? trimmed : trimmed.slice(lastSep + 1);
+  const safe = lastSegment.replace(/[^A-Za-z0-9._-]+/g, '_');
   return safe.length <= SHORT_LABEL_MAX ? safe : safe.slice(0, SHORT_LABEL_MAX);
 }
 // Stryker disable all

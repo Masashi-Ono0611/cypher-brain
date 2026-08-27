@@ -192,6 +192,24 @@ await property(
   { numRuns: 1000 },
 );
 
+// Pin concrete examples of the actual FEATURE, not just its safety properties (the three
+// properties above prove shortSourceLabel() is safe and bounded; they say nothing about
+// whether it does the readable thing #423 is actually about). shortSourceLabel()
+// deliberately splits on the LAST occurrence of EITHER separator regardless of the host
+// platform (see its doc comment in src/lib/restore.ts) — a forged/foreign manifest's
+// `source` field is attacker-controlled data, not necessarily a path in this OS's own
+// format, and node:path's basename() only splits on the CURRENT platform's separator
+// (backslash-only paths pass through unsplit on POSIX). Pin both forms plus a trailing-
+// separator case.
+check(
+  'shortSourceLabel: takes the last segment of a POSIX-separated source, trailing separator or not',
+  shortSourceLabel('/a/b/deep/memory') === 'memory' && shortSourceLabel('/a/b/deep/memory/') === 'memory',
+);
+check(
+  'shortSourceLabel: takes the last segment of a backslash-separated source even when running on POSIX (#423 review finding)',
+  shortSourceLabel('C:\\Users\\me\\memory') === 'memory',
+);
+
 // ---- crypt.ts: generateKeypair / newEncrypter / newDecrypter roundtrip ----
 //
 // Through this repo's OWN wrapper functions (not age-encryption's Encrypter/Decrypter
