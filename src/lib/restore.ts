@@ -3,7 +3,7 @@ import { rm, stat, readFile, writeFile, readdir, rename, lstat } from 'node:fs/p
 import { mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { Decrypter } from 'age-encryption';
 import {
   AGE_MAGIC,
@@ -32,10 +32,10 @@ import { recordAudit } from './audit.js';
 import type { CliOptions } from './types.js';
 
 // #228: this file's StrykerJS mutation run (`npm run mutation-test`) is deliberately
-// scoped, with the ignore-comment markers below, to ONLY isSafeComponentName() and
-// shortSourceLabel() (formerly encodeSourcePath(), renamed by #423) — the two
-// manifest-field guards PR #198's review finding was about, and the ones
-// scripts/selftest-properties.mjs property-tests. Everything else
+// scoped, with the ignore-comment markers below, to ONLY isSafeComponentName(),
+// shortSourceLabel() (formerly encodeSourcePath(), renamed by #423), and sourceDigest()
+// (added by #423) — the manifest-field guards PR #198's review finding was about, and
+// the ones scripts/selftest-properties.mjs property-tests. Everything else
 // in this file (the tar/pg_restore process orchestration, signal-guard wiring, the
 // verify() report) has no fast in-process test oracle for Stryker to run per mutant —
 // mutating it would only produce "survived" noise, not a security signal. See
@@ -317,20 +317,29 @@ export const SHORT_LABEL_MAX = 64;
 //
 // #423: this used to be encodeSourcePath(), which flattened the ENTIRE absolute path
 // (every separator replaced, truncated-and-hashed past 160 chars) into the directory
-// name itself, on the theory that the name needed to be collision-proof. It doesn't:
-// expandComponents() below always prefixes the directory name with the component's own
-// 1-based sequence number, which ALONE already guarantees no two components ever land in
-// the same directory (manifest component order is stable per snapshot) — including the
-// #181 case this scheme exists for in the first place (two --dir sources sharing a
-// basename, e.g. `001-memory` vs `002-memory`). Encoding the full path into the name on
-// top of that bought nothing but unreadable, 100+-character directory names for any
-// realistic (deep) source path. The full original absolute path is still recorded,
-// unambiguously, in expanded/README.txt's mapping table (written unconditionally by
-// expandComponents() below) — that table, not the directory name, is the authoritative
-// source→directory mapping.
+// name itself. expandComponents() below still prefixes the directory name with the
+// component's own 1-based sequence number, which guarantees no two components from the
+// SAME manifest ever land in the same directory (manifest component order is stable per
+// snapshot) — including the #181 case this scheme exists for in the first place (two
+// --dir sources sharing a basename land at DIFFERENT indices, e.g. `001-memory-<hash>`
+// vs `002-memory-<hash>`). But the index alone is only unique WITHIN one restore's
+// manifest — restoring a SECOND, different snapshot into the SAME --out-dir (an
+// explicitly supported, documented workflow: re-running restore does not clobber a
+// prior expansion) could put an unrelated source at that same index, and if it happened
+// to share a basename too, the two would collide into one directory (a real correctness
+// bug, not just a readability one — see sourceDigest() below, which is what actually
+// closes this). Encoding the full path into the name (encodeSourcePath()'s approach)
+// avoided that collision as a side effect, but at the cost of unreadable, 100+-character
+// directory names for any realistic (deep) source path. shortSourceLabel() below keeps
+// only the readable part; sourceDigest() (also appended to the directory name, see
+// expandComponents()) keeps the collision-proofing. The full original absolute path is
+// still recorded, unambiguously, in expanded/README.txt's mapping table (written
+// unconditionally by expandComponents() below) — that table, not the directory name, is
+// the authoritative source→directory mapping.
 //
-// Deliberately NOT unique by itself (two different sources can share a basename, and
-// this function does nothing to distinguish them) — see above for why that is fine.
+// Deliberately NOT unique by itself (two different sources can share a basename) — it is
+// only ever used together with sourceDigest() below, never alone, in the directory name
+// expandComponents() builds.
 //
 // Exported (#228, kept through #423's rename) so scripts/selftest-properties.mjs can
 // property-test, for ANY input string (manifest.components[].source is
@@ -347,6 +356,28 @@ export function shortSourceLabel(abs: string): string {
   const lastSegment = lastSep === -1 ? trimmed : trimmed.slice(lastSep + 1);
   const safe = lastSegment.replace(/[^A-Za-z0-9._-]+/g, '_');
   return safe.length <= SHORT_LABEL_MAX ? safe : safe.slice(0, SHORT_LABEL_MAX);
+}
+
+// Short, stable digest of a component's FULL absolute source path — appended, alongside
+// shortSourceLabel()'s basename, to the directory name expandComponents() builds below
+// (`<NNN>-<label>-<digest>`). This is what actually guarantees two DIFFERENT source
+// paths can never collide into the same expanded/ directory, even across two SEPARATE
+// restore invocations into the same --out-dir whose manifests happen to place a
+// same-basename source at the same numeric index (see shortSourceLabel()'s doc comment
+// above — the index alone only disambiguates WITHIN one manifest, not across two
+// different ones; #423 review finding). Two DIFFERENT source paths landing on the same
+// digest is negligible (8 hex chars of SHA-256 — the same collision margin the pre-#423
+// encodeSourcePath() already relied on for its own truncate-and-hash branch); two
+// restores of the exact SAME source path always produce the SAME digest, so re-running
+// restore into an out-dir that already holds that source's expansion still merges into
+// it via mergeNoClobber() below exactly as before, not a fresh, differently-named
+// directory each time.
+//
+// Exported (#423) so scripts/selftest-properties.mjs can property-test it the same way
+// as shortSourceLabel() above, instead of leaving it untested/unmutated code inside this
+// file's otherwise fully-scoped Stryker region (see stryker.conf.json).
+export function sourceDigest(abs: string): string {
+  return createHash('sha256').update(abs).digest('hex').slice(0, 8);
 }
 // Stryker disable all
 
@@ -478,14 +509,16 @@ function assertSupportedManifestSchema(manifestText: string, manifestPath: strin
 }
 
 // Auto-expand every --dir/--profile component's staged tarball under
-// <out-dir>/expanded/<NNN>-<short source label>/, keyed to the component's ORIGINAL
-// absolute source path (manifest.components[].source) rather than its on-disk name — see
-// #181: multiple --dir sources sharing a basename (e.g. many `~/.claude/projects/*/
-// memory/` dirs under --profile claude-code) all restore to opaque, indistinguishable
-// names like memory.tar.gz / memory-1.tar.gz / memory-2.tar.gz, and manually cross-
-// referencing the manifest to untar each one correctly does not scale past a handful of
-// components. (#423: the directory NAME itself only carries a short, readable label —
-// see shortSourceLabel's doc comment below — expanded/README.txt's mapping table is what
+// <out-dir>/expanded/<NNN>-<short source label>-<digest>/, keyed to the component's
+// ORIGINAL absolute source path (manifest.components[].source) rather than its on-disk
+// name — see #181: multiple --dir sources sharing a basename (e.g. many
+// `~/.claude/projects/*/memory/` dirs under --profile claude-code) all restore to
+// opaque, indistinguishable names like memory.tar.gz / memory-1.tar.gz /
+// memory-2.tar.gz, and manually cross-referencing the manifest to untar each one
+// correctly does not scale past a handful of components. (#423: the directory NAME
+// itself only carries a short, readable label — see shortSourceLabel's doc comment
+// below — plus a short digest of the full path for collision-proofing — see
+// sourceDigest's doc comment below — expanded/README.txt's mapping table is what
 // actually resolves each directory back to its full original source path.)
 //
 // A component with a `source` field is exactly a --dir/--profile component: pg_dump's
@@ -546,11 +579,14 @@ async function expandComponents(outDir: string): Promise<void> {
     // --out-dir already held a same-named file) — nothing to expand in that case.
     if (!(await exists(archivePath))) continue;
 
-    // The "<NNN>-" prefix alone makes this directory name unique (see shortSourceLabel's
-    // doc comment above) — it also means the full name can never itself equal "." or
-    // ".." even on a source whose basename would (e.g. source === ".."), with no extra
-    // case to handle here.
-    const dirName = `${String(i + 1).padStart(3, '0')}-${shortSourceLabel(c.source)}`;
+    // The "<NNN>-" prefix guarantees uniqueness WITHIN this manifest; the trailing
+    // sourceDigest() guarantees uniqueness ACROSS manifests too, so two different
+    // sources never collide into the same directory even across separate restore runs
+    // into the same --out-dir (see shortSourceLabel's and sourceDigest's doc comments
+    // above). The "<NNN>-" prefix also means the full name can never itself equal "."
+    // or ".." even on a source whose basename would (e.g. source === ".."), with no
+    // extra case to handle here.
+    const dirName = `${String(i + 1).padStart(3, '0')}-${shortSourceLabel(c.source)}-${sourceDigest(c.source)}`;
     const targetDir = join(expandedRoot, dirName);
     try {
       await refuseIfSymlink(targetDir, 'expanded component directory');

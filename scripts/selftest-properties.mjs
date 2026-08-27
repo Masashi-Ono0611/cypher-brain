@@ -15,17 +15,17 @@
 // minimal counterexample.
 //
 // Scope, stated narrowly on purpose (same discipline as selftest-error-codes.mjs's own
-// header): this file property-tests FOUR specific, already-identified invariants — the
+// header): this file property-tests FIVE specific, already-identified invariants — the
 // two manifest-field guards in src/lib/restore.ts (#198's vulnerability class), the
-// expanded/ directory-name uniqueness invariant those guards' numeric-index prefix relies
-// on (#181/#423), and the age encrypt/decrypt roundtrip in src/lib/crypt.ts. It does not
-// attempt to fuzz the whole CLI surface, and it is not a substitute for
-// scripts/selftest-cctv-age.mjs (which checks typage's CONFORMANCE to the age spec using
-// upstream's own vectors — a different question from "does OUR code's usage of typage
-// roundtrip correctly").
+// expanded/ directory-name uniqueness invariant those guards' numeric-index prefix and
+// sourceDigest() together provide (#181/#423), and the age encrypt/decrypt roundtrip in
+// src/lib/crypt.ts. It does not attempt to fuzz the whole CLI surface, and it is not a
+// substitute for scripts/selftest-cctv-age.mjs (which checks typage's CONFORMANCE to the
+// age spec using upstream's own vectors — a different question from "does OUR code's
+// usage of typage roundtrip correctly").
 import fc from 'fast-check';
 import { join, resolve, sep } from 'node:path';
-import { isSafeComponentName, shortSourceLabel, SHORT_LABEL_MAX } from '../src/lib/restore.ts';
+import { isSafeComponentName, shortSourceLabel, sourceDigest, SHORT_LABEL_MAX } from '../src/lib/restore.ts';
 import { generateKeypair, newEncrypter, newDecrypter } from '../src/lib/crypt.ts';
 
 let failed = 0;
@@ -171,26 +171,74 @@ await property(
   { numRuns: 1000 },
 );
 
+// sourceDigest() is a thin wrapper (see its doc comment in src/lib/restore.ts) — these
+// two properties pin the two things that actually matter for its role in the directory
+// name (deliberately NOT "different inputs never collide": SHA-256 collisions are only
+// NEGLIGIBLY, not IMPOSSIBLY, unlikely, so asserting that as a hard property over
+// randomly-sampled pairs would be a flaky test, not a real regression guard — the same
+// margin the pre-#423 encodeSourcePath() already relied on without ever claiming more).
+const buildDirName = (i, source) => `${String(i).padStart(3, '0')}-${shortSourceLabel(source)}-${sourceDigest(source)}`;
+await property(
+  'sourceDigest: always exactly 8 lowercase hex characters, for any input',
+  fc.property(sourceArb, (source) => /^[0-9a-f]{8}$/.test(sourceDigest(source))),
+  { numRuns: 1000 },
+);
+await property(
+  'sourceDigest: deterministic — the same input always produces the same digest',
+  fc.property(sourceArb, (source) => {
+    const first = sourceDigest(source);
+    const second = sourceDigest(source);
+    return first === second;
+  }),
+  { numRuns: 1000 },
+);
+
 // #423/#181: shortSourceLabel() is deliberately NOT collision-resistant by itself — two
 // different --dir sources sharing a basename (e.g. many `~/.claude/projects/*/memory/`
 // dirs — the exact case #181 introduced this whole expanded/ scheme to disambiguate)
-// produce the IDENTICAL label. expandComponents() instead relies entirely on prefixing
-// each directory name with the component's own 1-based sequence number to guarantee no
-// two components ever land in the same directory. This property pins exactly that
-// invariant at the level restore.ts actually builds the directory name (see its
-// `${String(i + 1).padStart(3, '0')}-${shortSourceLabel(c.source)}` expression): for ANY
-// two DISTINCT indices, even with the SAME source string fed to both (the worst case —
-// identical basenames), the resulting directory names never collide.
+// produce the IDENTICAL label. expandComponents() instead relies on TWO things together
+// to guarantee no two components ever land in the same directory (see its
+// `${String(i + 1).padStart(3, '0')}-${shortSourceLabel(c.source)}-${sourceDigest(c.source)}`
+// expression): the numeric index, which alone guarantees uniqueness WITHIN one restore's
+// manifest (component order is stable per snapshot); and sourceDigest(), which is what
+// keeps two DIFFERENT sources from colliding even when the index ALSO happens to match —
+// exactly the case of restoring two SEPARATE, unrelated snapshots into the same
+// --out-dir, where nothing ties their manifests' component ORDER together (a real
+// correctness gap in the #423 fix's first draft, caught by review — see
+// shortSourceLabel's doc comment in src/lib/restore.ts). This property pins the index
+// half of that: for ANY two DISTINCT indices, even with the SAME source string fed to
+// both (so same label AND same digest too), the resulting directory names never collide.
 await property(
   'expanded/ directory names: distinct component index alone guarantees distinct directory names, even for identical sources (#181)',
   fc.property(fc.integer({ min: 1, max: 999 }), fc.integer({ min: 1, max: 999 }), sourceArb, (i1, i2, source) => {
     if (i1 === i2) return true; // same index is not the case under test
-    const dirName1 = `${String(i1).padStart(3, '0')}-${shortSourceLabel(source)}`;
-    const dirName2 = `${String(i2).padStart(3, '0')}-${shortSourceLabel(source)}`;
-    return dirName1 !== dirName2;
+    return buildDirName(i1, source) !== buildDirName(i2, source);
   }),
   { numRuns: 1000 },
 );
+
+// The digest half of the same guarantee, pinned as a fixed example (not fuzzed — see the
+// "NOT flaky" note above sourceDigest's properties) rather than a property: the exact
+// #423 review scenario — restoring two SEPARATE snapshots into the same --out-dir, whose
+// manifests each place a same-basename source at the SAME index — must still produce
+// DISTINCT directory names.
+check(
+  'expanded/ directory names: same index + same basename from two DIFFERENT source paths (two separate restores into one --out-dir) still get distinct directory names (#423 review finding)',
+  buildDirName(1, '/home/alice/projects/alpha/memory') !== buildDirName(1, '/home/bob/projects/beta/memory'),
+);
+// ...and the flip side of that same guarantee (see sourceDigest's own doc comment): a
+// restore-into-an-existing-expansion of the exact SAME source, at the same index, must
+// produce the SAME directory name every time, or the #181 no-clobber-merge behavior
+// (scripts/selftest.sh's own re-run test) would silently start creating a fresh,
+// differently-named directory on every re-run instead of merging into the prior one.
+{
+  const rerun1 = buildDirName(1, '/home/alice/projects/alpha/memory');
+  const rerun2 = buildDirName(1, '/home/alice/projects/alpha/memory');
+  check(
+    'expanded/ directory names: the SAME source path at the SAME index always produces the SAME directory name (re-run merge behavior)',
+    rerun1 === rerun2,
+  );
+}
 
 // Pin concrete examples of the actual FEATURE, not just its safety properties (the three
 // properties above prove shortSourceLabel() is safe and bounded; they say nothing about
