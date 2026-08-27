@@ -13,7 +13,7 @@ import {
   TON_TONAPI_URL,
   TON_WALLET,
 } from './config.js';
-import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists, sha256 } from './util.js';
+import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists, sha256, importQuietly } from './util.js';
 import { printJson } from './ui.js';
 import { buildPlan, writePlanFile, readRecipientsFingerprint } from './plan.js';
 import type { CliOptions } from './types.js';
@@ -241,7 +241,7 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
   if (backend === 'turbo') {
     let TurboFactory: typeof import('@ardrive/turbo-sdk').TurboFactory;
     try {
-      ({ TurboFactory } = await import('@ardrive/turbo-sdk'));
+      ({ TurboFactory } = await importQuietly(() => import('@ardrive/turbo-sdk')));
     } catch (e) {
       const problem = sdkImportAdvice(e, '@ardrive/turbo-sdk');
       if (problem !== null) {

@@ -310,3 +310,28 @@ export function sdkImportAdvice(e: unknown, pkg: string): SdkImportProblem | nul
       `unlikely to fix it. ${isolated}`,
   };
 }
+
+// Some lazily-imported dependencies log to console.warn at MODULE LOAD time (top-level code a
+// caller's try/catch cannot intercept), with no cypher-brain prefix — indistinguishable from a
+// real error on first read. bigint-buffer@1.1.5 (pulled in via @ardrive/turbo-sdk ->
+// @solana/spl-token -> @solana/buffer-layout-utils) does exactly this when its native binding
+// fails to load: harmless (falls back to pure JS, which is all this project's use of the turbo
+// SDK needs), but it printed unprefixed before any of this tool's own output on every
+// `estimate`/`push --backend turbo` (#422). Scoped narrowly to the ONE known message text —
+// everything else console.warn receives during the wrapped call still reaches the real
+// console.warn — this is not a blanket "hide turbo SDK warnings" switch.
+const KNOWN_NOISY_IMPORT_WARNINGS = [/^bigint: Failed to load bindings/];
+
+export async function importQuietly<T>(load: () => Promise<T>): Promise<T> {
+  const realWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    const first = args[0];
+    if (typeof first === 'string' && KNOWN_NOISY_IMPORT_WARNINGS.some((re) => re.test(first))) return;
+    realWarn(...args);
+  };
+  try {
+    return await load();
+  } finally {
+    console.warn = realWarn;
+  }
+}
