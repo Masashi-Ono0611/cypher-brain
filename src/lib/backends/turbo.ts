@@ -8,7 +8,15 @@ import { stat, readFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { resolve } from 'node:path';
 import { AR_WALLET, AR_PAID_BY, AR_MAX_SPEND, SKIP_FUNDS_CHECK } from '../config.js';
-import { warnIfLooseKeyPerms, fmtBytes, errMsg, isWalletAddress, sleep, sdkImportAdvice } from '../util.js';
+import {
+  warnIfLooseKeyPerms,
+  fmtBytes,
+  errMsg,
+  isWalletAddress,
+  sleep,
+  sdkImportAdvice,
+  importQuietly,
+} from '../util.js';
 import { summarizeBalance, balanceLines, insufficientFundsError, type BalanceSummary } from '../balance.js';
 import { warn } from '../warn.js';
 import { arUsdRate, turboUsdRate, usdApprox } from '../estimate.js';
@@ -24,7 +32,7 @@ export function turboBackend(): StorageBackend {
       let TurboFactory: typeof import('@ardrive/turbo-sdk').TurboFactory;
       let ArweaveSigner: typeof import('@ardrive/turbo-sdk').ArweaveSigner;
       try {
-        ({ TurboFactory, ArweaveSigner } = await import('@ardrive/turbo-sdk'));
+        ({ TurboFactory, ArweaveSigner } = await importQuietly(() => import('@ardrive/turbo-sdk')));
       } catch (e) {
         const problem = sdkImportAdvice(e, '@ardrive/turbo-sdk');
         if (problem !== null) throw new Error(`turbo backend: ${problem.advice}`);

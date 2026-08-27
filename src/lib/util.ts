@@ -310,3 +310,58 @@ export function sdkImportAdvice(e: unknown, pkg: string): SdkImportProblem | nul
       `unlikely to fix it. ${isolated}`,
   };
 }
+
+// Some lazily-imported dependencies log to console.warn at MODULE LOAD time (top-level code a
+// caller's try/catch cannot intercept), with no cypher-brain prefix — indistinguishable from a
+// real error on first read. bigint-buffer@1.1.5 (pulled in via @ardrive/turbo-sdk ->
+// @solana/spl-token -> @solana/buffer-layout-utils) does exactly this when its native binding
+// fails to load: harmless (falls back to pure JS, which is all this project's use of the turbo
+// SDK needs), but it printed unprefixed before any of this tool's own output on every
+// `estimate`/`push --backend turbo` (#422). EXACT-matched, not a prefix (Codex review round 2):
+// bigint-buffer's own source (node_modules/bigint-buffer/dist/node.js) has exactly this one
+// console.warn call today, so a prefix match happens to be equally safe right now — but exact
+// match is what the comment already claimed ("the ONE known message text"), and a prefix would
+// ALSO swallow some future, unrelated bigint-buffer message that happened to share this prefix.
+// If a future bigint-buffer version rewords this message, add the new exact text as another
+// entry rather than loosening back to a prefix. Everything else console.warn receives during
+// the wrapped call still reaches the real console.warn — this is not a blanket "hide turbo SDK
+// warnings" switch.
+const KNOWN_NOISY_IMPORT_WARNINGS = new Set([
+  'bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)',
+]);
+
+// Reference-counted, not a bare save/restore (Codex review): the long-lived MCP server
+// (src/mcp.ts) processes tool calls off a single async handler, so two `estimate_cost`/
+// `snapshot_now` calls against --backend turbo can genuinely overlap — one call's load()
+// awaiting mid-flight while a second call's importQuietly() also runs. A naive "save
+// console.warn, restore it in finally" would have the SECOND call's save capture the
+// FIRST call's already-patched wrapper (not the real console.warn), and whichever call's
+// finally runs LAST would win, non-deterministically leaving console.warn permanently
+// patched to a stale, closed-over wrapper. Only the outermost (first) call saves the
+// real console.warn and only the innermost (last) call restores it; everything in
+// between just increments/decrements the count.
+let activeImportQuietlyCalls = 0;
+let savedConsoleWarn: typeof console.warn | null = null;
+
+function filteringWarn(...args: unknown[]): void {
+  const first = args[0];
+  if (typeof first === 'string' && args.length === 1 && KNOWN_NOISY_IMPORT_WARNINGS.has(first)) return;
+  (savedConsoleWarn ?? console.warn)(...args);
+}
+
+export async function importQuietly<T>(load: () => Promise<T>): Promise<T> {
+  if (activeImportQuietlyCalls === 0) {
+    savedConsoleWarn = console.warn;
+    console.warn = filteringWarn;
+  }
+  activeImportQuietlyCalls++;
+  try {
+    return await load();
+  } finally {
+    activeImportQuietlyCalls--;
+    if (activeImportQuietlyCalls === 0) {
+      console.warn = savedConsoleWarn as typeof console.warn;
+      savedConsoleWarn = null;
+    }
+  }
+}
