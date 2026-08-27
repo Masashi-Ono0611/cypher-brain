@@ -15,15 +15,17 @@
 // minimal counterexample.
 //
 // Scope, stated narrowly on purpose (same discipline as selftest-error-codes.mjs's own
-// header): this file property-tests THREE specific, already-identified invariants — the
-// two manifest-field guards in src/lib/restore.ts (#198's vulnerability class) and the
-// age encrypt/decrypt roundtrip in src/lib/crypt.ts. It does not attempt to fuzz the
-// whole CLI surface, and it is not a substitute for scripts/selftest-cctv-age.mjs (which
-// checks typage's CONFORMANCE to the age spec using upstream's own vectors — a different
-// question from "does OUR code's usage of typage roundtrip correctly").
+// header): this file property-tests FIVE specific, already-identified invariants — the
+// two manifest-field guards in src/lib/restore.ts (#198's vulnerability class), the
+// expanded/ directory-name uniqueness invariant those guards' numeric-index prefix and
+// sourceDigest() together provide (#181/#423), and the age encrypt/decrypt roundtrip in
+// src/lib/crypt.ts. It does not attempt to fuzz the whole CLI surface, and it is not a
+// substitute for scripts/selftest-cctv-age.mjs (which checks typage's CONFORMANCE to the
+// age spec using upstream's own vectors — a different question from "does OUR code's
+// usage of typage roundtrip correctly").
 import fc from 'fast-check';
 import { join, resolve, sep } from 'node:path';
-import { isSafeComponentName, encodeSourcePath, PATH_ENCODE_MAX } from '../src/lib/restore.ts';
+import { isSafeComponentName, shortSourceLabel, sourceDigest, SHORT_LABEL_MAX } from '../src/lib/restore.ts';
 import { generateKeypair, newEncrypter, newDecrypter } from '../src/lib/crypt.ts';
 
 let failed = 0;
@@ -118,24 +120,25 @@ check(
   isSafeComponentName('../../../etc/cron.d/evil.tar.gz') === false,
 );
 
-// ---- restore.ts: encodeSourcePath (the `source` field's guard) ----
+// ---- restore.ts: shortSourceLabel (the `source` field's directory-name guard) ----
 //
-// encodeSourcePath()'s output is used as ONE path segment (prefixed with a numeric
-// index, see restore.ts) — it must never smuggle a '/' or '\\' through, regardless of
-// what a forged manifest's `source` field contains, or that numeric-prefix defense
-// stops guaranteeing a single directory-name segment. `sourceArb` deliberately spans
-// well past PATH_ENCODE_MAX (160) so the truncate-and-hash branch is exercised too,
-// not just the short-input passthrough — a length-only regression in that branch
-// would otherwise never come up against a generator that only ever produces short
-// strings.
-// Boundary-exact lengths around PATH_ENCODE_MAX (160): random sampling alone rarely
-// lands on the EXACT length the truncate-vs-passthrough branch flips on, no matter how
-// many runs -- these constants guarantee the mutation-testing kill oracle actually sees
-// the boundary (off-by-one <= vs < mutants, "always truncate"/"never truncate" mutants).
+// #423: renamed/simplified from encodeSourcePath(), which used to flatten the ENTIRE
+// absolute source path (every separator replaced, truncated-and-hashed past 160 chars)
+// into the directory name itself. shortSourceLabel() instead only takes the source's
+// basename — expandComponents() (restore.ts) relies ENTIRELY on the numeric index it
+// prefixes onto this label for directory-name uniqueness (see the third property below),
+// not on this function. The two threat-model properties this guard still needs to satisfy
+// are unchanged: shortSourceLabel()'s output is used as ONE path segment (prefixed with
+// that numeric index) — it must never smuggle a '/' or '\\' through, regardless of what a
+// forged manifest's `source` field contains, and must stay bounded in length.
+// Boundary-exact lengths around SHORT_LABEL_MAX (64): random sampling alone rarely lands
+// on the EXACT length the truncate-vs-passthrough branch flips on, no matter how many
+// runs -- these constants guarantee the mutation-testing kill oracle actually sees the
+// boundary (off-by-one <= vs < mutants, "always truncate"/"never truncate" mutants).
 const boundaryLengthArb = fc.oneof(
-  fc.constant('a'.repeat(159)),
-  fc.constant('a'.repeat(160)),
-  fc.constant('a'.repeat(161)),
+  fc.constant('a'.repeat(63)),
+  fc.constant('a'.repeat(64)),
+  fc.constant('a'.repeat(65)),
 );
 const sourceArb = fc.oneof(
   wideString(),
@@ -143,29 +146,142 @@ const sourceArb = fc.oneof(
   traversalLike,
   boundaryLengthArb,
 );
-// numRuns raised for these two: wideString()'s full binary-code-unit domain is vastly
-// larger than the old ASCII-only default, so the mutation-testing kill oracle (a mutant
-// that misbehaves only on specific narrow inputs, e.g. one particular character class in
-// encodeSourcePath's own replace regex) needs more samples to stay as likely to land on
-// a triggering input as it was against the smaller domain -- 200 runs alone let real
+// numRuns raised for these: wideString()'s full binary-code-unit domain is vastly larger
+// than the old ASCII-only default, so the mutation-testing kill oracle (a mutant that
+// misbehaves only on specific narrow inputs, e.g. one particular character class in
+// shortSourceLabel's own replace regex) needs more samples to stay as likely to land on a
+// triggering input as it was against the smaller domain -- 200 runs alone let real
 // mutation-score coverage regress after the string arbitrary was widened.
 await property(
-  'encodeSourcePath: never emits a path separator, for any input',
+  'shortSourceLabel: never emits a path separator, for any input',
   fc.property(sourceArb, (source) => {
-    const encoded = encodeSourcePath(source);
-    return !encoded.includes('/') && !encoded.includes('\\');
+    const label = shortSourceLabel(source);
+    return !label.includes('/') && !label.includes('\\');
   }),
   { numRuns: 1000 },
 );
 
-// The per-component directory name is `<3-digit index>-<encoded>` (restore.ts) — this
-// pins encodeSourcePath()'s own documented contribution to that budget: comfortably
+// The per-component directory name is `<3-digit index>-<label>` (restore.ts) — this
+// pins shortSourceLabel()'s own documented contribution to that budget: comfortably
 // under common 255-byte filename limits regardless of how long/deeply-nested the
-// forged `source` string is. `+ 9` = a '-' plus the 8-hex-char digest suffix.
+// forged `source` string is.
 await property(
-  'encodeSourcePath: output length never exceeds PATH_ENCODE_MAX + digest suffix, for any input',
-  fc.property(sourceArb, (source) => encodeSourcePath(source).length <= PATH_ENCODE_MAX + 9),
+  'shortSourceLabel: output length never exceeds SHORT_LABEL_MAX, for any input',
+  fc.property(sourceArb, (source) => shortSourceLabel(source).length <= SHORT_LABEL_MAX),
   { numRuns: 1000 },
+);
+
+// sourceDigest() is a thin wrapper (see its doc comment in src/lib/restore.ts, including
+// the history of why it is the FULL, un-truncated 64-hex-char SHA-256 digest and not a
+// shortened one) — these two properties pin the two things that actually matter for its
+// role in the directory name (deliberately NOT "different inputs never collide": even a
+// full, untruncated SHA-256 collision is only cryptographically infeasible, not
+// mathematically impossible, so asserting that as a hard property over randomly-sampled
+// pairs would be a flaky test in principle, not a real regression guard).
+const buildDirName = (i, source) => `${String(i).padStart(3, '0')}-${shortSourceLabel(source)}-${sourceDigest(source)}`;
+await property(
+  'sourceDigest: always exactly 64 lowercase hex characters (the full, un-truncated SHA-256 digest), for any input',
+  fc.property(sourceArb, (source) => /^[0-9a-f]{64}$/.test(sourceDigest(source))),
+  { numRuns: 1000 },
+);
+await property(
+  'sourceDigest: deterministic — the same input always produces the same digest',
+  fc.property(sourceArb, (source) => {
+    const first = sourceDigest(source);
+    const second = sourceDigest(source);
+    return first === second;
+  }),
+  { numRuns: 1000 },
+);
+
+// Pin the specific, VERIFIED review finding that made sourceDigest() hash as 'utf16le'
+// instead of the default 'utf8' (see its doc comment in src/lib/restore.ts): a forged
+// manifest's `source` field can contain a LONE surrogate (valid JSON, invalid UTF-16
+// text — JSON.parse doesn't reject it), and Node's default utf8 string-to-bytes
+// conversion replaces EVERY lone surrogate with the SAME U+FFFD bytes regardless of its
+// actual code unit value. Two DIFFERENT strings differing only in WHICH invalid
+// surrogate they contain are therefore DIFFERENT as JS strings (confirmed below) but
+// were confirmed, before this fix, to hash IDENTICALLY under 'utf8' — a deterministic,
+// attacker-craftable collision, not merely an improbable one. 'utf16le' hashes the raw
+// code units with no substitution, so this pins that the fix actually holds.
+{
+  const loneSurrogateA = '/foo/bar/\uD800/memory';
+  const loneSurrogateB = '/foo/bar/\uD801/memory';
+  check(
+    'sourceDigest: two different lone-surrogate source strings (a forged-manifest shape) hash to DIFFERENT digests (#423 review finding)',
+    loneSurrogateA !== loneSurrogateB && sourceDigest(loneSurrogateA) !== sourceDigest(loneSurrogateB),
+  );
+}
+
+// #423/#181: shortSourceLabel() is deliberately NOT collision-resistant by itself — two
+// different --dir sources sharing a basename (e.g. many `~/.claude/projects/*/memory/`
+// dirs — the exact case #181 introduced this whole expanded/ scheme to disambiguate)
+// produce the IDENTICAL label. expandComponents() instead relies on TWO things together
+// to keep two components from landing in the same directory (see its
+// `${String(i + 1).padStart(3, '0')}-${shortSourceLabel(c.source)}-${sourceDigest(c.source)}`
+// expression) — and they give DIFFERENT strength guarantees, worth keeping separate: the
+// numeric index EXACTLY (not probabilistically) guarantees uniqueness WITHIN one
+// restore's manifest (component order is stable per snapshot); sourceDigest() makes it
+// PRACTICALLY negligible, not impossible, for two DIFFERENT sources to collide even when
+// the index ALSO happens to match — exactly the case of restoring two SEPARATE, unrelated
+// snapshots into the same --out-dir, where nothing ties their manifests' component ORDER
+// together (a real correctness gap in the #423 fix's first draft, caught by review — see
+// shortSourceLabel's and sourceDigest's doc comments in src/lib/restore.ts). This
+// property pins the EXACT half: for ANY two DISTINCT indices, even with the SAME source
+// string fed to both (so same label AND same digest too), the resulting directory names
+// are provably distinct — this one holds by construction (the indices' own decimal
+// string representations differ), not by a probabilistic digest margin.
+await property(
+  'expanded/ directory names: distinct component index alone guarantees distinct directory names, even for identical sources (#181)',
+  fc.property(fc.integer({ min: 1, max: 999 }), fc.integer({ min: 1, max: 999 }), sourceArb, (i1, i2, source) => {
+    if (i1 === i2) return true; // same index is not the case under test
+    return buildDirName(i1, source) !== buildDirName(i2, source);
+  }),
+  { numRuns: 1000 },
+);
+
+// The digest half, pinned as a fixed example (not fuzzed — see the "NOT flaky" note
+// above sourceDigest's properties) rather than a property: the exact #423 review
+// scenario — restoring two SEPARATE snapshots into the same --out-dir, whose manifests
+// each place a same-basename source at the SAME index — happens, for these two concrete
+// paths, to still produce distinct directory names (an example proves this specific
+// pair doesn't collide; it does not, and is not meant to, prove no pair ever could —
+// that's a property of the digest's bit-length, documented and reasoned about in
+// sourceDigest's own doc comment, not something this test can establish).
+check(
+  'expanded/ directory names: same index + same basename from two DIFFERENT source paths (two separate restores into one --out-dir) still get distinct directory names (#423 review finding)',
+  buildDirName(1, '/home/alice/projects/alpha/memory') !== buildDirName(1, '/home/bob/projects/beta/memory'),
+);
+// ...and the flip side of that same digest (see sourceDigest's own doc comment): a
+// restore-into-an-existing-expansion of the exact SAME source, at the same index, must
+// produce the SAME directory name every time, or the #181 no-clobber-merge behavior
+// (scripts/selftest.sh's own re-run test) would silently start creating a fresh,
+// differently-named directory on every re-run instead of merging into the prior one.
+{
+  const rerun1 = buildDirName(1, '/home/alice/projects/alpha/memory');
+  const rerun2 = buildDirName(1, '/home/alice/projects/alpha/memory');
+  check(
+    'expanded/ directory names: the SAME source path at the SAME index always produces the SAME directory name (re-run merge behavior)',
+    rerun1 === rerun2,
+  );
+}
+
+// Pin concrete examples of the actual FEATURE, not just its safety properties (the three
+// properties above prove shortSourceLabel() is safe and bounded; they say nothing about
+// whether it does the readable thing #423 is actually about). shortSourceLabel()
+// deliberately splits on the LAST occurrence of EITHER separator regardless of the host
+// platform (see its doc comment in src/lib/restore.ts) — a forged/foreign manifest's
+// `source` field is attacker-controlled data, not necessarily a path in this OS's own
+// format, and node:path's basename() only splits on the CURRENT platform's separator
+// (backslash-only paths pass through unsplit on POSIX). Pin both forms plus a trailing-
+// separator case.
+check(
+  'shortSourceLabel: takes the last segment of a POSIX-separated source, trailing separator or not',
+  shortSourceLabel('/a/b/deep/memory') === 'memory' && shortSourceLabel('/a/b/deep/memory/') === 'memory',
+);
+check(
+  'shortSourceLabel: takes the last segment of a backslash-separated source even when running on POSIX (#423 review finding)',
+  shortSourceLabel('C:\\Users\\me\\memory') === 'memory',
 );
 
 // ---- crypt.ts: generateKeypair / newEncrypter / newDecrypter roundtrip ----

@@ -376,10 +376,11 @@ cypher-brain snapshot --profile o2b --export ~/bank-export.json --out o2b.age
 
 Restoring one of these is the same `cypher-brain restore --in <file.age> --out-dir <dir>`
 as any other snapshot — no `--pg` needed. `restore` auto-expands every component into
-`<out-dir>/expanded/<NNN>-<encoded source path>/`, keyed to its original absolute source
-path, so many same-basename sources (e.g. dozens of claude-code project `memory/` dirs)
-land in separate, clearly-labeled directories instead of an undifferentiated pile of
-`memory.tar.gz` / `memory-1.tar.gz` / etc — see MANAGEMENT.md's Restore runbook.
+`<out-dir>/expanded/<NNN>-<source basename>-<digest>/`, keyed to its original absolute
+source path, so many same-basename sources (e.g. dozens of claude-code project
+`memory/` dirs) still land in separate directories — even across two separate restores
+into the same `--out-dir` — instead of an undifferentiated pile of `memory.tar.gz` /
+`memory-1.tar.gz` / etc — see MANAGEMENT.md's Restore runbook.
 
 ### Excluding files (`.cypherbrainignore`)
 
@@ -755,13 +756,13 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       --skip-old-files on GNU tar and --keep-old-files on bsdtar, which are those
       two tars' spellings of the same thing.
       Every --dir/--profile component's staged tarball is then auto-expanded into
-      "<out-dir>/expanded/<NNN>-<encoded source path>/", keyed to the component's
+      "<out-dir>/expanded/<NNN>-<source basename>-<digest>/", keyed to the component's
       ORIGINAL absolute source path (from manifest.json) rather than its on-disk name —
       so components with a colliding basename (e.g. many claude-code project memory/
-      dirs) land in separate, clearly-labeled directories instead of an undifferentiated
-      pile of memory.tar.gz / memory-1.tar.gz / etc. A "expanded/README.txt" (and the
-      same mapping on stdout) records which expanded directory came from which source
-      path. Nothing is ever written back to that original absolute path — this only ever
+      dirs) still land in separate directories, even across two SEPARATE restores into
+      the same --out-dir. A "expanded/README.txt" (and the same mapping on stdout)
+      records which expanded directory came from which FULL source path. Nothing is
+      ever written back to that original absolute path — this only ever
       creates NEW directories under --out-dir. Re-running restore into the same
       --out-dir does not clobber a prior expansion (same no-clobber posture as the outer
       extract). --no-expand-components skips this step, leaving only the raw *.tar.gz

@@ -16,6 +16,14 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export CYPHER_BRAIN_HOME="$TMP/keys"
 cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
+# Mirrors src/lib/restore.ts's sourceDigest() EXACTLY (delegates to node rather than
+# re-deriving it in bash) — the FULL, un-truncated 64-hex-char sha256 of the argument
+# STRING encoded as 'utf16le' (NOT shasum's default byte-for-byte/utf8 hashing of
+# stdin: a bash `printf '%s' | shasum` pipeline would silently drift from restore.ts's
+# own encoding choice, which matters — see sourceDigest's doc comment for why 'utf8'
+# was rejected). Used below to predict the "<NNN>-<basename>-<digest>" expanded/
+# directory name restore.ts builds (#423).
+src_digest() { node -e "process.stdout.write(require('node:crypto').createHash('sha256').update(process.argv[1], 'utf16le').digest('hex'))" "$1"; }
 
 MARKER="secret-thought-$(od -An -N6 -tx1 /dev/urandom | tr -d ' ')"
 SRC="$TMP/brain-src"
@@ -111,16 +119,22 @@ tar -xzf "$TMP/out/brain-src.tar.gz" -C "$TMP/out"
 diff -r "$SRC" "$TMP/out/brain-src"
 echo "[PASS] restored tree is byte-identical to source"
 
-echo "== #181: restore auto-expands the component into out-dir/expanded/, keyed to its source path =="
+echo "== #181/#423: restore auto-expands the component into out-dir/expanded/, keyed to its source path =="
 # tar archives a --dir source as "-C $(dirname abs) -- $(basename abs)", so the expanded
 # dir contains a basename(abs)-named subdirectory holding the actual tree (same shape as
 # the manual `tar -xzf brain-src.tar.gz -C "$TMP/out"` two lines above, which is why THAT
 # diff compares against "$TMP/out/brain-src", not "$TMP/out" itself).
-EXPANDED_SRC_DIR="$TMP/out/expanded/001-$(printf '%s' "$SRC" | sed -E -e 's#^/+##' -e 's#[^A-Za-z0-9._-]+#_#g')"
+# #423: the expanded/ directory NAME itself is now just "<NNN>-<basename>-<digest>"
+# (short and readable, plus the FULL, un-truncated 64-hex-char SHA-256 digest of the
+# FULL source path so two DIFFERENT sources sharing a basename won't collide — see
+# sourceDigest() in src/lib/restore.ts), not the whole source path flattened+encoded —
+# expanded/README.txt (checked below) is what actually maps the directory back to the
+# full original source path.
+EXPANDED_SRC_DIR="$TMP/out/expanded/001-$(basename "$SRC")-$(src_digest "$SRC")"
 diff -r "$SRC" "$EXPANDED_SRC_DIR/$(basename "$SRC")" || { echo "FAIL: expanded/ tree differs from source"; ls -la "$TMP/out/expanded"; exit 1; }
 test -f "$TMP/out/expanded/README.txt" || { echo "FAIL: expanded/README.txt was not written"; exit 1; }
 grep -q "$SRC" "$TMP/out/expanded/README.txt" || { echo "FAIL: expanded/README.txt does not reference the source path"; cat "$TMP/out/expanded/README.txt"; exit 1; }
-echo "[PASS] restore auto-expanded the single component under expanded/<001-source>/, with a README mapping it back to the source path"
+echo "[PASS] restore auto-expanded the single component under expanded/<001-basename-digest>/, with a README mapping it back to the full source path"
 
 echo "== #181 regression: colliding-basename --dir sources expand into SEPARATE, correctly-keyed directories =="
 # The motivating repro from issue #181: multiple --dir sources sharing a basename (e.g.
@@ -144,10 +158,25 @@ grep -rq 'beta project memory content' "$EXP_OUT/expanded" || { echo "FAIL: beta
 ALPHA_DIR=$(dirname "$(grep -rl 'alpha project memory content' "$EXP_OUT/expanded" | head -1)")
 BETA_DIR=$(dirname "$(grep -rl 'beta project memory content' "$EXP_OUT/expanded" | head -1)")
 [ "$ALPHA_DIR" != "$BETA_DIR" ] || { echo "FAIL: alpha and beta content ended up in the SAME expanded dir"; exit 1; }
+# #423: the component directory itself (one level up from the "memory" subdir tar -C'd
+# into it — same shape noted above) must now be the SHORT "<NNN>-memory-<digest>" form,
+# not the whole source path flattened+encoded -- and the two colliding-basename sources,
+# despite sharing a label, must still land in DIFFERENT component directories. Assert
+# the EXACT expected name (index + basename + src_digest of each source's own full
+# path), not just the shape, so this also pins sourceDigest()'s actual role in keeping
+# them apart, not just the numeric index (see shortSourceLabel's and sourceDigest's doc
+# comments in src/lib/restore.ts).
+ALPHA_COMPONENT_DIR=$(basename "$(dirname "$ALPHA_DIR")")
+BETA_COMPONENT_DIR=$(basename "$(dirname "$BETA_DIR")")
+EXPECTED_ALPHA_DIR="001-memory-$(src_digest "$COLLIDE_A")"
+EXPECTED_BETA_DIR="002-memory-$(src_digest "$COLLIDE_B")"
+[ "$ALPHA_COMPONENT_DIR" = "$EXPECTED_ALPHA_DIR" ] || { echo "FAIL: alpha component directory name is '$ALPHA_COMPONENT_DIR', expected '$EXPECTED_ALPHA_DIR'"; exit 1; }
+[ "$BETA_COMPONENT_DIR" = "$EXPECTED_BETA_DIR" ] || { echo "FAIL: beta component directory name is '$BETA_COMPONENT_DIR', expected '$EXPECTED_BETA_DIR'"; exit 1; }
+[ "$ALPHA_COMPONENT_DIR" != "$BETA_COMPONENT_DIR" ] || { echo "FAIL: alpha and beta component directories have the SAME short name despite sharing a basename"; exit 1; }
 grep -q "collide-project-a" "$EXP_OUT/expanded/README.txt" || { echo "FAIL: README.txt does not reference collide-project-a's source path"; cat "$EXP_OUT/expanded/README.txt"; exit 1; }
 grep -q "collide-project-b" "$EXP_OUT/expanded/README.txt" || { echo "FAIL: README.txt does not reference collide-project-b's source path"; cat "$EXP_OUT/expanded/README.txt"; exit 1; }
 grep -q "expanded" "$TMP/collide-restore.log" || { echo "FAIL: restore's own stdout did not summarize the expand step"; cat "$TMP/collide-restore.log"; exit 1; }
-echo "[PASS] two colliding-basename --dir sources restore into separate expanded/<NNN>-<source>/ dirs with the right content in each"
+echo "[PASS] two colliding-basename --dir sources restore into separate, short expanded/<NNN>-memory-<digest>/ dirs with the right content in each"
 
 echo "== #181: --no-expand-components opts out, leaving only the raw *.tar.gz files =="
 cb restore --in "$TMP/collide.age" --out-dir "$TMP/collide-noexpand" --no-expand-components >/dev/null
@@ -265,16 +294,19 @@ fi
 
 echo "== #181 hardening: a pre-existing SYMLINK at the expanded component directory path is refused, never followed =="
 # mkdirSync({recursive:true}) FOLLOWS an existing symlink rather than refusing it -- if
-# an attacker (or a prior run) planted one at the predictable expanded/<NNN>-<source>
-# path before expandComponents() ever runs, extracting into it would land OUTSIDE
-# --out-dir entirely. Pre-plant that symlink by hand and prove restore refuses to
-# follow it: warns, leaves the symlink untouched, and writes nothing through it.
+# an attacker (or a prior run) planted one at the predictable
+# expanded/<NNN>-<basename>-<digest> path (#423: the directory name is now
+# "<NNN>-<basename>-<digest>", see shortSourceLabel()/sourceDigest() in
+# src/lib/restore.ts) before expandComponents() ever runs, extracting into it would
+# land OUTSIDE --out-dir entirely. Pre-plant that symlink by hand and prove restore
+# refuses to follow it: warns, leaves the symlink untouched, and writes nothing
+# through it.
 SYM_SRC="$TMP/symlink-guard-src"; mkdir -p "$SYM_SRC"
 printf 'symlink guard test content\n' > "$SYM_SRC/note.txt"
 cb snapshot --dir "$SYM_SRC" --out "$TMP/symguard.age" >/dev/null
 SYM_OUT="$TMP/symguard-out"; mkdir -p "$SYM_OUT/expanded"
 SYM_ESCAPE_TARGET="$TMP/symlink-escape-target"; mkdir -p "$SYM_ESCAPE_TARGET"
-SYM_DIRNAME="001-$(printf '%s' "$SYM_SRC" | sed -E -e 's#^/+##' -e 's#[^A-Za-z0-9._-]+#_#g')"
+SYM_DIRNAME="001-$(basename "$SYM_SRC")-$(src_digest "$SYM_SRC")"
 ln -s "$SYM_ESCAPE_TARGET" "$SYM_OUT/expanded/$SYM_DIRNAME"
 set +e
 SYM_ERR=$(cb restore --in "$TMP/symguard.age" --out-dir "$SYM_OUT" 2>&1); SYM_RC=$?
