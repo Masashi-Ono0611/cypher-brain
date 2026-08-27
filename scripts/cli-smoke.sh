@@ -259,6 +259,25 @@ if grep -qi "did you mean" "$TMP/unknown-cmd.err"; then
 fi
 echo "[PASS] dist unknown command: 'snapsho' suggests 'did you mean snapshot?', 'definitelynotacommand' correctly gets no spurious suggestion"
 
+# (j cont. 2) zero arguments (#427): same shape as the unknown-command reply above —
+# exit 2, stdout EMPTY, a short stderr reply — instead of the #269 fix's own former gap:
+# bare `cypher-brain` used to fall into the same case as explicit `--help` and dump the
+# whole ~26 KB reference with exit 0. Explicit --help must still behave exactly as (a)
+# above confirmed: full reference, exit 0 — this only changes NO arguments at all.
+node "$DIST" > "$TMP/noargs.out" 2> "$TMP/noargs.err"
+NOARGS_RC=$?
+[ "$NOARGS_RC" = "2" ] || { echo "[FAIL] zero arguments exited $NOARGS_RC, expected 2"; cat "$TMP/noargs.err"; exit 1; }
+[ ! -s "$TMP/noargs.out" ] \
+  || { echo "[FAIL] zero arguments wrote $(wc -c < "$TMP/noargs.out") bytes to stdout, expected none"; exit 1; }
+grep -Fq 'error: no command given' "$TMP/noargs.err" \
+  || { echo "[FAIL] zero arguments did not print the no-command-given error"; cat "$TMP/noargs.err"; exit 1; }
+grep -Fq "cypher-brain <command> --help" "$TMP/noargs.err" \
+  || { echo "[FAIL] zero arguments did not point at --help"; cat "$TMP/noargs.err"; exit 1; }
+NOARGS_LINES=$(wc -l < "$TMP/noargs.err" | tr -d ' ')
+[ "$NOARGS_LINES" -le 5 ] \
+  || { echo "[FAIL] the zero-arguments reply is $NOARGS_LINES lines — the whole help is being dumped again"; exit 1; }
+echo "[PASS] dist zero arguments: exit 2, stdout empty, a ${NOARGS_LINES}-line stderr reply (explicit --help is unaffected, per (a) above)"
+
 # (k) estimate --json (#268): all seven documented keys are ALWAYS present, whichever
 # backend was asked about — the free ones used to drop unit/approx_ar/usd_estimate
 # entirely, so `est.unit` was undefined and the caller could not tell "no unit" from
