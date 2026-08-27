@@ -62,6 +62,7 @@ const BOOL_FLAGS = new Set([
   'pq',
   'dry_run',
   'json',
+  'verbose',
   'sign',
   'no_sign',
   'require_signature',
@@ -509,7 +510,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       No signing identity at all -> unchanged pre-#214 behavior (no *.minisig written).
 
   cypher-brain restore --in <file.age> --out-dir <dir> [--identity <file>] [--pg <conn>] [--yes] [--no-expand-components]
-                        [--sign-recipient <file>] [--require-signature]
+                        [--sign-recipient <file>] [--require-signature] [--verbose]
       Decrypt with the PRIVATE identity. Extraction never clobbers a file already
       present in --out-dir: an existing file is left untouched, the rest of the
       archive still extracts around it, and the collision itself is not an error.
@@ -542,9 +543,17 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       this box only warn and proceed — this never breaks a pre-#214 backup. --require-
       signature turns that warn into a refusal too: an attacker who simply DELETES the
       .minisig sidecar (rather than forging one) no longer silently succeeds either.
+      By default (#436), the console output is a short summary: which components were
+      auto-expanded and where they landed under expanded/ (see --no-expand-components
+      above), not the full manifest.json backing it. --verbose additionally prints that
+      raw manifest.json — tool, schema, created_at, and two fields worth knowing about
+      before turning it on: host (the hostname of the machine that ran "snapshot" — not
+      necessarily this one) and every component's original absolute SOURCE path on that
+      machine. Leave it off unless you actually need those fields (e.g. debugging a
+      manifest itself).
 
   cypher-brain verify --in <file.age> [--identity <file>] [--sha256 <hex>] [--sign-recipient <file>] [--require-signature] [--json]
-                       [--level quick|remote|drill]
+                       [--level quick|remote|drill] [--verbose]
       Assert it is real age ciphertext, a wrong key cannot open it, AND (when the
       private identity is on this box) that YOUR key decrypts it into a well-formed
       bundle. --sha256 also pins the artifact to an expected hash. Authenticity (#214):
@@ -574,7 +583,12 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
                pull -> decrypt -> extract rehearsal MANAGEMENT.md's restore runbook
                describes. Refuses --pg (a verification drill must never run
                pg_restore against a live database); the scratch directory is always
-               removed afterward, success or failure.
+               removed afterward, success or failure. Its non-JSON output is, by
+               default, the same short component-expansion summary restore itself
+               prints (#436) rather than the full manifest.json — pass --verbose
+               (alongside --level drill) to see that manifest too. --verbose has no
+               effect on --level quick/remote (neither ever reads a manifest.json) or
+               on --json (already a single alternate machine-readable report, #211).
       A failed remote/drill fetch reports VERDICT: FAIL (exit 1) rather than a raw
       error — retrievability itself is what those two levels test.
       --json prints one JSON object to stdout instead of the human-readable report.

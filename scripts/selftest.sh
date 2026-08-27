@@ -136,6 +136,28 @@ test -f "$TMP/out/expanded/README.txt" || { echo "FAIL: expanded/README.txt was 
 grep -q "$SRC" "$TMP/out/expanded/README.txt" || { echo "FAIL: expanded/README.txt does not reference the source path"; cat "$TMP/out/expanded/README.txt"; exit 1; }
 echo "[PASS] restore auto-expanded the single component under expanded/<001-basename-digest>/, with a README mapping it back to the full source path"
 
+echo "== #436: default restore console output omits the raw manifest.json dump; --verbose restores it =="
+# Same snap.age as above, into fresh --out-dir's so this doesn't disturb the restore
+# already sitting in $TMP/out (still used by later assertions in this script).
+DEFAULT_OUT="$TMP/manifest-default"
+DEFAULT_LOG=$(cb restore --in "$TMP/snap.age" --out-dir "$DEFAULT_OUT")
+printf '%s' "$DEFAULT_LOG" | grep -q '"schema"' \
+  && { echo "FAIL: default restore (no --verbose) printed the raw manifest.json dump"; printf '%s\n' "$DEFAULT_LOG"; exit 1; }
+printf '%s' "$DEFAULT_LOG" | grep -q "restored components into $DEFAULT_OUT" \
+  || { echo "FAIL: default restore console output is missing the 'restored components into' summary line"; printf '%s\n' "$DEFAULT_LOG"; exit 1; }
+printf '%s' "$DEFAULT_LOG" | grep -q '^expanded 1 component(s) into' \
+  || { echo "FAIL: default restore console output is missing the expanded-component summary"; printf '%s\n' "$DEFAULT_LOG"; exit 1; }
+test -f "$DEFAULT_OUT/manifest.json" || { echo "FAIL: manifest.json was not written to --out-dir (unrelated to console output)"; exit 1; }
+echo "[PASS] default restore console output is the short summary only, with no raw manifest.json dump"
+
+VERBOSE_OUT="$TMP/manifest-verbose"
+VERBOSE_LOG=$(cb restore --in "$TMP/snap.age" --out-dir "$VERBOSE_OUT" --verbose)
+printf '%s' "$VERBOSE_LOG" | grep -q '"schema"' \
+  || { echo "FAIL: restore --verbose did not print the raw manifest.json dump"; printf '%s\n' "$VERBOSE_LOG"; exit 1; }
+printf '%s' "$VERBOSE_LOG" | grep -q '^expanded 1 component(s) into' \
+  || { echo "FAIL: restore --verbose lost the expanded-component summary"; printf '%s\n' "$VERBOSE_LOG"; exit 1; }
+echo "[PASS] restore --verbose prints the raw manifest.json dump alongside the same summary"
+
 echo "== #181 regression: colliding-basename --dir sources expand into SEPARATE, correctly-keyed directories =="
 # The motivating repro from issue #181: multiple --dir sources sharing a basename (e.g.
 # many claude-code project memory/ dirs) restore to opaque names (memory.tar.gz,

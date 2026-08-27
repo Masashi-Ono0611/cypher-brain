@@ -894,7 +894,18 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   const manifestPath = join(o.out_dir, 'manifest.json');
   if (await exists(manifestPath)) {
     const manifestText = await readFile(manifestPath, 'utf8');
-    console.log(manifestText);
+    // #436: the raw manifest.json (tool/schema/host/created_at, every component's
+    // original absolute SOURCE path, digests) used to print here UNCONDITIONALLY,
+    // ahead of the actually-useful "expanded N component(s) into …" summary and (for
+    // verify --level drill, which replays this function's captured stdout) the
+    // VERDICT below it — a wall of JSON a human had to scroll past, and an incidental
+    // stdout leak of two fields worth gating: `host` (the hostname of whatever machine
+    // ran `snapshot` — see snapshot.ts's `hostname()` call — not necessarily this one)
+    // and each component's original absolute source path ON that machine. --verbose
+    // opts back into seeing it; assertSupportedManifestSchema still runs either way —
+    // that guard's job (refuse a manifest schema this build can't safely read) has
+    // nothing to do with whether its text gets printed.
+    if (o.verbose) console.log(manifestText);
     assertSupportedManifestSchema(manifestText, manifestPath);
   }
   // Auto-expand --dir/--profile components (#181) — independent of --pg below: it only
@@ -1377,10 +1388,10 @@ async function verifyImpl(o: CliOptions): Promise<number> {
 
     // restoreImpl(), NOT restore(): restore() prints its own mood mascot on success/failure
     // (issue #194), and a drill's own final mascot below would double up with it. Its
-    // stdout narrative (the manifest.json dump, "restored components into …", the
-    // component auto-expand summary) is captured rather than left to print directly, so a
-    // --json drill still emits exactly one JSON line on stdout — the same contract #211
-    // already holds --level quick/remote to.
+    // stdout narrative ("restored components into …", the component auto-expand summary,
+    // and — only with --verbose, #436 — the manifest.json dump) is captured rather than
+    // left to print directly, so a --json drill still emits exactly one JSON line on
+    // stdout — the same contract #211 already holds --level quick/remote to.
     const restoreOutDir = join(scratchRoot, 'restored');
     // A fresh CliOptions object, NOT a spread of `o`: restoreImpl() reads o.pg and would
     // run pg_restore --clean --if-exists (an irreversible DROP) if it were passed through
@@ -1392,6 +1403,7 @@ async function verifyImpl(o: CliOptions): Promise<number> {
       identity: o.identity,
       sign_recipient: o.sign_recipient,
       require_signature: o.require_signature,
+      verbose: o.verbose, // #436: let --level drill --verbose show the raw manifest.json restoreImpl() reads, same as a plain "restore --verbose" would
       dirs: [],
       tables: [],
       recipients: [],

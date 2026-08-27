@@ -28,6 +28,7 @@ export interface CliOptions {
   no_expand_components?: boolean;
   dry_run?: boolean; // snapshot --dry-run: preview .cypherbrainignore include/exclude without writing anything (#216)
   json?: boolean; // verify/estimate/schedule status: machine-readable JSON on stdout instead of the human-readable report (issue #211)
+  verbose?: boolean; // restore/verify --level drill: also print the raw manifest.json dump restoreImpl() reads (name, source, digests, host, created_at, …) — off by default (issue #436), since --json already means something else for these two commands (a whole alternate machine-readable report, not "show me the manifest too")
   csv?: boolean; // ledger --csv: one row per receipt on stdout instead of the aggregate report (#232)
   level?: string; // verify --level quick|remote|drill (issue #209) — validated in restore.ts (parseArgs can't know the enum), default 'quick' when absent
   sign?: boolean; // keygen --sign: generate a minisign-compatible Ed25519 signing keypair instead of an age identity (#214)
