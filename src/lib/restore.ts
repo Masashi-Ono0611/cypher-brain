@@ -25,7 +25,7 @@ import {
   setActiveRestoreScratchDir,
   setActiveVerifyScratchDir,
 } from './signal-guard.js';
-import { didYouMean } from './suggest.js';
+import { didYouMean, nearestName } from './suggest.js';
 import { moodForVerdict, printMascot, printJson } from './ui.js';
 import { pull, signatureGap } from './pushpull.js';
 import { recordAudit } from './audit.js';
@@ -1212,7 +1212,12 @@ export async function verify(o: CliOptions): Promise<void> {
 async function verifyImpl(o: CliOptions): Promise<number> {
   const level = o.level ?? 'quick';
   if (level !== 'quick' && level !== 'remote' && level !== 'drill') {
-    throw new Error(`--level must be quick, remote or drill (got "${o.level}")`);
+    // #435: --level is an enum-valued flag, same "did you mean" class #425 already
+    // covers for top-level commands/flags — nearestName() is the same matcher.
+    const suggestion = nearestName(level, ['quick', 'remote', 'drill']);
+    throw new Error(
+      `--level must be quick, remote or drill (got "${o.level}")${suggestion ? ` (${didYouMean(`--level ${suggestion}`)})` : ''}`,
+    );
   }
 
   if (level === 'quick') {
