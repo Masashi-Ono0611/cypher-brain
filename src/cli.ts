@@ -43,7 +43,7 @@ import { withSpan } from './lib/otel.js';
 import { init } from './lib/wizard.js';
 import { errMsg } from './lib/util.js';
 import { annotateErrorMessage, matchErrorCode } from './lib/errors.js';
-import { didYouMean } from './lib/suggest.js';
+import { didYouMean, nearestName } from './lib/suggest.js';
 import { hasWrittenJson, printMascot, installEpipeGuard } from './lib/ui.js';
 import { recoveryKit } from './lib/recoverykit.js';
 import { drainWarnings, formatWarningSummary } from './lib/warn.js';
@@ -112,6 +112,24 @@ const VALUE_FLAGS = new Set([
   'plan',
 ]);
 
+// Every flag name an "unknown flag" error can plausibly suggest (#425 — generalizing
+// #253's own "would be nice-to-have" mention of a did-you-mean suggestion beyond
+// restore's --out/--out-dir special case). Includes the four repeatable array flags
+// (--dir/--pg-table/--pg-exclude-table-data/--recipient) parseArgs() handles in their
+// own branches BEFORE ever consulting BOOL_FLAGS/VALUE_FLAGS — they are real, valid
+// flags and must be suggestable too (#253's own repro used exactly `--recipiant` for
+// `--recipient`), even though they never appear in either Set above. Hyphenated (the
+// form a user actually types), computed once at module load rather than per rejected
+// flag.
+const KNOWN_FLAG_NAMES: string[] = [
+  'dir',
+  'pg-table',
+  'pg-exclude-table-data',
+  'recipient',
+  ...BOOL_FLAGS,
+  ...VALUE_FLAGS,
+].map((k) => k.replace(/_/g, '-'));
+
 function parseArgs(argv: string[]): CliOptions {
   const o: CliOptions = { dirs: [], tables: [], recipients: [] };
   const rec = o as unknown as Record<string, string | boolean | undefined>;
@@ -160,8 +178,9 @@ function parseArgs(argv: string[]): CliOptions {
       // on `o` and then just never read by any command — no error, just quiet
       // wrong behavior (the same bug class as #96/#101/#114). Refuse instead.
       if (!BOOL_FLAGS.has(key) && !VALUE_FLAGS.has(key)) {
+        const suggestion = nearestName(a.slice(2), KNOWN_FLAG_NAMES);
         throw new Error(
-          `unknown flag: --${a.slice(2)} (run 'cypher-brain --help' or '<command> --help' to see valid flags)`,
+          `unknown flag: --${a.slice(2)} (${suggestion ? `${didYouMean(`--${suggestion}`)} — ` : ''}run 'cypher-brain --help' or '<command> --help' to see valid flags)`,
         );
       }
       rec[key] = BOOL_FLAGS.has(key) ? true : valueAt(++i, a);
@@ -1267,12 +1286,18 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
     // list of real commands plus where to read more — not 300 lines to scroll back
     // through with no indication of which one was meant.
     default: {
-      console.error(`error: unknown command: ${cmd}`);
       // Guard the derived list: if a future HELP edit ever changed the section-header
       // shape enough that nothing matches, "valid commands: " with nothing after it
       // would be worse than not printing the line at all.
       // cli-smoke also asserts the list matches the real command set on every run.
       const names = commandNames();
+      // #425: generalizes #253's own "would be nice-to-have" mention of a did-you-mean
+      // suggestion beyond restore's --out/--out-dir special case. `cmd` is only ever
+      // undefined via the earlier `case undefined:` arm (mapped to help), so it is
+      // always a real (if unrecognized) string here — the `cmd ? ... : undefined` guard
+      // exists for the type checker, not because this path can actually see undefined.
+      const suggestion = cmd ? nearestName(cmd, names) : undefined;
+      console.error(`error: unknown command: ${cmd}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`);
       if (names.length > 0) console.error(`valid commands: ${names.join(', ')}`);
       console.error(
         `run 'cypher-brain --help' for the full reference, or 'cypher-brain <command> --help' for one command`,
