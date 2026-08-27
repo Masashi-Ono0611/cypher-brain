@@ -5,7 +5,14 @@ import { hostname, tmpdir } from 'node:os';
 import { join, basename, dirname, resolve, relative, sep } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import ignore, { type Ignore } from 'ignore';
-import { RECIPIENT, PIN_RECIPIENTS, PIPE_TIMEOUT_MS, SIGN_IDENTITY, pgTool } from './config.js';
+import {
+  RECIPIENT,
+  PIN_RECIPIENTS,
+  PIPE_TIMEOUT_MS,
+  SIGN_IDENTITY,
+  pgTool,
+  MANIFEST_SCHEMA_VERSION,
+} from './config.js';
 import { run } from './proc.js';
 import { newEncrypter, encryptToFile } from './crypt.js';
 import { exists, fmtBytes, requirePath, sha256, errMsg, redactPgConn } from './util.js';
@@ -792,7 +799,7 @@ export async function snapshot(o: CliOptions): Promise<void> {
     const manifestJson = JSON.stringify(
       {
         tool: 'cypher-brain',
-        schema: 1,
+        schema: MANIFEST_SCHEMA_VERSION,
         host: hostname(),
         created_at: createdAt,
         content_digest: contentDigest,

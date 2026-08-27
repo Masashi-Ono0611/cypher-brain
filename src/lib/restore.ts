@@ -12,6 +12,7 @@ import {
   PIPE_TIMEOUT_MS,
   SIGN_RECIPIENT,
   NON_CONTENT_ADDRESSED_BACKENDS,
+  MANIFEST_SCHEMA_VERSION,
   pgTool,
 } from './config.js';
 import { run } from './proc.js';
@@ -421,6 +422,35 @@ async function mergeNoClobber(src: string, dest: string): Promise<void> {
   }
 }
 
+// #225 forward-compat guard: a manifest.json declaring a `schema` this build does not
+// recognize describes a shape restore has never been taught to read. Arweave's storage
+// is meant to outlive any one build of this tool — a decades-old binary silently
+// reinterpreting a changed/renamed field as the one it expects is worse than refusing
+// outright, so this throws (failing the whole restore) rather than letting
+// expandComponents()/pg_restore below proceed on a guess. Only a manifest with NO
+// `schema` field at all (every pre-#225 snapshot — `undefined`, not `null`) is treated
+// as legacy and let through; anything present that isn't a plain integer in
+// [1, MANIFEST_SCHEMA_VERSION] is refused — a non-numeric schema (a future format could
+// just as easily change the field's TYPE, not just its number) fails closed here rather
+// than silently falling through as if it were unversioned. A manifest that fails to
+// parse as JSON at all is NOT this guard's concern — that is the existing best-effort
+// manifest handling's job (see expandComponents' own parse guard just below).
+function assertSupportedManifestSchema(manifestText: string, manifestPath: string): void {
+  let schema: unknown;
+  try {
+    schema = (JSON.parse(manifestText) as { schema?: unknown } | null)?.schema;
+  } catch {
+    return; // unparsable — not this guard's concern, see above
+  }
+  if (schema === undefined) return; // no schema field at all — pre-#225 snapshot
+  if (typeof schema !== 'number' || !Number.isInteger(schema) || schema < 1 || schema > MANIFEST_SCHEMA_VERSION) {
+    throw new Error(
+      `${manifestPath} declares schema ${JSON.stringify(schema)}, which this cypher-brain build (understands integer schemas 1 through ${MANIFEST_SCHEMA_VERSION}) does not recognize — ` +
+        'upgrade cypher-brain before restoring this snapshot (an older build risks misreading a changed manifest shape)',
+    );
+  }
+}
+
 // Auto-expand every --dir/--profile component's staged tarball under
 // <out-dir>/expanded/<NNN>-<encoded source path>/, keyed to the component's ORIGINAL
 // absolute source path (manifest.components[].source) rather than its on-disk name — see
@@ -757,7 +787,11 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   }
   console.log(`restored components into ${o.out_dir}`);
   const manifestPath = join(o.out_dir, 'manifest.json');
-  if (await exists(manifestPath)) console.log(await readFile(manifestPath, 'utf8'));
+  if (await exists(manifestPath)) {
+    const manifestText = await readFile(manifestPath, 'utf8');
+    console.log(manifestText);
+    assertSupportedManifestSchema(manifestText, manifestPath);
+  }
   // Auto-expand --dir/--profile components (#181) — independent of --pg below: it only
   // ever touches components that carry a `source`, which pg_dump's never does, so the two
   // flows never race or duplicate work, and neither has to run before the other. --no-

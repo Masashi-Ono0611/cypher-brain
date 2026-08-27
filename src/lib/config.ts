@@ -327,6 +327,18 @@ export const LAUNCHD_DIR = readEnv('CYPHER_BRAIN_LAUNCHD_DIR') || join(homedir()
 export const SIGN_IDENTITY = join(HOME, 'sign-identity.key'); // PRIVATE signing key — keep offline, same posture as IDENTITY
 export const SIGN_RECIPIENT = join(HOME, 'sign-recipient.pub'); // PUBLIC verification key — safe to copy, same posture as RECIPIENT
 
+// manifest.json's own `schema` field (#225): the highest version THIS build's restore
+// logic knows how to interpret. snapshot() stamps every manifest it writes with this
+// exact value (never a hand-typed literal) so the writer and the reader can never drift
+// apart. restore() refuses (rather than guessing) when a manifest declares a HIGHER
+// schema than this — Arweave permanence means a decades-old build may one day face a
+// manifest shape it was never written to understand, and misinterpreting an unknown
+// component/field shape as a known one is worse than a clear "upgrade cypher-brain"
+// error. Bump this the day manifest.json's shape changes in a way older restore code
+// would misread (new required field, changed meaning of an existing one, etc.) —
+// purely additive/optional fields do not require a bump.
+export const MANIFEST_SCHEMA_VERSION = 1;
+
 export const AGE_MAGIC = 'age-encryption.org/v1';
 // The first bytes of a *.minisig, beside AGE_MAGIC because they answer the same question
 // for the other object type this project stores: "are these bytes the thing I asked for, or
