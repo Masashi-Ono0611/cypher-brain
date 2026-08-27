@@ -137,12 +137,29 @@ grep -q "unknown flag: --recipiant" "$TMP/unknown-flag.log" \
   || { echo "[FAIL] unknown --recipiant did not report 'unknown flag: --recipiant'"; cat "$TMP/unknown-flag.log"; exit 1; }
 echo "[PASS] dist estimate --recipiant (typo): rejected with 'unknown flag: --recipiant'"
 
+# (i cont.) #425: generalizing #253's own "would be nice-to-have" mention of a
+# did-you-mean suggestion beyond restore's --out/--out-dir special case (#277/#300).
+# --recipiant is close enough to --recipient (edit distance 1) to get one; a
+# genuinely unrelated unknown flag must NOT get a spurious suggestion.
+grep -Fq -- 'did you mean --recipient?' "$TMP/unknown-flag.log" \
+  || { echo "[FAIL] unknown --recipiant (close to --recipient) did not get a did-you-mean suggestion"; cat "$TMP/unknown-flag.log"; exit 1; }
+echo "[PASS] dist estimate --recipiant (typo): also suggests 'did you mean --recipient?'"
+
+node "$DIST" snapshot --out "$TMP/unrelated-flag.age" --xyzabc123 > "$TMP/unrelated-flag.log" 2>&1
+if [ $? -eq 0 ]; then echo "[FAIL] snapshot with unknown --xyzabc123 exited 0, expected non-zero"; cat "$TMP/unrelated-flag.log"; exit 1; fi
+if grep -qi "did you mean" "$TMP/unrelated-flag.log"; then
+  echo "[FAIL] a genuinely unrelated unknown flag (--xyzabc123) got a spurious did-you-mean suggestion"; cat "$TMP/unrelated-flag.log"; exit 1
+fi
+echo "[PASS] dist snapshot --xyzabc123 (unrelated to any real flag): rejected with NO spurious did-you-mean suggestion"
+
 node "$DIST" snapshot --out "$TMP/unknown-bool.age" --dirs "$CYPHER_BRAIN_HOME" > "$TMP/unknown-bool-flag.log" 2>&1
 if [ $? -eq 0 ]; then echo "[FAIL] snapshot with unknown --dirs exited 0, expected non-zero"; cat "$TMP/unknown-bool-flag.log"; exit 1; fi
 grep -q "unknown flag: --dirs" "$TMP/unknown-bool-flag.log" \
   || { echo "[FAIL] unknown --dirs did not report 'unknown flag: --dirs'"; cat "$TMP/unknown-bool-flag.log"; exit 1; }
+grep -Fq -- 'did you mean --dir?' "$TMP/unknown-bool-flag.log" \
+  || { echo "[FAIL] unknown --dirs (plural typo for --dir, a repeatable array flag handled outside BOOL_FLAGS/VALUE_FLAGS) did not get a did-you-mean suggestion"; cat "$TMP/unknown-bool-flag.log"; exit 1; }
 if [ -f "$TMP/unknown-bool.age" ]; then echo "[FAIL] snapshot with an unknown flag still wrote --out"; exit 1; fi
-echo "[PASS] dist snapshot --dirs (typo for --dir, plural): rejected with 'unknown flag: --dirs', no --out written"
+echo "[PASS] dist snapshot --dirs (typo for --dir, plural): rejected with 'unknown flag: --dirs' + 'did you mean --dir?', no --out written"
 
 # a legitimate, fully-recognized flag set must still pass through untouched
 node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend file > "$TMP/known-flags.log" 2>&1 \
@@ -228,6 +245,19 @@ UNKNOWN_LINES=$(wc -l < "$TMP/unknown-cmd.err" | tr -d ' ')
 [ "$UNKNOWN_LINES" -le 5 ] \
   || { echo "[FAIL] the unknown-command reply is $UNKNOWN_LINES lines — the whole help is being dumped again"; exit 1; }
 echo "[PASS] dist <unknown command>: exit 2, stdout empty, a ${UNKNOWN_LINES}-line stderr reply listing every valid command"
+
+# (j cont.) #425: generalizing #253's own "would be nice-to-have" mention of a
+# did-you-mean suggestion beyond restore's --out/--out-dir special case. "definitely-
+# notacommand" above is unrelated to every real command name and correctly got no
+# suggestion; "snapsho" (edit distance 1 from "snapshot") must get one.
+node "$DIST" snapsho > "$TMP/typo-cmd.out" 2> "$TMP/typo-cmd.err"
+[ "$?" = "2" ] || { echo "[FAIL] typo'd command 'snapsho' did not exit 2"; cat "$TMP/typo-cmd.err"; exit 1; }
+grep -Fq 'error: unknown command: snapsho (did you mean snapshot?)' "$TMP/typo-cmd.err" \
+  || { echo "[FAIL] 'snapsho' (typo for snapshot) did not get a did-you-mean suggestion"; cat "$TMP/typo-cmd.err"; exit 1; }
+if grep -qi "did you mean" "$TMP/unknown-cmd.err"; then
+  echo "[FAIL] 'definitelynotacommand' (unrelated to every real command) got a spurious did-you-mean suggestion"; cat "$TMP/unknown-cmd.err"; exit 1
+fi
+echo "[PASS] dist unknown command: 'snapsho' suggests 'did you mean snapshot?', 'definitelynotacommand' correctly gets no spurious suggestion"
 
 # (k) estimate --json (#268): all seven documented keys are ALWAYS present, whichever
 # backend was asked about — the free ones used to drop unit/approx_ar/usd_estimate
