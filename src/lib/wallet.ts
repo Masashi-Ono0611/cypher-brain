@@ -176,6 +176,14 @@ export async function loadTonWallet(
   try {
     parsed = JSON.parse(await readFile(walletPath, 'utf8'));
   } catch (e) {
+    // ENOENT specifically means "not created yet" — the same fact doctor's SKIP
+    // message already handles gracefully (#437) — so name the fix ('wallet create
+    // --chain ton') instead of surfacing a raw errno string. Any OTHER failure
+    // (EACCES, corrupt/non-JSON file, …) is a genuine problem the operator needs the
+    // real error to debug, so that keeps the raw errMsg(e) detail untouched.
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      throw new Error(`${what}: no TON wallet at ${walletPath} — run 'cypher-brain wallet create --chain ton' first`);
+    }
     throw new Error(`${what}: cannot read TON wallet at ${walletPath}: ${errMsg(e)}`);
   }
   if (!Array.isArray(parsed.mnemonic) || parsed.mnemonic.length === 0) {
@@ -278,6 +286,14 @@ async function addressFromWallet(o: CliOptions, what: string): Promise<string> {
   try {
     jwk = JSON.parse(await readFile(walletPath, 'utf8'));
   } catch (e) {
+    // ENOENT specifically means "not created yet" — the same fact doctor's SKIP
+    // message already handles gracefully (#437) — so name the fix ('wallet create')
+    // instead of surfacing a raw errno string. Any OTHER failure (EACCES,
+    // corrupt/non-JSON file, …) is a genuine problem the operator needs the real
+    // error to debug, so that keeps the raw errMsg(e) detail untouched.
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      throw new Error(`${what}: no wallet at ${walletPath} — run 'cypher-brain wallet create' first`);
+    }
     throw new Error(`${what}: cannot read JWK wallet at ${walletPath}: ${errMsg(e)}`);
   }
   const ar = await getArweave();
