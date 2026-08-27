@@ -1264,7 +1264,6 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
     case 'help':
     case '--help':
     case '-h':
-    case undefined:
       printMascot('neutral');
       console.log(HELP);
       return;
@@ -1276,6 +1275,26 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
     case '-V':
       console.log(cliVersion());
       return;
+    // issue #427: zero arguments used to be grouped with the `--help`/`-h`/`help` case
+    // above — the full ~26 KB reference on stdout, exit 0. That is the same shape #269
+    // fixed for a mistyped command, and for the same reason: `--help` is a REQUEST (the
+    // user asked for the reference, so printing it with exit 0 is correct), but no
+    // arguments at all almost always means the user forgot to type a command, not that
+    // they wanted to read ~300 lines. A script relying on "nothing typed" being an error
+    // (e.g. a shell-quoting bug that silently drops the argument) used to get a success
+    // exit and the whole reference captured instead. Treated as the same usage error as
+    // an unknown command below — exit 2, short reply, stdout empty — just with its own
+    // first line, since there is no offending token to name.
+    case undefined: {
+      const names = commandNames();
+      console.error('error: no command given');
+      if (names.length > 0) console.error(`valid commands: ${names.join(', ')}`);
+      console.error(
+        `run 'cypher-brain --help' for the full reference, or 'cypher-brain <command> --help' for one command`,
+      );
+      process.exitCode = 2;
+      return;
+    }
     // issue #269: this is an ERROR path, so all of it goes to stderr and stdout stays
     // empty — the HELP-on-stdout rule two cases up exists so `cypher-brain --help |
     // grep …` works, which is a REQUEST for the help, not a failure to parse a
@@ -1293,9 +1312,10 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
       const names = commandNames();
       // #425: generalizes #253's own "would be nice-to-have" mention of a did-you-mean
       // suggestion beyond restore's --out/--out-dir special case. `cmd` is only ever
-      // undefined via the earlier `case undefined:` arm (mapped to help), so it is
-      // always a real (if unrecognized) string here — the `cmd ? ... : undefined` guard
-      // exists for the type checker, not because this path can actually see undefined.
+      // undefined via the earlier `case undefined:` arm (mapped to its own usage-error
+      // reply, #427), so it is always a real (if unrecognized) string here — the
+      // `cmd ? ... : undefined` guard exists for the type checker, not because this
+      // path can actually see undefined.
       const suggestion = cmd ? nearestName(cmd, names) : undefined;
       console.error(`error: unknown command: ${cmd}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`);
       if (names.length > 0) console.error(`valid commands: ${names.join(', ')}`);
