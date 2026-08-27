@@ -30,6 +30,7 @@ import { fetchBalance, type CreditApproval } from './balance.js';
 import { warn } from './warn.js';
 import { arUsdRate, turboUsdRate, usdApprox, tonUsdRate } from './estimate.js';
 import { printJson } from './ui.js';
+import { didYouMean, nearestName } from './suggest.js';
 import type { CliOptions } from './types.js';
 import type { WalletContractV4 as TonWalletContractV4 } from '@ton/ton';
 
@@ -434,10 +435,27 @@ async function walletBalance(o: CliOptions): Promise<void> {
   }
 }
 
+// #435: same nearestName() "did you mean" idiom #425 wired into top-level commands/
+// flags, reused here for wallet's OWN sub-verb (`wallet adress` used to get only the
+// generic "expected create | address | balance" listing). Shared by both the ton and
+// arweave branches below — their sub-verb set is identical, so a single helper keeps
+// the two switches from drifting on this message the way #300's header warns against.
+const WALLET_SUBCOMMANDS = ['create', 'address', 'balance'];
+function unknownWalletSubcommand(got: string | undefined): Error {
+  const suggestion = got ? nearestName(got, WALLET_SUBCOMMANDS) : undefined;
+  return new Error(
+    `wallet: expected create | address | balance, got: ${got || '(nothing)'}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`,
+  );
+}
+
 export async function wallet(o: CliOptions): Promise<void> {
   const chain = o.chain || 'arweave';
   if (chain !== 'arweave' && chain !== 'ton') {
-    throw new Error(`wallet: --chain must be arweave or ton, got: ${JSON.stringify(chain)}`);
+    // #435: --chain is itself an enum-valued flag, same class as --level/--backend below.
+    const suggestion = nearestName(chain, ['arweave', 'ton']);
+    throw new Error(
+      `wallet: --chain must be arweave or ton, got: ${JSON.stringify(chain)}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`,
+    );
   }
   if (chain === 'ton') {
     switch (o._) {
@@ -448,7 +466,7 @@ export async function wallet(o: CliOptions): Promise<void> {
       case 'balance':
         return tonWalletBalance(o);
       default:
-        throw new Error(`wallet: expected create | address | balance, got: ${o._ || '(nothing)'}`);
+        throw unknownWalletSubcommand(o._);
     }
   }
   switch (o._) {
@@ -459,6 +477,6 @@ export async function wallet(o: CliOptions): Promise<void> {
     case 'balance':
       return walletBalance(o);
     default:
-      throw new Error(`wallet: expected create | address | balance, got: ${o._ || '(nothing)'}`);
+      throw unknownWalletSubcommand(o._);
   }
 }

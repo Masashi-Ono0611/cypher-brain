@@ -9,12 +9,29 @@ import { turboBackend } from './turbo.js';
 import { rcloneBackend } from './rclone.js';
 import { tonBackend } from './ton.js';
 import { tonProviderBackend } from './ton-provider.js';
+import { didYouMean, nearestName } from '../suggest.js';
 import type { StorageBackend } from '../types.js';
 
+// #435 (Codex review): backendFor()'s dispatch used to be an if-chain naming each
+// backend twice — once in the chain, once again in the "unknown backend" message's
+// hand-written list — the exact kind of drift #300's suggest.ts header warns about.
+// One map now IS the canonical name -> factory set: backendFor() dispatches through
+// it, and its keys are also the full "declared value set" nearestName() (#425/#435)
+// suggests --backend typos against — a backend added/removed here can no longer
+// silently fall out of sync with either.
+const BACKEND_FACTORIES: Record<string, () => StorageBackend | Promise<StorageBackend>> = {
+  file: fileBackend,
+  arweave: arweaveBackend,
+  turbo: turboBackend,
+  rclone: rcloneBackend,
+  ton: tonBackend,
+  'ton-provider': tonProviderBackend,
+};
+
 // The `init` wizard's interactive backend choices — NOT the complete/canonical list
-// of every --backend `backendFor` below accepts (that list is `backendFor`'s own
-// if-chain; a NEW caller needing the full set should read it from there, not assume
-// this constant is exhaustive). Exported (mirrors profiles.ts's PROFILE_NAMES) so the
+// of every --backend `backendFor` below accepts (that list is BACKEND_FACTORIES'
+// key set above; a NEW caller needing the full set should read it from there, not
+// assume this constant is exhaustive). Exported (mirrors profiles.ts's PROFILE_NAMES) so the
 // wizard prompt reads its OFFERED choices from one place instead of hand-rolling a
 // second copy that could drift. Order here is also the wizard's select() MENU order
 // (issue #396 Phase B) — turbo/arweave/ton-provider listed by recommendation strength
@@ -44,11 +61,10 @@ import type { StorageBackend } from '../types.js';
 export const BACKEND_NAMES = ['turbo', 'arweave', 'ton-provider', 'file'] as const;
 
 export async function backendFor(name: string | undefined): Promise<StorageBackend> {
-  if (name === 'file') return fileBackend();
-  if (name === 'arweave') return arweaveBackend();
-  if (name === 'turbo') return turboBackend();
-  if (name === 'rclone') return rcloneBackend();
-  if (name === 'ton') return tonBackend();
-  if (name === 'ton-provider') return tonProviderBackend();
-  throw new Error(`unknown backend: ${name || '(none)'} — use --backend file|arweave|turbo|rclone|ton|ton-provider`);
+  const factory = name ? BACKEND_FACTORIES[name] : undefined;
+  if (factory) return factory();
+  const suggestion = name ? nearestName(name, Object.keys(BACKEND_FACTORIES)) : undefined;
+  throw new Error(
+    `unknown backend: ${name || '(none)'}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use --backend file|arweave|turbo|rclone|ton|ton-provider`,
+  );
 }

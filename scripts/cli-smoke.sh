@@ -278,6 +278,40 @@ NOARGS_LINES=$(wc -l < "$TMP/noargs.err" | tr -d ' ')
   || { echo "[FAIL] the zero-arguments reply is $NOARGS_LINES lines — the whole help is being dumped again"; exit 1; }
 echo "[PASS] dist zero arguments: exit 2, stdout empty, a ${NOARGS_LINES}-line stderr reply (explicit --help is unaffected, per (a) above)"
 
+# (j cont. 3) #435 (follow-up to #425): the same nearestName() matcher, now also
+# covering a NESTED subcommand typo (schedule/wallet's own sub-verb) and an
+# ENUM-VALUED flag typo (--level/--backend/--chain) — neither got a suggestion
+# before #435, only the generic "expected X | Y | Z" listing.
+node "$DIST" schedule statuz > /dev/null 2> "$TMP/nested-schedule.err"
+grep -Fq 'schedule: expected install | uninstall | status, got: statuz (did you mean status?)' "$TMP/nested-schedule.err" \
+  || { echo "[FAIL] 'schedule statuz' did not suggest 'status'"; cat "$TMP/nested-schedule.err"; exit 1; }
+node "$DIST" wallet adress > /dev/null 2> "$TMP/nested-wallet.err"
+grep -Fq 'wallet: expected create | address | balance, got: adress (did you mean address?)' "$TMP/nested-wallet.err" \
+  || { echo "[FAIL] 'wallet adress' did not suggest 'address'"; cat "$TMP/nested-wallet.err"; exit 1; }
+# a genuinely unrelated nested sub-verb still gets no suggestion (same #425 asymmetry
+# the top-level unknown-command test above already covers).
+node "$DIST" wallet xyz > /dev/null 2> "$TMP/nested-wallet-unrelated.err"
+if grep -qi "did you mean" "$TMP/nested-wallet-unrelated.err"; then
+  echo "[FAIL] 'wallet xyz' (unrelated to every sub-verb) got a spurious did-you-mean suggestion"; cat "$TMP/nested-wallet-unrelated.err"; exit 1
+fi
+echo "[PASS] dist nested subcommand typos: 'schedule statuz'/'wallet adress' suggest their real sub-verb, 'wallet xyz' correctly gets no spurious suggestion"
+
+node "$DIST" verify --level remtoe --in "$TMP/does-not-exist.age" > /dev/null 2> "$TMP/enum-level.err"
+grep -Fq 'did you mean --level remote?' "$TMP/enum-level.err" \
+  || { echo "[FAIL] '--level remtoe' did not suggest '--level remote'"; cat "$TMP/enum-level.err"; exit 1; }
+node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend fille > /dev/null 2> "$TMP/enum-backend.err"
+grep -Fq 'did you mean file?' "$TMP/enum-backend.err" \
+  || { echo "[FAIL] '--backend fille' did not suggest 'file'"; cat "$TMP/enum-backend.err"; exit 1; }
+node "$DIST" wallet create --chain tona > /dev/null 2> "$TMP/enum-chain.err"
+grep -Fq 'did you mean ton?' "$TMP/enum-chain.err" \
+  || { echo "[FAIL] '--chain tona' did not suggest 'ton'"; cat "$TMP/enum-chain.err"; exit 1; }
+# a genuinely unrelated enum value still gets no suggestion.
+node "$DIST" verify --level bogus --in "$TMP/does-not-exist.age" > /dev/null 2> "$TMP/enum-level-unrelated.err"
+if grep -qi "did you mean" "$TMP/enum-level-unrelated.err"; then
+  echo "[FAIL] '--level bogus' (unrelated to every level) got a spurious did-you-mean suggestion"; cat "$TMP/enum-level-unrelated.err"; exit 1
+fi
+echo "[PASS] dist enum-valued flag typos: '--level remtoe'/'--backend fille'/'--chain tona' suggest the real value, '--level bogus' correctly gets no spurious suggestion"
+
 # (k) estimate --json (#268): all seven documented keys are ALWAYS present, whichever
 # backend was asked about — the free ones used to drop unit/approx_ar/usd_estimate
 # entirely, so `est.unit` was undefined and the caller could not tell "no unit" from

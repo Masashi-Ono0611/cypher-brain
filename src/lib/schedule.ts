@@ -53,6 +53,7 @@ import { exists } from './util.js';
 import { printJson } from './ui.js';
 import { assertExportRequiresO2bProfile } from './profiles.js';
 import { tonWalletConfigured } from './wallet.js';
+import { didYouMean, nearestName } from './suggest.js';
 import type { CliOptions } from './types.js';
 
 // LABEL/CRON_MARKER are scoped to CYPHER_BRAIN_HOME (#114) so a second `install` under a
@@ -1274,6 +1275,12 @@ async function uninstall(o: CliOptions): Promise<void> {
   }
 }
 
+// #435: the same "did you mean" nearestName() #425 wired into top-level commands/flags,
+// reused here for schedule's OWN sub-verb — `schedule statuz` used to get only the
+// generic "expected install | uninstall | status" listing, no closer than a top-level
+// `cypher-brain doctro` typo used to be before #425.
+const SCHEDULE_SUBCOMMANDS = ['install', 'status', 'uninstall'];
+
 export async function schedule(o: CliOptions): Promise<void> {
   switch (o._) {
     case 'install':
@@ -1282,7 +1289,11 @@ export async function schedule(o: CliOptions): Promise<void> {
       return status(o);
     case 'uninstall':
       return uninstall(o);
-    default:
-      throw new Error(`schedule: expected install | uninstall | status, got: ${o._ || '(nothing)'}`);
+    default: {
+      const suggestion = o._ ? nearestName(o._, SCHEDULE_SUBCOMMANDS) : undefined;
+      throw new Error(
+        `schedule: expected install | uninstall | status, got: ${o._ || '(nothing)'}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`,
+      );
+    }
   }
 }

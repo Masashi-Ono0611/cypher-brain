@@ -16,6 +16,7 @@ import {
 import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists, sha256, importQuietly } from './util.js';
 import { printJson } from './ui.js';
 import { buildPlan, writePlanFile, readRecipientsFingerprint } from './plan.js';
+import { didYouMean, nearestName } from './suggest.js';
 import type { CliOptions } from './types.js';
 
 // Every field is REQUIRED and nullable rather than optional (#268): a `--json`
@@ -343,7 +344,14 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
     }
   }
 
-  throw new Error(`unknown backend: ${backend} — use file|arweave|turbo|rclone|ton|ton-provider`);
+  // #435: same nearestName() "did you mean" idiom #425 wired into top-level commands/
+  // flags — --backend is an enum-valued flag like --level/--chain, and this is the
+  // "unknown backend" copy `estimate` actually hits (backends/index.ts's backendFor()
+  // is a separate copy for push/pull, per this function's own header comment on #159).
+  const suggestion = nearestName(backend, ['file', 'arweave', 'turbo', 'rclone', 'ton', 'ton-provider']);
+  throw new Error(
+    `unknown backend: ${backend}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use file|arweave|turbo|rclone|ton|ton-provider`,
+  );
 }
 
 // Render a CostEstimate as human-readable lines — SHARED by the CLI `estimate` command
