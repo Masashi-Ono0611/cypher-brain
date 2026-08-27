@@ -592,10 +592,22 @@ async function readOwnCronEntry(): Promise<string | null> {
 // ---------- subcommands ----------
 
 async function install(o: CliOptions): Promise<void> {
-  if (!o.backend) throw new Error('--backend <file|arweave|turbo> required');
+  if (!o.backend) throw new Error('--backend <file|arweave|turbo|ton-provider> required');
   const backends = await scheduleableBackends();
-  if (!backends.has(o.backend))
+  if (!backends.has(o.backend)) {
+    // #434: ton-provider IS a recognized, documented backend name — it's just
+    // excluded from `backends` above until a TON wallet is configured. Routing
+    // that case through the generic "unknown backend" message below reads as if
+    // the name itself were wrong, which misleads a user who already ran `wallet
+    // create --chain ton` but forgot to export the env var that makes it visible
+    // here. Name it specifically instead; every OTHER rejected name (rclone/ton,
+    // which are real but intentionally never scheduleable, or a genuine typo)
+    // still falls through to the generic message unchanged.
+    if (o.backend === 'ton-provider') {
+      throw new Error("ton-provider requires CYPHER_BRAIN_TON_WALLET=<path> — see 'wallet create --chain ton'");
+    }
     throw new Error(`unknown backend: ${o.backend} (expected one of ${[...backends].join('|')})`);
+  }
   // #206/multi-model review: install() bakes cfg.export into the runner's snapshot line
   // unconditionally (below) — it never calls resolveProfilePaths() itself, so an --export
   // given without --profile o2b would install cleanly and only turn out to be a no-op

@@ -524,7 +524,10 @@ if CYPHER_BRAIN_TON_WALLET= cb schedule install --backend ton-provider --dir "$S
   > "$TMP/schedule-no-wallet.out" 2>"$TMP/schedule-no-wallet.err"; then
   echo "[FAIL] schedule install accepted ton-provider with no TON wallet configured"; exit 1
 fi
-grep -q 'unknown backend' "$TMP/schedule-no-wallet.err" || { echo "[FAIL] wrong rejection for schedule install without a wallet"; cat "$TMP/schedule-no-wallet.err"; exit 1; }
+# #434: this now gets its own specific message (not the generic "unknown backend" —
+# ton-provider IS a recognized name, it just needs CYPHER_BRAIN_TON_WALLET set).
+grep -Fq "ton-provider requires CYPHER_BRAIN_TON_WALLET=<path> — see 'wallet create --chain ton'" "$TMP/schedule-no-wallet.err" \
+  || { echo "[FAIL] wrong rejection for schedule install without a wallet"; cat "$TMP/schedule-no-wallet.err"; exit 1; }
 echo "[PASS] schedule install rejects ton-provider with no TON wallet configured"
 CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" cb schedule install --backend ton-provider --dir "$SRC" --no-load \
   > "$TMP/schedule-with-wallet.out" 2>"$TMP/schedule-with-wallet.err" \
