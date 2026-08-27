@@ -322,16 +322,38 @@ export function sdkImportAdvice(e: unknown, pkg: string): SdkImportProblem | nul
 // console.warn — this is not a blanket "hide turbo SDK warnings" switch.
 const KNOWN_NOISY_IMPORT_WARNINGS = [/^bigint: Failed to load bindings/];
 
+// Reference-counted, not a bare save/restore (Codex review): the long-lived MCP server
+// (src/mcp.ts) processes tool calls off a single async handler, so two `estimate_cost`/
+// `snapshot_now` calls against --backend turbo can genuinely overlap — one call's load()
+// awaiting mid-flight while a second call's importQuietly() also runs. A naive "save
+// console.warn, restore it in finally" would have the SECOND call's save capture the
+// FIRST call's already-patched wrapper (not the real console.warn), and whichever call's
+// finally runs LAST would win, non-deterministically leaving console.warn permanently
+// patched to a stale, closed-over wrapper. Only the outermost (first) call saves the
+// real console.warn and only the innermost (last) call restores it; everything in
+// between just increments/decrements the count.
+let activeImportQuietlyCalls = 0;
+let savedConsoleWarn: typeof console.warn | null = null;
+
+function filteringWarn(...args: unknown[]): void {
+  const first = args[0];
+  if (typeof first === 'string' && KNOWN_NOISY_IMPORT_WARNINGS.some((re) => re.test(first))) return;
+  (savedConsoleWarn ?? console.warn)(...args);
+}
+
 export async function importQuietly<T>(load: () => Promise<T>): Promise<T> {
-  const realWarn = console.warn;
-  console.warn = (...args: unknown[]) => {
-    const first = args[0];
-    if (typeof first === 'string' && KNOWN_NOISY_IMPORT_WARNINGS.some((re) => re.test(first))) return;
-    realWarn(...args);
-  };
+  if (activeImportQuietlyCalls === 0) {
+    savedConsoleWarn = console.warn;
+    console.warn = filteringWarn;
+  }
+  activeImportQuietlyCalls++;
   try {
     return await load();
   } finally {
-    console.warn = realWarn;
+    activeImportQuietlyCalls--;
+    if (activeImportQuietlyCalls === 0) {
+      console.warn = savedConsoleWarn as typeof console.warn;
+      savedConsoleWarn = null;
+    }
   }
 }
