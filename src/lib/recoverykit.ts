@@ -137,7 +137,9 @@ export function buildRecoveryKit(k: KitInputs): string {
     lines.push('    knowledge — is NOT possible right now. Recovery IS possible if you still have the PRIMARY');
     lines.push(
       `    identity itself, originally at: ${k.primaryIdentityPath}${
-        k.backend === 'file' ? ' — AND the file-backend store above (also copied, or this same machine)' : ''
+        k.backend === 'file'
+          ? ' — AND the file-backend store (CYPHER_BRAIN_FILE_DIR), either this same machine or that store copied elsewhere'
+          : ''
       }.`,
     );
     lines.push('    See "Your actual options" in the RECOVERY STEPS section further below for the exact commands.');
