@@ -420,7 +420,7 @@ ${
 # reachability, the monitor being down, etc.).
 `
     : ''
-}trap 'rc=$?; wcnt=0; if [ -f "$LOG" ]; then for n in $(tail -n +"$((LOG_START_LINES + 1))" "$LOG" 2>/dev/null | grep -oE "[0-9]+ warning\\(s\\) a human should see \\(an agent relaying this run: show these verbatim\\):$" | grep -oE "^[0-9]+"); do wcnt=$((wcnt + n)); done; fi; if [ "$rc" -eq 0 ]; then echo "OK rc=0 warnings=$wcnt"; ${pingOkCmd}else echo "FAILED rc=$rc warnings=$wcnt"; ${pingFailCmd}fi' EXIT
+}trap 'rc=$?; wcnt=0; if [ -f "$LOG" ]; then for n in $(tail -n +"$((LOG_START_LINES + 1))" "$LOG" 2>/dev/null | grep -oE "^⚠  run summary — [0-9]+ warning\\(s\\) a human should see \\(an agent relaying this run: show these verbatim\\):$" | grep -oE "[0-9]+"); do wcnt=$((wcnt + n)); done; fi; if [ "$rc" -eq 0 ]; then echo "OK rc=0 warnings=$wcnt"; ${pingOkCmd}else echo "FAILED rc=$rc warnings=$wcnt"; ${pingFailCmd}fi' EXIT
 
 ${envLines.join('\n')}
 ${spendLines.length ? `${spendLines.join('\n')}\n` : ''}
@@ -1252,9 +1252,15 @@ async function status(o: CliOptions): Promise<void> {
   console.log(r.last_run ? `last run: ${r.last_run.log} — ${r.last_run.rc_line}` : 'last run: none yet');
   // #432: the trailing rc line alone ("OK rc=0 warnings=1") is easy to skim past as a
   // plain success — call the warning out on its OWN line so it can't hide in a
-  // machine-formatted status line. warning_count is `0`/`null`-safe here: both fall
-  // through (a genuinely clean run and an old-format log with no recorded count).
-  if (r.last_run?.warning_count) {
+  // machine-formatted status line. `null` (an old-format log from before #432 that
+  // never recorded a count) gets its OWN note rather than silently being treated the
+  // same as a real, counted `0` (Codex review round 3) — that would read as a clean
+  // run this doctor/status genuinely cannot vouch for.
+  if (r.last_run?.warning_count === null) {
+    console.log(
+      `(this log predates warning-count tracking, #432 — inspect ${r.last_run.log} directly for a "run summary" block if you want to be sure)`,
+    );
+  } else if (r.last_run?.warning_count) {
     console.log(
       `⚠  last run recorded ${r.last_run.warning_count} warning(s) a human should see — inspect ${r.last_run.log} in the schedule's logs directory (run summary block) for details`,
     );

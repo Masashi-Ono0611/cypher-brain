@@ -550,9 +550,20 @@ async function checkSchedule(): Promise<DoctorCheck[]> {
     // #432: an OK exit code says the pipeline didn't error — it says nothing about
     // whether the run itself flagged something a human needs to see (e.g. "snapshot
     // encrypted to a SINGLE recipient key — UNRECOVERABLE"). warning_count is read
-    // back from the SAME rc_line (schedule.ts's lastLog()); `0`/`null` (a clean run, or
-    // an old-format log this field cannot vouch for) both still PASS.
-    if (report.last_run.warning_count) {
+    // back from the SAME rc_line (schedule.ts's lastLog()). `null` is genuinely
+    // UNKNOWN (an old-format log from before #432 that never recorded a count) — NOT
+    // the same as a real, counted `0` — so it gets its OWN warn branch rather than
+    // silently falling into the same `if (falsy)` bucket as zero (Codex review round
+    // 3: doing that would give false assurance for an old log that may well have had
+    // warnings this doctor simply cannot see).
+    if (report.last_run.warning_count === null) {
+      results.push({
+        id: 'schedule-last-run',
+        status: 'warn',
+        message: `last scheduled run (${report.last_run.log}) succeeded (${report.last_run.rc_line}), but this log predates warning-count tracking (#432) — this doctor cannot tell whether it recorded any warnings a human should see`,
+        remediation: `inspect ${report.last_run.log} directly for a "run summary" block, or wait for the next scheduled run (its trailing line will carry warnings=N going forward)`,
+      });
+    } else if (report.last_run.warning_count > 0) {
       results.push({
         id: 'schedule-last-run',
         status: 'warn',
