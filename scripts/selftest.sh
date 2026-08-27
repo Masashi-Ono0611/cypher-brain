@@ -16,11 +16,14 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export CYPHER_BRAIN_HOME="$TMP/keys"
 cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
-# Mirrors src/lib/restore.ts's sourceDigest(): sha256 of the STRING (not a file's
-# content — printf '%s' writes exactly the string's bytes, no trailing newline),
-# first 8 hex chars. Used below to predict the "<NNN>-<basename>-<digest>" expanded/
-# directory name restore.ts builds (#423).
-src_digest() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1 | cut -c1-8; }
+# Mirrors src/lib/restore.ts's sourceDigest() EXACTLY (delegates to node rather than
+# re-deriving it in bash) — sha256 of the argument STRING encoded as 'utf16le' (NOT
+# shasum's default byte-for-byte/utf8 hashing of stdin: a bash `printf '%s' | shasum`
+# pipeline would silently drift from restore.ts's own encoding choice, which matters —
+# see sourceDigest's doc comment for why 'utf8' was rejected), first 8 hex chars. Used
+# below to predict the "<NNN>-<basename>-<digest>" expanded/ directory name restore.ts
+# builds (#423).
+src_digest() { node -e "process.stdout.write(require('node:crypto').createHash('sha256').update(process.argv[1], 'utf16le').digest('hex').slice(0, 8))" "$1"; }
 
 MARKER="secret-thought-$(od -An -N6 -tx1 /dev/urandom | tr -d ' ')"
 SRC="$TMP/brain-src"

@@ -373,11 +373,26 @@ export function shortSourceLabel(abs: string): string {
 // it via mergeNoClobber() below exactly as before, not a fresh, differently-named
 // directory each time.
 //
+// Hashed as 'utf16le', NOT the default 'utf8' — a review finding on #423 (verified):
+// manifest.components[].source is attacker-controlled (see the block above) and
+// JSON.parse happily produces a JS string containing a LONE surrogate (a bare `\uD800`
+// with no matching low surrogate is valid JSON, just not valid UTF-16 text). Node's
+// default utf8 conversion — what .update(str) does with no second argument — replaces
+// EVERY lone surrogate with the SAME U+FFFD bytes regardless of its actual code unit
+// value, so two DIFFERENT forged source strings that differ only in which invalid
+// surrogate they contain would hash identically (confirmed: two such strings differing
+// only in a single lone-surrogate code point produced the SAME sha256 digest under
+// 'utf8' — a deterministic, attacker-craftable collision, not merely an improbable one).
+// 'utf16le' encodes each UTF-16 code unit as its own 2 bytes with no substitution, so it
+// is injective over the actual JS string (a lossless round trip of exactly what `===`
+// string equality already compares) — the only remaining collision path is a genuine
+// SHA-256 collision, which is what "negligible" above is about.
+//
 // Exported (#423) so scripts/selftest-properties.mjs can property-test it the same way
 // as shortSourceLabel() above, instead of leaving it untested/unmutated code inside this
 // file's otherwise fully-scoped Stryker region (see stryker.conf.json).
 export function sourceDigest(abs: string): string {
-  return createHash('sha256').update(abs).digest('hex').slice(0, 8);
+  return createHash('sha256').update(abs, 'utf16le').digest('hex').slice(0, 8);
 }
 // Stryker disable all
 

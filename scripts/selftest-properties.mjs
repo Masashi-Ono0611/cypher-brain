@@ -193,6 +193,25 @@ await property(
   { numRuns: 1000 },
 );
 
+// Pin the specific, VERIFIED review finding that made sourceDigest() hash as 'utf16le'
+// instead of the default 'utf8' (see its doc comment in src/lib/restore.ts): a forged
+// manifest's `source` field can contain a LONE surrogate (valid JSON, invalid UTF-16
+// text — JSON.parse doesn't reject it), and Node's default utf8 string-to-bytes
+// conversion replaces EVERY lone surrogate with the SAME U+FFFD bytes regardless of its
+// actual code unit value. Two DIFFERENT strings differing only in WHICH invalid
+// surrogate they contain are therefore DIFFERENT as JS strings (confirmed below) but
+// were confirmed, before this fix, to hash IDENTICALLY under 'utf8' — a deterministic,
+// attacker-craftable collision, not merely an improbable one. 'utf16le' hashes the raw
+// code units with no substitution, so this pins that the fix actually holds.
+{
+  const loneSurrogateA = '/foo/bar/\uD800/memory';
+  const loneSurrogateB = '/foo/bar/\uD801/memory';
+  check(
+    'sourceDigest: two different lone-surrogate source strings (a forged-manifest shape) hash to DIFFERENT digests (#423 review finding)',
+    loneSurrogateA !== loneSurrogateB && sourceDigest(loneSurrogateA) !== sourceDigest(loneSurrogateB),
+  );
+}
+
 // #423/#181: shortSourceLabel() is deliberately NOT collision-resistant by itself — two
 // different --dir sources sharing a basename (e.g. many `~/.claude/projects/*/memory/`
 // dirs — the exact case #181 introduced this whole expanded/ scheme to disambiguate)
