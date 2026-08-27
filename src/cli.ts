@@ -288,7 +288,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       persisted field).
 
   cypher-brain doctor [--json]
-      Read-only environment health check (#201): inspects the EXISTING setup for the
+      Non-destructive environment health check (#201): inspects the EXISTING setup for the
       permission/config problems several past issues were filed for (the running
       build's provenance — which commit it was built from and how many days old that
       is, WARNing past 90 days; a hand-copied deployment once ran 5+ weeks stale with
