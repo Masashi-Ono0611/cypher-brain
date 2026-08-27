@@ -547,11 +547,36 @@ async function checkSchedule(): Promise<DoctorCheck[]> {
       remediation: `inspect ${report.last_run.log} in the schedule's logs directory for the cause, fix it, then confirm with a manual snapshot+push before trusting the next unattended run`,
     });
   } else if (report.last_run.rc_line.startsWith('OK')) {
-    results.push({
-      id: 'schedule-last-run',
-      status: 'pass',
-      message: `last scheduled run (${report.last_run.log}) succeeded: ${report.last_run.rc_line}`,
-    });
+    // #432: an OK exit code says the pipeline didn't error — it says nothing about
+    // whether the run itself flagged something a human needs to see (e.g. "snapshot
+    // encrypted to a SINGLE recipient key — UNRECOVERABLE"). warning_count is read
+    // back from the SAME rc_line (schedule.ts's lastLog()). `null` is genuinely
+    // UNKNOWN (an old-format log from before #432 that never recorded a count) — NOT
+    // the same as a real, counted `0` — so it gets its OWN warn branch rather than
+    // silently falling into the same `if (falsy)` bucket as zero (Codex review round
+    // 3: doing that would give false assurance for an old log that may well have had
+    // warnings this doctor simply cannot see).
+    if (report.last_run.warning_count === null) {
+      results.push({
+        id: 'schedule-last-run',
+        status: 'warn',
+        message: `last scheduled run (${report.last_run.log}) succeeded (${report.last_run.rc_line}), but this log predates warning-count tracking (#432) — this doctor cannot tell whether it recorded any warnings a human should see`,
+        remediation: `inspect ${report.last_run.log} directly for a "run summary" block, or wait for the next scheduled run (its trailing line will carry warnings=N going forward)`,
+      });
+    } else if (report.last_run.warning_count > 0) {
+      results.push({
+        id: 'schedule-last-run',
+        status: 'warn',
+        message: `last scheduled run (${report.last_run.log}) succeeded but recorded ${report.last_run.warning_count} warning(s) a human should see: ${report.last_run.rc_line}`,
+        remediation: `inspect ${report.last_run.log} in the schedule's logs directory — its run summary block names each warning`,
+      });
+    } else {
+      results.push({
+        id: 'schedule-last-run',
+        status: 'pass',
+        message: `last scheduled run (${report.last_run.log}) succeeded: ${report.last_run.rc_line}`,
+      });
+    }
   } else {
     // Neither "OK rc=0" nor "FAILED rc=N" — schedule.ts's own documented final-line
     // format (install()'s printed message: `final line: "OK rc=0" or "FAILED rc=N"`).
