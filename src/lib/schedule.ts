@@ -996,6 +996,19 @@ const legacyCronNote = (marker: string) =>
 // which takes Record<string, unknown>, and only a type alias carries the implicit index
 // signature that assignment needs.
 export type ScheduleStatusReport = {
+  // #426: always true here — scheduleStatusReport() still THROWS ScheduleNotInstalledError
+  // for the "nothing installed" case rather than returning an object with installed:false
+  // (that would be a bigger change: doctor.ts's own instanceof-checked catch of that
+  // exception, #333, would need reworking too). Only the CLI's `status()` catches that
+  // throw and synthesizes a separate `{installed:false}` object for its OWN --json output
+  // — literally the only place that ever produces installed:false, since this field is
+  // otherwise unconditionally true on every object THIS function returns. Present on the
+  // shared type (not bolted onto the CLI-only object) specifically so the MCP tool and the
+  // cypher-brain://schedule/status resource — which both return this function's result
+  // verbatim — report it too, keeping the field-for-field parity this type's own top
+  // comment already promises rather than letting `installed` become a CLI-only bolt-on
+  // (Codex review).
+  readonly installed: true;
   readonly configured: {
     readonly at: string;
     readonly backend: string;
@@ -1073,6 +1086,7 @@ export async function scheduleStatusReport(): Promise<ScheduleStatusReport> {
   const last = await lastLog();
 
   return {
+    installed: true,
     configured: { at: cfg.at, backend: cfg.backend, scan_secrets: cfg.scan_secrets ?? null },
     runner: cfg.runner,
     // #286: the config file is loaded SILENTLY by config.ts — deliberately, so it does
@@ -1124,12 +1138,13 @@ async function status(o: CliOptions): Promise<void> {
 
   if (o.json) {
     // --json (#211): the SAME object the MCP tool and the cypher-brain://schedule/status
-    // resource serve — never a re-implementation, so the three can never disagree.
-    // `installed: true` is added here (a status()-only field, not part of
-    // ScheduleStatusReport itself) so a --json consumer can branch on ONE field
-    // regardless of which shape it got back, instead of having to know in advance
-    // that a bare `{"installed": false}` is the OTHER possible response shape.
-    printJson({ installed: true, ...r });
+    // resource serve — never a re-implementation, so the three can never disagree. `r`
+    // already carries `installed: true` (part of ScheduleStatusReport itself, #426), so a
+    // --json consumer can branch on that ONE field regardless of which shape it got back,
+    // instead of having to know in advance that a bare `{"installed": false}` (this
+    // function's own catch below, the only place that ever produces it) is the OTHER
+    // possible response shape.
+    printJson(r);
     return;
   }
 
