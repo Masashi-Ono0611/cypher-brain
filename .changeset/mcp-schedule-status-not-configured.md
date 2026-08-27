@@ -7,10 +7,10 @@ called against a `CYPHER_BRAIN_HOME` with no schedule installed, instead of the 
 `ERR_INTERNAL` every unrelated failure falls back to (#440, a follow-up to #426).
 
 `ScheduleNotInstalledError` (CB-E014) is already a real, `instanceof`-checkable
-exception `doctor.ts`'s own [SKIP] handling and, post-#426, the CLI's `schedule status`
-both treat as an expected, non-fatal precondition rather than a real failure — the MCP
-tool was the one caller left funneling it into the same bucket as an actual internal
-bug, leaving a client that branches on error codes no way to tell "nothing is
+exception that `doctor.ts`'s own [SKIP] handling and, post-#426, the CLI's `schedule
+status` both treat as an expected, non-fatal precondition rather than a real failure —
+the MCP tool was the one caller left funneling it into the same bucket as an actual
+internal bug, leaving a client that branches on error codes no way to tell "nothing is
 configured yet, go run schedule_install" from "the server is broken" without matching
 on the inner message text.
 

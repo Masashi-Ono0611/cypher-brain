@@ -610,9 +610,14 @@ async function runKeygenWalletTests(tmp) {
 // moved past.
 async function runScheduleStatusNotInstalledTest(tmp) {
   const home4 = join(tmp, 'home-schedule-not-installed');
+  // Pinned explicitly (rather than relying on config.ts's HOME/schedule default) so the
+  // corrupt-schedule.json regression control below writes to the SAME path the server
+  // reads, regardless of whatever CYPHER_BRAIN_SCHEDULE_DIR this process happens to have
+  // inherited from its own environment.
+  const scheduleDir4 = join(home4, 'schedule');
   const child4 = spawn(process.execPath, [SERVER_PATH], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CYPHER_BRAIN_HOME: home4 },
+    env: { ...process.env, CYPHER_BRAIN_HOME: home4, CYPHER_BRAIN_SCHEDULE_DIR: scheduleDir4 },
   });
   const { send, waitFor } = makeRpcClient(child4);
   try {
@@ -651,11 +656,10 @@ async function runScheduleStatusNotInstalledTest(tmp) {
     // Regression control: a DIFFERENT failure reading an EXISTING schedule (a corrupt
     // schedule.json, here — the same "real problem with an existing setup" schedule.ts's
     // own status() comment calls out) must NOT be swallowed into the same
-    // ERR_NOT_CONFIGURED bucket. It stays a real, generic ERR_INTERNAL.
-    // CYPHER_BRAIN_SCHEDULE_DIR is not overridden above, so schedule.json lives at the
-    // default HOME/schedule/schedule.json (config.ts's SCHEDULE_DIR) — same path
-    // scheduleStatusReport()'s readConfig() checks for "installed at all".
-    const scheduleDir4 = join(home4, 'schedule');
+    // ERR_NOT_CONFIGURED bucket. It stays a real, generic ERR_INTERNAL. Written under
+    // scheduleDir4 — the SAME CYPHER_BRAIN_SCHEDULE_DIR the server above was started
+    // with — so this exercises exactly the path scheduleStatusReport()'s readConfig()
+    // checks for "installed at all".
     await mkdir(scheduleDir4, { recursive: true });
     await writeFile(join(scheduleDir4, 'schedule.json'), '{ not valid json', 'utf8');
     send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'schedule_status', arguments: {} } });
