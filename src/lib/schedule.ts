@@ -400,15 +400,17 @@ ${pingLines.length ? `${pingLines.join('\n')}\n` : ''}
 # think to \`cat\` the dated log to find; scheduleStatusReport()'s last_run.warning_count
 # reads this back structurally so \`schedule status\`/\`doctor\` can surface it instead of
 # a silent OK/PASS. Counted by tailing ONLY the lines THIS run appended (from
-# LOG_START_LINES on — see above) for warn.ts's formatWarningSummary() header line's
-# EXACT text ("N warning(s) a human should see" — deliberately the whole distinctive
-# phrase, not just "N warning", so arbitrary logged prose — e.g. a secret-scan finding
-# echoing matched file content into this same log — cannot coincidentally, or by a
-# maliciously crafted file in the snapshotted source, inflate the count) rather than
-# threading a counter through snapshot/push's separate node invocations — grep matches
-# the leading count of each such header (there is one per subcommand that recorded
-# warnings) and sums them (formatWarningSummary is exported specifically so this exact
-# text stays pinned by tests).
+# LOG_START_LINES on — see above) for warn.ts's formatWarningSummary() header line,
+# matched end-to-end and end-of-line-anchored on its EXACT fixed text ("N warning(s) a
+# human should see (an agent relaying this run: show these verbatim):" — the whole
+# distinctive phrase including its parenthetical, not just "N warning", and anchored so
+# it must be the WHOLE tail of the line) so arbitrary logged prose — e.g. a secret-scan
+# finding echoing matched file content into this same log — cannot coincidentally, or
+# by a maliciously crafted file in the snapshotted source, inflate the count — rather
+# than threading a counter through snapshot/push's separate node invocations — grep
+# matches the leading count of each such header (there is one per subcommand that
+# recorded warnings) and sums them (formatWarningSummary is exported specifically so
+# this exact text stays pinned by tests).
 ${
   cfg.ping_url
     ? `# This install also configured --ping-url (issue #202): the SAME trap pushes a dead
@@ -418,7 +420,7 @@ ${
 # reachability, the monitor being down, etc.).
 `
     : ''
-}trap 'rc=$?; wcnt=0; if [ -f "$LOG" ]; then for n in $(tail -n +"$((LOG_START_LINES + 1))" "$LOG" 2>/dev/null | grep -oE "[0-9]+ warning\\(s\\) a human should see" | grep -oE "^[0-9]+"); do wcnt=$((wcnt + n)); done; fi; if [ "$rc" -eq 0 ]; then echo "OK rc=0 warnings=$wcnt"; ${pingOkCmd}else echo "FAILED rc=$rc warnings=$wcnt"; ${pingFailCmd}fi' EXIT
+}trap 'rc=$?; wcnt=0; if [ -f "$LOG" ]; then for n in $(tail -n +"$((LOG_START_LINES + 1))" "$LOG" 2>/dev/null | grep -oE "[0-9]+ warning\\(s\\) a human should see \\(an agent relaying this run: show these verbatim\\):$" | grep -oE "^[0-9]+"); do wcnt=$((wcnt + n)); done; fi; if [ "$rc" -eq 0 ]; then echo "OK rc=0 warnings=$wcnt"; ${pingOkCmd}else echo "FAILED rc=$rc warnings=$wcnt"; ${pingFailCmd}fi' EXIT
 
 ${envLines.join('\n')}
 ${spendLines.length ? `${spendLines.join('\n')}\n` : ''}
