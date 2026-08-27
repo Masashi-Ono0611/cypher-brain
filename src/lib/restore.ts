@@ -318,24 +318,26 @@ export const SHORT_LABEL_MAX = 64;
 // #423: this used to be encodeSourcePath(), which flattened the ENTIRE absolute path
 // (every separator replaced, truncated-and-hashed past 160 chars) into the directory
 // name itself. expandComponents() below still prefixes the directory name with the
-// component's own 1-based sequence number, which guarantees no two components from the
-// SAME manifest ever land in the same directory (manifest component order is stable per
-// snapshot) — including the #181 case this scheme exists for in the first place (two
-// --dir sources sharing a basename land at DIFFERENT indices, e.g. `001-memory-<hash>`
-// vs `002-memory-<hash>`). But the index alone is only unique WITHIN one restore's
-// manifest — restoring a SECOND, different snapshot into the SAME --out-dir (an
-// explicitly supported, documented workflow: re-running restore does not clobber a
-// prior expansion) could put an unrelated source at that same index, and if it happened
-// to share a basename too, the two would collide into one directory (a real correctness
-// bug, not just a readability one — see sourceDigest() below, which is what actually
-// closes this). Encoding the full path into the name (encodeSourcePath()'s approach)
-// avoided that collision as a side effect, but at the cost of unreadable, 100+-character
-// directory names for any realistic (deep) source path. shortSourceLabel() below keeps
-// only the readable part; sourceDigest() (also appended to the directory name, see
-// expandComponents()) keeps the collision-proofing. The full original absolute path is
-// still recorded, unambiguously, in expanded/README.txt's mapping table (written
-// unconditionally by expandComponents() below) — that table, not the directory name, is
-// the authoritative source→directory mapping.
+// component's own 1-based sequence number, which is an EXACT, mathematical guarantee
+// (not a probabilistic one — see sourceDigest() below for the difference) that no two
+// components from the SAME manifest ever land in the same directory (manifest component
+// order is stable per snapshot) — including the #181 case this scheme exists for in the
+// first place (two --dir sources sharing a basename land at DIFFERENT indices, e.g.
+// `001-memory-<hash>` vs `002-memory-<hash>`). But the index alone is only unique WITHIN
+// one restore's manifest — restoring a SECOND, different snapshot into the SAME
+// --out-dir (an explicitly supported, documented workflow: re-running restore does not
+// clobber a prior expansion) could put an unrelated source at that same index, and if it
+// happened to share a basename too, the two would collide into one directory (a real
+// correctness bug, not just a readability one — see sourceDigest() below, which is what
+// makes that PRACTICALLY, though not mathematically, negligible). Encoding the full path
+// into the name (encodeSourcePath()'s approach) avoided that collision as a side effect,
+// but at the cost of unreadable, 100+-character directory names for any realistic (deep)
+// source path. shortSourceLabel() below keeps only the readable part; sourceDigest()
+// (also appended to the directory name, see expandComponents()) keeps the collision risk
+// small. The full original absolute path is still recorded, unambiguously, in
+// expanded/README.txt's mapping table (written unconditionally by expandComponents()
+// below) — that table, not the directory name, is the authoritative source→directory
+// mapping.
 //
 // Deliberately NOT unique by itself (two different sources can share a basename) — it is
 // only ever used together with sourceDigest() below, never alone, in the directory name
@@ -360,18 +362,31 @@ export function shortSourceLabel(abs: string): string {
 
 // Short, stable digest of a component's FULL absolute source path — appended, alongside
 // shortSourceLabel()'s basename, to the directory name expandComponents() builds below
-// (`<NNN>-<label>-<digest>`). This is what actually guarantees two DIFFERENT source
-// paths can never collide into the same expanded/ directory, even across two SEPARATE
-// restore invocations into the same --out-dir whose manifests happen to place a
+// (`<NNN>-<label>-<digest>`). This is what makes it PRACTICALLY negligible for two
+// DIFFERENT source paths to collide into the same expanded/ directory, even across two
+// SEPARATE restore invocations into the same --out-dir whose manifests happen to place a
 // same-basename source at the same numeric index (see shortSourceLabel()'s doc comment
 // above — the index alone only disambiguates WITHIN one manifest, not across two
-// different ones; #423 review finding). Two DIFFERENT source paths landing on the same
-// digest is negligible (8 hex chars of SHA-256 — the same collision margin the pre-#423
-// encodeSourcePath() already relied on for its own truncate-and-hash branch); two
-// restores of the exact SAME source path always produce the SAME digest, so re-running
-// restore into an out-dir that already holds that source's expansion still merges into
-// it via mergeNoClobber() below exactly as before, not a fresh, differently-named
-// directory each time.
+// different ones; #423 review finding). "Practically negligible", not "impossible" or
+// "guaranteed" — say so precisely, this is attacker-controlled input (see the block
+// above), not just noisy real-world data:
+//   - SOURCE_DIGEST_LEN below is 16 hex chars = 64 bits of SHA-256, not the 8 hex chars
+//     (32 bits) the pre-#423 encodeSourcePath() used for its own truncate-and-hash
+//     branch. 32 bits is fine for AVOIDING ACCIDENTAL collisions among ordinary paths
+//     (which is all encodeSourcePath() ever needed — its label already carried almost
+//     the whole path, so the digest was a cosmetic tie-breaker, not the ONLY thing
+//     preventing a collision). It is NOT fine here: shortSourceLabel() gives up almost
+//     all of that entropy for readability, so the digest is now the primary guard, and
+//     manifest.components[].source is attacker-controlled — an attacker who can choose a
+//     forged source string to match a KNOWN target digest is running a 2nd-preimage
+//     search, and 32 bits (~2^32 SHA-256 evaluations) is well within reach of commodity
+//     hardware in well under a minute. 64 bits (~2^64 evaluations) is not — this is the
+//     same order of magnitude the field treats as a real security margin, not a
+//     "shouldn't come up" one.
+//   - Two restores of the exact SAME source path always produce the SAME digest, so
+//     re-running restore into an out-dir that already holds that source's expansion
+//     still merges into it via mergeNoClobber() below exactly as before, not a fresh,
+//     differently-named directory each time.
 //
 // Hashed as 'utf16le', NOT the default 'utf8' — a review finding on #423 (verified):
 // manifest.components[].source is attacker-controlled (see the block above) and
@@ -382,17 +397,19 @@ export function shortSourceLabel(abs: string): string {
 // value, so two DIFFERENT forged source strings that differ only in which invalid
 // surrogate they contain would hash identically (confirmed: two such strings differing
 // only in a single lone-surrogate code point produced the SAME sha256 digest under
-// 'utf8' — a deterministic, attacker-craftable collision, not merely an improbable one).
-// 'utf16le' encodes each UTF-16 code unit as its own 2 bytes with no substitution, so it
-// is injective over the actual JS string (a lossless round trip of exactly what `===`
-// string equality already compares) — the only remaining collision path is a genuine
-// SHA-256 collision, which is what "negligible" above is about.
+// 'utf8' — a deterministic, attacker-craftable collision at ANY digest length, not a
+// probabilistic one the digest length above helps with at all). 'utf16le' encodes each
+// UTF-16 code unit as its own 2 bytes with no substitution, so it is injective over the
+// actual JS string (a lossless round trip of exactly what `===` string equality already
+// compares) — closing that specific deterministic path entirely, leaving only the
+// generic SHA-256-collision risk the digest length above is about.
 //
 // Exported (#423) so scripts/selftest-properties.mjs can property-test it the same way
 // as shortSourceLabel() above, instead of leaving it untested/unmutated code inside this
 // file's otherwise fully-scoped Stryker region (see stryker.conf.json).
+export const SOURCE_DIGEST_LEN = 16;
 export function sourceDigest(abs: string): string {
-  return createHash('sha256').update(abs, 'utf16le').digest('hex').slice(0, 8);
+  return createHash('sha256').update(abs, 'utf16le').digest('hex').slice(0, SOURCE_DIGEST_LEN);
 }
 // Stryker disable all
 
@@ -532,9 +549,10 @@ function assertSupportedManifestSchema(manifestText: string, manifestPath: strin
 // memory-2.tar.gz, and manually cross-referencing the manifest to untar each one
 // correctly does not scale past a handful of components. (#423: the directory NAME
 // itself only carries a short, readable label — see shortSourceLabel's doc comment
-// below — plus a short digest of the full path for collision-proofing — see
-// sourceDigest's doc comment below — expanded/README.txt's mapping table is what
-// actually resolves each directory back to its full original source path.)
+// below — plus a short digest of the full path to keep collisions practically
+// negligible — see sourceDigest's doc comment below — expanded/README.txt's mapping
+// table is what actually resolves each directory back to its full original source
+// path.)
 //
 // A component with a `source` field is exactly a --dir/--profile component: pg_dump's
 // component (kind 'pg_dump:custom') never has one, so filtering on `source` alone already
@@ -594,13 +612,14 @@ async function expandComponents(outDir: string): Promise<void> {
     // --out-dir already held a same-named file) — nothing to expand in that case.
     if (!(await exists(archivePath))) continue;
 
-    // The "<NNN>-" prefix guarantees uniqueness WITHIN this manifest; the trailing
-    // sourceDigest() guarantees uniqueness ACROSS manifests too, so two different
-    // sources never collide into the same directory even across separate restore runs
-    // into the same --out-dir (see shortSourceLabel's and sourceDigest's doc comments
-    // above). The "<NNN>-" prefix also means the full name can never itself equal "."
-    // or ".." even on a source whose basename would (e.g. source === ".."), with no
-    // extra case to handle here.
+    // The "<NNN>-" prefix EXACTLY guarantees uniqueness WITHIN this manifest; the
+    // trailing sourceDigest() makes a collision ACROSS manifests practically negligible
+    // (not mathematically impossible — see sourceDigest's doc comment above for exactly
+    // what margin that is and why), so two different sources are not expected to collide
+    // into the same directory even across separate restore runs into the same --out-dir
+    // (see shortSourceLabel's and sourceDigest's doc comments above). The "<NNN>-" prefix
+    // also means the full name can never itself equal "." or ".." even on a source whose
+    // basename would (e.g. source === ".."), with no extra case to handle here.
     const dirName = `${String(i + 1).padStart(3, '0')}-${shortSourceLabel(c.source)}-${sourceDigest(c.source)}`;
     const targetDir = join(expandedRoot, dirName);
     try {

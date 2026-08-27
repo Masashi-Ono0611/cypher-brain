@@ -20,10 +20,12 @@ cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
 # re-deriving it in bash) — sha256 of the argument STRING encoded as 'utf16le' (NOT
 # shasum's default byte-for-byte/utf8 hashing of stdin: a bash `printf '%s' | shasum`
 # pipeline would silently drift from restore.ts's own encoding choice, which matters —
-# see sourceDigest's doc comment for why 'utf8' was rejected), first 8 hex chars. Used
-# below to predict the "<NNN>-<basename>-<digest>" expanded/ directory name restore.ts
-# builds (#423).
-src_digest() { node -e "process.stdout.write(require('node:crypto').createHash('sha256').update(process.argv[1], 'utf16le').digest('hex').slice(0, 8))" "$1"; }
+# see sourceDigest's doc comment for why 'utf8' was rejected), first SOURCE_DIGEST_LEN
+# (16) hex chars — kept as a literal 16 here rather than importing the TS constant,
+# since this file is plain bash; if that constant ever changes this literal needs
+# updating too. Used below to predict the "<NNN>-<basename>-<digest>" expanded/
+# directory name restore.ts builds (#423).
+src_digest() { node -e "process.stdout.write(require('node:crypto').createHash('sha256').update(process.argv[1], 'utf16le').digest('hex').slice(0, 16))" "$1"; }
 
 MARKER="secret-thought-$(od -An -N6 -tx1 /dev/urandom | tr -d ' ')"
 SRC="$TMP/brain-src"
@@ -125,11 +127,11 @@ echo "== #181/#423: restore auto-expands the component into out-dir/expanded/, k
 # the manual `tar -xzf brain-src.tar.gz -C "$TMP/out"` two lines above, which is why THAT
 # diff compares against "$TMP/out/brain-src", not "$TMP/out" itself).
 # #423: the expanded/ directory NAME itself is now just "<NNN>-<basename>-<digest>"
-# (short and readable, plus an 8-hex-char digest of the FULL source path so two
-# DIFFERENT sources sharing a basename can never collide — see sourceDigest() in
-# src/lib/restore.ts), not the whole source path flattened+encoded — expanded/README.txt
-# (checked below) is what actually maps the directory back to the full original source
-# path.
+# (short and readable, plus a 16-hex-char digest of the FULL source path so two
+# DIFFERENT sources sharing a basename are practically negligible, though not
+# mathematically impossible, to collide — see sourceDigest() in src/lib/restore.ts),
+# not the whole source path flattened+encoded — expanded/README.txt (checked below) is
+# what actually maps the directory back to the full original source path.
 EXPANDED_SRC_DIR="$TMP/out/expanded/001-$(basename "$SRC")-$(src_digest "$SRC")"
 diff -r "$SRC" "$EXPANDED_SRC_DIR/$(basename "$SRC")" || { echo "FAIL: expanded/ tree differs from source"; ls -la "$TMP/out/expanded"; exit 1; }
 test -f "$TMP/out/expanded/README.txt" || { echo "FAIL: expanded/README.txt was not written"; exit 1; }

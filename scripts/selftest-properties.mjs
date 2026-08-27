@@ -25,7 +25,13 @@
 // usage of typage roundtrip correctly").
 import fc from 'fast-check';
 import { join, resolve, sep } from 'node:path';
-import { isSafeComponentName, shortSourceLabel, sourceDigest, SHORT_LABEL_MAX } from '../src/lib/restore.ts';
+import {
+  isSafeComponentName,
+  shortSourceLabel,
+  sourceDigest,
+  SHORT_LABEL_MAX,
+  SOURCE_DIGEST_LEN,
+} from '../src/lib/restore.ts';
 import { generateKeypair, newEncrypter, newDecrypter } from '../src/lib/crypt.ts';
 
 let failed = 0;
@@ -174,13 +180,14 @@ await property(
 // sourceDigest() is a thin wrapper (see its doc comment in src/lib/restore.ts) — these
 // two properties pin the two things that actually matter for its role in the directory
 // name (deliberately NOT "different inputs never collide": SHA-256 collisions are only
-// NEGLIGIBLY, not IMPOSSIBLY, unlikely, so asserting that as a hard property over
-// randomly-sampled pairs would be a flaky test, not a real regression guard — the same
-// margin the pre-#423 encodeSourcePath() already relied on without ever claiming more).
+// PRACTICALLY NEGLIGIBLE at SOURCE_DIGEST_LEN's 64 bits, not IMPOSSIBLE, so asserting
+// that as a hard property over randomly-sampled pairs would be a flaky test, not a real
+// regression guard — see sourceDigest's doc comment for exactly why 64 bits, not the 32
+// bits the pre-#423 encodeSourcePath() used, is the margin this needs).
 const buildDirName = (i, source) => `${String(i).padStart(3, '0')}-${shortSourceLabel(source)}-${sourceDigest(source)}`;
 await property(
-  'sourceDigest: always exactly 8 lowercase hex characters, for any input',
-  fc.property(sourceArb, (source) => /^[0-9a-f]{8}$/.test(sourceDigest(source))),
+  'sourceDigest: always exactly SOURCE_DIGEST_LEN lowercase hex characters, for any input',
+  fc.property(sourceArb, (source) => new RegExp(`^[0-9a-f]{${SOURCE_DIGEST_LEN}}$`).test(sourceDigest(source))),
   { numRuns: 1000 },
 );
 await property(
@@ -216,17 +223,20 @@ await property(
 // different --dir sources sharing a basename (e.g. many `~/.claude/projects/*/memory/`
 // dirs — the exact case #181 introduced this whole expanded/ scheme to disambiguate)
 // produce the IDENTICAL label. expandComponents() instead relies on TWO things together
-// to guarantee no two components ever land in the same directory (see its
+// to keep two components from landing in the same directory (see its
 // `${String(i + 1).padStart(3, '0')}-${shortSourceLabel(c.source)}-${sourceDigest(c.source)}`
-// expression): the numeric index, which alone guarantees uniqueness WITHIN one restore's
-// manifest (component order is stable per snapshot); and sourceDigest(), which is what
-// keeps two DIFFERENT sources from colliding even when the index ALSO happens to match —
-// exactly the case of restoring two SEPARATE, unrelated snapshots into the same
-// --out-dir, where nothing ties their manifests' component ORDER together (a real
-// correctness gap in the #423 fix's first draft, caught by review — see
-// shortSourceLabel's doc comment in src/lib/restore.ts). This property pins the index
-// half of that: for ANY two DISTINCT indices, even with the SAME source string fed to
-// both (so same label AND same digest too), the resulting directory names never collide.
+// expression) — and they give DIFFERENT strength guarantees, worth keeping separate: the
+// numeric index EXACTLY (not probabilistically) guarantees uniqueness WITHIN one
+// restore's manifest (component order is stable per snapshot); sourceDigest() makes it
+// PRACTICALLY negligible, not impossible, for two DIFFERENT sources to collide even when
+// the index ALSO happens to match — exactly the case of restoring two SEPARATE, unrelated
+// snapshots into the same --out-dir, where nothing ties their manifests' component ORDER
+// together (a real correctness gap in the #423 fix's first draft, caught by review — see
+// shortSourceLabel's and sourceDigest's doc comments in src/lib/restore.ts). This
+// property pins the EXACT half: for ANY two DISTINCT indices, even with the SAME source
+// string fed to both (so same label AND same digest too), the resulting directory names
+// are provably distinct — this one holds by construction (the indices' own decimal
+// string representations differ), not by a probabilistic digest margin.
 await property(
   'expanded/ directory names: distinct component index alone guarantees distinct directory names, even for identical sources (#181)',
   fc.property(fc.integer({ min: 1, max: 999 }), fc.integer({ min: 1, max: 999 }), sourceArb, (i1, i2, source) => {
@@ -236,16 +246,19 @@ await property(
   { numRuns: 1000 },
 );
 
-// The digest half of the same guarantee, pinned as a fixed example (not fuzzed — see the
-// "NOT flaky" note above sourceDigest's properties) rather than a property: the exact
-// #423 review scenario — restoring two SEPARATE snapshots into the same --out-dir, whose
-// manifests each place a same-basename source at the SAME index — must still produce
-// DISTINCT directory names.
+// The digest half, pinned as a fixed example (not fuzzed — see the "NOT flaky" note
+// above sourceDigest's properties) rather than a property: the exact #423 review
+// scenario — restoring two SEPARATE snapshots into the same --out-dir, whose manifests
+// each place a same-basename source at the SAME index — happens, for these two concrete
+// paths, to still produce distinct directory names (an example proves this specific
+// pair doesn't collide; it does not, and is not meant to, prove no pair ever could —
+// that's a property of the digest's bit-length, documented and reasoned about in
+// sourceDigest's own doc comment, not something this test can establish).
 check(
   'expanded/ directory names: same index + same basename from two DIFFERENT source paths (two separate restores into one --out-dir) still get distinct directory names (#423 review finding)',
   buildDirName(1, '/home/alice/projects/alpha/memory') !== buildDirName(1, '/home/bob/projects/beta/memory'),
 );
-// ...and the flip side of that same guarantee (see sourceDigest's own doc comment): a
+// ...and the flip side of that same digest (see sourceDigest's own doc comment): a
 // restore-into-an-existing-expansion of the exact SAME source, at the same index, must
 // produce the SAME directory name every time, or the #181 no-clobber-merge behavior
 // (scripts/selftest.sh's own re-run test) would silently start creating a fresh,
