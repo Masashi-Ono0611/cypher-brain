@@ -899,10 +899,12 @@ async function restoreImpl(o: CliOptions): Promise<void> {
     // ahead of the actually-useful "expanded N component(s) into …" summary and (for
     // verify --level drill, which replays this function's captured stdout) the
     // VERDICT below it — a wall of JSON a human had to scroll past, and an incidental
-    // stdout leak of the local hostname + whatever machine originally ran `snapshot`.
-    // --verbose opts back into seeing it; assertSupportedManifestSchema still runs
-    // either way — that guard's job (refuse a manifest schema this build can't safely
-    // read) has nothing to do with whether its text gets printed.
+    // stdout leak of two fields worth gating: `host` (the hostname of whatever machine
+    // ran `snapshot` — see snapshot.ts's `hostname()` call — not necessarily this one)
+    // and each component's original absolute source path ON that machine. --verbose
+    // opts back into seeing it; assertSupportedManifestSchema still runs either way —
+    // that guard's job (refuse a manifest schema this build can't safely read) has
+    // nothing to do with whether its text gets printed.
     if (o.verbose) console.log(manifestText);
     assertSupportedManifestSchema(manifestText, manifestPath);
   }

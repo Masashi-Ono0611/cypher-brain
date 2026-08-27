@@ -784,10 +784,11 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       By default (#436), the console output is a short summary: which components were
       auto-expanded and where they landed under expanded/ (see --no-expand-components
       above), not the full manifest.json backing it. --verbose additionally prints that
-      raw manifest.json — tool, schema, host, created_at, every component's original
-      absolute SOURCE path and digests — which also means the local hostname and, for a
-      snapshot taken elsewhere, that machine's absolute filesystem paths, so leave it off
-      unless you actually need those fields (e.g. debugging a manifest itself).
+      raw manifest.json — tool, schema, created_at, and two fields worth knowing about
+      before turning it on: host (the hostname of the machine that ran "snapshot" — not
+      necessarily this one) and every component's original absolute SOURCE path on that
+      machine. Leave it off unless you actually need those fields (e.g. debugging a
+      manifest itself).
 
   cypher-brain verify --in <file.age> [--identity <file>] [--sha256 <hex>] [--sign-recipient <file>] [--require-signature] [--json]
                        [--level quick|remote|drill] [--verbose]
@@ -823,7 +824,9 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
                removed afterward, success or failure. Its non-JSON output is, by
                default, the same short component-expansion summary restore itself
                prints (#436) rather than the full manifest.json — pass --verbose
-               (alongside --level drill) to see that manifest too.
+               (alongside --level drill) to see that manifest too. --verbose has no
+               effect on --level quick/remote (neither ever reads a manifest.json) or
+               on --json (already a single alternate machine-readable report, #211).
       A failed remote/drill fetch reports VERDICT: FAIL (exit 1) rather than a raw
       error — retrievability itself is what those two levels test.
       --json prints one JSON object to stdout instead of the human-readable report.

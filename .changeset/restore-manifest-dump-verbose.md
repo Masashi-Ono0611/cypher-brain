@@ -10,7 +10,10 @@ console ahead of the actually-useful "expanded N component(s) into ..."
 summary and (for `verify --level drill`) the VERDICT (#436). The default
 console output is now just that short summary: which components landed
 where under `expanded/`. A new `--verbose` flag opts back into the raw
-manifest dump for both commands.
+manifest dump — for `restore` unconditionally, for `verify` only its
+non-JSON `--level drill` output (the only level that ever reads a
+manifest.json in the first place; `--json` already means "one alternate
+machine-readable report", so `--verbose` has no effect alongside it).
 
 `--json` was deliberately left alone rather than reused for this: it
 already means something different for `verify` (one machine-readable JSON
