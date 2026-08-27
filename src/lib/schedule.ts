@@ -1096,12 +1096,40 @@ export async function scheduleStatusReport(): Promise<ScheduleStatusReport> {
 }
 
 async function status(o: CliOptions): Promise<void> {
-  const r = await scheduleStatusReport();
+  // #426: "not installed" is an OPTIONAL, expected state — schedule install is opt-in,
+  // exactly the same fact doctor.ts's checkSchedule() already treats as [SKIP] rather
+  // than a failure (see its own ScheduleNotInstalledError catch, same reasoning). A
+  // plain STATUS query (as opposed to an action that requires a schedule to exist)
+  // reporting nonzero for "nothing is configured yet" was inconsistent with that
+  // precedent, and made scripting harder than it needed to be: a caller wanting to
+  // branch on "is a schedule installed?" had to catch/parse a CB-E014 error instead of
+  // reading a field. `schedule uninstall`'s "nothing to remove" already exits 0 for the
+  // same underlying fact — this brings status in line with it. Any OTHER failure
+  // reading the schedule (corrupt schedule.json, a crontab/launchctl call that itself
+  // errored) is a real problem with an EXISTING setup, not "nothing installed", and
+  // must still propagate as an error — only this one specific, checkable exception
+  // class is downgraded.
+  let r: ScheduleStatusReport;
+  try {
+    r = await scheduleStatusReport();
+  } catch (e) {
+    if (!(e instanceof ScheduleNotInstalledError)) throw e;
+    if (o.json) {
+      printJson({ installed: false });
+    } else {
+      console.log("schedule: not installed — run 'cypher-brain schedule install' to automate nightly snapshots");
+    }
+    return;
+  }
 
   if (o.json) {
     // --json (#211): the SAME object the MCP tool and the cypher-brain://schedule/status
     // resource serve — never a re-implementation, so the three can never disagree.
-    printJson(r);
+    // `installed: true` is added here (a status()-only field, not part of
+    // ScheduleStatusReport itself) so a --json consumer can branch on ONE field
+    // regardless of which shape it got back, instead of having to know in advance
+    // that a bare `{"installed": false}` is the OTHER possible response shape.
+    printJson({ installed: true, ...r });
     return;
   }
 
