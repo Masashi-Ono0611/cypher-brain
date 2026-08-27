@@ -53,6 +53,7 @@ import { restoreRunbook } from './lib/runbook.js';
 import { drainWarnings } from './lib/warn.js';
 import { snapshot } from './lib/snapshot.js';
 import { restore, verify } from './lib/restore.js';
+import { withSpan } from './lib/otel.js';
 import {
   push,
   pull,
@@ -2182,61 +2183,78 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToo
   const name = request.params.name;
   const args: ToolArgs = request.params.arguments ?? {};
   try {
-    // #300: one check, derived from the tool's own advertised inputSchema, applying to
-    // every tool including any added later — so `additionalProperties: false` means at
-    // runtime what tools/list says it means. Runs BEFORE dispatch, so no handler can
-    // start work on a call carrying a field it will not read.
-    //
-    // A name that is not in ALL_TOOLS is answered HERE and never reaches the switch —
-    // otherwise a future case added to the switch but forgotten in ALL_TOOLS would be
-    // both invisible in tools/list and reachable with entirely unvalidated arguments,
-    // which is the hole this whole change is about, one level up (multi-model review
-    // finding). Being unlisted therefore means uncallable, not unchecked.
-    const tool = TOOLS_BY_NAME.get(name);
-    if (!tool) return structuredErr(new ToolError('ERR_INVALID_INPUT', `Unknown tool: ${name}`));
-    // Before anything else, and deliberately before the argument checks: a tool nobody has
-    // answered the branch-relevance question for must not serve a call at all (#308). Put
-    // last it would be unreachable for exactly the calls the every-tool CI pass makes,
-    // which is what turns a forgotten declaration into a red build rather than a quiet gap.
-    assertBranchDeclared(name);
-    assertDeclaredArgs(tool, args);
-    // #308: names first, then the VALUES those names carry — a declared field whose
-    // schema pins an `enum` is checked against it here, for every tool, before dispatch,
-    // so a bad value is refused whether or not the branch taken would have read it.
-    assertDeclaredEnums(tool, args);
-    // #308 direction 2: names, then values, then whether the branch this call selects will
-    // actually READ the fields it carries. Last of the three because a field that is
-    // undeclared or out-of-enum is wrong on its own terms, and should be reported that way
-    // rather than as irrelevant.
-    assertBranchRelevance(name, args);
-    switch (name) {
-      case 'snapshot_now':
-        return await handleSnapshotNow(args);
-      case 'last_snapshot_status':
-        return await handleLastSnapshotStatus(args);
-      case 'verify_restore':
-        return await handleVerifyRestore(args);
-      case 'restore_now':
-        return await handleRestoreNow(args);
-      case 'estimate_cost':
-        return await handleEstimateCost(args);
-      case 'schedule_install':
-        return await handleScheduleInstall(args);
-      case 'schedule_status':
-        return await handleScheduleStatus();
-      case 'keygen':
-        return await handleKeygen(args);
-      case 'wallet_create':
-        return await handleWalletCreate(args);
-      case 'wallet_address':
-        return await handleWalletAddress(args);
-      // Unreachable via the guard above for any name outside ALL_TOOLS; what lands here
-      // is a tool this server ADVERTISES and cannot dispatch, which is a wiring bug on
-      // our side rather than a caller mistake — and ERR_INTERNAL is the honest way to
-      // say so. scripts/mcp-smoke.mjs calls every advertised tool, so it fires in CI.
-      default:
-        return structuredErr(new ToolError('ERR_INTERNAL', `${name} is advertised in tools/list but not dispatched`));
-    }
+    // #226: each MCP tool call becomes an OTel span when active (see otel.ts's
+    // withSpan() — a pure passthrough when OTEL_EXPORTER_OTLP_ENDPOINT is unset, the
+    // default). Wraps the validation checks below TOO, not just the switch — a call
+    // refused for an unknown tool name, an undeclared/out-of-enum arg, or a branch-
+    // irrelevant field is still a real invocation, and this is exactly the kind of
+    // thing #226's own "what actually happened" motivation cares about seeing (Codex
+    // review, #226 part 3). `name` is known before any of these checks can throw, so
+    // the span name doesn't depend on validation succeeding.
+    return await withSpan(
+      name,
+      async (): Promise<CallToolResult> => {
+        // #300: one check, derived from the tool's own advertised inputSchema, applying to
+        // every tool including any added later — so `additionalProperties: false` means at
+        // runtime what tools/list says it means. Runs BEFORE dispatch, so no handler can
+        // start work on a call carrying a field it will not read.
+        //
+        // A name that is not in ALL_TOOLS is answered HERE and never reaches the switch —
+        // otherwise a future case added to the switch but forgotten in ALL_TOOLS would be
+        // both invisible in tools/list and reachable with entirely unvalidated arguments,
+        // which is the hole this whole change is about, one level up (multi-model review
+        // finding). Being unlisted therefore means uncallable, not unchecked.
+        const tool = TOOLS_BY_NAME.get(name);
+        if (!tool) return structuredErr(new ToolError('ERR_INVALID_INPUT', `Unknown tool: ${name}`));
+        // Before anything else, and deliberately before the argument checks: a tool nobody has
+        // answered the branch-relevance question for must not serve a call at all (#308). Put
+        // last it would be unreachable for exactly the calls the every-tool CI pass makes,
+        // which is what turns a forgotten declaration into a red build rather than a quiet gap.
+        assertBranchDeclared(name);
+        assertDeclaredArgs(tool, args);
+        // #308: names first, then the VALUES those names carry — a declared field whose
+        // schema pins an `enum` is checked against it here, for every tool, before dispatch,
+        // so a bad value is refused whether or not the branch taken would have read it.
+        assertDeclaredEnums(tool, args);
+        // #308 direction 2: names, then values, then whether the branch this call selects will
+        // actually READ the fields it carries. Last of the three because a field that is
+        // undeclared or out-of-enum is wrong on its own terms, and should be reported that way
+        // rather than as irrelevant.
+        assertBranchRelevance(name, args);
+        switch (name) {
+          case 'snapshot_now':
+            return await handleSnapshotNow(args);
+          case 'last_snapshot_status':
+            return await handleLastSnapshotStatus(args);
+          case 'verify_restore':
+            return await handleVerifyRestore(args);
+          case 'restore_now':
+            return await handleRestoreNow(args);
+          case 'estimate_cost':
+            return await handleEstimateCost(args);
+          case 'schedule_install':
+            return await handleScheduleInstall(args);
+          case 'schedule_status':
+            return await handleScheduleStatus();
+          case 'keygen':
+            return await handleKeygen(args);
+          case 'wallet_create':
+            return await handleWalletCreate(args);
+          case 'wallet_address':
+            return await handleWalletAddress(args);
+          // Unreachable via the guard above for any name outside ALL_TOOLS; what lands
+          // here is a tool this server ADVERTISES and cannot dispatch, which is a wiring
+          // bug on our side rather than a caller mistake — and ERR_INTERNAL is the
+          // honest way to say so. scripts/mcp-smoke.mjs calls every advertised tool, so
+          // it fires in CI.
+          default:
+            return structuredErr(
+              new ToolError('ERR_INTERNAL', `${name} is advertised in tools/list but not dispatched`),
+            );
+        }
+      },
+      { isError: (r) => r.isError === true },
+    );
   } catch (err) {
     return structuredErr(err);
   }
