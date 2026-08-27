@@ -1142,7 +1142,7 @@ async function status(o: CliOptions): Promise<void> {
     // already carries `installed: true` (part of ScheduleStatusReport itself, #426), so a
     // --json consumer can branch on that ONE field regardless of which shape it got back,
     // instead of having to know in advance that a bare `{"installed": false}` (this
-    // function's own catch below, the only place that ever produces it) is the OTHER
+    // function's own catch above, the only place that ever produces it) is the OTHER
     // possible response shape.
     printJson(r);
     return;
