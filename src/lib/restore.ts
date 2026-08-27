@@ -12,6 +12,7 @@ import {
   PIPE_TIMEOUT_MS,
   SIGN_RECIPIENT,
   NON_CONTENT_ADDRESSED_BACKENDS,
+  MANIFEST_SCHEMA_VERSION,
   pgTool,
 } from './config.js';
 import { run } from './proc.js';
@@ -421,6 +422,30 @@ async function mergeNoClobber(src: string, dest: string): Promise<void> {
   }
 }
 
+// #225 forward-compat guard: a manifest.json declaring a `schema` HIGHER than this
+// build's MANIFEST_SCHEMA_VERSION describes a shape restore has never been taught to
+// read. Arweave's storage is meant to outlive any one build of this tool — a decades-
+// old binary silently reinterpreting a changed/renamed field as the old one it expects
+// is worse than refusing outright, so this throws (failing the whole restore) rather
+// than letting expandComponents()/pg_restore below proceed on a guess. A manifest that
+// fails to parse, or has no numeric `schema` at all (every pre-#225 snapshot), is
+// deliberately NOT this guard's concern — that is the existing best-effort manifest
+// handling's job (see expandComponents' own parse guard just below).
+function assertSupportedManifestSchema(manifestText: string, manifestPath: string): void {
+  let schema: unknown;
+  try {
+    schema = (JSON.parse(manifestText) as { schema?: unknown } | null)?.schema;
+  } catch {
+    return; // unparsable — not this guard's concern, see above
+  }
+  if (typeof schema === 'number' && schema > MANIFEST_SCHEMA_VERSION) {
+    throw new Error(
+      `${manifestPath} declares schema ${schema}, newer than the ${MANIFEST_SCHEMA_VERSION} this cypher-brain build understands — ` +
+        'upgrade cypher-brain before restoring this snapshot (an older build risks misreading a changed manifest shape)',
+    );
+  }
+}
+
 // Auto-expand every --dir/--profile component's staged tarball under
 // <out-dir>/expanded/<NNN>-<encoded source path>/, keyed to the component's ORIGINAL
 // absolute source path (manifest.components[].source) rather than its on-disk name — see
@@ -757,7 +782,11 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   }
   console.log(`restored components into ${o.out_dir}`);
   const manifestPath = join(o.out_dir, 'manifest.json');
-  if (await exists(manifestPath)) console.log(await readFile(manifestPath, 'utf8'));
+  if (await exists(manifestPath)) {
+    const manifestText = await readFile(manifestPath, 'utf8');
+    console.log(manifestText);
+    assertSupportedManifestSchema(manifestText, manifestPath);
+  }
   // Auto-expand --dir/--profile components (#181) — independent of --pg below: it only
   // ever touches components that carry a `source`, which pg_dump's never does, so the two
   // flows never race or duplicate work, and neither has to run before the other. --no-
