@@ -377,6 +377,17 @@ LOG="$LOG_DIR/nightly-$(date +%F).log"
 # "$LOG" yet, so that spurious "No such file or directory" would leak to whatever
 # invoked this runner instead of landing in the log like everything else here does.
 if [ -f "$LOG" ]; then LOG_START_LINES=$(wc -l < "$LOG"); else LOG_START_LINES=0; fi
+# Known limitation (Codex review): LOG_START_LINES is a snapshot taken once, up front.
+# It scopes the count correctly against SEQUENTIAL same-day retries (the scenario the
+# retry-safe --out naming above exists for — "a manual test on install day, or a
+# legitimate retry after a transient failure"), but two invocations of THIS SAME
+# runner that are genuinely CONCURRENT (both appending to the same dated LOG at once)
+# can each mis-attribute the other's warnings — this script has no locking around the
+# log, matching every other append into LOG here (the same hazard already applies to
+# the plain human-readable interleaving of two runs' output). Not addressed: it would
+# require real mutual exclusion (flock is not available on macOS by default), a much
+# bigger change than this warnings=N surfacing fix, for a scenario the existing
+# same-day retry-safety comments never claimed to cover.
 exec >>"$LOG" 2>&1
 ${pingLines.length ? `${pingLines.join('\n')}\n` : ''}
 # Every run ends with a machine-readable status line a heartbeat monitor can tail:
@@ -389,14 +400,15 @@ ${pingLines.length ? `${pingLines.join('\n')}\n` : ''}
 # think to \`cat\` the dated log to find; scheduleStatusReport()'s last_run.warning_count
 # reads this back structurally so \`schedule status\`/\`doctor\` can surface it instead of
 # a silent OK/PASS. Counted by tailing ONLY the lines THIS run appended (from
-# LOG_START_LINES on — see above) for warn.ts's formatWarningSummary() header line
-# ("N warning(s) a human should see...") rather than threading a counter through
-# snapshot/push's separate node invocations — grep matches the leading count of each
-# such header (there is one per subcommand that recorded warnings) and sums them;
-# deliberately NOT anchored on the header's parentheses/em-dash so it survives
-# incidental rewording of the surrounding prose, only the "<N> warning" prefix is
-# load-bearing (formatWarningSummary is exported specifically so it stays pinned by
-# tests).
+# LOG_START_LINES on — see above) for warn.ts's formatWarningSummary() header line's
+# EXACT text ("N warning(s) a human should see" — deliberately the whole distinctive
+# phrase, not just "N warning", so arbitrary logged prose — e.g. a secret-scan finding
+# echoing matched file content into this same log — cannot coincidentally, or by a
+# maliciously crafted file in the snapshotted source, inflate the count) rather than
+# threading a counter through snapshot/push's separate node invocations — grep matches
+# the leading count of each such header (there is one per subcommand that recorded
+# warnings) and sums them (formatWarningSummary is exported specifically so this exact
+# text stays pinned by tests).
 ${
   cfg.ping_url
     ? `# This install also configured --ping-url (issue #202): the SAME trap pushes a dead
@@ -406,7 +418,7 @@ ${
 # reachability, the monitor being down, etc.).
 `
     : ''
-}trap 'rc=$?; wcnt=0; if [ -f "$LOG" ]; then for n in $(tail -n +"$((LOG_START_LINES + 1))" "$LOG" 2>/dev/null | grep -oE "[0-9]+ warning" | grep -oE "^[0-9]+"); do wcnt=$((wcnt + n)); done; fi; if [ "$rc" -eq 0 ]; then echo "OK rc=0 warnings=$wcnt"; ${pingOkCmd}else echo "FAILED rc=$rc warnings=$wcnt"; ${pingFailCmd}fi' EXIT
+}trap 'rc=$?; wcnt=0; if [ -f "$LOG" ]; then for n in $(tail -n +"$((LOG_START_LINES + 1))" "$LOG" 2>/dev/null | grep -oE "[0-9]+ warning\\(s\\) a human should see" | grep -oE "^[0-9]+"); do wcnt=$((wcnt + n)); done; fi; if [ "$rc" -eq 0 ]; then echo "OK rc=0 warnings=$wcnt"; ${pingOkCmd}else echo "FAILED rc=$rc warnings=$wcnt"; ${pingFailCmd}fi' EXIT
 
 ${envLines.join('\n')}
 ${spendLines.length ? `${spendLines.join('\n')}\n` : ''}
