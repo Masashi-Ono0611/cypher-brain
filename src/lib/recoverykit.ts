@@ -76,7 +76,31 @@ export interface KitInputs {
   generatedAt: string;
 }
 
+// The two marker blocks (PRIMARY/BACKUP IDENTITY, SAVE-LOCATOR) plus the fixed
+// install/pull/restore command sequence are what an operator ACTUALLY types to
+// recover — shared between the QUICK RECOVERY block (top of the file, #428) and
+// the detailed "RECOVERY STEPS" section further down, so the two can never state
+// different commands. Only the wording of where the referenced blocks live
+// ("above" the detail section, "below" the quick block) differs by caller.
+function recoverySteps(which: 'BACKUP' | 'PRIMARY', blockLocation: 'above' | 'below'): string[] {
+  return [
+    '1) npm install -g cypher-brain          (or: npx cypher-brain@latest <command>)',
+    `2) Copy the ${which} IDENTITY block ${blockLocation} (the lines between its BEGIN and END markers,`,
+    '   not including the marker lines themselves) into its own file, e.g.: ~/restore-identity.age',
+    `3) Copy the SAVE-LOCATOR line ${blockLocation} (between its BEGIN and END markers) into its own`,
+    '   file, e.g.: ~/restore-locator.tsv',
+    '4) cypher-brain pull --from-locator-file ~/restore-locator.tsv --out ~/restored.age',
+    '5) cypher-brain restore --in ~/restored.age --out-dir ~/restored --identity ~/restore-identity.age',
+    '   (if the identity is passphrase-wrapped, this step prompts for that passphrase)',
+  ];
+}
+
 export function buildRecoveryKit(k: KitInputs): string {
+  // Which identity block a self-contained recovery copies from — null when NEITHER
+  // a backup identity nor an inlined primary is in this kit (the "kit-only recovery
+  // is not possible" case below). Hoisted so the QUICK RECOVERY block (top) and the
+  // detailed RECOVERY STEPS section (further down) agree on it by construction.
+  const which: 'BACKUP' | 'PRIMARY' | null = k.backup ? 'BACKUP' : k.primaryInline ? 'PRIMARY' : null;
   const lines: string[] = [];
   lines.push('='.repeat(72));
   lines.push('CYPHER-BRAIN RECOVERY KIT — KEEP THIS OFFLINE / PHYSICALLY SECURE');
@@ -85,6 +109,41 @@ export function buildRecoveryKit(k: KitInputs): string {
   lines.push('store it somewhere physically secure (a safe, a password manager secure');
   lines.push('note, a trusted person) AWAY from this machine, then treat it like cash.');
   lines.push('='.repeat(72));
+  lines.push('');
+  // --- QUICK RECOVERY (#428): "what do I type, right now" first, full detail below.
+  // Purely additive resequencing — nothing below this block changes or is removed.
+  lines.push('--- QUICK RECOVERY (read this first — full detail and caveats are further below) ---');
+  // Applies regardless of which branch below: EVERY recovery path here (the
+  // self-contained one AND the "Your actual options" primary-identity one) goes
+  // through pull --from-locator-file, which the file backend breaks identically —
+  // gating this on `which` would have let the no-backup branch imply a working
+  // cross-machine recovery it cannot deliver (Codex review).
+  if (k.backend === 'file') {
+    lines.push('!!! Locator is LOCAL-ONLY (file backend) — any pull --from-locator-file below only works on THIS');
+    lines.push('    machine unless the file-backend store is also copied elsewhere. See the "LOCATOR IS LOCAL-ONLY"');
+    lines.push('    caveat further below.');
+    lines.push('');
+  }
+  if (which) {
+    lines.push('If you need to recover RIGHT NOW (the identity + locator blocks referenced below are further down):');
+    for (const step of recoverySteps(which, 'below')) lines.push(`  ${step}`);
+    if (k.pg !== 'none') {
+      lines.push('');
+      lines.push('If a Postgres dump is included: do NOT pg_restore it into a live database once restored — see the');
+      lines.push('Postgres caveat further below before running pg_restore.');
+    }
+  } else {
+    lines.push('!!! NO BACKUP IDENTITY IS IN THIS KIT: kit-only recovery — on a fresh machine with ZERO other prior');
+    lines.push('    knowledge — is NOT possible right now. Recovery IS possible if you still have the PRIMARY');
+    lines.push(
+      `    identity itself, originally at: ${k.primaryIdentityPath}${
+        k.backend === 'file'
+          ? ' — AND the file-backend store (CYPHER_BRAIN_FILE_DIR), either this same machine or that store copied elsewhere'
+          : ''
+      }.`,
+    );
+    lines.push('    See "Your actual options" in the RECOVERY STEPS section further below for the exact commands.');
+  }
   lines.push('');
   lines.push(`Kit generated: ${k.generatedAt}`);
   lines.push(`Profile used:  ${k.profile}`);
@@ -184,18 +243,10 @@ export function buildRecoveryKit(k: KitInputs): string {
     lines.push('    manually copy the file-backend store alongside this kit. See MANAGEMENT.md "Key recovery #3".');
     lines.push('');
   }
-  if (k.backup || k.primaryInline) {
-    const which = k.backup ? 'BACKUP' : 'PRIMARY';
+  if (which) {
     lines.push('An operator with ZERO prior knowledge of this repo can follow these verbatim. The two marker');
     lines.push('blocks above (each a single BEGIN/END pair, unique in this file) are the two things you copy:');
-    lines.push('  1) npm install -g cypher-brain          (or: npx cypher-brain@latest <command>)');
-    lines.push(`  2) Copy the ${which} IDENTITY block above (the lines between its BEGIN and END markers,`);
-    lines.push('     not including the marker lines themselves) into its own file, e.g.: ~/restore-identity.age');
-    lines.push('  3) Copy the SAVE-LOCATOR line above (between its BEGIN and END markers) into its own');
-    lines.push('     file, e.g.: ~/restore-locator.tsv');
-    lines.push('  4) cypher-brain pull --from-locator-file ~/restore-locator.tsv --out ~/restored.age');
-    lines.push('  5) cypher-brain restore --in ~/restored.age --out-dir ~/restored --identity ~/restore-identity.age');
-    lines.push('     (if the identity above is passphrase-wrapped, this step prompts for that passphrase)');
+    for (const step of recoverySteps(which, 'above')) lines.push(`  ${step}`);
   } else {
     lines.push('!!! NO BACKUP IDENTITY IS IN THIS KIT: true kit-only recovery — restoring on a fresh machine');
     lines.push('    with ZERO other prior knowledge — is NOT possible right now. The only thing that can');
