@@ -317,10 +317,18 @@ export function sdkImportAdvice(e: unknown, pkg: string): SdkImportProblem | nul
 // @solana/spl-token -> @solana/buffer-layout-utils) does exactly this when its native binding
 // fails to load: harmless (falls back to pure JS, which is all this project's use of the turbo
 // SDK needs), but it printed unprefixed before any of this tool's own output on every
-// `estimate`/`push --backend turbo` (#422). Scoped narrowly to the ONE known message text —
-// everything else console.warn receives during the wrapped call still reaches the real
-// console.warn — this is not a blanket "hide turbo SDK warnings" switch.
-const KNOWN_NOISY_IMPORT_WARNINGS = [/^bigint: Failed to load bindings/];
+// `estimate`/`push --backend turbo` (#422). EXACT-matched, not a prefix (Codex review round 2):
+// bigint-buffer's own source (node_modules/bigint-buffer/dist/node.js) has exactly this one
+// console.warn call today, so a prefix match happens to be equally safe right now — but exact
+// match is what the comment already claimed ("the ONE known message text"), and a prefix would
+// ALSO swallow some future, unrelated bigint-buffer message that happened to share this prefix.
+// If a future bigint-buffer version rewords this message, add the new exact text as another
+// entry rather than loosening back to a prefix. Everything else console.warn receives during
+// the wrapped call still reaches the real console.warn — this is not a blanket "hide turbo SDK
+// warnings" switch.
+const KNOWN_NOISY_IMPORT_WARNINGS = new Set([
+  'bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)',
+]);
 
 // Reference-counted, not a bare save/restore (Codex review): the long-lived MCP server
 // (src/mcp.ts) processes tool calls off a single async handler, so two `estimate_cost`/
@@ -337,7 +345,7 @@ let savedConsoleWarn: typeof console.warn | null = null;
 
 function filteringWarn(...args: unknown[]): void {
   const first = args[0];
-  if (typeof first === 'string' && KNOWN_NOISY_IMPORT_WARNINGS.some((re) => re.test(first))) return;
+  if (typeof first === 'string' && args.length === 1 && KNOWN_NOISY_IMPORT_WARNINGS.has(first)) return;
   (savedConsoleWarn ?? console.warn)(...args);
 }
 

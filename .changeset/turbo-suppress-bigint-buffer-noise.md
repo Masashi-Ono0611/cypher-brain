@@ -11,7 +11,8 @@ logging at module-load time when its native binding fails to load — harmless
 (falls back to pure JS, which is all this project's use of the turbo SDK
 needs) but indistinguishable from a real error on first read, since it
 carries none of this CLI's own `error:`/`warning:` vocabulary. A new
-`importQuietly()` helper (`src/lib/util.ts`) wraps the lazy `@ardrive/turbo-
-sdk` import and swallows only that one known message text — every other
-`console.warn` during the same call still reaches the real console.warn, so
-this is not a blanket "hide turbo SDK warnings" switch.
+`importQuietly()` helper (`src/lib/util.ts`) wraps the lazy
+`@ardrive/turbo-sdk` import and swallows only that one known message
+text — every other `console.warn` during the same call still reaches the
+real console.warn, so this is not a blanket "hide turbo SDK warnings"
+switch.

@@ -17,15 +17,23 @@ const fail = (m) => {
   process.exitCode = 1;
 };
 
+// The exact string src/lib/util.ts's KNOWN_NOISY_IMPORT_WARNINGS matches against.
+const KNOWN_MESSAGE = 'bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)';
+// Same prefix as KNOWN_MESSAGE, different text after it — proves the filter matches the
+// EXACT known string, not just a prefix (Codex review round 2: a prefix match would ALSO
+// swallow a hypothetical future bigint-buffer message that happened to share this
+// prefix, silently hiding it).
+const NEAR_MATCH_MESSAGE = 'bigint: Failed to load bindings, but this is a DIFFERENT hypothetical future message';
+
 async function main() {
   const captured = [];
   const realWarn = console.warn;
   console.warn = (...args) => captured.push(args.join(' '));
-
   let returnValue;
   try {
     returnValue = await importQuietly(async () => {
-      console.warn('bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)');
+      console.warn(KNOWN_MESSAGE);
+      console.warn(NEAR_MATCH_MESSAGE);
       console.warn('some other totally unrelated warning that must NOT be swallowed');
       return 'load-result';
     });
@@ -39,10 +47,20 @@ async function main() {
     pass("importQuietly returns the wrapped load()'s own result unchanged");
   }
 
-  if (captured.some((line) => line.startsWith('bigint: Failed to load bindings'))) {
+  if (captured.includes(KNOWN_MESSAGE)) {
     fail('the known-noisy bigint-buffer message was NOT suppressed');
   } else {
     pass('the known-noisy bigint-buffer message is suppressed');
+  }
+
+  if (captured.includes(NEAR_MATCH_MESSAGE)) {
+    pass(
+      'a message sharing the same PREFIX but different exact text still reaches the real console.warn (exact match, not prefix match)',
+    );
+  } else {
+    fail(
+      'a near-match message (same prefix, different text) was ALSO swallowed — the filter is matching by prefix, not exact text',
+    );
   }
 
   if (captured.includes('some other totally unrelated warning that must NOT be swallowed')) {
@@ -100,7 +118,7 @@ async function testOverlappingCalls(realWarn) {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    console.warn('bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)');
+    console.warn(KNOWN_MESSAGE);
     return 'p2-result';
   });
   const [r1, r2] = await Promise.all([p1, p2]);
@@ -113,7 +131,7 @@ async function testOverlappingCalls(realWarn) {
     );
   }
 
-  const noisyLinesSeen = captured.filter((l) => l.startsWith('bigint: Failed to load bindings')).length;
+  const noisyLinesSeen = captured.filter((l) => l === KNOWN_MESSAGE).length;
   if (noisyLinesSeen === 0) {
     pass('the known-noisy message stays suppressed even when the shorter call finishes first');
   } else {
