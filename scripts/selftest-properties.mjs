@@ -25,13 +25,7 @@
 // usage of typage roundtrip correctly").
 import fc from 'fast-check';
 import { join, resolve, sep } from 'node:path';
-import {
-  isSafeComponentName,
-  shortSourceLabel,
-  sourceDigest,
-  SHORT_LABEL_MAX,
-  SOURCE_DIGEST_LEN,
-} from '../src/lib/restore.ts';
+import { isSafeComponentName, shortSourceLabel, sourceDigest, SHORT_LABEL_MAX } from '../src/lib/restore.ts';
 import { generateKeypair, newEncrypter, newDecrypter } from '../src/lib/crypt.ts';
 
 let failed = 0;
@@ -177,17 +171,17 @@ await property(
   { numRuns: 1000 },
 );
 
-// sourceDigest() is a thin wrapper (see its doc comment in src/lib/restore.ts) — these
-// two properties pin the two things that actually matter for its role in the directory
-// name (deliberately NOT "different inputs never collide": SHA-256 collisions are only
-// PRACTICALLY NEGLIGIBLE at SOURCE_DIGEST_LEN's 64 bits, not IMPOSSIBLE, so asserting
-// that as a hard property over randomly-sampled pairs would be a flaky test, not a real
-// regression guard — see sourceDigest's doc comment for exactly why 64 bits, not the 32
-// bits the pre-#423 encodeSourcePath() used, is the margin this needs).
+// sourceDigest() is a thin wrapper (see its doc comment in src/lib/restore.ts, including
+// the history of why it is the FULL, un-truncated 64-hex-char SHA-256 digest and not a
+// shortened one) — these two properties pin the two things that actually matter for its
+// role in the directory name (deliberately NOT "different inputs never collide": even a
+// full, untruncated SHA-256 collision is only cryptographically infeasible, not
+// mathematically impossible, so asserting that as a hard property over randomly-sampled
+// pairs would be a flaky test in principle, not a real regression guard).
 const buildDirName = (i, source) => `${String(i).padStart(3, '0')}-${shortSourceLabel(source)}-${sourceDigest(source)}`;
 await property(
-  'sourceDigest: always exactly SOURCE_DIGEST_LEN lowercase hex characters, for any input',
-  fc.property(sourceArb, (source) => new RegExp(`^[0-9a-f]{${SOURCE_DIGEST_LEN}}$`).test(sourceDigest(source))),
+  'sourceDigest: always exactly 64 lowercase hex characters (the full, un-truncated SHA-256 digest), for any input',
+  fc.property(sourceArb, (source) => /^[0-9a-f]{64}$/.test(sourceDigest(source))),
   { numRuns: 1000 },
 );
 await property(

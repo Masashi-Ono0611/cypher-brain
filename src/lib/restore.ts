@@ -360,33 +360,36 @@ export function shortSourceLabel(abs: string): string {
   return safe.length <= SHORT_LABEL_MAX ? safe : safe.slice(0, SHORT_LABEL_MAX);
 }
 
-// Short, stable digest of a component's FULL absolute source path — appended, alongside
+// Stable digest of a component's FULL absolute source path — appended, alongside
 // shortSourceLabel()'s basename, to the directory name expandComponents() builds below
-// (`<NNN>-<label>-<digest>`). This is what makes it PRACTICALLY negligible for two
-// DIFFERENT source paths to collide into the same expanded/ directory, even across two
-// SEPARATE restore invocations into the same --out-dir whose manifests happen to place a
-// same-basename source at the same numeric index (see shortSourceLabel()'s doc comment
-// above — the index alone only disambiguates WITHIN one manifest, not across two
-// different ones; #423 review finding). "Practically negligible", not "impossible" or
-// "guaranteed" — say so precisely, this is attacker-controlled input (see the block
-// above), not just noisy real-world data:
-//   - SOURCE_DIGEST_LEN below is 16 hex chars = 64 bits of SHA-256, not the 8 hex chars
-//     (32 bits) the pre-#423 encodeSourcePath() used for its own truncate-and-hash
-//     branch. 32 bits is fine for AVOIDING ACCIDENTAL collisions among ordinary paths
-//     (which is all encodeSourcePath() ever needed — its label already carried almost
-//     the whole path, so the digest was a cosmetic tie-breaker, not the ONLY thing
-//     preventing a collision). It is NOT fine here: shortSourceLabel() gives up almost
-//     all of that entropy for readability, so the digest is now the primary guard, and
-//     manifest.components[].source is attacker-controlled — an attacker who can choose a
-//     forged source string to match a KNOWN target digest is running a 2nd-preimage
-//     search, and 32 bits (~2^32 SHA-256 evaluations) is well within reach of commodity
-//     hardware in well under a minute. 64 bits (~2^64 evaluations) is not — this is the
-//     same order of magnitude the field treats as a real security margin, not a
-//     "shouldn't come up" one.
-//   - Two restores of the exact SAME source path always produce the SAME digest, so
-//     re-running restore into an out-dir that already holds that source's expansion
-//     still merges into it via mergeNoClobber() below exactly as before, not a fresh,
-//     differently-named directory each time.
+// (`<NNN>-<label>-<digest>`). This is what keeps two DIFFERENT source paths from
+// colliding into the same expanded/ directory, even across two SEPARATE restore
+// invocations into the same --out-dir whose manifests happen to place a same-basename
+// source at the same numeric index (see shortSourceLabel()'s doc comment above — the
+// index alone only disambiguates WITHIN one manifest, not across two different ones;
+// #423 review finding).
+//
+// Deliberately the FULL, UN-TRUNCATED hex digest (64 chars), not a shortened one —
+// history worth keeping, because the same review thread arrived here by successive
+// correction: an initial 8-hex-char (32-bit) truncation was flagged as an attacker
+// (manifest.components[].source is attacker-controlled — see the block above) needing
+// only a ~2^32 2nd-preimage search on commodity hardware to force a collision; widening
+// to 16 hex chars (64 bits) was then flagged again, because an attacker able to choose
+// BOTH colliding source strings (e.g. crafting two separate malicious manifests) faces
+// only the ~2^32 BIRTHDAY bound, not the full 64-bit 2nd-preimage cost. Every truncation
+// length just moves the argument, never closes it, and costs a tunable this file would
+// have to keep re-justifying. The untruncated digest is unambiguously the standard-
+// strength primitive (SHA-256's actual, widely-accepted collision resistance, the same
+// guarantee git's own hash-based addressing relies on) — directory names stay
+// comfortably under common 255-byte filename limits either way (label + "-" + 64 hex
+// chars is still well short of that), and the READABLE part of the name (the label) is
+// unaffected by the digest's length, so this costs nothing readability-wise. This is
+// also SIMPLER than any truncated version (no slice(), no length constant to defend).
+//
+// Two restores of the exact SAME source path always produce the SAME digest, so
+// re-running restore into an out-dir that already holds that source's expansion still
+// merges into it via mergeNoClobber() below exactly as before, not a fresh,
+// differently-named directory each time.
 //
 // Hashed as 'utf16le', NOT the default 'utf8' — a review finding on #423 (verified):
 // manifest.components[].source is attacker-controlled (see the block above) and
@@ -397,19 +400,19 @@ export function shortSourceLabel(abs: string): string {
 // value, so two DIFFERENT forged source strings that differ only in which invalid
 // surrogate they contain would hash identically (confirmed: two such strings differing
 // only in a single lone-surrogate code point produced the SAME sha256 digest under
-// 'utf8' — a deterministic, attacker-craftable collision at ANY digest length, not a
-// probabilistic one the digest length above helps with at all). 'utf16le' encodes each
-// UTF-16 code unit as its own 2 bytes with no substitution, so it is injective over the
-// actual JS string (a lossless round trip of exactly what `===` string equality already
-// compares) — closing that specific deterministic path entirely, leaving only the
-// generic SHA-256-collision risk the digest length above is about.
+// 'utf8' — a deterministic, attacker-craftable collision that no digest LENGTH, even the
+// full one used here, would have helped with). 'utf16le' encodes each UTF-16 code unit
+// as its own 2 bytes with no substitution, so it is injective over the actual JS string
+// (a lossless round trip of exactly what `===` string equality already compares) —
+// closing that specific deterministic path entirely, leaving only a genuine SHA-256
+// collision, which the full, untruncated digest above makes standard-strength
+// infeasible rather than merely improbable.
 //
 // Exported (#423) so scripts/selftest-properties.mjs can property-test it the same way
 // as shortSourceLabel() above, instead of leaving it untested/unmutated code inside this
 // file's otherwise fully-scoped Stryker region (see stryker.conf.json).
-export const SOURCE_DIGEST_LEN = 16;
 export function sourceDigest(abs: string): string {
-  return createHash('sha256').update(abs, 'utf16le').digest('hex').slice(0, SOURCE_DIGEST_LEN);
+  return createHash('sha256').update(abs, 'utf16le').digest('hex');
 }
 // Stryker disable all
 

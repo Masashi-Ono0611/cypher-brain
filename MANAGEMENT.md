@@ -417,12 +417,12 @@ on-disk name. This is what makes many same-basename sources (e.g. dozens of clau
 project `memory/` dirs under `--profile claude-code`) still land in separate directories
 instead of an undifferentiated pile of `memory.tar.gz` / `memory-1.tar.gz` / etc that
 only `manifest.json` could disambiguate (#181) — the numeric `<NNN>` index guarantees
-that exactly within one restore's manifest, and a 16-hex-char digest of the full source
-path keeps a collision practically negligible (not mathematically impossible — the
-digest is a truncated SHA-256, and `source` is attacker-controlled data) even across two
-SEPARATE restores into the same `--out-dir` (#423), so the directory NAME itself only
-needs to carry a short, readable label plus that digest, not the whole source path. `./restored/expanded/README.txt` (and restore's own stdout)
-records which expanded directory came from which FULL source path. Nothing is ever
+that exactly within one restore's manifest, and the full, un-truncated SHA-256 digest of
+the full source path keeps that guarantee even across two SEPARATE restores into the
+same `--out-dir` (#423), so the directory NAME itself only needs to carry a short,
+readable label plus that digest, not the whole source path.
+`./restored/expanded/README.txt` (and restore's own stdout) records which expanded
+directory came from which FULL source path. Nothing is ever
 written back to that original absolute path — expansion only ever creates NEW
 directories under `--out-dir`, and re-running restore into the same `--out-dir` does not
 clobber a prior expansion (same no-clobber posture as the outer extract). Pass
