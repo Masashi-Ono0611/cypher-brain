@@ -638,8 +638,9 @@ if (j.last_run.rc_line !== 'OK rc=0') throw new Error('expected last_run.rc_line
 if (typeof j.next_run !== 'string' || j.next_run.length === 0) throw new Error('expected a non-empty next_run');
 if (!j.trigger || typeof j.trigger.loaded !== 'string') throw new Error('expected trigger.loaded to be a string');
 if (j.trigger.legacy !== false) throw new Error('expected trigger.legacy false for a freshly-installed schedule');
+if (j.installed !== true) throw new Error('expected installed:true for an installed schedule (#426), got ' + JSON.stringify(j.installed));
 " "$SJOUT"
-echo "[PASS] status --json: one JSON line; configured/runner/last_run/next_run/trigger all correct"
+echo "[PASS] status --json: one JSON line; configured/runner/last_run/next_run/trigger/installed all correct"
 
 echo "== (c2) a failing run leaves a trailing FAILED rc=N line (heartbeat contract) =="
 CYPHER_BRAIN_SCHEDULE_DIR="$TMP/sched-fail" cb schedule install --backend file --dir "$TMP/does-not-exist" --no-load > /dev/null 2>&1 \
@@ -729,8 +730,18 @@ else
   [ -f "$IDX" ] || { echo "[FAIL] uninstall must KEEP index.tsv"; exit 1; }
   cb schedule uninstall > "$TMP/uninstall2.log" 2>&1 || { echo "[FAIL] second uninstall exited non-zero (must be idempotent)"; exit 1; }
   grep -q 'nothing to remove' "$TMP/uninstall2.log" || { echo "[FAIL] second uninstall did not report a no-op"; exit 1; }
-  if cb schedule status > /dev/null 2>&1; then echo "[FAIL] status after uninstall must fail (not installed)"; exit 1; fi
-  echo "[PASS] uninstall: trigger + runner removed, data kept, idempotent; status reports not installed"
+  # #426: "not installed" is a normal, exit-0 status result (matching doctor.ts's own
+  # [SKIP]-not-fail treatment of the identical fact), not an error -- a status QUERY
+  # asking "is anything configured?" is answered truthfully by reporting "no", the same
+  # way `schedule uninstall`'s own "nothing to remove" already exits 0 above.
+  cb schedule status > "$TMP/status-after-uninstall.log" 2>&1 \
+    || { echo "[FAIL] status after uninstall exited non-zero (should be a normal exit-0 'not installed' result, #426)"; cat "$TMP/status-after-uninstall.log"; exit 1; }
+  grep -qF "not installed" "$TMP/status-after-uninstall.log" \
+    || { echo "[FAIL] status after uninstall did not report 'not installed'"; cat "$TMP/status-after-uninstall.log"; exit 1; }
+  SJ_UNINSTALLED=$(cb schedule status --json)
+  [ "$SJ_UNINSTALLED" = '{"installed":false}' ] \
+    || { echo "[FAIL] status --json after uninstall was [$SJ_UNINSTALLED], expected {\"installed\":false}"; exit 1; }
+  echo "[PASS] uninstall: trigger + runner removed, data kept, idempotent; status exits 0 and reports 'not installed' (plain + --json, #426)"
 fi
 
 echo "== (f) two different CYPHER_BRAIN_HOME schedules never collide: distinct LABEL/CRON_MARKER, installing/uninstalling one never touches the other's REAL registration (#114) =="

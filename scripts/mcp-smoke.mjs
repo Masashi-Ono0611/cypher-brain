@@ -1553,6 +1553,12 @@ async function run(tmp) {
     if (!schedSc?.trigger?.type || !('loaded' in (schedSc.trigger ?? {}))) {
       throw new Error(`schedule_status.trigger missing: ${JSON.stringify(schedSc)}`);
     }
+    // #426: `installed` is on the SHARED ScheduleStatusReport type specifically so the
+    // MCP tool/resource and the CLI's --json output can never disagree about it (Codex
+    // review — the field must not become a CLI-only bolt-on).
+    if (schedSc?.installed !== true) {
+      throw new Error(`schedule_status.installed unexpected: ${JSON.stringify(schedSc?.installed)}`);
+    }
 
     // 2l-b. #285: the cypher-brain://schedule/status RESOURCE must serve byte-identical
     // state to the tool. That equality is the whole safety argument for adding a second

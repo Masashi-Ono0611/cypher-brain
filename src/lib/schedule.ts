@@ -996,6 +996,19 @@ const legacyCronNote = (marker: string) =>
 // which takes Record<string, unknown>, and only a type alias carries the implicit index
 // signature that assignment needs.
 export type ScheduleStatusReport = {
+  // #426: always true here — scheduleStatusReport() still THROWS ScheduleNotInstalledError
+  // for the "nothing installed" case rather than returning an object with installed:false
+  // (that would be a bigger change: doctor.ts's own instanceof-checked catch of that
+  // exception, #333, would need reworking too). Only the CLI's `status()` catches that
+  // throw and synthesizes a separate `{installed:false}` object for its OWN --json output
+  // — literally the only place that ever produces installed:false, since this field is
+  // otherwise unconditionally true on every object THIS function returns. Present on the
+  // shared type (not bolted onto the CLI-only object) specifically so the MCP tool and the
+  // cypher-brain://schedule/status resource — which both return this function's result
+  // verbatim — report it too, keeping the field-for-field parity this type's own top
+  // comment already promises rather than letting `installed` become a CLI-only bolt-on
+  // (Codex review).
+  readonly installed: true;
   readonly configured: {
     readonly at: string;
     readonly backend: string;
@@ -1073,6 +1086,7 @@ export async function scheduleStatusReport(): Promise<ScheduleStatusReport> {
   const last = await lastLog();
 
   return {
+    installed: true,
     configured: { at: cfg.at, backend: cfg.backend, scan_secrets: cfg.scan_secrets ?? null },
     runner: cfg.runner,
     // #286: the config file is loaded SILENTLY by config.ts — deliberately, so it does
@@ -1096,11 +1110,40 @@ export async function scheduleStatusReport(): Promise<ScheduleStatusReport> {
 }
 
 async function status(o: CliOptions): Promise<void> {
-  const r = await scheduleStatusReport();
+  // #426: "not installed" is an OPTIONAL, expected state — schedule install is opt-in,
+  // exactly the same fact doctor.ts's checkSchedule() already treats as [SKIP] rather
+  // than a failure (see its own ScheduleNotInstalledError catch, same reasoning). A
+  // plain STATUS query (as opposed to an action that requires a schedule to exist)
+  // reporting nonzero for "nothing is configured yet" was inconsistent with that
+  // precedent, and made scripting harder than it needed to be: a caller wanting to
+  // branch on "is a schedule installed?" had to catch/parse a CB-E014 error instead of
+  // reading a field. `schedule uninstall`'s "nothing to remove" already exits 0 for the
+  // same underlying fact — this brings status in line with it. Any OTHER failure
+  // reading the schedule (corrupt schedule.json, a crontab/launchctl call that itself
+  // errored) is a real problem with an EXISTING setup, not "nothing installed", and
+  // must still propagate as an error — only this one specific, checkable exception
+  // class is downgraded.
+  let r: ScheduleStatusReport;
+  try {
+    r = await scheduleStatusReport();
+  } catch (e) {
+    if (!(e instanceof ScheduleNotInstalledError)) throw e;
+    if (o.json) {
+      printJson({ installed: false });
+    } else {
+      console.log("schedule: not installed — run 'cypher-brain schedule install' to automate nightly snapshots");
+    }
+    return;
+  }
 
   if (o.json) {
     // --json (#211): the SAME object the MCP tool and the cypher-brain://schedule/status
-    // resource serve — never a re-implementation, so the three can never disagree.
+    // resource serve — never a re-implementation, so the three can never disagree. `r`
+    // already carries `installed: true` (part of ScheduleStatusReport itself, #426), so a
+    // --json consumer can branch on that ONE field regardless of which shape it got back,
+    // instead of having to know in advance that a bare `{"installed": false}` (this
+    // function's own catch above, the only place that ever produces it) is the OTHER
+    // possible response shape.
     printJson(r);
     return;
   }
