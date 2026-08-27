@@ -422,15 +422,19 @@ async function mergeNoClobber(src: string, dest: string): Promise<void> {
   }
 }
 
-// #225 forward-compat guard: a manifest.json declaring a `schema` HIGHER than this
-// build's MANIFEST_SCHEMA_VERSION describes a shape restore has never been taught to
-// read. Arweave's storage is meant to outlive any one build of this tool — a decades-
-// old binary silently reinterpreting a changed/renamed field as the old one it expects
-// is worse than refusing outright, so this throws (failing the whole restore) rather
-// than letting expandComponents()/pg_restore below proceed on a guess. A manifest that
-// fails to parse, or has no numeric `schema` at all (every pre-#225 snapshot), is
-// deliberately NOT this guard's concern — that is the existing best-effort manifest
-// handling's job (see expandComponents' own parse guard just below).
+// #225 forward-compat guard: a manifest.json declaring a `schema` this build does not
+// recognize describes a shape restore has never been taught to read. Arweave's storage
+// is meant to outlive any one build of this tool — a decades-old binary silently
+// reinterpreting a changed/renamed field as the one it expects is worse than refusing
+// outright, so this throws (failing the whole restore) rather than letting
+// expandComponents()/pg_restore below proceed on a guess. Only a manifest with NO
+// `schema` field at all (every pre-#225 snapshot — `undefined`, not `null`) is treated
+// as legacy and let through; anything present that isn't a plain integer in
+// [1, MANIFEST_SCHEMA_VERSION] is refused — a non-numeric schema (a future format could
+// just as easily change the field's TYPE, not just its number) fails closed here rather
+// than silently falling through as if it were unversioned. A manifest that fails to
+// parse as JSON at all is NOT this guard's concern — that is the existing best-effort
+// manifest handling's job (see expandComponents' own parse guard just below).
 function assertSupportedManifestSchema(manifestText: string, manifestPath: string): void {
   let schema: unknown;
   try {
@@ -438,9 +442,10 @@ function assertSupportedManifestSchema(manifestText: string, manifestPath: strin
   } catch {
     return; // unparsable — not this guard's concern, see above
   }
-  if (typeof schema === 'number' && schema > MANIFEST_SCHEMA_VERSION) {
+  if (schema === undefined) return; // no schema field at all — pre-#225 snapshot
+  if (typeof schema !== 'number' || !Number.isInteger(schema) || schema < 1 || schema > MANIFEST_SCHEMA_VERSION) {
     throw new Error(
-      `${manifestPath} declares schema ${schema}, newer than the ${MANIFEST_SCHEMA_VERSION} this cypher-brain build understands — ` +
+      `${manifestPath} declares schema ${JSON.stringify(schema)}, which this cypher-brain build (understands integer schemas 1 through ${MANIFEST_SCHEMA_VERSION}) does not recognize — ` +
         'upgrade cypher-brain before restoring this snapshot (an older build risks misreading a changed manifest shape)',
     );
   }

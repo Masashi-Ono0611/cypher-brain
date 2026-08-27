@@ -235,6 +235,32 @@ MANIFEST
   printf '%s' "$FUTURE_ERR" | grep -qi "upgrade cypher-brain" || { echo "FAIL: error does not tell the operator to upgrade"; echo "$FUTURE_ERR"; exit 1; }
   test ! -d "$FUTURE_OUT/expanded" || { echo "FAIL: component expansion ran despite the unsupported future schema"; exit 1; }
   echo "[PASS] a manifest declaring a schema newer than this build supports is refused with a clear upgrade message, before any component expansion runs"
+
+  # A future format could change the FIELD'S TYPE, not just bump the number -- a guard
+  # that only special-cases numbers-too-high would fail OPEN here (silently falling
+  # through as if unversioned) instead of refusing. Prove a non-numeric schema is
+  # refused too, not treated as legacy/absent.
+  NONNUM_STAGE="$TMP/nonnum-schema-stage"; mkdir -p "$NONNUM_STAGE"
+  cat > "$NONNUM_STAGE/manifest.json" <<MANIFEST
+{
+  "tool": "cypher-brain",
+  "schema": "2",
+  "host": "nonnumeric-schema-test-fixture",
+  "created_at": "2026-01-01T00:00:00.000Z",
+  "content_digest": "0",
+  "recipients_fingerprint": "0",
+  "components": []
+}
+MANIFEST
+  ( cd "$NONNUM_STAGE" && tar -cf - manifest.json ) | age -r "$(cat "$TMP/keys/recipient.txt")" -o "$TMP/nonnum-schema.age"
+  NONNUM_OUT="$TMP/nonnum-schema-restored"
+  set +e
+  NONNUM_ERR=$(cb restore --in "$TMP/nonnum-schema.age" --out-dir "$NONNUM_OUT" 2>&1); NONNUM_RC=$?
+  set -e
+  [ "$NONNUM_RC" != "0" ] || { echo "FAIL: restore of a manifest with a non-numeric schema (\"2\") exited 0 (should refuse, not treat it as legacy/absent)"; echo "$NONNUM_ERR"; exit 1; }
+  printf '%s' "$NONNUM_ERR" | grep -qi "upgrade cypher-brain" || { echo "FAIL: error does not tell the operator to upgrade"; echo "$NONNUM_ERR"; exit 1; }
+  test ! -d "$NONNUM_OUT/expanded" || { echo "FAIL: component expansion ran despite the non-numeric schema"; exit 1; }
+  echo "[PASS] a manifest with a non-numeric schema value is refused (fails closed), not silently treated as an unversioned legacy manifest"
 fi
 
 echo "== #181 hardening: a pre-existing SYMLINK at the expanded component directory path is refused, never followed =="
