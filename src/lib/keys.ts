@@ -38,6 +38,18 @@ export interface KeygenAtResult {
   wrapped: boolean;
 }
 
+// Elide a long recipient string for terminal display (issue #424): a --pq hybrid
+// recipient is ~1960 bytes, so printed in full it dominates the terminal output for
+// dozens of wrapped rows. Show first+last 20 chars instead — mirrors how git shows
+// abbreviated commit hashes. Display-only: the caller is expected to have already
+// written the FULL value to recipient.txt before calling this.
+function elideRecipient(recipient: string): string {
+  const HEAD = 20;
+  const TAIL = 20;
+  if (recipient.length <= HEAD + TAIL + '…'.length) return recipient;
+  return `${recipient.slice(0, HEAD)}…${recipient.slice(-TAIL)} (${recipient.length} bytes, full value written to recipient.txt)`;
+}
+
 // Write `payload` to `path`, choosing an ordering that never destroys an existing
 // file before its replacement is fully durable on disk (#122):
 //  - !force: exclusive create ('wx') directly at `path` — the OS itself refuses if
@@ -234,7 +246,12 @@ export async function keygen(o: CliOptions): Promise<void> {
   // colon is what actually lines the two paths up (issue #263).
   console.log(`identity (PRIVATE, keep offline): ${IDENTITY}${wrapped ? ' (passphrase-wrapped)' : ''}`);
   console.log(`recipient (PUBLIC, safe to copy): ${RECIPIENT}`);
-  console.log(`recipient = ${recipient}`);
+  // --pq's hybrid recipient is ~1960 bytes — printed in full it line-wraps across
+  // the entire terminal for dozens of rows and drowns out every other line above
+  // (issue #424). recipient.txt (written above, in full, by keygenAt()) is what's
+  // actually used for encryption, so eliding stdout here is display-only and safe;
+  // the plain X25519 case (~62 bytes) is already compact and stays untouched.
+  console.log(`recipient = ${o.pq ? elideRecipient(recipient) : recipient}`);
   if (o.pq)
     console.log(
       '(post-quantum HYBRID keypair: ML-KEM-768 + X25519 — the recipient/ciphertext are much bigger than plain X25519, see README Threat model)',
