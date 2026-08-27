@@ -113,12 +113,18 @@ export function buildRecoveryKit(k: KitInputs): string {
   // --- QUICK RECOVERY (#428): "what do I type, right now" first, full detail below.
   // Purely additive resequencing — nothing below this block changes or is removed.
   lines.push('--- QUICK RECOVERY (read this first — full detail and caveats are further below) ---');
+  // Applies regardless of which branch below: EVERY recovery path here (the
+  // self-contained one AND the "Your actual options" primary-identity one) goes
+  // through pull --from-locator-file, which the file backend breaks identically —
+  // gating this on `which` would have let the no-backup branch imply a working
+  // cross-machine recovery it cannot deliver (Codex review).
+  if (k.backend === 'file') {
+    lines.push('!!! Locator is LOCAL-ONLY (file backend) — any pull --from-locator-file below only works on THIS');
+    lines.push('    machine unless the file-backend store is also copied elsewhere. See the "LOCATOR IS LOCAL-ONLY"');
+    lines.push('    caveat further below.');
+    lines.push('');
+  }
   if (which) {
-    if (k.backend === 'file') {
-      lines.push('!!! Locator is LOCAL-ONLY (file backend) — step 4 below only works on THIS machine unless the');
-      lines.push('    file-backend store is also copied elsewhere. See the "LOCATOR IS LOCAL-ONLY" caveat below.');
-      lines.push('');
-    }
     lines.push('If you need to recover RIGHT NOW (the identity + locator blocks referenced below are further down):');
     for (const step of recoverySteps(which, 'below')) lines.push(`  ${step}`);
     if (k.pg !== 'none') {
