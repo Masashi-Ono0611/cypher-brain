@@ -13,8 +13,10 @@
 // Every generated file is DETERMINISTIC for a given set of inputs (no embedded
 // timestamps) — dates appear only where the RUNNER computes them at run time.
 // The runner logs each run to <schedule>/logs/nightly-YYYY-MM-DD.log and always
-// leaves a final "OK rc=0" / "FAILED rc=N" line, so `schedule status` can tail
-// the newest log for the outcome — but that is a PULL: nothing surfaces a run
+// leaves a final "OK rc=0 warnings=N" / "FAILED rc=N warnings=N" line (warnings=N
+// added by #432 — the count of ⚠-class warnings, e.g. a single-recipient snapshot,
+// that run recorded into the SAME log), so `schedule status` can tail the newest
+// log for the outcome — but that is a PULL: nothing surfaces a run
 // that silently stopped happening at all (launchd/cron itself wedged, the box
 // was off). --ping-url (issue #202) adds the PUSH half: a healthchecks.io-style
 // dead man's switch the runner curl's on every run's outcome (success URL /
@@ -363,10 +365,38 @@ LOG_DIR="$SCHEDULE_DIR/logs"
 SNAP_DIR="$SCHEDULE_DIR/snapshots"
 mkdir -p "$LOG_DIR" "$SNAP_DIR"
 LOG="$LOG_DIR/nightly-$(date +%F).log"
+# #432: a same-day retry APPENDS to this same dated LOG (see the retry-safe --out
+# naming below) — record how many lines already exist BEFORE this run's own output
+# lands, so the warning count computed in the trap below can be scoped to what THIS
+# invocation wrote, not the whole day's cumulative log (which would double-count an
+# earlier run's warnings against a later, clean retry's rc line). The [ -f ] check
+# (rather than \`wc -l < "$LOG" 2>/dev/null || echo 0\`) matters on the FIRST run of a
+# new day: redirecting FROM a not-yet-existing file is a shell-level open() failure
+# that bash reports on ITS OWN stderr before wc even runs — a 2>/dev/null attached to
+# wc cannot suppress it, and at this point in the script exec hasn't redirected into
+# "$LOG" yet, so that spurious "No such file or directory" would leak to whatever
+# invoked this runner instead of landing in the log like everything else here does.
+if [ -f "$LOG" ]; then LOG_START_LINES=$(wc -l < "$LOG"); else LOG_START_LINES=0; fi
 exec >>"$LOG" 2>&1
 ${pingLines.length ? `${pingLines.join('\n')}\n` : ''}
 # Every run ends with a machine-readable status line a heartbeat monitor can tail:
-# "OK rc=0" on success, "FAILED rc=N" on any failure (set -e exits at the first error).
+# "OK rc=0 warnings=N" on success, "FAILED rc=N warnings=N" on any failure (set -e
+# exits at the first error). warnings=N (#432) is the total count of ⚠-class
+# warnings (warn.ts's chokepoint — see cli.ts's printWarningSummary) that snapshot
+# and/or push above recorded and printed into THIS SAME log via
+# \`exec >>"$LOG" 2>&1\` above, e.g. "snapshot encrypted to a SINGLE recipient key —
+# ... UNRECOVERABLE". Before this, that warning existed only as prose a human had to
+# think to \`cat\` the dated log to find; scheduleStatusReport()'s last_run.warning_count
+# reads this back structurally so \`schedule status\`/\`doctor\` can surface it instead of
+# a silent OK/PASS. Counted by tailing ONLY the lines THIS run appended (from
+# LOG_START_LINES on — see above) for warn.ts's formatWarningSummary() header line
+# ("N warning(s) a human should see...") rather than threading a counter through
+# snapshot/push's separate node invocations — grep matches the leading count of each
+# such header (there is one per subcommand that recorded warnings) and sums them;
+# deliberately NOT anchored on the header's parentheses/em-dash so it survives
+# incidental rewording of the surrounding prose, only the "<N> warning" prefix is
+# load-bearing (formatWarningSummary is exported specifically so it stays pinned by
+# tests).
 ${
   cfg.ping_url
     ? `# This install also configured --ping-url (issue #202): the SAME trap pushes a dead
@@ -376,7 +406,7 @@ ${
 # reachability, the monitor being down, etc.).
 `
     : ''
-}trap 'rc=$?; if [ "$rc" -eq 0 ]; then echo "OK rc=0"; ${pingOkCmd}else echo "FAILED rc=$rc"; ${pingFailCmd}fi' EXIT
+}trap 'rc=$?; wcnt=0; if [ -f "$LOG" ]; then for n in $(tail -n +"$((LOG_START_LINES + 1))" "$LOG" 2>/dev/null | grep -oE "[0-9]+ warning" | grep -oE "^[0-9]+"); do wcnt=$((wcnt + n)); done; fi; if [ "$rc" -eq 0 ]; then echo "OK rc=0 warnings=$wcnt"; ${pingOkCmd}else echo "FAILED rc=$rc warnings=$wcnt"; ${pingFailCmd}fi' EXIT
 
 ${envLines.join('\n')}
 ${spendLines.length ? `${spendLines.join('\n')}\n` : ''}
@@ -926,7 +956,7 @@ async function install(o: CliOptions): Promise<void> {
     );
   }
   console.error(
-    `runs log to ${LOGS_DIR}/nightly-YYYY-MM-DD.log (final line: "OK rc=0" or "FAILED rc=N"); check with: cypher-brain schedule status`,
+    `runs log to ${LOGS_DIR}/nightly-YYYY-MM-DD.log (final line: "OK rc=0 warnings=N" or "FAILED rc=N warnings=N"); check with: cypher-brain schedule status`,
   );
   if (cfg.ping_url) {
     console.error(
@@ -951,7 +981,7 @@ async function readConfig(): Promise<ScheduleConfig> {
   return JSON.parse(await readFile(CONFIG, 'utf8'));
 }
 
-async function lastLog(): Promise<{ name: string; rcLine: string } | null> {
+async function lastLog(): Promise<{ name: string; rcLine: string; warningCount: number | null } | null> {
   let names: string[] = [];
   try {
     names = (await readdir(LOGS_DIR)).filter((n) => /^nightly-\d{4}-\d{2}-\d{2}\.log$/.test(n)).sort();
@@ -961,10 +991,22 @@ async function lastLog(): Promise<{ name: string; rcLine: string } | null> {
   if (names.length === 0) return null;
   const name = names[names.length - 1];
   const lines = (await readFile(join(LOGS_DIR, name), 'utf8')).split('\n').filter((l) => l.trim());
-  // The runner guarantees a trailing OK/FAILED rc line per run; take the last one.
+  // The runner guarantees a trailing OK/FAILED rc line per run; take the last one. The
+  // trailing " warnings=N" suffix is #432 and OPTIONAL in this regex specifically so a
+  // log written by an OLDER runner (pre-#432, bare "OK rc=0"/"FAILED rc=N") still
+  // matches — it just carries an unknown (null, not 0) warning count below, rather than
+  // falling through to the "(empty log)"/last-line fallback as if the log were corrupt.
   const rcLine =
-    [...lines].reverse().find((l) => /^(OK|FAILED) rc=\d+$/.test(l)) || lines[lines.length - 1] || '(empty log)';
-  return { name, rcLine };
+    [...lines].reverse().find((l) => /^(OK|FAILED) rc=\d+( warnings=\d+)?$/.test(l)) ||
+    lines[lines.length - 1] ||
+    '(empty log)';
+  // null = the rc line has no " warnings=N" suffix at all (an old-format log, or the
+  // '(empty log)'/corrupt-line fallback above) — genuinely UNKNOWN, deliberately not
+  // coerced to 0, so callers don't report "no warnings" for a run that predates this
+  // field ever being recorded.
+  const m = /warnings=(\d+)$/.exec(rcLine);
+  const warningCount = m ? Number(m[1]) : null;
+  return { name, rcLine, warningCount };
 }
 
 function nextRunAt(hour: number, minute: number): string {
@@ -1039,7 +1081,20 @@ export type ScheduleStatusReport = {
     readonly legacy: boolean;
     readonly legacy_note?: string;
   };
-  readonly last_run: { readonly log: string; readonly rc_line: string } | null;
+  readonly last_run: {
+    readonly log: string;
+    readonly rc_line: string;
+    /**
+     * #432: the total ⚠-class warnings (warn.ts's chokepoint, e.g. a single-recipient
+     * "UNRECOVERABLE" snapshot) that this run recorded, read back from rc_line's
+     * "warnings=N" suffix — structured, so callers don't have to re-parse the log's
+     * prose. `0` means the run genuinely recorded none. `null` means UNKNOWN, not
+     * zero: this log was written by a runner from before #432 (bare "OK rc=0"/"FAILED
+     * rc=N", no suffix at all), so nothing here can vouch for whether that run had
+     * warnings or not.
+     */
+    readonly warning_count: number | null;
+  } | null;
   readonly next_run: string;
 };
 
@@ -1104,7 +1159,7 @@ export async function scheduleStatusReport(): Promise<ScheduleStatusReport> {
       legacy,
       ...(legacyNote !== undefined ? { legacy_note: legacyNote } : {}),
     },
-    last_run: last ? { log: last.name, rc_line: last.rcLine } : null,
+    last_run: last ? { log: last.name, rc_line: last.rcLine, warning_count: last.warningCount } : null,
     next_run: nextRunAt(cfg.hour, cfg.minute),
   };
 }
@@ -1181,6 +1236,15 @@ async function status(o: CliOptions): Promise<void> {
   }
   if (r.trigger.legacy_note) console.log(`note: ${r.trigger.legacy_note}`);
   console.log(r.last_run ? `last run: ${r.last_run.log} — ${r.last_run.rc_line}` : 'last run: none yet');
+  // #432: the trailing rc line alone ("OK rc=0 warnings=1") is easy to skim past as a
+  // plain success — call the warning out on its OWN line so it can't hide in a
+  // machine-formatted status line. warning_count is `0`/`null`-safe here: both fall
+  // through (a genuinely clean run and an old-format log with no recorded count).
+  if (r.last_run?.warning_count) {
+    console.log(
+      `⚠  last run recorded ${r.last_run.warning_count} warning(s) a human should see — inspect ${r.last_run.log} in the schedule's logs directory (run summary block) for details`,
+    );
+  }
   console.log(`next run: ${r.next_run} (local)`);
 }
 

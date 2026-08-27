@@ -582,7 +582,11 @@ bash "$RUNNER" || { echo "[FAIL] second runner invocation (same day, immediate r
 STORE_COUNT_2="$(find "$CYPHER_BRAIN_FILE_DIR" -maxdepth 1 -name '*.age' 2>/dev/null | wc -l | tr -d ' ')"
 
 [ -f "$LOG" ] || { echo "[FAIL] dated log not produced: $LOG"; exit 1; }
-tail -n 1 "$LOG" | grep -q '^OK rc=0$' || { echo "[FAIL] log does not end with OK rc=0 after the second run"; tail -n 3 "$LOG"; exit 1; }
+# #432: the trailing line now carries a " warnings=N" suffix — this fixture's install
+# never passes --recipient, so it snapshots to the single default identity and DOES
+# record the single-recipient warning every run (N is not pinned to a specific value
+# here; the invariant this line checks is "ended OK", not the warning count).
+tail -n 1 "$LOG" | grep -qE '^OK rc=0 warnings=[0-9]+$' || { echo "[FAIL] log does not end with OK rc=0 warnings=N after the second run"; tail -n 3 "$LOG"; exit 1; }
 grep -q 'SKIPPED: content, recipients and signing unchanged' "$LOG" || { echo "[FAIL] #100: second same-day run (identical \$SRC content) did not SKIP the re-upload — the runner's --skip-unchanged is not wired in / not working"; tail -n 20 "$LOG"; exit 1; }
 [ "$STORE_COUNT_2" = "$STORE_COUNT_1" ] || { echo "[FAIL] #100: the file backend store gained a new object on the second (unchanged-content) run — expected $STORE_COUNT_1, got $STORE_COUNT_2 (skip-unchanged did not prevent the re-upload)"; exit 1; }
 SNAP_COUNT="$(find "$SNAP_DIR" -maxdepth 1 -name "brain-$TODAY_COMPACT*.age" | wc -l | tr -d ' ')"
@@ -611,7 +615,7 @@ STORE_COUNT_3="$(find "$CYPHER_BRAIN_FILE_DIR" -maxdepth 1 -name '*.age' 2>/dev/
 RUN3_LOG="$(tail -n "+$((LOG_LINES_BEFORE_RUN3 + 1))" "$LOG")"
 if echo "$RUN3_LOG" | grep -q 'SKIPPED:'; then echo "[FAIL] #100: the 3rd run (changed content) was wrongly SKIPPED"; echo "$RUN3_LOG"; exit 1; fi
 echo "$RUN3_LOG" | grep -q '^pushed -> file:' || { echo "[FAIL] 3rd run log lacks the pushed confirmation line"; echo "$RUN3_LOG"; exit 1; }
-tail -n 1 "$LOG" | grep -q '^OK rc=0$' || { echo "[FAIL] log does not end with OK rc=0 after the 3rd (changed-content) run"; tail -n 3 "$LOG"; exit 1; }
+tail -n 1 "$LOG" | grep -qE '^OK rc=0 warnings=[0-9]+$' || { echo "[FAIL] log does not end with OK rc=0 warnings=N after the 3rd (changed-content) run"; tail -n 3 "$LOG"; exit 1; }
 [ "$(wc -l < "$IDX" | tr -d ' ')" = "3" ] || { echo "[FAIL] index.tsv does not have exactly 3 appended lines after 3 runs (2 unchanged + 1 changed)"; cat "$IDX"; exit 1; }
 [ "$(awk -F'\t' '{print $2"\t"$3}' "$IDX" | sort -u | wc -l | tr -d ' ')" = "2" ] || { echo "[FAIL] #100: index.tsv should now have exactly 2 DISTINCT locator+sha pairs (the 2 unchanged runs sharing one, the changed run with a new one)"; cat "$IDX"; exit 1; }
 echo "[PASS] a genuinely changed \$SRC on a same-day 3rd run triggers a REAL re-upload (new store object, new locator+sha in index.tsv, no false SKIPPED) — --skip-unchanged never suppresses an actual content change"
@@ -634,7 +638,8 @@ if (j.configured.at !== '03:30') throw new Error('expected configured.at 03:30, 
 if (j.configured.backend !== 'file') throw new Error('expected configured.backend file, got ' + j.configured.backend);
 if (typeof j.runner !== 'string' || j.runner.length === 0) throw new Error('expected a non-empty runner path');
 if (!j.last_run || !/^nightly-.*\.log$/.test(j.last_run.log)) throw new Error('expected last_run.log to name a nightly log, got ' + JSON.stringify(j.last_run));
-if (j.last_run.rc_line !== 'OK rc=0') throw new Error('expected last_run.rc_line OK rc=0, got ' + j.last_run.rc_line);
+if (!/^OK rc=0 warnings=\d+$/.test(j.last_run.rc_line)) throw new Error('expected last_run.rc_line to match OK rc=0 warnings=N (#432), got ' + j.last_run.rc_line);
+if (typeof j.last_run.warning_count !== 'number') throw new Error('expected last_run.warning_count to be a number (#432), got ' + JSON.stringify(j.last_run.warning_count));
 if (typeof j.next_run !== 'string' || j.next_run.length === 0) throw new Error('expected a non-empty next_run');
 if (!j.trigger || typeof j.trigger.loaded !== 'string') throw new Error('expected trigger.loaded to be a string');
 if (j.trigger.legacy !== false) throw new Error('expected trigger.legacy false for a freshly-installed schedule');
@@ -646,8 +651,8 @@ echo "== (c2) a failing run leaves a trailing FAILED rc=N line (heartbeat contra
 CYPHER_BRAIN_SCHEDULE_DIR="$TMP/sched-fail" cb schedule install --backend file --dir "$TMP/does-not-exist" --no-load > /dev/null 2>&1 \
   || { echo "[FAIL] install (failure fixture) exited non-zero"; exit 1; }
 if bash "$TMP/sched-fail/nightly.sh"; then echo "[FAIL] runner with a missing --dir succeeded"; exit 1; fi
-tail -n 1 "$TMP/sched-fail/logs/nightly-$TODAY.log" | grep -q '^FAILED rc=[0-9][0-9]*$' \
-  || { echo "[FAIL] failing run did not end the log with FAILED rc=N"; tail -n 3 "$TMP/sched-fail/logs/nightly-$TODAY.log"; exit 1; }
+tail -n 1 "$TMP/sched-fail/logs/nightly-$TODAY.log" | grep -qE '^FAILED rc=[0-9][0-9]* warnings=[0-9]+$' \
+  || { echo "[FAIL] failing run did not end the log with FAILED rc=N warnings=N"; tail -n 3 "$TMP/sched-fail/logs/nightly-$TODAY.log"; exit 1; }
 echo "[PASS] failing run: non-zero exit + trailing FAILED rc=N in the dated log"
 
 echo "== (c3) a CYPHER_BRAIN_HOME containing an XML metacharacter ('&') still produces a VALID, well-formed launchd plist (macOS only) =="
@@ -684,7 +689,7 @@ bash "$RUNNER" || { echo "[FAIL] runner with a not-yet-existing --index-file dir
 [ -f "$IDX_NESTED_DIR/index.tsv" ] || { echo "[FAIL] index file was not created under the nested directory"; exit 1; }
 [ "$(wc -l < "$IDX_NESTED_DIR/index.tsv" | tr -d ' ')" = "1" ] || { echo "[FAIL] index file does not have exactly 1 appended line"; cat "$IDX_NESTED_DIR/index.tsv"; exit 1; }
 [ "$(awk -F'\t' '{print NF; exit}' "$IDX_NESTED_DIR/index.tsv")" = "3" ] || { echo "[FAIL] index line is not timestamp/locator/sha256"; exit 1; }
-tail -n 1 "$LOG" | grep -q '^OK rc=0$' || { echo "[FAIL] log does not end with OK rc=0 after the nested-index-dir run"; tail -n 3 "$LOG"; exit 1; }
+tail -n 1 "$LOG" | grep -qE '^OK rc=0 warnings=[0-9]+$' || { echo "[FAIL] log does not end with OK rc=0 warnings=N after the nested-index-dir run"; tail -n 3 "$LOG"; exit 1; }
 echo "[PASS] runner mkdir -p's the --index-file's parent directory before appending, on a not-yet-existing nested path"
 
 echo "== (e0) uninstall --no-load is a pure status report: never orphans a live trigger by deleting only the files (#113) =="
