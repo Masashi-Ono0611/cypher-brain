@@ -1278,7 +1278,26 @@ async function status(o: CliOptions): Promise<void> {
       `⚠  last run recorded ${r.last_run.warning_count} warning(s) a human should see — inspect ${r.last_run.log} in the schedule's logs directory (run summary block) for details`,
     );
   }
-  console.log(`next run: ${r.next_run} (local)`);
+  // #433: next_run is computed purely from the configured hour/minute — it never
+  // checked trigger.loaded, so a --no-load (or otherwise unregistered) schedule
+  // printed a confident "next run: <time>" right below a "(loaded: no)" trigger line
+  // that already said nothing will actually happen. Reword the PLAIN-TEXT line to
+  // match what the trigger line above it says (rather than contradicting it) whenever
+  // loaded isn't a confirmed 'yes'. 'no' and 'unknown' are NOT the same claim (Codex
+  // review) — 'no' means the trigger was actually checked and is confirmed absent;
+  // 'unknown' means the check itself failed (e.g. crontab errored), so it may well BE
+  // registered and this code just cannot confirm it — each gets its own honest
+  // wording rather than both collapsing into "is not registered". next_run itself is
+  // left UNCHANGED in --json (above) — a --json consumer already has trigger.loaded to
+  // cross-reference, and the computed time is still useful to know ("this is when it
+  // WOULD run").
+  console.log(
+    r.trigger.loaded === 'yes'
+      ? `next run: ${r.next_run} (local)`
+      : r.trigger.loaded === 'no'
+        ? `next run: none — the ${r.trigger.type} trigger is not registered (loaded: no, see above); would run at ${r.next_run} (local) if loaded`
+        : `next run: unknown — the ${r.trigger.type} trigger's registration could not be confirmed (loaded: unknown, see above); would run at ${r.next_run} (local) if loaded`,
+  );
 }
 
 async function uninstall(o: CliOptions): Promise<void> {
