@@ -135,7 +135,11 @@ export function buildRecoveryKit(k: KitInputs): string {
   } else {
     lines.push('!!! NO BACKUP IDENTITY IS IN THIS KIT: kit-only recovery — on a fresh machine with ZERO other prior');
     lines.push('    knowledge — is NOT possible right now. Recovery IS possible if you still have the PRIMARY');
-    lines.push(`    identity itself, originally at: ${k.primaryIdentityPath}`);
+    lines.push(
+      `    identity itself, originally at: ${k.primaryIdentityPath}${
+        k.backend === 'file' ? ' — AND the file-backend store above (also copied, or this same machine)' : ''
+      }.`,
+    );
     lines.push('    See "Your actual options" in the RECOVERY STEPS section further below for the exact commands.');
   }
   lines.push('');
