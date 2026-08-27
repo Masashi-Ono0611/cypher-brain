@@ -81,6 +81,13 @@
 //      scripts/selftest-push-partial-failure.sh — the file backend's
 //      content-addressed locator makes that failure deterministic to force
 //      only outside the combined snapshot+push call this file drives.
+//   5. runScheduleStatusNotInstalledTest() (#440): a SEPARATE server + a fresh,
+//      isolated CYPHER_BRAIN_HOME with NOTHING installed proves schedule_status
+//      reports the specific ERR_NOT_CONFIGURED code (cb_code CB-E014 still intact)
+//      instead of the generic ERR_INTERNAL every unrelated failure falls back to —
+//      plus a regression control: a genuinely corrupt schedule.json (a real,
+//      existing-setup failure, not "nothing installed") still reports ERR_INTERNAL,
+//      not swallowed into the same bucket.
 //
 // Exits 0 on success, 1 on any failure with a descriptive message on stderr.
 
@@ -118,6 +125,7 @@ async function main() {
   try {
     await run(tmp);
     await runKeygenWalletTests(tmp);
+    await runScheduleStatusNotInstalledTest(tmp);
     await runIdempotencyTtlTest(tmp);
     await runIdempotencyTtlValidationTest(tmp);
     await runIdempotencyCorruptedLogTest(tmp);
@@ -586,6 +594,102 @@ async function runKeygenWalletTests(tmp) {
     }
     try {
       child2.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// #440: schedule_status against a home with NOTHING installed must report a specific,
+// checkable code (ERR_NOT_CONFIGURED) rather than the generic ERR_INTERNAL every other
+// unexpected failure falls back to — the same "expected precondition, not a real
+// failure" distinction #426 already gave the CLI's own `schedule status --json`
+// ({installed:false}, no error) and doctor.ts's [SKIP] handling. A SEPARATE, fresh,
+// isolated CYPHER_BRAIN_HOME (never touched by schedule_install) so this exercises the
+// real "nothing configured yet" path, not a state some earlier test in run() already
+// moved past.
+async function runScheduleStatusNotInstalledTest(tmp) {
+  const home4 = join(tmp, 'home-schedule-not-installed');
+  const child4 = spawn(process.execPath, [SERVER_PATH], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CYPHER_BRAIN_HOME: home4 },
+  });
+  const { send, waitFor } = makeRpcClient(child4);
+  try {
+    send({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'ci-smoke', version: '0.0.0' } },
+    });
+    await waitFor(1);
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    await wait(100);
+
+    // Positive control: schedule_status on a fresh home (no schedule.json) must fail
+    // with the new specific code, not ERR_INTERNAL — and the inner CB-E014 pattern
+    // (errors.ts, matched on the message text) must still be identifiable via cb_code,
+    // exactly as it is for every other error this server reports (#212).
+    send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'schedule_status', arguments: {} } });
+    const notInstalled = await waitFor(2);
+    const notInstalledSc = notInstalled.result?.structuredContent;
+    if (notInstalled.result?.isError !== true) {
+      throw new Error(
+        `schedule_status (nothing installed) did not fail: ${JSON.stringify(notInstalled.result).slice(0, 300)}`,
+      );
+    }
+    if (notInstalledSc?.code !== 'ERR_NOT_CONFIGURED') {
+      throw new Error(
+        `schedule_status (nothing installed) reported the wrong code — expected ERR_NOT_CONFIGURED, ` +
+          `not the generic ERR_INTERNAL every unrelated failure falls back to: ${JSON.stringify(notInstalledSc)}`,
+      );
+    }
+    if (notInstalledSc?.cb_code !== 'CB-E014') {
+      throw new Error(`schedule_status (nothing installed) cb_code unexpected: ${JSON.stringify(notInstalledSc)}`);
+    }
+
+    // Regression control: a DIFFERENT failure reading an EXISTING schedule (a corrupt
+    // schedule.json, here — the same "real problem with an existing setup" schedule.ts's
+    // own status() comment calls out) must NOT be swallowed into the same
+    // ERR_NOT_CONFIGURED bucket. It stays a real, generic ERR_INTERNAL.
+    // CYPHER_BRAIN_SCHEDULE_DIR is not overridden above, so schedule.json lives at the
+    // default HOME/schedule/schedule.json (config.ts's SCHEDULE_DIR) — same path
+    // scheduleStatusReport()'s readConfig() checks for "installed at all".
+    const scheduleDir4 = join(home4, 'schedule');
+    await mkdir(scheduleDir4, { recursive: true });
+    await writeFile(join(scheduleDir4, 'schedule.json'), '{ not valid json', 'utf8');
+    send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'schedule_status', arguments: {} } });
+    const corrupt = await waitFor(3);
+    const corruptSc = corrupt.result?.structuredContent;
+    if (corrupt.result?.isError !== true) {
+      throw new Error(
+        `schedule_status (corrupt schedule.json) did not fail: ${JSON.stringify(corrupt.result).slice(0, 300)}`,
+      );
+    }
+    if (corruptSc?.code === 'ERR_NOT_CONFIGURED') {
+      throw new Error(
+        `schedule_status (corrupt schedule.json) was misclassified as ERR_NOT_CONFIGURED — a real, ` +
+          `existing-setup failure must not be swallowed into the "nothing installed" bucket: ${JSON.stringify(corruptSc)}`,
+      );
+    }
+    if (corruptSc?.code !== 'ERR_INTERNAL') {
+      throw new Error(
+        `schedule_status (corrupt schedule.json) reported an unexpected code: ${JSON.stringify(corruptSc)}`,
+      );
+    }
+
+    process.stdout.write(
+      'MCP SMOKE (schedule_status not-installed): PASS — ERR_NOT_CONFIGURED (not ERR_INTERNAL) for nothing ' +
+        'installed, cb_code CB-E014 preserved, a genuinely corrupt schedule.json still reports ERR_INTERNAL\n',
+    );
+  } finally {
+    try {
+      child4.stdin.end();
+    } catch {
+      /* ignore */
+    }
+    try {
+      child4.kill();
     } catch {
       /* ignore */
     }

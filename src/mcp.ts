@@ -63,7 +63,7 @@ import {
   writeReplayedSavedLocator,
 } from './lib/pushpull.js';
 import { lookupIdempotencyResult, recordIdempotencyResult, IdempotencyStoreError } from './lib/idempotency.js';
-import { schedule, scheduleStatusReport } from './lib/schedule.js';
+import { schedule, scheduleStatusReport, ScheduleNotInstalledError } from './lib/schedule.js';
 import { estimateCost } from './lib/estimate.js';
 import { keygenAt } from './lib/keys.js';
 import { wallet, tonWalletConfigured } from './lib/wallet.js';
@@ -766,7 +766,7 @@ const SCHEDULE_STATUS_TOOL: Tool = {
     'by `cypher-brain schedule install`: the configured time + backend, whether the launchd/cron ' +
     'trigger is actually registered, the last run\'s log filename and its final "OK rc=0"/"FAILED ' +
     'rc=N" line, and the next scheduled run — the SAME report `cypher-brain schedule status` prints ' +
-    'on the CLI, verbatim (one string per line). No arguments. Fails with ERR_INTERNAL if no ' +
+    'on the CLI, verbatim (one string per line). No arguments. Fails with ERR_NOT_CONFIGURED if no ' +
     'schedule is installed yet — call schedule_install first.',
   inputSchema: {
     type: 'object',
@@ -2015,8 +2015,28 @@ async function handleScheduleInstall(args: ToolArgs): Promise<CallToolResult> {
 // about. That reasoning was always true of every tool here, not just this one — it is
 // now stated once and enforced for all of them in assertDeclaredArgs (#300), which is
 // why this takes no `args` at all.
+// #440: scheduleStatusReport() throws ScheduleNotInstalledError (CB-E014) for "nothing
+// installed yet" — the SAME expected precondition #426 already made the CLI's own
+// `schedule status` treat as a normal, non-error result, and doctor.ts's checkSchedule()
+// already treats as [SKIP] rather than a failure. Left uncaught, that throw fell through
+// to the switch's generic catch and structuredErr()'s `ERR_INTERNAL` fallback — telling
+// an agent the server was broken, indistinguishable from any OTHER thing scheduleStatusReport()
+// could fail on (a corrupt schedule.json, a crontab/launchctl call that itself errored),
+// which stay real ERR_INTERNAL failures on purpose. `ERR_NOT_CONFIGURED` names ONLY this
+// one checkable (`instanceof`) condition, so a caller can branch on the code instead of
+// string-matching the message the way `errors.ts`'s CB-E014 pattern already does. This
+// stays a thrown error (not a structured `{installed:false}` result the way the CLI's
+// `--json` output now is, #426) deliberately: the resource at SCHEDULE_STATUS_URI below
+// serves this SAME scheduleStatusReport() call and is documented to error when nothing is
+// installed — matching that, rather than making the tool and the resource disagree, is
+// the smaller and safer fix (issue #440's own suggestion also allows for it).
 async function handleScheduleStatus(): Promise<CallToolResult> {
-  return structuredOk(await scheduleStatusReport());
+  try {
+    return structuredOk(await scheduleStatusReport());
+  } catch (e) {
+    if (!(e instanceof ScheduleNotInstalledError)) throw e;
+    throw new ToolError('ERR_NOT_CONFIGURED', e.message);
+  }
 }
 
 // keygenAt() (src/lib/keys.ts) is the SAME generation logic `cypher-brain keygen`
