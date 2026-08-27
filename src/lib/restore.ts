@@ -2,8 +2,8 @@
 import { rm, stat, readFile, writeFile, readdir, rename, lstat } from 'node:fs/promises';
 import { mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
-import { createHash, randomBytes } from 'node:crypto';
+import { basename, join, relative } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { Decrypter } from 'age-encryption';
 import {
   AGE_MAGIC,
@@ -33,8 +33,9 @@ import type { CliOptions } from './types.js';
 
 // #228: this file's StrykerJS mutation run (`npm run mutation-test`) is deliberately
 // scoped, with the ignore-comment markers below, to ONLY isSafeComponentName() and
-// encodeSourcePath() — the two manifest-field guards PR #198's review finding was
-// about, and the ones scripts/selftest-properties.mjs property-tests. Everything else
+// shortSourceLabel() (formerly encodeSourcePath(), renamed by #423) — the two
+// manifest-field guards PR #198's review finding was about, and the ones
+// scripts/selftest-properties.mjs property-tests. Everything else
 // in this file (the tar/pg_restore process orchestration, signal-guard wiring, the
 // verify() report) has no fast in-process test oracle for Stryker to run per mutant —
 // mutating it would only produce "survived" noise, not a security signal. See
@@ -289,38 +290,46 @@ interface RestoreManifestComponent {
   source?: unknown;
 }
 
-// Cap on the human-legible part of an encoded directory name (see encodeSourcePath) —
-// keeps `<index>-<encoded>` comfortably under common 255-byte filename limits even for a
-// deeply nested source path, before any truncation suffix is appended.
+// Cap on the short, human-legible label built by shortSourceLabel() below — keeps
+// `<index>-<label>` comfortably under common 255-byte filename limits, and keeps
+// `ls expanded/` scannable even with many components (the point of #423).
 //
-// Exported (#228) so scripts/selftest-properties.mjs can state its length-bound
-// property in terms of the same constant, instead of a second, driftable copy of 160.
-export const PATH_ENCODE_MAX = 160;
+// Exported (#228, kept through #423's rename) so scripts/selftest-properties.mjs can
+// state its length-bound property in terms of the same constant, instead of a second,
+// driftable copy of 64.
+export const SHORT_LABEL_MAX = 64;
 
-// Encode an absolute source path into a filesystem-safe directory-name fragment: drop the
-// leading separator(s), then replace anything that is not an ASCII alnum/dot/dash/
-// underscore with '_'. Deliberately NOT collision-proof by itself (two different paths
-// could in principle encode to the same string) — expandComponents() below always
-// prefixes the directory name with the component's own 1-based sequence number, which
-// alone guarantees no two components ever land in the same directory (manifest
-// component order is stable per snapshot). This function only needs to stay human-
-// legible enough to recognize the source at a glance.
+// Build the short, human-legible label used for an expanded component's directory name:
+// just the final path segment (basename) of the component's original absolute source
+// path, then sanitized to a filesystem-safe fragment (drop anything that is not an ASCII
+// alnum/dot/dash/underscore) and capped at SHORT_LABEL_MAX.
 //
-// Exported (#228) so scripts/selftest-properties.mjs can property-test, for ANY input
-// string (manifest.components[].source is attacker-controlled — see the block above),
-// that the output never contains a path separator — the invariant expandComponents()
-// below relies on to build a single, un-escapable directory-name segment out of it.
+// #423: this used to be encodeSourcePath(), which flattened the ENTIRE absolute path
+// (every separator replaced, truncated-and-hashed past 160 chars) into the directory
+// name itself, on the theory that the name needed to be collision-proof. It doesn't:
+// expandComponents() below always prefixes the directory name with the component's own
+// 1-based sequence number, which ALONE already guarantees no two components ever land in
+// the same directory (manifest component order is stable per snapshot) — including the
+// #181 case this scheme exists for in the first place (two --dir sources sharing a
+// basename, e.g. `001-memory` vs `002-memory`). Encoding the full path into the name on
+// top of that bought nothing but unreadable, 100+-character directory names for any
+// realistic (deep) source path. The full original absolute path is still recorded,
+// unambiguously, in expanded/README.txt's mapping table (written unconditionally by
+// expandComponents() below) — that table, not the directory name, is the authoritative
+// source→directory mapping.
+//
+// Deliberately NOT unique by itself (two different sources can share a basename, and
+// this function does nothing to distinguish them) — see above for why that is fine.
+//
+// Exported (#228, kept through #423's rename) so scripts/selftest-properties.mjs can
+// property-test, for ANY input string (manifest.components[].source is
+// attacker-controlled — see the block above), that the output never contains a path
+// separator — the invariant expandComponents() below relies on to build a single,
+// un-escapable directory-name segment out of it.
 // Stryker restore all
-export function encodeSourcePath(abs: string): string {
-  const flat = abs.replace(/^[/\\]+/, '').replace(/[^A-Za-z0-9._-]+/g, '_');
-  if (flat.length <= PATH_ENCODE_MAX) return flat;
-  // A very long/deeply-nested path could otherwise blow past a filesystem's per-component
-  // name limit once the numeric prefix is added. Truncate, then append a short digest of
-  // the FULL original path — purely so a human skimming expanded/ can still tell two
-  // long, similarly-prefixed paths apart (the numeric prefix already makes the directory
-  // itself unique regardless of this hash).
-  const digest = createHash('sha256').update(abs).digest('hex').slice(0, 8);
-  return `${flat.slice(0, PATH_ENCODE_MAX)}-${digest}`;
+export function shortSourceLabel(abs: string): string {
+  const safe = basename(abs).replace(/[^A-Za-z0-9._-]+/g, '_');
+  return safe.length <= SHORT_LABEL_MAX ? safe : safe.slice(0, SHORT_LABEL_MAX);
 }
 // Stryker disable all
 
@@ -452,13 +461,15 @@ function assertSupportedManifestSchema(manifestText: string, manifestPath: strin
 }
 
 // Auto-expand every --dir/--profile component's staged tarball under
-// <out-dir>/expanded/<NNN>-<encoded source path>/, keyed to the component's ORIGINAL
+// <out-dir>/expanded/<NNN>-<short source label>/, keyed to the component's ORIGINAL
 // absolute source path (manifest.components[].source) rather than its on-disk name — see
 // #181: multiple --dir sources sharing a basename (e.g. many `~/.claude/projects/*/
 // memory/` dirs under --profile claude-code) all restore to opaque, indistinguishable
 // names like memory.tar.gz / memory-1.tar.gz / memory-2.tar.gz, and manually cross-
 // referencing the manifest to untar each one correctly does not scale past a handful of
-// components.
+// components. (#423: the directory NAME itself only carries a short, readable label —
+// see shortSourceLabel's doc comment below — expanded/README.txt's mapping table is what
+// actually resolves each directory back to its full original source path.)
 //
 // A component with a `source` field is exactly a --dir/--profile component: pg_dump's
 // component (kind 'pg_dump:custom') never has one, so filtering on `source` alone already
@@ -503,7 +514,7 @@ async function expandComponents(outDir: string): Promise<void> {
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
     // A forged manifest `name` (e.g. "../../../etc/cron.d/evil.tar.gz") must never be
-    // trusted as a path component — see the threat-model note above encodeSourcePath.
+    // trusted as a path component — see the threat-model note above shortSourceLabel.
     // Reject anything that is not a bare filename and move on to the next component;
     // this is the ONLY thing that ever builds `archivePath` from `c.name`.
     if (!isSafeComponentName(c.name)) {
@@ -518,7 +529,11 @@ async function expandComponents(outDir: string): Promise<void> {
     // --out-dir already held a same-named file) — nothing to expand in that case.
     if (!(await exists(archivePath))) continue;
 
-    const dirName = `${String(i + 1).padStart(3, '0')}-${encodeSourcePath(c.source)}`;
+    // The "<NNN>-" prefix alone makes this directory name unique (see shortSourceLabel's
+    // doc comment above) — it also means the full name can never itself equal "." or
+    // ".." even on a source whose basename would (e.g. source === ".."), with no extra
+    // case to handle here.
+    const dirName = `${String(i + 1).padStart(3, '0')}-${shortSourceLabel(c.source)}`;
     const targetDir = join(expandedRoot, dirName);
     try {
       await refuseIfSymlink(targetDir, 'expanded component directory');

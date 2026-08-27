@@ -15,15 +15,17 @@
 // minimal counterexample.
 //
 // Scope, stated narrowly on purpose (same discipline as selftest-error-codes.mjs's own
-// header): this file property-tests THREE specific, already-identified invariants — the
-// two manifest-field guards in src/lib/restore.ts (#198's vulnerability class) and the
-// age encrypt/decrypt roundtrip in src/lib/crypt.ts. It does not attempt to fuzz the
-// whole CLI surface, and it is not a substitute for scripts/selftest-cctv-age.mjs (which
-// checks typage's CONFORMANCE to the age spec using upstream's own vectors — a different
-// question from "does OUR code's usage of typage roundtrip correctly").
+// header): this file property-tests FOUR specific, already-identified invariants — the
+// two manifest-field guards in src/lib/restore.ts (#198's vulnerability class), the
+// expanded/ directory-name uniqueness invariant those guards' numeric-index prefix relies
+// on (#181/#423), and the age encrypt/decrypt roundtrip in src/lib/crypt.ts. It does not
+// attempt to fuzz the whole CLI surface, and it is not a substitute for
+// scripts/selftest-cctv-age.mjs (which checks typage's CONFORMANCE to the age spec using
+// upstream's own vectors — a different question from "does OUR code's usage of typage
+// roundtrip correctly").
 import fc from 'fast-check';
 import { join, resolve, sep } from 'node:path';
-import { isSafeComponentName, encodeSourcePath, PATH_ENCODE_MAX } from '../src/lib/restore.ts';
+import { isSafeComponentName, shortSourceLabel, SHORT_LABEL_MAX } from '../src/lib/restore.ts';
 import { generateKeypair, newEncrypter, newDecrypter } from '../src/lib/crypt.ts';
 
 let failed = 0;
@@ -118,24 +120,25 @@ check(
   isSafeComponentName('../../../etc/cron.d/evil.tar.gz') === false,
 );
 
-// ---- restore.ts: encodeSourcePath (the `source` field's guard) ----
+// ---- restore.ts: shortSourceLabel (the `source` field's directory-name guard) ----
 //
-// encodeSourcePath()'s output is used as ONE path segment (prefixed with a numeric
-// index, see restore.ts) — it must never smuggle a '/' or '\\' through, regardless of
-// what a forged manifest's `source` field contains, or that numeric-prefix defense
-// stops guaranteeing a single directory-name segment. `sourceArb` deliberately spans
-// well past PATH_ENCODE_MAX (160) so the truncate-and-hash branch is exercised too,
-// not just the short-input passthrough — a length-only regression in that branch
-// would otherwise never come up against a generator that only ever produces short
-// strings.
-// Boundary-exact lengths around PATH_ENCODE_MAX (160): random sampling alone rarely
-// lands on the EXACT length the truncate-vs-passthrough branch flips on, no matter how
-// many runs -- these constants guarantee the mutation-testing kill oracle actually sees
-// the boundary (off-by-one <= vs < mutants, "always truncate"/"never truncate" mutants).
+// #423: renamed/simplified from encodeSourcePath(), which used to flatten the ENTIRE
+// absolute source path (every separator replaced, truncated-and-hashed past 160 chars)
+// into the directory name itself. shortSourceLabel() instead only takes the source's
+// basename — expandComponents() (restore.ts) relies ENTIRELY on the numeric index it
+// prefixes onto this label for directory-name uniqueness (see the third property below),
+// not on this function. The two threat-model properties this guard still needs to satisfy
+// are unchanged: shortSourceLabel()'s output is used as ONE path segment (prefixed with
+// that numeric index) — it must never smuggle a '/' or '\\' through, regardless of what a
+// forged manifest's `source` field contains, and must stay bounded in length.
+// Boundary-exact lengths around SHORT_LABEL_MAX (64): random sampling alone rarely lands
+// on the EXACT length the truncate-vs-passthrough branch flips on, no matter how many
+// runs -- these constants guarantee the mutation-testing kill oracle actually sees the
+// boundary (off-by-one <= vs < mutants, "always truncate"/"never truncate" mutants).
 const boundaryLengthArb = fc.oneof(
-  fc.constant('a'.repeat(159)),
-  fc.constant('a'.repeat(160)),
-  fc.constant('a'.repeat(161)),
+  fc.constant('a'.repeat(63)),
+  fc.constant('a'.repeat(64)),
+  fc.constant('a'.repeat(65)),
 );
 const sourceArb = fc.oneof(
   wideString(),
@@ -143,28 +146,49 @@ const sourceArb = fc.oneof(
   traversalLike,
   boundaryLengthArb,
 );
-// numRuns raised for these two: wideString()'s full binary-code-unit domain is vastly
-// larger than the old ASCII-only default, so the mutation-testing kill oracle (a mutant
-// that misbehaves only on specific narrow inputs, e.g. one particular character class in
-// encodeSourcePath's own replace regex) needs more samples to stay as likely to land on
-// a triggering input as it was against the smaller domain -- 200 runs alone let real
+// numRuns raised for these: wideString()'s full binary-code-unit domain is vastly larger
+// than the old ASCII-only default, so the mutation-testing kill oracle (a mutant that
+// misbehaves only on specific narrow inputs, e.g. one particular character class in
+// shortSourceLabel's own replace regex) needs more samples to stay as likely to land on a
+// triggering input as it was against the smaller domain -- 200 runs alone let real
 // mutation-score coverage regress after the string arbitrary was widened.
 await property(
-  'encodeSourcePath: never emits a path separator, for any input',
+  'shortSourceLabel: never emits a path separator, for any input',
   fc.property(sourceArb, (source) => {
-    const encoded = encodeSourcePath(source);
-    return !encoded.includes('/') && !encoded.includes('\\');
+    const label = shortSourceLabel(source);
+    return !label.includes('/') && !label.includes('\\');
   }),
   { numRuns: 1000 },
 );
 
-// The per-component directory name is `<3-digit index>-<encoded>` (restore.ts) — this
-// pins encodeSourcePath()'s own documented contribution to that budget: comfortably
+// The per-component directory name is `<3-digit index>-<label>` (restore.ts) — this
+// pins shortSourceLabel()'s own documented contribution to that budget: comfortably
 // under common 255-byte filename limits regardless of how long/deeply-nested the
-// forged `source` string is. `+ 9` = a '-' plus the 8-hex-char digest suffix.
+// forged `source` string is.
 await property(
-  'encodeSourcePath: output length never exceeds PATH_ENCODE_MAX + digest suffix, for any input',
-  fc.property(sourceArb, (source) => encodeSourcePath(source).length <= PATH_ENCODE_MAX + 9),
+  'shortSourceLabel: output length never exceeds SHORT_LABEL_MAX, for any input',
+  fc.property(sourceArb, (source) => shortSourceLabel(source).length <= SHORT_LABEL_MAX),
+  { numRuns: 1000 },
+);
+
+// #423/#181: shortSourceLabel() is deliberately NOT collision-resistant by itself — two
+// different --dir sources sharing a basename (e.g. many `~/.claude/projects/*/memory/`
+// dirs — the exact case #181 introduced this whole expanded/ scheme to disambiguate)
+// produce the IDENTICAL label. expandComponents() instead relies entirely on prefixing
+// each directory name with the component's own 1-based sequence number to guarantee no
+// two components ever land in the same directory. This property pins exactly that
+// invariant at the level restore.ts actually builds the directory name (see its
+// `${String(i + 1).padStart(3, '0')}-${shortSourceLabel(c.source)}` expression): for ANY
+// two DISTINCT indices, even with the SAME source string fed to both (the worst case —
+// identical basenames), the resulting directory names never collide.
+await property(
+  'expanded/ directory names: distinct component index alone guarantees distinct directory names, even for identical sources (#181)',
+  fc.property(fc.integer({ min: 1, max: 999 }), fc.integer({ min: 1, max: 999 }), sourceArb, (i1, i2, source) => {
+    if (i1 === i2) return true; // same index is not the case under test
+    const dirName1 = `${String(i1).padStart(3, '0')}-${shortSourceLabel(source)}`;
+    const dirName2 = `${String(i2).padStart(3, '0')}-${shortSourceLabel(source)}`;
+    return dirName1 !== dirName2;
+  }),
   { numRuns: 1000 },
 );
 
