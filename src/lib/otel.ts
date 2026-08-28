@@ -56,9 +56,22 @@
 // that happened: a misconfigured collector made every command ~20x slower with byte-
 // identical stdout/stderr to a healthy run — a real dogfooding session had no way to
 // tell "tracing silently failed" from "this machine is just slow today". boundedFlush()
-// below now reports whether the flush actually completed and warns ONCE (the same
-// `warn()`/once-per-process shape the packages-not-available case already uses) when it
-// did not — still never gating: the command's own result is untouched either way.
+// below now reports whether the flush actually completed, ONCE per process (the same
+// once-per-process shape the packages-not-available case already uses) — still never
+// gating: the command's own result is untouched either way.
+//
+// #653: boundedFlush() itself does NOT call warn() any more — it used to, but warn()'s
+// `recorded` buffer (warn.ts) is drained per CALL (mcp.ts's captureCall()), and this
+// flush only ever runs AFTER the handler that owns THIS span has already built its
+// CallToolResult (withSpan() wraps the whole handler, span.end()+flush happen in ITS
+// finally, once fn() — the handler — has already returned). In the CLI (one command per
+// process) that lag is invisible: the SAME run's end-of-run summary drains it moments
+// later either way. In the long-lived MCP server, the NEXT tool call's captureCall()
+// drains the buffer FIRST and reports the PREVIOUS call's flush failure as its own —
+// warning ownership becomes nondeterministic whenever OTel tracing is enabled. Instead
+// boundedFlush() returns the message (or null) to withSpan(), which attaches it to
+// THIS call's own result (mcp.ts's `onFlushWarning`) or, for a caller that gave it no
+// such hook (cli.ts), falls back to the original warn() behavior — see withSpan() below.
 import { warn } from './warn.js';
 import { sdkImportAdvice, errMsg } from './util.js';
 
@@ -76,13 +89,16 @@ const FLUSH_TIMEOUT_MS = 3000;
 // Races `provider.forceFlush()` against a timer so a slow/unreachable collector delays
 // this run by at most FLUSH_TIMEOUT_MS — never by the exporter's own longer internal
 // timeout. Never THROWS either way (a flush failure is exactly as inconsequential to
-// the caller as tracing being off entirely) — but it DOES warn once (#474) when the
-// flush did not actually complete, so an operator sees a diagnostic instead of just a
-// mysteriously slower command. `flushed` distinguishes "forceFlush() resolved" from
-// "the outer race's own timer won" (belt-and-suspenders over the SDK's own bound, see
-// the header comment above) — either way, not settling successfully means this run's
-// span(s) may not have reached the collector.
-async function boundedFlush(provider: OtelProvider): Promise<void> {
+// the caller as tracing being off entirely). `flushed` distinguishes "forceFlush()
+// resolved" from "the outer race's own timer won" (belt-and-suspenders over the SDK's
+// own bound, see the header comment above) — either way, not settling successfully
+// means this run's span(s) may not have reached the collector.
+//
+// Returns the warning message (once per process, #474) instead of calling warn()
+// itself (#653) — see the header comment above for why: the CALLER is the only one
+// that knows whether it has somewhere per-call to attach this to, or whether the
+// shared warn()/recorded buffer is the right (and, for the CLI, correct) fallback.
+async function boundedFlush(provider: OtelProvider): Promise<string | null> {
   let flushed = false;
   await Promise.race([
     provider
@@ -93,14 +109,13 @@ async function boundedFlush(provider: OtelProvider): Promise<void> {
       .catch(() => {}),
     new Promise<void>((resolve) => setTimeout(resolve, FLUSH_TIMEOUT_MS).unref()),
   ]);
-  if (!flushed && !flushWarnedOnce) {
-    flushWarnedOnce = true;
-    warn(
-      `OTEL_EXPORTER_OTLP_ENDPOINT is set but exporting a span did not complete within ` +
-        `${FLUSH_TIMEOUT_MS}ms (the collector may be unreachable, slow, or refusing the request) — ` +
-        `tracing may be incomplete for this run, everything else proceeds normally`,
-    );
-  }
+  if (flushed || flushWarnedOnce) return null;
+  flushWarnedOnce = true;
+  return (
+    `OTEL_EXPORTER_OTLP_ENDPOINT is set but exporting a span did not complete within ` +
+    `${FLUSH_TIMEOUT_MS}ms (the collector may be unreachable, slow, or refusing the request) — ` +
+    `tracing may be incomplete for this run, everything else proceeds normally`
+  );
 }
 
 let providerPromise: Promise<TracerHandle | null> | null = null;
@@ -219,29 +234,61 @@ async function getTracer(): Promise<TracerHandle | null> {
 // unknown-tool or invalid-arg call reading as a successful one, working against #226's
 // own "what actually happened" motivation. cli.ts's commands (which DO throw) simply
 // omit `opts` and get the exception-only behavior unchanged.
+//
+// `opts.onFlushWarning` (#653) is how a caller with somewhere per-call to put a LATE
+// OTel flush warning (boundedFlush() resolving only after `fn()` has already built its
+// own result — see otel.ts's header comment) opts into that instead of the shared
+// warn()/recorded buffer a differently-timed, unrelated call could otherwise drain
+// first. Given the message and this call's own already-built `result`, it returns the
+// (possibly modified) result to use in `result`'s place — mcp.ts uses this to splice
+// the warning into `result`'s OWN structured `warnings` field. cli.ts omits it (a
+// single-command process has nowhere more specific to attach it than the run-level
+// buffer it already drains at exit) and keeps exactly today's warn() behavior.
 export async function withSpan<T>(
   name: string,
   fn: () => Promise<T>,
-  opts?: { isError?: (result: T) => boolean },
+  opts?: { isError?: (result: T) => boolean; onFlushWarning?: (message: string, result: T) => T },
 ): Promise<T> {
   const handle = await getTracer();
   if (!handle) return fn();
   const { api, tracer, provider } = handle;
   return tracer.startActiveSpan(name, async (span) => {
+    let result: T;
     try {
-      const result = await fn();
-      span.setStatus(
-        opts?.isError?.(result)
-          ? { code: api.SpanStatusCode.ERROR, message: 'the call completed but returned a logical error result' }
-          : { code: api.SpanStatusCode.OK },
-      );
-      return result;
+      result = await fn();
     } catch (e) {
       span.setStatus({ code: api.SpanStatusCode.ERROR, message: errMsg(e) });
-      throw e;
-    } finally {
       span.end();
-      await boundedFlush(provider);
+      const flushWarning = await boundedFlush(provider);
+      if (flushWarning) {
+        // This call is about to throw — attach the late flush warning directly to the
+        // error object (the SAME `cbWarnings` convention mcp.ts's captureCall()/
+        // reclassify() already use to ride a warning onto a thrown error) rather than
+        // the shared buffer, UNLESS this caller has no such convention (cli.ts), in
+        // which case warn() is still the right (and correct — see header comment)
+        // fallback: a single CLI command drains that same buffer for its own summary
+        // moments later either way.
+        if (opts?.onFlushWarning && e instanceof Error) {
+          (e as Error & { cbWarnings?: string[] }).cbWarnings = [
+            ...((e as Error & { cbWarnings?: string[] }).cbWarnings ?? []),
+            flushWarning,
+          ];
+        } else {
+          warn(flushWarning);
+        }
+      }
+      throw e;
     }
+    span.setStatus(
+      opts?.isError?.(result)
+        ? { code: api.SpanStatusCode.ERROR, message: 'the call completed but returned a logical error result' }
+        : { code: api.SpanStatusCode.OK },
+    );
+    span.end();
+    const flushWarning = await boundedFlush(provider);
+    if (!flushWarning) return result;
+    if (opts?.onFlushWarning) return opts.onFlushWarning(flushWarning, result);
+    warn(flushWarning);
+    return result;
   });
 }

@@ -20,10 +20,10 @@
 // env escape hatch the CLI honors is deliberately NOT honored here, so an
 // agent can never spend without saying so in the call itself.
 
-import { stat, readFile, rm, copyFile } from 'node:fs/promises';
+import { stat, readFile, rm, copyFile, realpath } from 'node:fs/promises';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { join, resolve, sep, dirname, basename } from 'node:path';
 import { createHash } from 'node:crypto';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -326,6 +326,25 @@ function structuredErr(errObj: unknown): CallToolResult {
   };
 }
 
+// #653: passed as withSpan()'s `onFlushWarning` below — splices a LATE OTel flush
+// warning (see otel.ts's header comment: boundedFlush() only resolves after `fn()`,
+// i.e. after the dispatched handler, has already built and returned its own
+// CallToolResult) into THIS call's own already-built result, rather than the shared
+// warn()/recorded buffer a differently-timed, unrelated tool call could otherwise
+// drain first (the exact cross-request misattribution #653 is about). Re-derives
+// `content[0].text` from the merged structuredContent the same way structuredOk()
+// itself does, so the two views of the result never disagree with each other.
+function attachLateFlushWarning(message: string, result: CallToolResult): CallToolResult {
+  const structured: Record<string, unknown> = { ...(result.structuredContent as Record<string, unknown>) };
+  const existing = Array.isArray(structured.warnings) ? (structured.warnings as string[]) : [];
+  structured.warnings = [...existing, message];
+  return {
+    ...result,
+    content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
+    structuredContent: structured,
+  };
+}
+
 // #558: resources/read and prompts/get handlers throw directly rather than returning a
 // CallToolResult, so — unlike every tools/call error, which structuredErr() above wraps
 // — a thrown ToolError (or anything else) used to reach the SDK's own top-level catch
@@ -373,6 +392,81 @@ function assertWithinHome(p: string): void {
   if (isOutsideHome(p)) {
     throw new ToolError('ERR_INVALID_INPUT', `out must be inside CYPHER_BRAIN_HOME (${HOME}), got: ${p}`);
   }
+}
+
+// #648: isOutsideHome()'s resolve() above is purely LEXICAL — it normalizes `.`/`..`
+// segments and makes the path absolute, but never follows an actual symlink that
+// exists on disk. If some ancestor directory under CYPHER_BRAIN_HOME is (or later
+// becomes) a symlink pointing elsewhere — e.g. $CYPHER_BRAIN_HOME/escape ->
+// $HOME/.ssh — a caller-supplied `out` like `$CYPHER_BRAIN_HOME/escape/authorized_keys`
+// passes assertWithinHome()'s lexical prefix check while wallet.ts's write-temp-then-
+// rename (createKeyFile()/writeKeyFile(), which mkdir's `dirname(outPath)` and then
+// writes/renames INTO it) actually follows that symlink and lands outside
+// CYPHER_BRAIN_HOME entirely — restoring the exact arbitrary-file-clobber capability
+// this containment check exists to prevent (issue #174 / PR #180's own threat model).
+//
+// `out`'s FINAL path component (and possibly more of its ancestry, e.g. a not-yet-
+// created subdirectory) does not need to exist yet — wallet_create may be creating it
+// — so this cannot simply call realpath() on the whole path unconditionally (it throws
+// ENOENT when the target itself is missing). It tries the full path FIRST (multi-model
+// review, #648: an earlier version always skipped straight to the ancestor walk below,
+// which never resolves `p`'s OWN final component even when `p` already exists — a
+// symlinked CYPHER_BRAIN_HOME itself, not just a symlinked ancestor under it, produced
+// a false-positive rejection of a legitimately-scoped `out`, since HOME's own realpath
+// and `out`'s realpath then disagreed on whether HOME's symlink had been followed).
+// Only on ENOENT does it fall back to walking UP to the nearest ancestor that already
+// exists, resolving THAT (following any symlinks), and re-attaching the still-
+// nonexistent tail lexically — the tail cannot itself be a symlink escape because
+// nothing is there yet for a write to follow.
+async function realpathOfNearestAncestor(p: string): Promise<string> {
+  const abs = resolve(p);
+  try {
+    return await realpath(abs);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') throw e;
+  }
+  let dir = dirname(abs);
+  const tail: string[] = [basename(abs)];
+  for (;;) {
+    try {
+      const real = await realpath(dir);
+      return join(real, ...tail);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') throw e;
+      const parent = dirname(dir);
+      if (parent === dir) throw e; // reached the filesystem root and even that failed
+      tail.unshift(basename(dir));
+      dir = parent;
+    }
+  }
+}
+
+// The actual security boundary for wallet_create's `out` (assertWithinHome() above is
+// kept, unchanged, as the cheap lexical pre-check every caller still gets first) —
+// resolves symlinks on BOTH sides before comparing, so a symlinked ancestor anywhere
+// under CYPHER_BRAIN_HOME (or CYPHER_BRAIN_HOME itself being a symlink) cannot smuggle
+// the write outside the scoped directory. Returns the RESOLVED path rather than just
+// validating it (multi-model review, #648: a Critical finding on an earlier version
+// that only checked and let the caller re-resolve the ORIGINAL, possibly-symlinked
+// path a second time at write time) — an ancestor symlink swapped in the gap between
+// this check and the actual write would otherwise still be followed a SECOND time by
+// that later resolution (a classic check-then-use TOCTOU). Callers must use the
+// returned path for the actual write, not the original `p`, so the write only ever
+// touches the path this check already vetted, closing that gap for the ancestor
+// portion of the path (the same residual risk any other fixed-path write in this
+// codebase already carries — e.g. a symlink planted at the resolved path itself
+// after this check returns — is unavoidable without an O_NOFOLLOW-based openat
+// rewrite of every write primitive, which is out of scope for this check).
+async function resolveRealpathWithinHome(p: string): Promise<string> {
+  const resolved = await realpathOfNearestAncestor(p);
+  const homeResolved = await realpathOfNearestAncestor(HOME);
+  if (resolved !== homeResolved && !resolved.startsWith(homeResolved + sep)) {
+    throw new ToolError(
+      'ERR_INVALID_INPUT',
+      `out must be inside CYPHER_BRAIN_HOME (${HOME}), got: ${p} (resolves to ${resolved} after following symlinks)`,
+    );
+  }
+  return resolved;
 }
 
 // #559: restore_now writes DECRYPTED PLAINTEXT into out_dir — a materially higher-risk
@@ -926,6 +1020,20 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
       result.locator = locator;
       if (locatorFile) result.locator_file = locatorFile;
       (result.log as string[]).push(...pushRes.err);
+      // #649: `result.warnings` above was seeded from the SNAPSHOT phase (snap.warnings)
+      // only — pushRes.warnings (an insufficient-funds-buffer notice, a receipt-
+      // persistence failure, a too-low-bounty notice, ...) was previously dropped
+      // entirely from the structured result, even though push() just succeeded. Merge
+      // rather than overwrite: both phases can carry independent warnings on the same
+      // call. With an idempotency_key set this `result` is also PERSISTED and replayed
+      // verbatim on retry (recordIdempotencyResult() below), so an unmerged push warning
+      // would have been lost for that cached response permanently, not just delayed.
+      if (pushRes.warnings.length) {
+        result.warnings = [
+          ...(Array.isArray(result.warnings) ? (result.warnings as string[]) : []),
+          ...pushRes.warnings,
+        ];
+      }
     }
 
     if (idempotencyKey && fingerprint) {
@@ -1391,6 +1499,17 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
   }
 
   const { target, tdir, pulled, signature } = await resolveRestoreTarget(args);
+  // #650: cleanup of the fetch/scratch dir used to live in a `finally` wrapping the try
+  // block below. A `finally` that throws REPLACES whatever the try block already
+  // returned/threw — so a transient EIO/EACCES removing `tdir` (an NFS-backed TMPDIR,
+  // say) turned an ALREADY-SUCCESSFUL restore (pg_restore --clean --if-exists may have
+  // already dropped and replaced live database objects by this point) into an
+  // ERR_INTERNAL response. An agent seeing that error has every reason to retry, which
+  // would run that same destructive pg_restore a SECOND time purely because of a
+  // cleanup-step false negative. Cleanup is now handled explicitly on each path instead:
+  // its failure rides along as a warning on a successful result, and never masks the
+  // real error on a failed one.
+  let resultPayload: Record<string, unknown>;
   try {
     const restoreOpts: CliOptions = {
       in: target,
@@ -1436,17 +1555,56 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
     // warns rather than refuses when out_dir sits outside CYPHER_BRAIN_HOME.
     const homeWarning = outsideHomeWarning(outDir);
     const warnings = [...(homeWarning ? [homeWarning] : []), ...res.warnings];
-    return structuredOk({
+    resultPayload = {
       out_dir: outDir,
       ...(pulled ? { pulled } : {}),
       ...(signature ? { signature } : {}),
       pg_restored: Boolean(pg),
       log: [...res.out, ...res.err],
       ...(warnings.length ? { warnings } : {}),
-    });
-  } finally {
-    await discardFetchDir(tdir);
+    };
+  } catch (e) {
+    // The restore itself failed (or was reclassified above) — still clean up the
+    // fetch/scratch dir, but a cleanup failure here must never mask `e`: `e` is the
+    // thing the caller needs to see and act on, and a cleanup error piggy-backing on
+    // top of it would only obscure that (and revive the exact masking bug this fix is
+    // for, just on the failure path instead of the success one).
+    try {
+      await discardFetchDir(tdir);
+    } catch (cleanupErr) {
+      const warnMsg =
+        `failed to clean up restore fetch/scratch dir ${tdir} after a failed restore_now call: ` +
+        `${errMsg(cleanupErr)} (it may remain on disk until server restart) — the error below is the one to act on.`;
+      console.error(`warning: ${warnMsg}`);
+      // multi-model review, #650: ride this onto `e.cbWarnings` (the SAME convention
+      // captureCall()'s own catch / reclassify() already use to carry a warning onto a
+      // thrown error) so it reaches the structured error's `warnings` field via
+      // buildErrorPayload() too, not just the server's raw stderr — an agent branching
+      // on the structured result otherwise never sees it at all.
+      if (e instanceof Error) {
+        (e as Error & { cbWarnings?: string[] }).cbWarnings = [
+          ...((e as Error & { cbWarnings?: string[] }).cbWarnings ?? []),
+          warnMsg,
+        ];
+      }
+    }
+    throw e;
   }
+
+  // The restore already completed successfully by this point — a cleanup failure here
+  // must not override that with ERR_INTERNAL (see the comment above `resultPayload`).
+  // Surface it as a warning ON the already-successful result instead.
+  try {
+    await discardFetchDir(tdir);
+  } catch (cleanupErr) {
+    const warnMsg =
+      `failed to clean up restore fetch/scratch dir ${tdir} after a successful restore: ${errMsg(cleanupErr)} ` +
+      '— it may remain on disk until server restart.';
+    console.error(`warning: ${warnMsg}`);
+    const existingWarnings = Array.isArray(resultPayload.warnings) ? (resultPayload.warnings as string[]) : [];
+    resultPayload.warnings = [...existingWarnings, warnMsg];
+  }
+  return structuredOk(resultPayload);
 }
 
 async function handleEstimateCost(args: ToolArgs): Promise<CallToolResult> {
@@ -1643,13 +1801,21 @@ async function handleWalletCreate(args: ToolArgs): Promise<CallToolResult> {
   const { out, force } = args;
   if (out !== undefined && !isStr(out)) throw new ToolError('ERR_INVALID_INPUT', 'out must be a string path');
   if (force !== undefined && !isBool(force)) throw new ToolError('ERR_INVALID_INPUT', 'force must be a boolean');
-  if (isStr(out)) assertWithinHome(out);
+  // #648: the actual WRITE below uses `resolvedOut` (this check's own resolved output),
+  // never the caller's original `out` — see resolveRealpathWithinHome()'s own comment
+  // for why (closes the check-then-use TOCTOU a separate check-and-reuse-the-original-
+  // path approach would leave open).
+  let resolvedOut: string | undefined;
+  if (isStr(out)) {
+    assertWithinHome(out); // cheap lexical pre-check every caller still gets first
+    resolvedOut = await resolveRealpathWithinHome(out);
+  }
   const walletOpts: CliOptions = {
     _: 'create',
     dirs: [],
     tables: [],
     recipients: [],
-    out: isStr(out) ? out : undefined,
+    out: resolvedOut,
     force,
   };
   const res = await captureCall(() => wallet(walletOpts));
@@ -1866,7 +2032,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToo
             );
         }
       },
-      { isError: (r) => r.isError === true },
+      { isError: (r) => r.isError === true, onFlushWarning: attachLateFlushWarning },
     );
   } catch (err) {
     return structuredErr(err);
