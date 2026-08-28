@@ -35,6 +35,8 @@ import {
   ReadResourceRequestSchema,
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
+  McpError,
+  ErrorCode,
   type Tool,
   type CallToolResult,
 } from '@modelcontextprotocol/sdk/types.js';
@@ -93,6 +95,23 @@ const SERVER_VERSION = '0.0.1'; // keep in sync with package.json "version"
 // is unreachable from here per BACKENDS above, but the constant is still one definition)
 // can't drift apart on which backends this applies to.
 const SHA256_HEX = /^[0-9a-fA-F]{64}$/;
+
+// #560: three lib-level messages reclassified from ERR_INTERNAL to ERR_INVALID_INPUT at
+// their MCP call sites (handleWalletAddress / handleSnapshotNow / handleRestoreNow) —
+// same "caller gave a bad path/value" class requireCallerFile() already turns into
+// ERR_INVALID_INPUT for `file`/`identity` args, extended to the three inputs #560 found
+// still falling through to the generic, unclassified fallback. Matched by substring
+// against the already-formatted message, the SAME approach src/lib/errors.ts's own
+// registry uses and documents the tradeoff of (rewording the throw site silently stops
+// the match) — kept here rather than in errors.ts because these three also need their
+// `code` field changed from ERR_INTERNAL to ERR_INVALID_INPUT, which errors.ts's
+// annotateErrorMessage()/matchErrorCode() deliberately never do (they only ever add a
+// `[CB-E0xx]` suffix and `cb_code`, additive to whatever `code` the error already
+// carries). CB-E019/CB-E020/CB-E021 in src/lib/errors.ts give the reclassified
+// ToolError the same stable cb_code CB-E015 already gives a missing identity file.
+const NO_WALLET_AT_PATTERN = /no wallet at /;
+const NO_RECIPIENT_AT_PATTERN = /no recipient at /;
+const OUT_DIR_NOT_A_DIRECTORY_PATTERN = /exists and is not a directory/;
 
 // Untyped JSON-RPC tool-call arguments (an MCP client can send anything) — every
 // handler below validates its own shape at runtime (isStr/isStrArray etc), so
@@ -183,6 +202,20 @@ class ToolError extends Error {
   }
 }
 
+// #560 (multi-model review finding): a catch block that reclassifies a caught error into
+// a NEW ToolError — e.g. "this ERR_INTERNAL is actually bad input" — otherwise drops
+// whatever captureCall() had already bound onto the ORIGINAL error's `cbWarnings`
+// (line ~175 above): a warning the failed call recorded before it failed would silently
+// vanish from the structured error result instead of riding it (the exact relay hole
+// #347 exists to close). Copying it onto the replacement preserves that regardless of
+// which ToolError the caller ends up seeing.
+function reclassify(code: string, message: string, original: Error): ToolError {
+  const replacement = new ToolError(code, message);
+  const cbWarnings = (original as Error & { cbWarnings?: string[] }).cbWarnings;
+  if (cbWarnings) (replacement as ToolError & { cbWarnings?: string[] }).cbWarnings = cbWarnings;
+  return replacement;
+}
+
 // #347: module-load warnings, preserved by main()'s startup drain — attached to every
 // structured result below (session-scoped facts like a deprecated env var).
 let startupWarnings: string[] = [];
@@ -247,7 +280,22 @@ async function discardFetchDir(dir: string | null): Promise<void> {
   removeActiveMcpFetchDir(dir);
 }
 
-function structuredErr(errObj: unknown): CallToolResult {
+// The structured {code, message[, cb_code][, warnings][, startup_warnings]} shape every
+// tools/call error carries in structuredContent (#212, #347) — factored out of
+// structuredErr() (#558) so resources/read and prompts/get can put the SAME payload in
+// their JSON-RPC error's `data` field instead of falling through to the SDK's generic,
+// unclassified -32603. Those two protocols have no isError/structuredContent slot of
+// their own to carry it in, but the underlying contract (a stable `code`, an
+// already-`[CB-E0xx]`-annotated `message`, and `cb_code` for an agent to branch on
+// without regexing text) is the same one, so it should not depend on which JSON-RPC
+// method the caller happened to use.
+function buildErrorPayload(errObj: unknown): {
+  code: string;
+  message: string;
+  cb_code?: string;
+  warnings?: string[];
+  startup_warnings?: string[];
+} {
   const rawMessage = errObj instanceof Error ? errObj.message : String(errObj);
   // issue #212: same stable "[CB-E0xx] see MANAGEMENT.md#error-codes" suffix the CLI
   // appends (cli.ts's main().catch) — applied HERE, the one place every tool call's
@@ -260,18 +308,41 @@ function structuredErr(errObj: unknown): CallToolResult {
   // Read off the error object (captureCall's catch bound them there), never off
   // shared state — this function runs outside the call mutex.
   const warnings = (errObj as (Error & { cbWarnings?: string[] }) | null)?.cbWarnings ?? [];
-  const payload = {
+  return {
     code: errObj instanceof ToolError ? errObj.code : 'ERR_INTERNAL',
     message: annotateErrorMessage(rawMessage),
     ...(cbCode ? { cb_code: cbCode } : {}),
     ...(warnings.length ? { warnings } : {}),
     ...(startupWarnings.length ? { startup_warnings: startupWarnings } : {}),
   };
+}
+
+function structuredErr(errObj: unknown): CallToolResult {
+  const payload = buildErrorPayload(errObj);
   return {
     content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
     structuredContent: payload,
     isError: true,
   };
+}
+
+// #558: resources/read and prompts/get handlers throw directly rather than returning a
+// CallToolResult, so — unlike every tools/call error, which structuredErr() above wraps
+// — a thrown ToolError (or anything else) used to reach the SDK's own top-level catch
+// unwrapped and come back as a bare `{code: -32603, message}` JSON-RPC error: no `code`
+// field, no `cb_code`, no `[CB-E0xx]` suffix. The JSON-RPC spec's `data` slot on an
+// error response is exactly where a server is meant to put extra structured detail, so
+// this puts buildErrorPayload()'s SAME {code, message, cb_code, ...} object there —
+// an agent branching on `error.data.cb_code` gets the identical signal a tools/call
+// error gives it in `structuredContent.cb_code`. The outer numeric `code` only needs to
+// be A json-rpc code (clients that don't look past it just see "an error happened");
+// InvalidParams for a caller-input mistake and InternalError otherwise is the closest
+// existing category, picked for readability, not because any spec requires that split.
+function throwStructuredResourceError(errObj: unknown): never {
+  if (errObj instanceof McpError) throw errObj; // already the right shape — do not double-wrap
+  const payload = buildErrorPayload(errObj);
+  const jsonRpcCode = payload.code === 'ERR_INVALID_INPUT' ? ErrorCode.InvalidParams : ErrorCode.InternalError;
+  throw new McpError(jsonRpcCode, payload.message, payload);
 }
 
 function isStr(v: unknown): v is string {
@@ -292,12 +363,43 @@ function isBool(v: unknown): v is boolean {
 // with a shell already does. Scope `out` to CYPHER_BRAIN_HOME so this tool can only
 // ever clobber cypher-brain's own key material, never an arbitrary server-writable
 // file (multi-model review finding, PR #180 / issue #174).
-function assertWithinHome(p: string): void {
+function isOutsideHome(p: string): boolean {
   const resolved = resolve(p);
   const homeResolved = resolve(HOME);
-  if (resolved !== homeResolved && !resolved.startsWith(homeResolved + sep)) {
+  return resolved !== homeResolved && !resolved.startsWith(homeResolved + sep);
+}
+
+function assertWithinHome(p: string): void {
+  if (isOutsideHome(p)) {
     throw new ToolError('ERR_INVALID_INPUT', `out must be inside CYPHER_BRAIN_HOME (${HOME}), got: ${p}`);
   }
+}
+
+// #559: restore_now writes DECRYPTED PLAINTEXT into out_dir — a materially higher-risk
+// write than wallet_create's `out` (a small generated JWK) or snapshot_now's `out`
+// (ciphertext only) — yet unlike wallet_create's `out` above, it was not scoped to
+// CYPHER_BRAIN_HOME at all. assertWithinHome()'s own reasoning applies here too: MCP's
+// threat model gives a shell-less caller no OTHER path to an arbitrary-file-write
+// primitive the way a human with a shell already has.
+//
+// But restoring a backup INTO an arbitrary location outside this server's own config
+// directory is restore_now's ENTIRE normal use case — a fresh disk, a specific recovery
+// target that has nothing to do with where cypher-brain keeps its own state.
+// scripts/mcp-smoke.mjs's own real restore round-trip (#183) restores outside
+// CYPHER_BRAIN_HOME as a matter of course, and the CLI's `restore --out-dir` has never
+// been scoped either. Hard-refusing here the way wallet_create's `out` is refused would
+// break that legitimate, intended workflow, not just an adversarial one — so this only
+// WARNS (surfaced in the result's `warnings` array, which #347's warn()/relay
+// convention already guarantees reaches a human) instead of refusing outright: visibility
+// without breaking the tool's own purpose. confirm_write=true is still required before
+// ANY write happens either way — the actual consequential-action gate is unchanged.
+function outsideHomeWarning(outDir: string): string | undefined {
+  if (!isOutsideHome(outDir)) return undefined;
+  return (
+    `out_dir (${outDir}) is outside CYPHER_BRAIN_HOME (${HOME}) — restore_now writes DECRYPTED plaintext ` +
+    "there, to a path this server does not otherwise scope or manage (unlike wallet_create's out, which " +
+    'refuses outside CYPHER_BRAIN_HOME). Confirm this destination is what you intended (#559).'
+  );
 }
 
 // The PRESENCE half of the backend rule — the part no schema keyword states and the
@@ -725,7 +827,17 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
     }
 
     const snapOpts: CliOptions = { out, pg, dirs, tables: [], recipients, scan_secrets: scanSecrets };
-    const snap = await captureCall(() => snapshot(snapOpts));
+    let snap: CaptureResult<void>;
+    try {
+      snap = await captureCall(() => snapshot(snapOpts));
+    } catch (e) {
+      // #560: a bad recipient (neither an age1... pubkey nor an existing file) is bad
+      // INPUT, not a server fault — see NO_RECIPIENT_AT_PATTERN's own comment above.
+      if (e instanceof Error && NO_RECIPIENT_AT_PATTERN.test(e.message)) {
+        throw reclassify('ERR_INVALID_INPUT', e.message, e);
+      }
+      throw e;
+    }
     const size = (await stat(out)).size;
     const digest = await sha256(out);
 
@@ -1300,24 +1412,37 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
     try {
       res = await captureCall(() => restore(restoreOpts));
     } catch (e) {
+      // #560: out_dir naming an EXISTING NON-DIRECTORY is bad INPUT (a caller-given path
+      // collision), not a server fault — restore.ts's own throw for it has nothing to do
+      // with require_signature, so it is reclassified here BEFORE that unrelated
+      // carry-forward logic below, rather than falling through to it (which would only
+      // trigger when `signature` happens to be set) or past it to plain ERR_INTERNAL.
+      if (e instanceof Error && OUT_DIR_NOT_A_DIRECTORY_PATTERN.test(e.message)) {
+        throw reclassify('ERR_INVALID_INPUT', e.message, e);
+      }
       // A refusal under require_signature throws, so the structured result below — and with
       // it the `signature` object #312 added — never gets built. The caller would then read
       // restore()'s generic "no signature found" wording for a case where this server KNOWS
       // a recorded sidecar failed to fetch, and knows why.
       // Carry that diagnosis onto the error rather than losing it.
       if (!signature) throw e;
-      throw new ToolError(
+      throw reclassify(
         'ERR_INVALID_INPUT',
         `${errMsg(e)} — note: ${String(signature.note ?? '')} (${String(signature.reason ?? 'no reason recorded')})`,
+        e instanceof Error ? e : new Error(errMsg(e)),
       );
     }
+    // #559: non-blocking — see outsideHomeWarning()'s own comment for why restore_now
+    // warns rather than refuses when out_dir sits outside CYPHER_BRAIN_HOME.
+    const homeWarning = outsideHomeWarning(outDir);
+    const warnings = [...(homeWarning ? [homeWarning] : []), ...res.warnings];
     return structuredOk({
       out_dir: outDir,
       ...(pulled ? { pulled } : {}),
       ...(signature ? { signature } : {}),
       pg_restored: Boolean(pg),
       log: [...res.out, ...res.err],
-      ...(res.warnings.length ? { warnings: res.warnings } : {}),
+      ...(warnings.length ? { warnings } : {}),
     });
   } finally {
     await discardFetchDir(tdir);
@@ -1463,14 +1588,20 @@ async function handleScheduleInstall(args: ToolArgs): Promise<CallToolResult> {
 // `--json` output now is, #426) deliberately: the resource at SCHEDULE_STATUS_URI below
 // serves this SAME scheduleStatusReport() call and is documented to error when nothing is
 // installed — matching that, rather than making the tool and the resource disagree, is
-// the smaller and safer fix (issue #440's own suggestion also allows for it).
-async function handleScheduleStatus(): Promise<CallToolResult> {
+// the smaller and safer fix (issue #440's own suggestion also allows for it). Shared with
+// the SCHEDULE_STATUS_URI resource handler below (#558) so both surfaces reclassify the
+// SAME condition identically instead of one of them falling through to ERR_INTERNAL.
+async function scheduleStatusReportOrToolError(): Promise<Awaited<ReturnType<typeof scheduleStatusReport>>> {
   try {
-    return structuredOk(await scheduleStatusReport());
+    return await scheduleStatusReport();
   } catch (e) {
     if (!(e instanceof ScheduleNotInstalledError)) throw e;
     throw new ToolError('ERR_NOT_CONFIGURED', e.message);
   }
+}
+
+async function handleScheduleStatus(): Promise<CallToolResult> {
+  return structuredOk(await scheduleStatusReportOrToolError());
 }
 
 // keygenAt() (src/lib/keys.ts) is the SAME generation logic `cypher-brain keygen`
@@ -1541,7 +1672,17 @@ async function handleWalletAddress(args: ToolArgs): Promise<CallToolResult> {
     recipients: [],
     wallet: isStr(walletPath) ? walletPath : undefined,
   };
-  const res = await captureCall(() => wallet(walletOpts));
+  let res: CaptureResult<void>;
+  try {
+    res = await captureCall(() => wallet(walletOpts));
+  } catch (e) {
+    // #560: a missing wallet file at a caller-given path is bad INPUT, not a server
+    // fault — see NO_WALLET_AT_PATTERN's own comment above.
+    if (e instanceof Error && NO_WALLET_AT_PATTERN.test(e.message)) {
+      throw reclassify('ERR_INVALID_INPUT', e.message, e);
+    }
+    throw e;
+  }
   return structuredOk({
     address: lastToken(res.out[0]),
     log: [...res.out, ...res.err],
@@ -1595,10 +1736,21 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
 
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const { uri } = request.params;
-  if (uri !== SCHEDULE_STATUS_URI) throw new ToolError('ERR_INVALID_INPUT', `no such resource: ${uri}`);
-  return {
-    contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(await scheduleStatusReport(), null, 2) }],
-  };
+  // #558: wrapped in try/catch — without it, both "no such resource" and whatever
+  // scheduleStatusReportOrToolError() throws (including the ScheduleNotInstalledError ->
+  // ERR_NOT_CONFIGURED reclassification shared with the schedule_status tool) reached the
+  // SDK's own top-level catch unwrapped and came back as a bare -32603 with no `code`/
+  // `cb_code`, unlike every tools/call error.
+  try {
+    if (uri !== SCHEDULE_STATUS_URI) throw new ToolError('ERR_INVALID_INPUT', `no such resource: ${uri}`);
+    return {
+      contents: [
+        { uri, mimeType: 'application/json', text: JSON.stringify(await scheduleStatusReportOrToolError(), null, 2) },
+      ],
+    };
+  } catch (err) {
+    return throwStructuredResourceError(err);
+  }
 });
 
 // ─── prompts (#285) ────────────────────────────────────────────────────────────
@@ -1624,11 +1776,18 @@ server.setRequestHandler(ListPromptsRequestSchema, async () => ({
 
 server.setRequestHandler(GetPromptRequestSchema, async (request) => {
   const { name } = request.params;
-  if (name !== RESTORE_PROMPT) throw new ToolError('ERR_INVALID_INPUT', `no such prompt: ${name}`);
-  return {
-    description: 'cypher-brain restore runbook (from MANAGEMENT.md)',
-    messages: [{ role: 'user' as const, content: { type: 'text' as const, text: restoreRunbook() } }],
-  };
+  // #558: same wrapping as ReadResourceRequestSchema above — a bad prompt name, or
+  // restoreRunbook() failing to find its own text, must not fall through to the SDK's
+  // generic unclassified -32603.
+  try {
+    if (name !== RESTORE_PROMPT) throw new ToolError('ERR_INVALID_INPUT', `no such prompt: ${name}`);
+    return {
+      description: 'cypher-brain restore runbook (from MANAGEMENT.md)',
+      messages: [{ role: 'user' as const, content: { type: 'text' as const, text: restoreRunbook() } }],
+    };
+  } catch (err) {
+    return throwStructuredResourceError(err);
+  }
 });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: ALL_TOOLS }));

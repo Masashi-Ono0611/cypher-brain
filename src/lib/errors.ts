@@ -236,6 +236,29 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
       'src/lib/backends/file.ts (get, "file backend: no object at …") + src/lib/backends/rclone.ts (runRclone, ' +
       '"rclone backend: no object at …", #539 — translated from rclone\'s own raw "directory not found" retry-loop text)',
   },
+  {
+    code: 'CB-E019',
+    title: 'wallet JWK file not found at the given/default path',
+    pattern: /no wallet at /,
+    origin: 'ours',
+    source: 'src/lib/wallet.ts (walletAddress, "…: no wallet at … — run \'cypher-brain wallet create\' first")',
+  },
+  {
+    code: 'CB-E020',
+    title: 'recipient (age1... pubkey or file of pubkeys) not found',
+    pattern: /no recipient at /,
+    origin: 'ours',
+    source:
+      'src/lib/snapshot.ts (snapshot, "no recipient at … — run \\"cypher-brain keygen\\" first, or pass an age1... pubkey") + ' +
+      'src/lib/recoverykit.ts (same "no recipient at …" condition for the recovery kit)',
+  },
+  {
+    code: 'CB-E021',
+    title: 'restore --out-dir already exists and is not a directory',
+    pattern: /exists and is not a directory/,
+    origin: 'ours',
+    source: 'src/lib/restore.ts (restoreImpl, "--out-dir … exists and is not a directory")',
+  },
 ];
 
 /** The first registry entry whose pattern matches `message`, if any. */
