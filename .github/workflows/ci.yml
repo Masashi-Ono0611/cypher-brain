@@ -3,6 +3,24 @@ on:
   push:
     branches: [main]
   pull_request:
+
+# #596: without this, pushing multiple commits to the same branch/PR in quick
+# succession queues every run's macOS jobs behind each other (macOS runner
+# capacity is scarcer than ubuntu's), ballooning wall-clock time well past actual
+# job execution time. Cancel superseded PR runs (only the latest push matters);
+# push-to-main runs are only serialized, not cancelled, so a run that already
+# reached main isn't torn down mid-flight.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# #606: matches the explicit style of the other 3 workflows. Defense-in-depth --
+# this repo's default_workflow_permissions is already "read", but an explicit
+# declaration means this job keeps read-only access even if that default ever
+# changes or the workflow runs under a different org default.
+permissions:
+  contents: read
+
 jobs:
   verify:
     strategy:
@@ -10,6 +28,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         node: ['22', '24']
+        # #597: the OS-gated interop-tool installs below (age/minisign/rclone/
+        # gitleaks) branch on runner.os only, never on node version -- so macOS
+        # was being run twice for checks that don't vary by node, at roughly 10x
+        # ubuntu's per-minute billing rate. Cover both node versions on ubuntu and
+        # run macOS on just the newer one (3 cells instead of 4).
+        exclude:
+          - os: macos-latest
+            node: '22'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
