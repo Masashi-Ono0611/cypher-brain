@@ -580,5 +580,28 @@ if (g.message.includes('sk-selftest-decoy-gbrain-home')) throw new Error('the re
 " "$TMP/w.json"
 echo "[PASS] GBRAIN_HOME relocated: gbrain-engine-detection reads \$GBRAIN_HOME/.gbrain/config.json instead of falsely SKIPping against the unset default ~/.gbrain"
 
+echo "== (x) gbrain-engine-detection: an INVALID GBRAIN_HOME must WARN, even with a genuine config sitting at the \$HOME fallback =="
+# The exact scenario multi-model review flagged: GBRAIN_HOME is invalid (gbrain itself
+# refuses to start with it), but ~/.gbrain HAPPENS to hold a real, well-formed PGLite
+# config — a plausible leftover from before GBRAIN_HOME was ever set. Without
+# invalidOverride, this would silently PASS on that stale config as if it were gbrain's
+# actual, working setup, when gbrain will never touch it.
+export CYPHER_BRAIN_HOME="$TMP/gbrain-invalid-cb-home"
+export HOME="$TMP/gbrain-invalid-home"; mkdir -p "$HOME/.gbrain"
+printf '{"engine":"pglite","database_path":"%s/.gbrain/.pglite"}\n' "$HOME" > "$HOME/.gbrain/config.json"
+RC=0
+GBRAIN_HOME="not/absolute" cb doctor --json > "$TMP/x.json" 2>&1 || RC=$?
+[ "$RC" = "2" ] || { echo "[FAIL] doctor --json with an invalid GBRAIN_HOME exited $RC, expected 2 (PARTIAL — WARN only)"; cat "$TMP/x.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const g = j.checks.find((c) => c.id === 'gbrain-engine-detection');
+if (!g || g.status !== 'warn') throw new Error('expected gbrain-engine-detection warn for an invalid GBRAIN_HOME, got ' + JSON.stringify(g));
+if (!g.message.includes('not/absolute')) throw new Error('message does not name the actual (invalid) GBRAIN_HOME value: ' + g.message);
+if (/PGLite/.test(g.message)) throw new Error('an invalid GBRAIN_HOME still got a confident PGLite claim — the stale \$HOME/.gbrain config was presented as a real detection: ' + g.message);
+if (j.checks.some((c) => c.status === 'fail')) throw new Error('an invalid GBRAIN_HOME must never escalate to FAIL');
+if (j.verdict !== 'PARTIAL') throw new Error('expected verdict PARTIAL, got ' + j.verdict);
+" "$TMP/x.json"
+echo "[PASS] an invalid GBRAIN_HOME WARNs by name (not FAIL) even with a genuine config sitting at the \$HOME fallback, and never presents that stale config as a confident detection; doctor VERDICT PARTIAL (exit 2)"
+
 echo
 echo "all cypher-brain doctor selftests passed"

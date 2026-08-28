@@ -594,7 +594,20 @@ async function checkReceiptLedger(): Promise<DoctorCheck> {
 // plumbing this check does not need to do its job.
 async function checkGbrainEngine(): Promise<DoctorCheck> {
   const id = 'gbrain-engine-detection';
-  const gbrainConfigPath = resolveGbrainConfigPath();
+  const { path: gbrainConfigPath, invalidOverride } = resolveGbrainConfigPath();
+  if (invalidOverride) {
+    // GBRAIN_HOME is set but invalid (see resolveGbrainConfigPath's own doc comment) —
+    // gbrain itself will refuse to start with it, so a PASS below on whatever the
+    // ~/.gbrain fallback finds would be a false "this works" (it may just be a stale
+    // config from before GBRAIN_HOME was set). WARN, never FAIL, matching this check's
+    // own informational posture elsewhere.
+    return {
+      id,
+      status: 'warn',
+      message: `GBRAIN_HOME="${process.env.GBRAIN_HOME}" is invalid (must be an absolute path with no '..' segments) — gbrain itself refuses to start with this value; the default ${gbrainConfigPath} was checked instead, but gbrain will NOT actually use it until GBRAIN_HOME is fixed or unset`,
+      remediation: `fix GBRAIN_HOME to an absolute path with no '..' segments, or unset it to use the default ~/.gbrain`,
+    };
+  }
   if (!(await exists(gbrainConfigPath))) {
     return {
       id,

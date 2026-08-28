@@ -582,7 +582,17 @@ export async function init(_o: CliOptions): Promise<void> {
       // gbrain config is actually detected: everyone else's flow is completely
       // unchanged, and init already documents that anything beyond its opinionated fast
       // path is driven by hand (see requireTTY's own message above).
-      const gbrainConfigPath = resolveGbrainConfigPath();
+      const { path: gbrainConfigPath, invalidOverride: gbrainInvalidOverride } = resolveGbrainConfigPath();
+      if (gbrainInvalidOverride) {
+        // GBRAIN_HOME is set but invalid (see resolveGbrainConfigPath's own doc comment)
+        // — gbrain itself will refuse to start with it, so whatever the ~/.gbrain
+        // fallback below finds cannot be presented as a real detection: it may just be a
+        // stale config left over from before GBRAIN_HOME was set.
+        console.log(`\nGBRAIN_HOME="${process.env.GBRAIN_HOME}" is set but invalid (it must be an absolute path`);
+        console.log("with no '..' segments) — gbrain itself will refuse to start with this value. Checking the");
+        console.log(`default ${gbrainConfigPath} instead, but note gbrain will NOT actually use it until`);
+        console.log('GBRAIN_HOME is fixed or unset.');
+      }
       if (await exists(gbrainConfigPath)) {
         // Reads the engine verdict and, on PGLite, the configured store path — and
         // nothing else out of config.json, which holds API keys (see detectGbrainEngine's

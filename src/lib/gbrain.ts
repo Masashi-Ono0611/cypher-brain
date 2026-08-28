@@ -59,6 +59,22 @@ export interface GbrainEngineInfo {
   readError?: true;
 }
 
+/** Return value of resolveGbrainConfigPath — see that function's own doc comment. */
+export interface GbrainConfigPathInfo {
+  /** The path to check for gbrain's config.json — always set, never empty. */
+  path: string;
+  /**
+   * True ONLY when `GBRAIN_HOME` was set to a non-blank value that failed gbrain's own
+   * validation (not absolute, or containing a `..` segment). `path` is the `~/.gbrain`
+   * FALLBACK in this case — NOT a location gbrain would actually use, since gbrain
+   * itself refuses to start against the same invalid value. A caller must not present
+   * whatever is found at `path` as a confirmed detection when this is true: at best it
+   * is a coincidence (e.g. a stale config left over from before GBRAIN_HOME was set),
+   * and gbrain will error out the moment the operator actually runs it.
+   */
+  invalidOverride?: true;
+}
+
 /**
  * Where gbrain's OWN config.json actually lives, mirroring `configDir()` in gbrain's
  * `src/core/config.ts` (re-confirmed live against v0.47.3.0, lines ~1550-1564, the same
@@ -78,19 +94,28 @@ export interface GbrainEngineInfo {
  * gbrain VALIDATES the override and THROWS on a bad one (relative, or containing a `..`
  * segment) because it is about to `mkdir`/write there. This function never throws: an
  * operator's malformed `GBRAIN_HOME` is a problem for gbrain itself to surface the next
- * time it runs, not something a read-only wizard/doctor check should crash over. An
- * invalid override is treated the same as an unset one — falling back to `~/.gbrain` —
- * which is honest rather than merely convenient: gbrain would refuse to start against
- * that same invalid value too, so there is no real config to find at the override path
- * either way, and the fallback location is the only one that could possibly hold one.
+ * time it runs, not something a read-only wizard/doctor check should crash over. Instead
+ * it falls back to `~/.gbrain` AND flags `invalidOverride` (multi-model review — an
+ * earlier version fell back silently, which meant a STALE `~/.gbrain` config left over
+ * from before GBRAIN_HOME was ever set could be reported as a genuine, working detection
+ * even though gbrain itself will refuse to start and never touch it: the exact "confident
+ * claim that can be wrong" failure this module exists to eliminate, in a new form). A
+ * caller MUST check this flag before presenting whatever is at `path` as a real answer.
+ *
+ * Trimming applies to the RETURNED value too, matching gbrain's own `configDir()` exactly
+ * (it reassigns `trimmed = override.trim()` and both validates and joins on that, not the
+ * raw value) — `GBRAIN_HOME=" /srv/x "` and `GBRAIN_HOME="/srv/x"` are the same override
+ * to gbrain, so treating them differently here would itself be a fidelity bug.
  */
-export function resolveGbrainConfigPath(): string {
+export function resolveGbrainConfigPath(): GbrainConfigPathInfo {
+  const fallback = join(homedir(), '.gbrain', 'config.json');
   const override = process.env.GBRAIN_HOME;
   const trimmed = override?.trim();
-  if (trimmed && isAbsolute(trimmed) && !trimmed.split(/[\\/]/).includes('..')) {
-    return join(trimmed, '.gbrain', 'config.json');
+  if (!trimmed) return { path: fallback };
+  if (isAbsolute(trimmed) && !trimmed.split(/[\\/]/).includes('..')) {
+    return { path: join(trimmed, '.gbrain', 'config.json') };
   }
-  return join(homedir(), '.gbrain', 'config.json');
+  return { path: fallback, invalidOverride: true };
 }
 
 /**

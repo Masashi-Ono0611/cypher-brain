@@ -17,5 +17,11 @@ appends `.gbrain` to itself, so `GBRAIN_HOME=/srv/x` means the config lives at
 `/srv/x/.gbrain/config.json`. Unlike gbrain, an invalid override (relative, or
 containing a `..` segment) does not throw — it falls back to `~/.gbrain`, since gbrain
 itself would refuse to start against that same value, so a read-only check crashing
-over another tool's malformed env var would be worse than a silent, harmless fallback
-to a location that also holds nothing.
+over another tool's malformed env var would be worse than a fallback.
+
+That fallback is flagged, not silent (multi-model review): an invalid `GBRAIN_HOME`
+now makes `init` print a notice naming the bad value, and `doctor`'s
+`gbrain-engine-detection` WARN by name instead of PASSing on whatever it happens to
+find at `~/.gbrain` — a stale config left over from before `GBRAIN_HOME` was ever set
+would otherwise be reported as a genuine, working setup even though gbrain itself will
+never touch it once it refuses to start.
