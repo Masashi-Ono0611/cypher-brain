@@ -427,11 +427,14 @@ async function pushCore(
   // as `yes` is only meaningful to arweave/turbo/ton-provider. `onReceipt` (#232, and
   // #484 for ton-provider) is likewise only ever called by arweave/turbo/ton-provider —
   // every other backend's receiptBox stays null, and persistReceiptIfAny() above is
-  // then a no-op for it.
+  // then a no-op for it. `force` (#533) is likewise rclone-only — its own no-clobber
+  // check over an existing --remote object, deliberately the SAME o.force that opted
+  // resolveSkipUnchanged() past the digest check above, not a second flag.
   const receiptBox = newReceiptBox();
   const locator = await backend.put(o.in, {
     yes,
     remote: o.remote,
+    force: o.force,
     onReceipt: (raw, cost) => {
       receiptBox.value = { raw, cost };
     },
@@ -456,9 +459,18 @@ async function pushCore(
     // variable is still assigned right below for --save-locator's own later use.
     let justUploaded: string;
     try {
+      // #533: the sidecar's OWN no-clobber check (rclone.ts's put(), against
+      // "<remote>.minisig") can refuse here even though the ciphertext just above
+      // already uploaded successfully — that is not a new failure mode this
+      // introduces, just one more reason the catch block below's existing
+      // PushSignatureUploadError path (ciphertext-succeeded-sidecar-failed) can
+      // fire, same as a network blip or auth failure always could.
+      // selftest-push-partial-failure.sh already exercises that partial-success
+      // shape end-to-end.
       justUploaded = await backend.put(sigPath, {
         yes,
         remote: o.remote ? `${o.remote}.minisig` : undefined,
+        force: o.force,
         onReceipt: (raw, cost) => {
           sigReceiptBox.value = { raw, cost };
         },
