@@ -1010,11 +1010,56 @@ async function install(o: CliOptions): Promise<void> {
 // class) still recognizes it.
 export class ScheduleNotInstalledError extends Error {}
 
+// #494: the exact fields scheduleStatusReport() (readConfig's only caller) dereferences
+// off the returned config, checked up front so a partially-written/older-schema
+// schedule.json that parses fine but is missing one of them surfaces as THIS clear
+// message instead of a generic "Cannot read properties of undefined" deep inside that
+// function. Deliberately narrower than every key ScheduleConfig declares (e.g. `tables`/
+// `dirs`/`recipients`/`env` are never read by readConfig's caller) — validating fields
+// nothing here uses would reject a config that `status` can perfectly well report on.
+function assertScheduleConfigShape(v: unknown): asserts v is ScheduleConfig {
+  const missing = (field: string) =>
+    new Error(
+      `schedule config is corrupt (${CONFIG} is missing required field "${field}") — reinstall with: cypher-brain schedule install`,
+    );
+  if (typeof v !== 'object' || v === null) {
+    throw new Error(
+      `schedule config is corrupt (${CONFIG} is not a JSON object) — reinstall with: cypher-brain schedule install`,
+    );
+  }
+  const cfg = v as Record<string, unknown>;
+  if (typeof cfg.at !== 'string') throw missing('at');
+  if (typeof cfg.hour !== 'number') throw missing('hour');
+  if (typeof cfg.minute !== 'number') throw missing('minute');
+  if (typeof cfg.backend !== 'string') throw missing('backend');
+  if (typeof cfg.home !== 'string') throw missing('home');
+  if (typeof cfg.runner !== 'string') throw missing('runner');
+  const trigger = cfg.trigger as Record<string, unknown> | undefined;
+  if (typeof trigger !== 'object' || trigger === null) throw missing('trigger');
+  if (trigger.type === 'launchd') {
+    if (typeof trigger.path !== 'string') throw missing('trigger.path');
+  } else if (trigger.type === 'cron') {
+    if (typeof trigger.entry_file !== 'string') throw missing('trigger.entry_file');
+  } else {
+    throw missing('trigger.type');
+  }
+}
+
 async function readConfig(): Promise<ScheduleConfig> {
   if (!(await exists(CONFIG))) {
     throw new ScheduleNotInstalledError(`schedule not installed (no ${CONFIG}) — run: cypher-brain schedule install`);
   }
-  return JSON.parse(await readFile(CONFIG, 'utf8'));
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(CONFIG, 'utf8'));
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `schedule config is corrupt (${CONFIG} is not valid JSON: ${detail}) — reinstall with: cypher-brain schedule install`,
+    );
+  }
+  assertScheduleConfigShape(parsed);
+  return parsed;
 }
 
 async function lastLog(): Promise<{ name: string; rcLine: string; warningCount: number | null } | null> {
