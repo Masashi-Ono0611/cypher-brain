@@ -486,6 +486,21 @@ async function checkAuditChain(): Promise<DoctorCheck> {
       remediation: `check that every path component of ${AUDIT_LOG} is accessible, or run 'cypher-brain audit' directly for more detail`,
     };
   }
+  // Deliberately NOT the same "explicit path, nothing there = FAIL" convention
+  // checkKeyPerms()'s explicitPath does for a user-supplied wallet/identity path (Codex
+  // review): those are key material the user must have generated BEFORE pointing an env
+  // var at them, so an explicit path with nothing there is itself a misconfiguration.
+  // AUDIT_LOG/RECEIPT_LEDGER are the OPPOSITE — CLI-WRITTEN artifacts (appendAuditEntry/
+  // appendReceipt create them on first push/restore/verify via mkdir+append) — pointing
+  // CYPHER_BRAIN_AUDIT_LOG at a custom path BEFORE ever running one of those commands is
+  // a completely ordinary, forward-looking setup, indistinguishable from (and no less
+  // valid than) the default path never having been used yet. Also deliberately does NOT
+  // try to distinguish "file never existed" from "file exists but is fully empty"
+  // (Codex review, Suggestion): verifyAuditChain() itself treats a zero-entry chain as
+  // trivially ok, and audit.ts's own header comment documents a full truncation of the
+  // log as an ACCEPTED, undetectable-by-design limitation of the underlying mechanism
+  // (only an in-place edit or a middle-of-the-log deletion breaks the hash chain) — this
+  // check must never claim to catch more than `cypher-brain audit` itself can.
   if (entries.length === 0 && skippedLines === 0) {
     return {
       id,
