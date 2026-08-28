@@ -12,9 +12,10 @@ key-management tool.
 
 This is a young, fast-moving, single-maintainer project without long-term
 support branches. Only the **latest published version** receives security
-fixes. The CLI has no `--version` flag yet — check the `version` field in
-[`package.json`](package.json), the version pinned in your lockfile, or
-`npm view cypher-brain version` for what's current on the registry.
+fixes. Run `cypher-brain --version` (or `-V`) to check what you have
+installed; compare it against `npm view cypher-brain version` for what's
+current on the registry, or check the `version` field in
+[`package.json`](package.json) / the version pinned in your lockfile.
 
 | Version | Security fixes |
 |---|---|
@@ -33,8 +34,8 @@ advisory. Include:
 1. A description of the issue and its impact.
 2. Reproduction steps (or a PoC). Never include real identity files, recipient
    files, or unencrypted snapshot contents in a report — use synthetic data.
-3. The affected version (see the `version` field in `package.json` or your
-   lockfile — the CLI has no `--version` flag yet).
+3. The affected version — run `cypher-brain --version` (or see the `version`
+   field in `package.json` or your lockfile).
 4. Your suggested fix, if any.
 
 ## Threat model — what's in scope
@@ -65,10 +66,13 @@ Out of scope (already acknowledged as caveats in the README's threat model):
   plaintext, or local root/shell access) — `cypher-brain` protects the
   snapshots shipped off-box, not the source machine. Keep that machine
   full-disk-encrypted; that's outside this tool's control.
-- The fact that age's X25519 recipient scheme is not post-quantum secure, and
-  that ciphertext already parked on a permanent public network (e.g. Arweave)
-  cannot be recalled — these are documented, accepted tradeoffs of the design,
-  not bugs. (A post-quantum hybrid recipient is on the roadmap.)
+- The fact that age's X25519 recipient scheme (the default) is not
+  post-quantum secure, and that ciphertext already parked on a permanent
+  public network (e.g. Arweave) cannot be recalled — these are documented,
+  accepted tradeoffs of the design, not bugs. A post-quantum hybrid recipient
+  (ML-KEM-768 + X25519) is already available and CI-verified — run
+  `cypher-brain keygen --pq` to mitigate "harvest now, decrypt later" against
+  a future quantum computer (see the README's threat model).
 - Bugs in upstream dependencies (`age-encryption`/typage, `@ardrive/turbo-sdk`,
   `arweave`, `@modelcontextprotocol/sdk`) themselves — report those upstream,
   though a report here that identifies how this repo's usage of them is unsafe
