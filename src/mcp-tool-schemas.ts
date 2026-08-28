@@ -250,7 +250,10 @@ export const RESTORE_NOW_TOOL: Tool = {
     'or pass locator_file (a push --save-locator file) which supplies the locator, its backend AND the ' +
     'sha256 integrity pin in one — the SAME dual-mode input as verify_restore (exactly one of ' +
     'locator/file/locator_file). Decrypts with the PRIVATE identity and extracts into out_dir; extraction ' +
-    'never clobbers a file already present there (tar --keep-old-files/--skip-old-files, same as the CLI). ' +
+    'never clobbers a file already present there (tar --keep-old-files/--skip-old-files, same as the CLI) — ' +
+    'EXCEPT a component archive (<name>.tar.gz) whose pre-existing content does not match what this restore ' +
+    'just decrypted: that refuses the WHOLE restore instead of silently auto-expanding stale/unrelated data ' +
+    'and reporting it as the manifest-recorded source (#527). ' +
     'REQUIRES confirm_write=true before ANY work happens (pull/decrypt/extract): confirms writing decrypted ' +
     'files into out_dir, and — when pg is given — that pg_restore --clean --if-exists will ALSO DROP and ' +
     'replace objects in that database, an irreversible operation (the MCP equivalent of the CLI --yes/' +
