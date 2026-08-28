@@ -11,16 +11,38 @@
 // the SAME functions with the SAME options — it never bypasses or duplicates them.
 //
 // Interactivity: non-secret yes/no and path/text prompts use @clack/prompts (issue
-// #230) via the askLine/askYesNo wrappers below — cancel (Ctrl+C) detection, NO_COLOR
-// (Node's own util.styleText, which every clack render call goes through, already
-// checks NO_COLOR/FORCE_COLOR/isTTY before emitting any COLOR escape code — nothing
-// extra to wire up here for coloring specifically) and terminal-width wrapping come
-// from the library instead of being hand-rolled. NO_COLOR does NOT suppress every
-// escape code clack emits, only color: cursor movement/hide/show/erase sequences
-// (clack's own rendering, via sisteransi — a separate mechanism from styleText) are
-// still written regardless of NO_COLOR — expected here, since this wizard refuses
-// outright on a non-TTY stdin (requireTTY below) unless the automation escape hatch
-// is set, so a real terminal is always on the other end of that output. Before this,
+// #230) via the askLine/askYesNo wrappers below — cancel (Ctrl+C) detection and
+// terminal-width wrapping come from the library instead of being hand-rolled.
+//
+// Coloring (verified empirically — #464 corrected this comment after the ORIGINAL
+// version asserted a premise that does not hold under this wizard's own documented
+// automation path): every clack render call goes through Node's own util.styleText
+// for COLOR specifically, which already checks NO_COLOR/FORCE_COLOR/isTTY on the
+// OUTPUT stream before emitting a color escape code — nothing extra to wire up here
+// for that part. But clack's own rendering underneath styleText (cursor move/hide/
+// show/erase, via sisteransi — a separate mechanism, gated on none of those three)
+// writes those non-color escapes UNCONDITIONALLY, on every render, TTY or not. A
+// transcript captured via this wizard's CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1
+// escape hatch (requireTTY below) — piped stdin AND stdout, exactly how this repo's
+// own scripts/drive-init.mjs drives it for scripts/selftest-init.sh — is NOT "a real
+// terminal on the other end": it is thousands of bytes of cursor-movement noise
+// (~1876 in a typical full wizard run, independently of NO_COLOR) around whatever
+// text content the automation actually wants, e.g. `tee`'d to a file for an audit
+// log. NO_COLOR genuinely does keep that transcript free of COLOR codes (confirmed:
+// zero SGR color sequences with plain piped stdio, NO_COLOR set or not — isTTY=false
+// alone is already enough for styleText to suppress them), but it cannot rescue a
+// clean transcript if the caller's own environment happens to set FORCE_COLOR for
+// unrelated tooling (confirmed: FORCE_COLOR=1 + NO_COLOR=1 together still produced
+// hundreds of color codes — FORCE_COLOR wins). Neither case can be fixed from here:
+// @clack/prompts has no documented option (in its README, its exported
+// updateSettings()/CommonOptions, or its Prompt base class) to suppress its own
+// cursor/erase escapes independent of TTY detection — only an `output: Writable`
+// redirect point, which would require THIS project to write and maintain its own
+// ANSI-stripping stream, a workaround the library itself does not provide. A caller
+// that wants a genuinely plain transcript must pipe this wizard's combined
+// stdout+stderr through a stripping tool (e.g. Node's own
+// `util.stripVTControlCharacters`, which clack itself imports for exactly this
+// purpose internally) rather than relying on NO_COLOR alone. Before @clack/prompts,
 // each prompt ran on its own node:readline/promises
 // Interface that had to be closed before crypt.ts's OWN raw-mode passphrase reader
 // (promptHidden) touched the same stdin, then reopened afterwards — see the passphrase
@@ -512,15 +534,25 @@ export async function init(_o: CliOptions): Promise<void> {
       );
       const snapshotOpts: CliOptions = { dirs: [], tables: [], recipients: [] };
       if (profileChoice === 'none') {
-        const dirsInput = await askLine('Directory path(s) to back up, comma-separated (at least one, required)');
-        const dirs = dirsInput
-          .split(',')
-          .map((d) => expandHome(d.trim()))
-          .filter(Boolean);
-        if (dirs.length === 0)
-          throw new Error(
-            'no directory given — "cypher-brain init" cannot produce an empty snapshot; re-run and pass at least one path, or pick a profile',
-          );
+        // #492: this used to throw on the FIRST empty answer (Enter with nothing typed,
+        // or only whitespace/commas) — same bug class as #462's profile prompt above,
+        // and just as costly: this step runs after 1-5 have already written the primary
+        // identity, the offline backup keypair, and the signing keypair, and the catch
+        // block a few hundred lines down rolls ALL of that back on any throw from inside
+        // this try. Unlike the profile prompt, this one genuinely cannot become a
+        // select() menu (the paths are free-form, unbounded), so instead of throwing,
+        // loop askLine until at least one directory is given — the same fix the
+        // maintainer already chose for the sibling bug, applied here since a menu isn't
+        // available.
+        let dirs: string[] = [];
+        while (dirs.length === 0) {
+          const dirsInput = await askLine('Directory path(s) to back up, comma-separated (at least one, required)');
+          dirs = dirsInput
+            .split(',')
+            .map((d) => expandHome(d.trim()))
+            .filter(Boolean);
+          if (dirs.length === 0) console.log('At least one directory is required — please try again.');
+        }
         snapshotOpts.dirs = dirs;
       } else {
         // askSelect()/clack's select() can only return one of the `value`s it was
