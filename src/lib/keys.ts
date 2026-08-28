@@ -185,8 +185,14 @@ async function keygenSign(o: CliOptions): Promise<void> {
   // Captured BEFORE generation: --force alone doesn't mean a prior key was replaced
   // (e.g. a fresh `keygen --sign --force` with nothing there yet), so the "this
   // overwrote a previous key" warning below must key off actual pre-existence, not
-  // the flag (#532 review feedback).
-  const hadExistingKey = (await exists(identityPath)) || (await exists(recipientPath));
+  // the flag (#532 review feedback). Specifically recipientPath's OWN pre-existence,
+  // not identityPath's or "either" — the warning is entirely about the PUBLIC
+  // verification key at recipientPath being overwritten (that's what makes old
+  // *.minisig files start failing), so it would be wrong to fire it off identityPath
+  // alone existing while recipientPath itself was actually untouched-before (e.g. an
+  // identity re-used at its default path alongside a brand-new --sign-recipient path
+  // that never existed) — a second review round on #532 caught this.
+  const recipientExistedBefore = await exists(recipientPath);
   const { wrapped, pubkeyText } = await keygenSignAt({
     home: HOME,
     identityPath,
@@ -213,8 +219,8 @@ async function keygenSign(o: CliOptions): Promise<void> {
   // (review feedback on an earlier draft that assumed default paths only).
   const isDefaultRecipientPath = recipientPath === SIGN_RECIPIENT;
   console.log(
-    hadExistingKey
-      ? `\n⚠  Back up the signing identity now. --force overwrote the previous signing key at ${recipientPath}` +
+    recipientExistedBefore
+      ? `\n⚠  Back up the signing identity now. --force overwrote the previous signing public key at ${recipientPath}` +
           (isDefaultRecipientPath ? ' (the default path)' : ' (pass the same --sign-recipient to verify to use it)') +
           ' — a `verify` resolving to this path now sees the NEW key, so existing *.minisig files signed with ' +
           'the OLD key will FAIL verification there unless you retained a copy of the OLD sign-recipient.pub ' +
