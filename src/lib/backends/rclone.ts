@@ -231,6 +231,13 @@ export function rcloneBackend(): StorageBackend {
       // SAME flag push's own --skip-unchanged digest override already uses just
       // below in pushpull.ts: both mean "push despite this safety net", not two
       // unrelated behaviors sharing a name by accident.
+      //
+      // Check-then-upload, not atomic: two concurrent pushes to the SAME --remote
+      // could both observe "nothing there" and race to overwrite each other. Same
+      // shape (and same accepted limitation) as every other exists()-then-write
+      // no-clobber check in this CLI (pull --out, restore --out-dir — pushpull.ts) —
+      // this tool has no locking primitive, and a single operator's sequential runs
+      // are its design center, not concurrent multi-writer pushes to one path.
       if (!opts.force && (await rcloneObjectExists(remote))) {
         // Wording matches the OTHER refuse-by-default sites this exact "<subject>
         // already exists — refusing to overwrite it with <description>" shape is

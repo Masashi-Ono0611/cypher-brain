@@ -459,6 +459,14 @@ async function pushCore(
     // variable is still assigned right below for --save-locator's own later use.
     let justUploaded: string;
     try {
+      // #533: the sidecar's OWN no-clobber check (rclone.ts's put(), against
+      // "<remote>.minisig") can refuse here even though the ciphertext just above
+      // already uploaded successfully — that is not a new failure mode this
+      // introduces, just one more reason the catch block below's existing
+      // PushSignatureUploadError path (ciphertext-succeeded-sidecar-failed) can
+      // fire, same as a network blip or auth failure always could.
+      // selftest-push-partial-failure.sh already exercises that partial-success
+      // shape end-to-end.
       justUploaded = await backend.put(sigPath, {
         yes,
         remote: o.remote ? `${o.remote}.minisig` : undefined,
