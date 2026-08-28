@@ -4,12 +4,13 @@
 
 Split `src/mcp.ts`'s ten MCP `Tool` schema constants (JSON-schema data + prose
 descriptions, ~630 of the file's 2300+ lines) out into a new `src/mcp-tool-schemas.ts`
-(#507) — a pure extraction, so `tools/list` and every tool's behavior are unchanged
-(verified via a live MCP round-trip: byte-identical `tools/list` output, and the full
-`scripts/mcp-smoke.mjs` suite passing before and after). `restore_now`'s dual-mode
+(#507) — a pure extraction, verified via a live MCP round-trip (byte-identical
+`tools/list` output at that point, before either docs fix below landed) and the full
+`scripts/mcp-smoke.mjs` suite passing before and after. `restore_now`'s dual-mode
 locator/file/locator_file input resolution is now its own `resolveRestoreTarget()`
-helper (#509), also a pure extraction — `handleRestoreNow` reads as validate → resolve
-target → restore → format result instead of interleaving all four.
+helper (#509), also a pure extraction (same smoke-suite verification) — `handleRestoreNow`
+reads as validate → resolve target → restore → format result instead of interleaving
+all four.
 
 Also two documentation fixes found alongside: `snapshot_now`'s `recipients` field now
 notes that, unlike the CLI `snapshot` (which defaults to

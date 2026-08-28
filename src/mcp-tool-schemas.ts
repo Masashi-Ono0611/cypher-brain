@@ -6,11 +6,14 @@
 // `description` strings and JSON Schema shapes, no logic — glued in the same
 // file as the handler implementations that dispatch on them. Splitting them out
 // makes it faster to find handler logic vs. tool-description prose when editing
-// either. Pure extraction: every value below (including BACKENDS/PAID_BACKENDS,
-// which the schemas' `enum`s read) is byte-identical to what src/mcp.ts used to
-// define in place — same tool names, same schemas, same annotations. Imported
-// by src/mcp.ts, whose handlers also need BACKENDS/PAID_BACKENDS and (for the
-// #220 idempotency-key lock) SNAPSHOT_NOW_TOOL.name.
+// either. The #507 move itself was a pure extraction — verified via a live MCP
+// round-trip that `tools/list` came back byte-identical to src/mcp.ts's in-place
+// version before any further edit landed. `snapshot_now`'s `recipients` description
+// below has since gained a #478 note (a deliberate, separately-reviewed content
+// change, not part of the extraction) — everything else here is still exactly what
+// src/mcp.ts used to define in place: same tool names, same schemas, same
+// annotations. Imported by src/mcp.ts, whose handlers also need BACKENDS/
+// PAID_BACKENDS and (for the #220 idempotency-key lock) SNAPSHOT_NOW_TOOL.name.
 
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { SCAN_SECRETS_MODES } from './lib/secrets-scan.js';
