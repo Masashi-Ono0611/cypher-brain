@@ -131,9 +131,18 @@ const KNOWN_FLAG_NAMES: string[] = [
   ...VALUE_FLAGS,
 ].map((k) => k.replace(/_/g, '-'));
 
-function parseArgs(argv: string[]): CliOptions {
+// #637: schedule/wallet each read `o._` as their OWN single sub-verb (install|
+// status|uninstall, or create|address|balance — see schedule.ts's/wallet.ts's own
+// `switch (o._)`). Every other command never reads `o._` at all. Named here (not
+// inferred from FLAG_IRRELEVANT, which is about specific --flag names, a different
+// axis) so parseArgs() knows, for a KNOWN command, how many bare (non "--") tokens
+// its own o._ slot is allowed to hold — see the positional-argument check below.
+const POSITIONAL_COMMANDS = new Set(['schedule', 'wallet']);
+
+function parseArgs(argv: string[], cmd: string | undefined): CliOptions {
   const o: CliOptions = { dirs: [], tables: [], recipients: [] };
   const rec = o as unknown as Record<string, string | boolean | undefined>;
+  const positionals: string[] = [];
   // A value-taking flag whose value is MISSING used to read its value off the end of the
   // array (or off the next flag), i.e. `undefined` — which then looks exactly like "the
   // flag was never passed" to every reader downstream. For a REQUIRED flag that surfaces
@@ -209,7 +218,57 @@ function parseArgs(argv: string[]): CliOptions {
         );
       }
       rec[key] = BOOL_FLAGS.has(key) ? true : valueAt(++i, a);
-    } else o._ = a;
+    } else positionals.push(a);
+  }
+  // #637: every non-"--" token used to collapse into the single `o._` slot, with a
+  // LATER token silently overwriting an earlier one — no error, no trace. Two real
+  // shapes of that bug, both now refused instead:
+  //
+  //   snapshot --dir one --dir two /data/three     -> /data/three silently became
+  //                                                    o._ and was dropped; snapshot
+  //                                                    never reads o._ at all, so
+  //                                                    ONLY /data/one and /data/two
+  //                                                    were backed up, no error
+  //   snapshot --out x.age -r age1BACKUP…           -> -r isn't a recognized "--"
+  //                                                    flag, so it (and its value)
+  //                                                    fell through as TWO bare
+  //                                                    tokens — the backup recipient
+  //                                                    was silently omitted
+  //   schedule install status                       -> o._ ended up "status" (the
+  //                                                    LAST token), dispatching the
+  //                                                    wrong sub-command entirely
+  //
+  // A command not in POSITIONAL_COMMANDS reads no positional at all, so even ONE is
+  // refused (the same "would have been silently ignored" test #253/#277 already
+  // apply to flags). A command IN POSITIONAL_COMMANDS reads exactly one (its own
+  // sub-verb), so more than one is refused rather than picking a token to keep.
+  // An unrecognized `cmd` (a typo) is left alone here — dispatchCommand()'s own
+  // "unknown command" reply (#269) already names the real problem, and duplicating
+  // that diagnostic as a positional-argument error would only be more confusing.
+  if (positionals.length > 0) {
+    const knownCommand = cmd !== undefined && Object.hasOwn(FLAG_IRRELEVANT, cmd);
+    if (knownCommand && !POSITIONAL_COMMANDS.has(cmd as string)) {
+      // Codex review: a "write it as './name'" remediation (the valueAt() hint above
+      // uses this for a VALUE that merely looks like a flag) would NOT fix a bare
+      // positional — it is still a plain, non-"--" token either way and would be
+      // rejected identically on retry. Only naming the flag it should be attached to
+      // is an actual fix here.
+      throw new Error(
+        `${cmd} does not take a bare argument: ${positionals.map((p) => JSON.stringify(p)).join(', ')}. ` +
+          `Every value must be attached to a flag (e.g. "--dir ${positionals[0]}"). Refused rather than ignored: ` +
+          `an argument that is silently dropped looks exactly like one that was honored.`,
+      );
+    }
+    if (knownCommand && positionals.length > 1) {
+      throw new Error(
+        `${cmd} takes exactly one sub-command word, got ${positionals.length}: ${positionals.join(' ')}. ` +
+          `Refused rather than silently dispatching the last one ("${positionals[positionals.length - 1]}").`,
+      );
+    }
+    // Unknown cmd: preserve pre-#637 behavior (last token wins) so the eventual
+    // "unknown command" reply below is reached exactly as it was before this check
+    // existed — this branch never actually gets READ by any command in that case.
+    o._ = knownCommand ? positionals[0] : positionals[positionals.length - 1];
   }
   return o;
 }
@@ -1371,7 +1430,7 @@ async function main(): Promise<void> {
   // dispatch would miss every rejected one (Codex review, #226 part 3). `cmd` is known
   // before parseArgs() can throw, so the span name doesn't depend on parsing succeeding.
   return withSpan(cmd ?? 'help', async () => {
-    const o = parseArgs(rest);
+    const o = parseArgs(rest, cmd);
     assertFlagsDeclared(cmd);
     assertFlagsRelevant(cmd, o);
     return dispatchCommand(cmd, o);

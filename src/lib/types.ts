@@ -21,7 +21,10 @@ export const STORAGE_BACKEND_NAMES = ['file', 'arweave', 'turbo', 'rclone', 'ton
 // three always-initialized arrays is optional rather than a big union of exact
 // per-command shapes the parser can't actually guarantee.
 export interface CliOptions {
-  _?: string; // the schedule/wallet subcommand (install|status|uninstall|create|address) or the top-level positional arg
+  _?: string; // the schedule/wallet sub-verb (install|status|uninstall|create|address|balance) — cli.ts's
+  // parseArgs() (#637) refuses a bare argument outright for every OTHER command, so this is
+  // never set for them; an unrecognized top-level command word is a separate `cmd` string in
+  // cli.ts, not carried here at all
   dirs: string[];
   tables: string[];
   recipients: string[];
