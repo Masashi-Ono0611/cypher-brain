@@ -124,6 +124,7 @@ const lowBalanceFlagPath = process.argv[4];
 const frozenAddrFlagPath = process.argv[5]; // if present, its CONTENTS name an address to report 'frozen' for
 const seqnoFilePath = process.argv[6]; // if present, its CONTENTS are the seqno to answer /methods/seqno with (default 0)
 const broadcastLogPath = process.argv[7]; // every accepted POST /v2/blockchain/message body is appended here, one BOC per line
+const neverActiveFlagPath = process.argv[8]; // if present, every NON-owner address (i.e. a just-deployed contract) reports 'uninitialized' forever — issue #480's waitForContractActive() timeout positive control
 createServer((req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (url.pathname === '/v2/rates') {
@@ -151,15 +152,18 @@ createServer((req, res) => {
   const frozenAddr = frozenAddrFlagPath && existsSync(frozenAddrFlagPath) ? readFileSync(frozenAddrFlagPath, 'utf8').trim() : null;
   const isFrozenTarget = frozenAddr && url.pathname.includes(frozenAddr);
   const lowBalance = lowBalanceFlagPath && existsSync(lowBalanceFlagPath) && url.pathname.includes(ownerAddr);
+  const neverActive = neverActiveFlagPath && existsSync(neverActiveFlagPath) && !url.pathname.includes(ownerAddr);
+  const status = neverActive ? 'uninitialized' : isFrozenTarget ? 'frozen' : 'active';
   res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ status: isFrozenTarget ? 'frozen' : 'active', balance: lowBalance ? 1 : 5000000000 }));
+  res.end(JSON.stringify({ status, balance: lowBalance ? 1 : 5000000000 }));
 }).listen(port, '127.0.0.1');
 MOCKEOF
 FROZEN_ADDR_FLAG="$TMP/frozen-addr-flag"
 SEQNO_FILE="$TMP/seqno-value"
 BROADCAST_LOG="$TMP/broadcast-log"
+NEVER_ACTIVE_FLAG="$TMP/never-active-flag"
 TONAPI_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" &
+node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" &
 TONAPI_PID=$!
 export CYPHER_BRAIN_TON_TONAPI_URL="http://127.0.0.1:$TONAPI_PORT"
 
@@ -518,6 +522,53 @@ grep -q 'is frozen on-chain' "$TMP/frozen.err" || { echo "[FAIL] wrong frozen-wa
 [ -s "$BROADCAST_LOG" ] && { echo "[FAIL] a frozen wallet still reached broadcast before being refused"; exit 1; }
 rm -f "$FROZEN_ADDR_FLAG"
 echo "[PASS] frozen-wallet guard fired before any broadcast attempt"
+
+# ========================================================================
+# issue #480: waitForContractActive()'s timeout message must match the path that
+# actually ran (auto-sign vs. Tonkeeper-deeplink) instead of always pointing at "the
+# deeplink printed above" — which the auto-sign path never prints. Both runs below use
+# the CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_* test-only overrides (config.ts) so this
+# exercises the REAL 20-minute-bounded poll loop, just on a millisecond timescale, against
+# the mock tonapi's never-active-flag (added above) instead of a live 20-minute wait.
+# ========================================================================
+# Exported (not prefixed per-invocation, since bash only recognizes literal `NAME=value`
+# tokens written directly before the command as prefix assignments — NOT tokens produced
+# by expanding an array/variable at runtime) so both pushes below pick them up; unset
+# again right after this section so it cannot leak into any later test.
+export CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS=1500
+export CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS=200
+export CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS=400
+
+echo "== auto-sign: a deploy that never confirms on-chain times out with auto-sign-appropriate guidance, NOT the Tonkeeper-deeplink instruction (#480) =="
+touch "$NEVER_ACTIVE_FLAG"
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/autosign-timeout.err"; then
+  echo "[FAIL] push succeeded despite the mock tonapi reporting the contract as never-active"; exit 1
+fi
+grep -q 'did not become active on-chain within' "$TMP/autosign-timeout.err" || { echo "[FAIL] the deploy-confirm timeout did not fire"; cat "$TMP/autosign-timeout.err"; exit 1; }
+if grep -q 'sign the deeplink printed above' "$TMP/autosign-timeout.err"; then
+  echo "[FAIL] the auto-sign timeout wrongly told the operator to sign a deeplink that was never printed (issue #480)"; cat "$TMP/autosign-timeout.err"; exit 1
+fi
+grep -q "TON balance" "$TMP/autosign-timeout.err" || { echo "[FAIL] the auto-sign timeout did not give auto-sign-appropriate guidance"; cat "$TMP/autosign-timeout.err"; exit 1; }
+echo "[PASS] auto-sign timeout gives auto-sign-appropriate guidance, not the Tonkeeper-deeplink instruction"
+
+echo "== auto-sign: the same timeout wait prints periodic progress instead of staying silent for its whole duration (#480) =="
+PROGRESS_LINES=$(grep -c 'still waiting for contract' "$TMP/autosign-timeout.err")
+[ "$PROGRESS_LINES" -ge 1 ] || { echo "[FAIL] no progress line was printed during the deploy-confirm wait"; cat "$TMP/autosign-timeout.err"; exit 1; }
+grep -Eq 'still waiting for contract .+ to become active on-chain \([0-9]+s elapsed\)' "$TMP/autosign-timeout.err" || { echo "[FAIL] progress line has the wrong shape"; cat "$TMP/autosign-timeout.err"; exit 1; }
+echo "[PASS] the deploy-confirm wait prints periodic progress ($PROGRESS_LINES line(s) in a ${CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS}ms window)"
+
+echo "== Tonkeeper-deeplink path: the SAME timeout keeps the original 'sign the deeplink' guidance (positive control — #480 must not have broken the manual path) =="
+if cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/manual-timeout.err"; then
+  echo "[FAIL] push succeeded despite the mock tonapi reporting the contract as never-active"; exit 1
+fi
+grep -q 'sign the deeplink printed above' "$TMP/manual-timeout.err" || { echo "[FAIL] the Tonkeeper-deeplink path lost its original timeout guidance"; cat "$TMP/manual-timeout.err"; exit 1; }
+if grep -q "TON balance" "$TMP/manual-timeout.err"; then
+  echo "[FAIL] the Tonkeeper-deeplink path wrongly printed the auto-sign-only guidance"; cat "$TMP/manual-timeout.err"; exit 1
+fi
+echo "[PASS] the Tonkeeper-deeplink path's timeout guidance is unchanged"
+rm -f "$NEVER_ACTIVE_FLAG"
+unset CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS
 
 echo "== schedule install --backend ton-provider is eligible ONLY when a TON wallet is configured (#396 PR2) =="
 if CYPHER_BRAIN_TON_WALLET= cb schedule install --backend ton-provider --dir "$SRC" --no-load \

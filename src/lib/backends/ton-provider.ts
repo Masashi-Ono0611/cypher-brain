@@ -83,6 +83,9 @@ import {
   TON_PROVIDER_MYTONPROVIDER_URL,
   TON_PROVIDER_NOTIFY_RETRY_MS,
   TON_PROVIDER_NOTIFY_INTERVAL_MS,
+  TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS,
+  TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS,
+  TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS,
   TON_TONAPI_URL,
   TON_BIN,
   TON_NETWORK_CONFIG,
@@ -580,13 +583,19 @@ async function autoSignAndBroadcastDeploy(
   }
 }
 
-const DEPLOY_CONFIRM_TIMEOUT_MS = 20 * 60_000; // human has to open their wallet and approve — generous
-const DEPLOY_POLL_INTERVAL_MS = 5_000;
-
-// Waits for the operator to sign the deeplink and for the deploy to land, by polling
-// tonapi's account-state endpoint until it reports 'active'. Bounded (20 min): a human
-// is on the other end of this, not a script, so timing out is a real, expected outcome
-// (the operator can re-run push once they have signed), not a bug.
+// Waits for the deploy to land, by polling tonapi's account-state endpoint until it
+// reports 'active'. Bounded (20 min default, TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS):
+// on the Tonkeeper-deeplink path a human is on the other end of this, so timing out is a
+// real, expected outcome (the operator can re-run push once they have signed), not a bug.
+//
+// `isAutoSign` distinguishes the two ways put() can reach this call (#480): with
+// CYPHER_BRAIN_TON_WALLET configured, put() already signed and broadcast the deploy
+// itself and printed NO deeplink ("no Tonkeeper deeplink needed") — so a timeout here
+// must NOT tell the operator to "sign the deeplink printed above" (issue #480: that
+// instruction is inapplicable, and was actively misleading, on this exact path). The
+// most likely real cause on the auto-sign path is the wallet not having enough TON to
+// cover gas — tonapi's broadcast endpoint accepts (HTTP 200) a doomed transaction just as
+// readily as a good one, so "broadcast succeeded" proves nothing about "will confirm".
 //
 // 'active' alone does not prove the deploy message's modify_providers body specifically
 // added THIS provider to the on-chain dict (Codex review) — it only proves some message
@@ -598,19 +607,39 @@ const DEPLOY_POLL_INTERVAL_MS = 5_000;
 // that surfaced the original ProviderV1.Address field-mapping incident this session
 // (docs/ton-storage-status.md). A silently-empty provider dict would fail loudly at that
 // step, not pass silently through this one.
-async function waitForContractActive(addr: TonAddress): Promise<void> {
-  const deadline = Date.now() + DEPLOY_CONFIRM_TIMEOUT_MS;
+async function waitForContractActive(addr: TonAddress, isAutoSign: boolean): Promise<void> {
+  const start = Date.now();
+  const deadline = start + TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS;
+  // #480: a real 20-minute wait with zero output in between reads as a hang, not a wait
+  // (the issue's own repro: "produced ZERO further output for 13+ minutes"). Anchored at
+  // start + interval (not "every Nth poll") so the cadence stays correct regardless of
+  // what the poll interval itself is set to.
+  let nextProgressAt = start + TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS;
   for (;;) {
     const acc = await fetchAccountState(addr).catch(() => null); // tonapi indexing lag / transient errors: keep polling, don't abort on one bad read
     if (acc?.status === 'active') return;
-    if (Date.now() > deadline) {
+    const now = Date.now();
+    if (now > deadline) {
+      const remediation = isAutoSign
+        ? "the auto-signed broadcast may not have landed — check the wallet's TON balance and this " +
+          "address's transaction history on a TON explorer (a common cause is the wallet not holding enough " +
+          "TON to cover gas; tonapi's broadcast endpoint accepts a doomed transaction the same as a good one), " +
+          'then re-run push'
+        : 'sign the deeplink printed above, then re-run push';
       throw new Error(
         `ton-provider backend: contract ${addr.toRawString()} did not become active on-chain within ` +
-          `${DEPLOY_CONFIRM_TIMEOUT_MS}ms — sign the deeplink printed above, then re-run push (the same ` +
-          'ciphertext will resolve to the same bag id and reuse this bag).',
+          `${TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS}ms — ${remediation} (the same ciphertext will resolve to the ` +
+          'same bag id and reuse this bag).',
       );
     }
-    await sleep(DEPLOY_POLL_INTERVAL_MS);
+    if (now >= nextProgressAt) {
+      console.error(
+        `ton-provider: still waiting for contract ${addr.toRawString()} to become active on-chain ` +
+          `(${Math.round((now - start) / 1000)}s elapsed)`,
+      );
+      nextProgressAt = now + TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS;
+    }
+    await sleep(TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS);
   }
 }
 
@@ -992,7 +1021,7 @@ export function tonProviderBackend(): StorageBackend {
           console.error(`  ${deploy.deeplink}`);
         }
 
-        await waitForContractActive(deploy.contractAddress);
+        await waitForContractActive(deploy.contractAddress, Boolean(autoSignWallet));
         console.error(`ton-provider: contract ${deploy.contractAddress.toRawString()} is active on-chain`);
 
         await notifyProviderWithRetry(provider.pubkey, deploy.contractAddress.toRawString(), bag.dataSizeBytes);
