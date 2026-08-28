@@ -115,9 +115,26 @@ JSON
 # rather than a second copy of the original prompt text -- the original prompt text
 # is already present in the transcript from the first render, so keying the retry to
 # it would let drive-init.mjs fire the second answer immediately, before the wizard
-# has actually re-rendered the prompt and re-attached its input listener.
-
-CYPHER_BRAIN_HOME="$NODIR_CB_HOME" CYPHER_BRAIN_FILE_DIR="$NODIR_STORE" HOME="$NODIR_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+# has actually re-rendered the prompt and re-attached its input listener. That listener
+# gap is NOT a real race on the wizard's own side, though (Codex review round 1, this
+# PR): @clack/core's Prompt.prompt() is `new Promise((resolve) => { ...
+# this.input.on('keypress', ...) ... })` -- the whole body, including attaching the
+# keypress listener, runs SYNCHRONOUSLY inside that executor before prompt() (and so
+# askLine's `await text(...)`) ever yields back to the event loop. Since the retry
+# console.log() and the next askLine() call happen back-to-back with no `await`
+# between them, the new listener is already attached before this driver's own
+# stdout-read -> stdin-write round trip (real IPC latency) can possibly land the next
+# keystroke -- confirmed by reading node_modules/@clack/core/dist/index.mjs directly,
+# not just by this test happening to pass once.
+#
+# FORCE_COLOR is also unset here (issue #464's own doc fix, test (q) below reuses this
+# exact transcript): if the CALLER's shell/CI already exports FORCE_COLOR, clack's
+# color codes would be forced back on regardless of NO_COLOR (the doc comment's own
+# point), which would break (q)'s "zero color codes" assertion for a reason that has
+# nothing to do with this test. NO_COLOR=1 is set explicitly to match the original
+# issue's own repro, rather than leaving it to ambient environment.
+unset FORCE_COLOR
+CYPHER_BRAIN_HOME="$NODIR_CB_HOME" CYPHER_BRAIN_FILE_DIR="$NODIR_STORE" HOME="$NODIR_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 NO_COLOR=1 \
   with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-nodir.json" --out "$TMP/nodir.log" \
   -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
   || { echo "[FAIL] the empty-then-valid directory answer made init fail (it should re-prompt, then complete normally)"; cat "$TMP/nodir.log"; exit 1; }
@@ -1309,7 +1326,7 @@ if grep -qi "is not a function" "$TMP/nonpipe-stdin.log"; then echo "[FAIL] proc
 [ ! -f "$P_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity survived the cancellation — rollback should still fire on this path"; exit 1; }
 echo "[PASS] file-redirected (non-pipe) stdin under CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 surfaces the real InitCancelledError instead of a masking 'unref is not a function' crash"
 
-echo "== (q) issue #464: a piped automation transcript is free of clack's OWN color escape codes, with or without NO_COLOR — but still carries clack's non-color cursor-movement escapes (doc-comment accuracy check, wizard.ts header) =="
+echo "== (q) issue #464: a piped automation transcript with NO_COLOR=1 is free of clack's OWN color escape codes — but still carries clack's non-color cursor-movement escapes (doc-comment accuracy check, wizard.ts header) =="
 # wizard.ts's own header comment (just above InitCancelledError) used to assert "a
 # real terminal is always on the other end of that output" whenever
 # CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 is used -- false for the EXACT way this
@@ -1317,12 +1334,16 @@ echo "== (q) issue #464: a piped automation transcript is free of clack's OWN co
 # stdin AND stdout, no TTY at all). #464 rewrote that comment; this case is the
 # regression guard for what it now claims: (1) Node's own util.styleText -- which
 # every clack render call goes through for COLOR -- already suppresses every color
-# escape code on a non-TTY output stream on its own, NO_COLOR or not (so a captured
-# automation transcript is never colorized by accident); (2) clack's OWN
-# cursor-movement/hide/show/erase escapes (sisteransi, a separate mechanism NOT
-# gated by NO_COLOR/FORCE_COLOR/isTTY at all) are still written unconditionally, so
-# the transcript is NOT plain text either -- reusing test (c)'s own already-captured
-# "$TMP/nodir.log" rather than spawning a whole extra wizard run for this.
+# escape code on a non-TTY output stream on its own (so a captured automation
+# transcript is never colorized by accident) -- test (c) above sets NO_COLOR=1
+# explicitly (matching the original issue's own repro) AND unsets FORCE_COLOR (a
+# caller's FORCE_COLOR would force color back on regardless of NO_COLOR -- the doc
+# comment's other point -- which would fail this assertion for a reason unrelated to
+# this test); (2) clack's OWN cursor-movement/hide/show/erase escapes (sisteransi, a
+# separate mechanism NOT gated by NO_COLOR/FORCE_COLOR/isTTY at all) are still written
+# unconditionally, so the transcript is NOT plain text either -- reusing test (c)'s
+# own already-captured "$TMP/nodir.log" rather than spawning a whole extra wizard run
+# for this.
 python3 - "$TMP/nodir.log" <<'PY'
 import re
 import sys
@@ -1336,7 +1357,7 @@ esc_bytes = data.count(b"\x1b")
 if esc_bytes == 0:
     print("[FAIL] expected clack's own cursor-movement escapes (sisteransi) to still be present per the doc comment's own claim, but found zero ESC bytes -- this fixture may no longer exercise a real clack render")
     sys.exit(1)
-print(f"[PASS] zero SGR color escape codes in the piped automation transcript (styleText's own isTTY check holds, NO_COLOR or not); {esc_bytes} non-color cursor-movement ESC byte(s) remain, exactly as the corrected doc comment now says")
+print(f"[PASS] zero SGR color escape codes in the piped, NO_COLOR=1 automation transcript (styleText's own isTTY check holds); {esc_bytes} non-color cursor-movement ESC byte(s) remain, exactly as the corrected doc comment now says")
 PY
 
 echo
