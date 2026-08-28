@@ -127,36 +127,32 @@ func parseWithdrawFlags(args []string) (*withdrawParams, error) {
 		return nil, fmt.Errorf("unexpected extra arguments: %v", fs.Args())
 	}
 
-	if f.contractRaw == "" {
-		return nil, fmt.Errorf("withdraw requires --contract <raw-addr>")
+	if err := checkRequiredFlags("withdraw",
+		requiredFlag{"--contract <raw-addr>", f.contractRaw},
+		requiredFlag{"--bag-id <64hex>", f.bagIDHex},
+		requiredFlag{"--merkle-hash <64hex>", f.merkleHashRaw},
+		requiredFlag{"--size-bytes <n>", f.sizeBytesRaw},
+		requiredFlag{"--piece-size <n>", f.pieceSizeRaw},
+		requiredFlag{"--owner <raw-addr>", f.ownerRaw},
+	); err != nil {
+		return nil, err
 	}
+
 	contractAddr, err := parseRawAddr("--contract", f.contractRaw, 0, -1)
 	if err != nil {
 		return nil, err
-	}
-	if f.bagIDHex == "" {
-		return nil, fmt.Errorf("withdraw requires --bag-id <64hex>")
 	}
 	bagID, err := parseHex32("--bag-id", f.bagIDHex)
 	if err != nil {
 		return nil, err
 	}
-	if f.merkleHashRaw == "" {
-		return nil, fmt.Errorf("withdraw requires --merkle-hash <64hex>")
-	}
 	merkleHash, err := parseHex32("--merkle-hash", f.merkleHashRaw)
 	if err != nil {
 		return nil, err
 	}
-	if f.sizeBytesRaw == "" {
-		return nil, fmt.Errorf("withdraw requires --size-bytes <n>")
-	}
 	dataSizeBytes, err := parsePositiveUint64Flag("--size-bytes", f.sizeBytesRaw)
 	if err != nil {
 		return nil, err
-	}
-	if f.pieceSizeRaw == "" {
-		return nil, fmt.Errorf("withdraw requires --piece-size <n>")
 	}
 	pieceSizeU64, err := parsePositiveUint64Flag("--piece-size", f.pieceSizeRaw)
 	if err != nil {
@@ -164,9 +160,6 @@ func parseWithdrawFlags(args []string) (*withdrawParams, error) {
 	}
 	if pieceSizeU64 > uint64(^uint32(0)) {
 		return nil, fmt.Errorf("--piece-size %d exceeds uint32 range", pieceSizeU64)
-	}
-	if f.ownerRaw == "" {
-		return nil, fmt.Errorf("withdraw requires --owner <raw-addr>")
 	}
 	owner, err := parseRawAddr("--owner", f.ownerRaw, 0, -1)
 	if err != nil {
@@ -207,9 +200,18 @@ func parseWithdrawFlags(args []string) (*withdrawParams, error) {
 func runWithdraw(ctx context.Context, args []string, stdout io.Writer) error {
 	p, err := parseWithdrawFlags(args)
 	if errIsHelp(err) {
-		fmt.Fprint(stdout, helpText)
+		fmt.Fprint(stdout, subHelpText("withdraw"))
 		return nil
 	}
+	if err != nil {
+		return err
+	}
+
+	// buildWithdraw is the pure, network-free core of `withdraw` (address
+	// derivation cross-check + --gas-ton/--max-spend-ton guard) — run it
+	// before the network call so a local input mistake fails fast instead of
+	// paying for a tonapi round trip first.
+	res, err := buildWithdraw(*p)
 	if err != nil {
 		return err
 	}
@@ -231,11 +233,6 @@ func runWithdraw(ctx context.Context, args []string, stdout io.Writer) error {
 		)
 	}
 	fmt.Fprintf(stdout, "  current balance: %.9f TON — this ENTIRE amount (minus a small storage-fee reserve) will be returned to --owner\n", float64(acc.Balance)/1e9)
-
-	res, err := buildWithdraw(*p)
-	if err != nil {
-		return err
-	}
 
 	if !p.testnet {
 		fmt.Fprintln(stdout, "")

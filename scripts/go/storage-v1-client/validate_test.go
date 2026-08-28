@@ -118,3 +118,34 @@ func TestParsePositiveUint64Flag(t *testing.T) {
 		t.Fatalf("got (%d, %v), want (7, nil)", n, err)
 	}
 }
+
+// TestCheckRequiredFlags exercises checkRequiredFlags directly: it should
+// report every missing flag in one error (not stop at the first), and
+// return nil when all are present.
+func TestCheckRequiredFlags(t *testing.T) {
+	if err := checkRequiredFlags("cmd",
+		requiredFlag{"--a", "present"},
+		requiredFlag{"--b", "also-present"},
+	); err != nil {
+		t.Fatalf("expected nil for all-present flags, got %v", err)
+	}
+
+	err := checkRequiredFlags("cmd",
+		requiredFlag{"--a", ""},
+		requiredFlag{"--b", "present"},
+		requiredFlag{"--c", ""},
+	)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	msg := err.Error()
+	if !strings.HasPrefix(msg, "cmd requires ") {
+		t.Fatalf("error %q does not start with %q", msg, "cmd requires ")
+	}
+	if !strings.Contains(msg, "--a") || !strings.Contains(msg, "--c") {
+		t.Fatalf("error %q does not mention both missing flags --a and --c", msg)
+	}
+	if strings.Contains(msg, "--b") {
+		t.Fatalf("error %q unexpectedly mentions present flag --b", msg)
+	}
+}

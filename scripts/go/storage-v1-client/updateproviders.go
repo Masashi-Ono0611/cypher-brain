@@ -149,29 +149,26 @@ func parseUpdateProvidersFlags(args []string) (*updateProvidersParams, error) {
 		return nil, fmt.Errorf("unexpected extra arguments: %v", fs.Args())
 	}
 
-	if f.contractRaw == "" {
-		return nil, fmt.Errorf("update-providers requires --contract <raw-addr>")
+	if err := checkRequiredFlags("update-providers",
+		requiredFlag{"--contract <raw-addr>", f.contractRaw},
+		requiredFlag{"--provider-pubkey <64hex>", f.providerPubkeyRaw},
+		requiredFlag{"--rate-nano-per-mb-day <int>", f.rateRaw},
+		requiredFlag{"--span-days <int>", f.spanDaysRaw},
+	); err != nil {
+		return nil, err
 	}
+
 	contractAddr, err := parseRawAddr("--contract", f.contractRaw, 0, -1)
 	if err != nil {
 		return nil, err
-	}
-	if f.providerPubkeyRaw == "" {
-		return nil, fmt.Errorf("update-providers requires --provider-pubkey <64hex>")
 	}
 	providerPubkey, err := parseHex32("--provider-pubkey", f.providerPubkeyRaw)
 	if err != nil {
 		return nil, err
 	}
-	if f.rateRaw == "" {
-		return nil, fmt.Errorf("update-providers requires --rate-nano-per-mb-day <int>")
-	}
 	rate, err := parsePositiveUint64Flag("--rate-nano-per-mb-day", f.rateRaw)
 	if err != nil {
 		return nil, err
-	}
-	if f.spanDaysRaw == "" {
-		return nil, fmt.Errorf("update-providers requires --span-days <int>")
 	}
 	spanDays, err := parsePositiveUint64Flag("--span-days", f.spanDaysRaw)
 	if err != nil {
@@ -210,9 +207,23 @@ func parseUpdateProvidersFlags(args []string) (*updateProvidersParams, error) {
 func runUpdateProviders(ctx context.Context, args []string, stdout io.Writer) error {
 	p, err := parseUpdateProvidersFlags(args)
 	if errIsHelp(err) {
-		fmt.Fprint(stdout, helpText)
+		fmt.Fprint(stdout, subHelpText("update-providers"))
 		return nil
 	}
+	if err != nil {
+		return err
+	}
+
+	// Run the pure, network-free checks first — the --gas-ton/--max-spend-ton
+	// guard and buildUpdateProvidersBody's own validation (--span-days
+	// overflow, --rate-nano-per-mb-day) are static, input-only checks, so a
+	// local mistake here fails fast instead of paying for a tonapi round
+	// trip first (and getting a misleading "contract not active"-style error
+	// for what is actually the caller's own typo).
+	if err := checkUpdateProvidersGasGuard(p.gasNano, p.maxSpendNano); err != nil {
+		return err
+	}
+	body, err := buildUpdateProvidersBody(p.providerPubkey, p.rateNanoPerMB, p.spanDays)
 	if err != nil {
 		return err
 	}
@@ -245,14 +256,6 @@ func runUpdateProviders(ctx context.Context, args []string, stdout io.Writer) er
 		)
 	}
 
-	if err := checkUpdateProvidersGasGuard(p.gasNano, p.maxSpendNano); err != nil {
-		return err
-	}
-
-	body, err := buildUpdateProvidersBody(p.providerPubkey, p.rateNanoPerMB, p.spanDays)
-	if err != nil {
-		return err
-	}
 	deeplink := buildUpdateProvidersDeeplink(p.contract, body.ToBOC(), p.gasNano, p.testnet)
 
 	if !p.testnet {

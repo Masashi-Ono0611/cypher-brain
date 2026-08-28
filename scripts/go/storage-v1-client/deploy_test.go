@@ -194,6 +194,32 @@ func TestResolveDeployParamsRequiredFlags(t *testing.T) {
 	}
 }
 
+// TestResolveDeployParamsReportsAllMissingRequiredFlags pins the fix for the
+// "reports missing required flags one at a time" UX issue: an operator
+// running `deploy` with every required flag omitted should see all of them
+// listed in the single error, not just the first one checked.
+func TestResolveDeployParamsReportsAllMissingRequiredFlags(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := resolveDeployParams(ctx, &deployFlags{maxSpendTon: "0.5"})
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"--bag-id <64hex>",
+		"--provider-pubkey <64hex>",
+		"--owner <raw-addr>",
+		"--rate-nano-per-mb-day <int>",
+		"--span-days <int>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not mention missing flag %q", msg, want)
+		}
+	}
+}
+
 // TestRunDeployOffline exercises the FULL `deploy` subcommand end to end —
 // flag parsing, resolveDeployParams, buildDeploy, and stdout formatting —
 // entirely offline via the --size-bytes/--piece-size/--merkle-hash bypass

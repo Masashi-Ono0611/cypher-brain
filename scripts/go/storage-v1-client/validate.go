@@ -76,3 +76,28 @@ func parsePositiveUint64Flag(name, v string) (uint64, error) {
 	}
 	return n, nil
 }
+
+// requiredFlag pairs a required flag's usage description (as shown in an
+// error message, e.g. "--bag-id <64hex>") with its as-parsed raw value.
+type requiredFlag struct {
+	desc  string
+	value string
+}
+
+// checkRequiredFlags reports every required flag that is missing in one
+// error, instead of stopping at the first one — an operator who ran a
+// subcommand with several required flags omitted would otherwise have to
+// fix-and-rerun repeatedly to discover each missing flag in turn. Returns
+// nil if all given flags are present.
+func checkRequiredFlags(cmd string, flags ...requiredFlag) error {
+	var missing []string
+	for _, f := range flags {
+		if f.value == "" {
+			missing = append(missing, f.desc)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s requires %s", cmd, strings.Join(missing, ", "))
+}

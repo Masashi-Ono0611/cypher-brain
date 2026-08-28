@@ -139,10 +139,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 )
 
-const helpText = `storage-v1-client — operator-run EXPERIMENTAL client for the live TON
+// helpIntro is the shared overview + full Usage block, common to the global
+// `storage-v1-client --help`/no-args output and every focused per-subcommand
+// `<sub> --help` output (see subHelpText below) — an operator asking about
+// one subcommand still sees the overall command shape, just not the other
+// four subcommands' full flag docs.
+const helpIntro = `storage-v1-client — operator-run EXPERIMENTAL client for the live TON
 Storage Go/StorageV1 provider market (registry: mytonprovider.org).
 
 This is NOT a cypher-brain CLI feature — see the top-of-file comment in
@@ -168,8 +174,9 @@ Usage:
       --merkle-hash <64hex> --size-bytes <n> --piece-size <n> --owner <raw-addr> \
       [--gas-ton 0.05] [--mainnet] [--max-spend-ton 0.1]
   storage-v1-client --help
+`
 
-deploy: derives the StorageV1 contract address, builds its StateInit + the
+const deployHelp = `deploy: derives the StorageV1 contract address, builds its StateInit + the
 modify_providers deploy body (with --provider-pubkey already included — see
 the "field notes" in main.go), computes a suggested funding amount, and
 prints a Tonkeeper deeplink. Refuses (exit 2) if the computed amount exceeds
@@ -230,8 +237,9 @@ Env (deploy, only when the three overrides above are not all given):
   CYPHER_BRAIN_TON_SSH_KEY    (optional) -i identity file for ssh
   CYPHER_BRAIN_TON_REMOTE_API (optional) tonutils-storage API addr on the
                                seeder, default 127.0.0.1:9955
+`
 
-notify: sends the ADNL/RLDP "storageProvider.storageRequest" query that is
+const notifyHelp = `notify: sends the ADNL/RLDP "storageProvider.storageRequest" query that is
 the ONLY way (per main.go field notes) a provider daemon learns of a
 newly-deployed contract. Before querying, this checks --contract's on-chain
 account state via tonapi (read-only HTTP) and REFUSES (exit 2) if the
@@ -262,7 +270,19 @@ program cannot distinguish "not yet confirmed" from "never happened".
   client construction, ADNL gateway startup, argument validation) is
   exercised; the actual network round trip is not.
 
-status: queries tonapi for --contract's on-chain account state. Read-only,
+  Exit-code note: a REFUSE above (--contract 'nonexist') exits 2, distinct
+  from exit 1 for any other failure — but as of 2026-08 the only in-repo
+  caller of this program (src/lib/backends/ton-provider.ts's
+  notifyProviderWithRetry, via src/lib/proc.ts's run()) does not act on that
+  distinction: it treats every non-zero exit code identically and retries
+  for the same bounded window (TON_PROVIDER_NOTIFY_RETRY_MS) regardless of
+  cause. The 1-vs-2 split is documented here for a future/other caller that
+  might want to react differently; today it is intent, not enforced
+  behavior — retrying through a transient 'nonexist' while tonapi catches up
+  is arguably fine anyway.
+`
+
+const statusHelp = `status: queries tonapi for --contract's on-chain account state. Read-only,
 informational — mirrors scripts/ton-provider-experiment.mjs's 'status'
 subcommand, EXCEPT it exits 1 (not 0) if the tonapi query itself fails
 (timeout/HTTP error/malformed response), so an automated caller checking
@@ -274,8 +294,9 @@ on-chain and its balance.
 
   --contract <raw-addr>     required.
   --mainnet                 opt in to mainnet. Default: testnet.
+`
 
-update-providers: REPAIR path for an ALREADY-DEPLOYED contract whose provider
+const updateProvidersHelp = `update-providers: REPAIR path for an ALREADY-DEPLOYED contract whose provider
 list is wrong or needs changing — sends a bare modify_providers message (no
 StateInit, same contract address, existing balance untouched) instead of a
 new deploy. Added 2026-08-23 after a real incident: 'deploy' (before that
@@ -303,8 +324,9 @@ contract instead).
   --max-spend-ton <float>       refuse (exit 2) if --gas-ton would exceed
                                  this. Default 0.1.
   --mainnet                     opt in to mainnet (REAL FUNDS). Default: testnet.
+`
 
-withdraw: sends withdraw_owner (op 0x61fff683, contract.PrepareWithdrawalRequest
+const withdrawHelp = `withdraw: sends withdraw_owner (op 0x61fff683, contract.PrepareWithdrawalRequest
 — the exact upstream function) to an ALREADY-DEPLOYED StorageV1 contract.
 PERMANENTLY ends the contract's proof cycle: the on-chain handler checks
 sender == OwnerAddr, then sends the contract's ENTIRE remaining balance
@@ -342,13 +364,45 @@ paid for it the moment this lands.
   --mainnet                     opt in to mainnet (REAL FUNDS). Default: testnet.
 `
 
+// helpText is the full global help — helpIntro plus every subcommand's own
+// section, in usage order — shown by the bare `storage-v1-client --help`/
+// `-h` and the no-args/unknown-subcommand error paths (see run() below).
+const helpText = helpIntro + "\n" + deployHelp + "\n" + notifyHelp + "\n" + statusHelp + "\n" + updateProvidersHelp + "\n" + withdrawHelp
+
+// subcommandHelp maps each subcommand name to its own focused help section.
+var subcommandHelp = map[string]string{
+	"deploy":           deployHelp,
+	"notify":           notifyHelp,
+	"status":           statusHelp,
+	"update-providers": updateProvidersHelp,
+	"withdraw":         withdrawHelp,
+}
+
+// subHelpText returns the shared usage overview (helpIntro) followed by ONLY
+// the given subcommand's own detailed section, instead of all five — so
+// `storage-v1-client <sub> --help` leads with that subcommand's own
+// usage/flags rather than dumping the entire global help text (falls back to
+// the full helpText for an unrecognized name, which should not happen since
+// callers only pass this program's own subcommand names).
+func subHelpText(sub string) string {
+	body, ok := subcommandHelp[sub]
+	if !ok {
+		return helpText
+	}
+	return helpIntro + "\n" + body
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout, stderr *os.File) int {
+func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprint(stdout, helpText)
+		// exit 2 means "treated as an error" — print the help to stderr, not
+		// stdout, so a caller that only reads stdout (e.g. `cmd 2>/dev/null`
+		// to check for real output) doesn't see a success-shaped dump on an
+		// error-shaped exit code.
+		fmt.Fprint(stderr, helpText)
 		return 2
 	}
 	sub, rest := args[0], args[1:]
@@ -373,7 +427,7 @@ func run(args []string, stdout, stderr *os.File) int {
 		err = runWithdraw(ctx, rest, stdout)
 	default:
 		fmt.Fprintf(stderr, "storage-v1-client: unknown subcommand %q\n\n", sub)
-		fmt.Fprint(stdout, helpText)
+		fmt.Fprint(stderr, helpText)
 		return 2
 	}
 
