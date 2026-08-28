@@ -23,7 +23,14 @@ var (
 )
 
 func assertSafe(value, what string, re *regexp.Regexp) (string, error) {
-	if value == "" || !re.MatchString(value) || strings.HasPrefix(value, "-") {
+	// Empty and "contains disallowed characters" are different failures for an operator
+	// to diagnose — an unset env var reads as a simple missing-config problem, while
+	// "contains characters this program refuses" about a value shown as "" instead reads
+	// as a quoting/encoding mystery (issue #563). Keep them as distinct messages.
+	if value == "" {
+		return "", fmt.Errorf("%s is not set (empty) — this program requires it to be exported before running", what)
+	}
+	if !re.MatchString(value) || strings.HasPrefix(value, "-") {
 		return "", fmt.Errorf("%s contains characters this program refuses to place in a remote command: %q", what, value)
 	}
 	return value, nil
