@@ -10,7 +10,10 @@
 //
 // Credit: the engine defaults, the torn-store failure signature, and the
 // `gbrain pglite-repair` recovery command are all gbrain's own — see
-// https://github.com/garrytan/gbrain (v0.42.75.0 and its README's engine section).
+// https://github.com/garrytan/gbrain (v0.47.3.0 and its README's engine section;
+// re-confirmed live against that tag's own src/core/config.ts for #541 — the
+// resolution order and field names below are unchanged since the v0.42.75.0 citation
+// this replaces, so only the version number needed refreshing).
 // Nothing is copied from it; the rules below are reimplemented from the documented
 // config contract and described here in our own words.
 import type { Dirent } from 'node:fs';
@@ -42,14 +45,41 @@ export interface GbrainEngineInfo {
    * leaves this module.
    */
   relativeDataPath?: string;
+  /**
+   * True ONLY when config.json could not be treated as a real config at all — missing,
+   * unreadable (e.g. the path is a directory), unparseable JSON, or JSON that parses to
+   * something other than an object (`null`, an array, a bare string/number). In every one
+   * of those cases `engine` still falls back to 'postgres' (the safe pre-#367 default,
+   * see detectGbrainEngine's own doc comment) — but it is a DEFAULT, not a DETECTION, and
+   * a caller presenting that verdict to an operator should say so (#543). Never set when
+   * the file parsed fine as an object and simply had no usable `engine`/`database_path`
+   * fields — THAT is a genuine (if uninformative) read, not a failure.
+   */
+  readError?: true;
 }
 
 /**
  * What a gbrain home is configured for, mirroring gbrain's OWN resolution order for the
- * config file: an explicit `engine` field wins; otherwise the presence of
- * `database_path` (the on-disk PGLite data directory) implies PGLite; otherwise
- * Postgres. Anything unreadable or unparseable falls back to 'postgres' — the pre-#367
- * assumption, so a malformed config can never make this the thing that breaks a run.
+ * config file (`fileConfig?.engine || (fileConfig?.database_path ? 'pglite' : 'postgres')`,
+ * verified live against gbrain's current source for #541): a TRUTHY `engine` field wins
+ * outright; otherwise the presence of `database_path` (the on-disk PGLite data directory)
+ * implies PGLite; otherwise Postgres. Anything unreadable or unparseable falls back to
+ * 'postgres' — the pre-#367 assumption, so a malformed config can never make this the
+ * thing that breaks a run (see `readError` on GbrainEngineInfo for how a caller can tell
+ * that fallback apart from a genuine "no engine configured" read, #543).
+ *
+ * "A truthy `engine` field wins outright" is doing real work (#534): gbrain's own `||`
+ * resolution only falls through to the `database_path` heuristic when `engine` is FALSY
+ * (absent, `null`, `''`) — a PRESENT-but-unrecognized value (a hand-edited typo like
+ * `"Postgres"`, or a future gbrain engine type this union does not know about yet) is
+ * truthy, so real gbrain would take that raw string as-is, never touching
+ * `database_path` at all. This function's return type can only ever be `'pglite' |
+ * 'postgres'`, so it cannot mirror that exactly — but the one thing it must NOT do is
+ * what an earlier version did: treat a present-but-unrecognized value the same as an
+ * ABSENT one and run the `database_path` heuristic anyway. That inverted the one case
+ * this module explicitly documents as `engine` winning over a stale `database_path` the
+ * moment the string was not byte-identical to `'pglite'`/`'postgres'` — the safe answer
+ * for a value it cannot represent is the Postgres default, not a heuristic guess.
  *
  * READS EXACTLY TWO FIELDS, AND RETURNS THE VERDICT PLUS `database_path`. `config.json`
  * holds API keys, so nothing else in it is logged, echoed, copied, or returned. That is
@@ -93,7 +123,10 @@ export interface GbrainEngineInfo {
 export async function detectGbrainEngine(configPath: string): Promise<GbrainEngineInfo> {
   try {
     const parsed: unknown = JSON.parse(await readFile(configPath, 'utf8'));
-    if (typeof parsed !== 'object' || parsed === null) return { engine: 'postgres' };
+    // A parsed-but-non-object JSON value (null, an array, a bare string/number) is just
+    // as much "not a real config" as a read/parse failure below — flagged the same way
+    // (#543), not silently folded into the ordinary "no engine field" read.
+    if (typeof parsed !== 'object' || parsed === null) return { engine: 'postgres', readError: true };
     const cfg = parsed as { engine?: unknown; database_path?: unknown };
     const raw = typeof cfg.database_path === 'string' && cfg.database_path.length > 0 ? cfg.database_path : null;
     // Absolute: knowable, hand it over. Relative: quotable but NOT resolvable — see above.
@@ -104,9 +137,17 @@ export async function detectGbrainEngine(configPath: string): Promise<GbrainEngi
       : {};
     if (cfg.engine === 'pglite') return { engine: 'pglite', ...where };
     if (cfg.engine === 'postgres') return { engine: 'postgres' }; // an explicit engine wins; a stale path is not the store
+    // #534: a PRESENT but unrecognized `engine` (a typo, or a future gbrain engine type)
+    // is truthy, so gbrain's own `||` resolution would never reach the database_path
+    // heuristic for it either — it must NOT be treated the same as `engine` being absent.
+    // This union cannot represent the raw value, so the safe fallback is Postgres, not a
+    // database_path guess (see this function's own doc comment for why that inversion was
+    // the bug). Only a genuinely FALSY engine (absent, null, '') falls through to the
+    // heuristic below, matching gbrain's own short-circuit exactly.
+    if (cfg.engine) return { engine: 'postgres' };
     return raw ? { engine: 'pglite', ...where } : { engine: 'postgres' };
   } catch {
-    return { engine: 'postgres' };
+    return { engine: 'postgres', readError: true };
   }
 }
 

@@ -61,6 +61,12 @@ trap 'chmod -R u+rwX "$TMP" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 for _leaked in $(env | sed -n 's/^\(CYPHER_BRAIN_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$_leaked"; done
 unset _leaked
 
+# #542: the gbrain-engine-detection check reads $HOME/.gbrain/config.json directly (it
+# is not scoped to CYPHER_BRAIN_HOME like every other check here) — export a default,
+# empty HOME so the bulk of this file never touches whoever-runs-this's REAL ~/.gbrain.
+# Cases that specifically exercise gbrain-engine-detection override HOME per-case below.
+export HOME="$TMP/default-home"; mkdir -p "$HOME"
+
 cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
 
 echo "== (a) a not-yet-set-up home: every check SKIPs, health_score 100, PASS, exit 0 =="
@@ -494,6 +500,63 @@ if (typeof j.health_score !== 'number' || !Number.isFinite(j.health_score)) thro
 if (j.health_score >= 100) throw new Error('verdict PARTIAL but --json health_score is ' + j.health_score + ' — score/verdict must not disagree');
 " "$TMP/r.json"
 echo "[PASS] the same fixture via --json: verdict PARTIAL, exit 2, receipt-ledger-readability warn (not fail), score/verdict agree"
+
+echo "== (s) gbrain-engine-detection (#542): no ~/.gbrain config -> SKIP =="
+export CYPHER_BRAIN_HOME="$TMP/gbrain-none-cb-home"
+export HOME="$TMP/gbrain-none-home"; mkdir -p "$HOME"
+cb doctor --json > "$TMP/s.json" 2>&1 || { echo "[FAIL] doctor --json exited non-zero with no gbrain config"; cat "$TMP/s.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const g = j.checks.find((c) => c.id === 'gbrain-engine-detection');
+if (!g || g.status !== 'skip') throw new Error('expected gbrain-engine-detection skip with no ~/.gbrain, got ' + JSON.stringify(g));
+if (j.verdict !== 'PASS') throw new Error('expected verdict PASS, got ' + j.verdict);
+" "$TMP/s.json"
+echo "[PASS] no gbrain config: gbrain-engine-detection SKIPs, doesn't affect verdict"
+
+echo "== (t) gbrain-engine-detection: a genuine PGLite config -> PASS naming the engine and the store path =="
+export CYPHER_BRAIN_HOME="$TMP/gbrain-pglite-cb-home"
+export HOME="$TMP/gbrain-pglite-home"; mkdir -p "$HOME/.gbrain"
+printf '{"engine":"pglite","database_path":"%s/.gbrain/.pglite","api_key":"sk-selftest-decoy"}\n' "$HOME" > "$HOME/.gbrain/config.json"
+cb doctor --json > "$TMP/t.json" 2>&1 || { echo "[FAIL] doctor --json exited non-zero with a PGLite gbrain config"; cat "$TMP/t.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const g = j.checks.find((c) => c.id === 'gbrain-engine-detection');
+if (!g || g.status !== 'pass') throw new Error('expected gbrain-engine-detection pass for a PGLite config, got ' + JSON.stringify(g));
+if (!/PGLite/.test(g.message)) throw new Error('message does not name PGLite: ' + g.message);
+if (!g.message.includes('.pglite')) throw new Error('message does not include the configured store path: ' + g.message);
+if (g.message.includes('sk-selftest-decoy')) throw new Error('the config secret leaked into the doctor message: ' + g.message);
+" "$TMP/t.json"
+echo "[PASS] a genuine PGLite config: PASS naming PGLite and the configured store path, no config secret leaked"
+
+echo "== (u) gbrain-engine-detection: a genuine Postgres config -> PASS naming Postgres =="
+export CYPHER_BRAIN_HOME="$TMP/gbrain-postgres-cb-home"
+export HOME="$TMP/gbrain-postgres-home"; mkdir -p "$HOME/.gbrain"
+printf '{"engine":"postgres"}\n' > "$HOME/.gbrain/config.json"
+cb doctor --json > "$TMP/u.json" 2>&1 || { echo "[FAIL] doctor --json exited non-zero with a Postgres gbrain config"; cat "$TMP/u.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const g = j.checks.find((c) => c.id === 'gbrain-engine-detection');
+if (!g || g.status !== 'pass') throw new Error('expected gbrain-engine-detection pass for a Postgres config, got ' + JSON.stringify(g));
+if (!/Postgres/.test(g.message)) throw new Error('message does not name Postgres: ' + g.message);
+" "$TMP/u.json"
+echo "[PASS] a genuine Postgres config: PASS naming Postgres"
+
+echo "== (v) gbrain-engine-detection: an unreadable/malformed config -> WARN (never FAIL), doctor VERDICT PARTIAL =="
+export CYPHER_BRAIN_HOME="$TMP/gbrain-broken-cb-home"
+export HOME="$TMP/gbrain-broken-home"; mkdir -p "$HOME/.gbrain"
+printf '{not valid json' > "$HOME/.gbrain/config.json"
+RC=0
+cb doctor --json > "$TMP/v.json" 2>&1 || RC=$?
+[ "$RC" = "2" ] || { echo "[FAIL] doctor --json with a malformed gbrain config exited $RC, expected 2 (PARTIAL — WARN only)"; cat "$TMP/v.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const g = j.checks.find((c) => c.id === 'gbrain-engine-detection');
+if (!g || g.status !== 'warn') throw new Error('expected gbrain-engine-detection warn for a malformed config, got ' + JSON.stringify(g));
+if (!/could not be read/.test(g.message)) throw new Error('message does not say the config could not be read: ' + g.message);
+if (j.checks.some((c) => c.status === 'fail')) throw new Error('a malformed gbrain config must never escalate to FAIL');
+if (j.verdict !== 'PARTIAL') throw new Error('expected verdict PARTIAL, got ' + j.verdict);
+" "$TMP/v.json"
+echo "[PASS] an unreadable/malformed gbrain config: gbrain-engine-detection WARN (not FAIL), doctor VERDICT PARTIAL (exit 2)"
 
 echo
 echo "all cypher-brain doctor selftests passed"

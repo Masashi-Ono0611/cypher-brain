@@ -79,6 +79,9 @@ NOT_COVERED_MARK="NONE of the paths you gave above covers it"
 COVERED_MARK="The path(s) you gave above cover it"
 UNKNOWN_PATH_MARK="does not record a database_path"
 RELATIVE_PATH_MARK="records the store as a RELATIVE path"
+# #543: the distinct "could not be read" wording for a config read/parse FAILURE, as
+# opposed to the confident POSTGRES_BRANCH_MARK a genuinely-parsed config gets.
+UNREADABLE_MARK="could not be read (defaulting to Postgres)"
 
 CB_SRC="$TMP/plain-src"; mkdir -p "$CB_SRC"
 printf 'gbrain-pglite-selftest\n' > "$CB_SRC/note.txt"
@@ -129,7 +132,12 @@ wizard_case() {
   # so a branch that prompts differently than expected stalls and with_timeout kills
   # it — a mis-branch can never quietly pass here.
   local pg_line=""
-  [ "$expect" = "postgres" ] && pg_line="  [\"$PG_PROMPT_MARK\", \"n\"],"
+  # Both ordinary "postgres" and the #543 "postgres-unreadable" case land in the wizard's
+  # Postgres branch (the ONLY difference is which prose precedes the --pg prompt), so both
+  # need the same scripted answer here.
+  case "$expect" in
+    postgres | postgres-unreadable) pg_line="  [\"$PG_PROMPT_MARK\", \"n\"]," ;;
+  esac
   cat > "$qa" <<JSON
 [
   ["Generate an offline backup keypair now?", "n"],
@@ -164,10 +172,19 @@ JSON
     grep -qF "$PGLITE_BRANCH_MARK" "$logfile" || { echo "[FAIL] $label: expected the PGLite branch"; cat "$logfile"; exit 1; }
     if grep -qF "$POSTGRES_BRANCH_MARK" "$logfile"; then echo "[FAIL] $label: PGLite brain still printed the Postgres prose"; cat "$logfile"; exit 1; fi
     if grep -qF "$PG_PROMPT_MARK" "$logfile"; then echo "[FAIL] $label: PGLite brain was offered --pg — there is no Postgres server to dump"; cat "$logfile"; exit 1; fi
+  elif [ "$expect" = "postgres-unreadable" ]; then
+    # #543: a read/parse FAILURE must get the "could not be read" wording, and must NOT
+    # get the confident "Detected a gbrain config ... lives in Postgres" claim a genuinely
+    # parsed config gets — even though both fall back to the same underlying engine.
+    grep -qF "$UNREADABLE_MARK" "$logfile" || { echo "[FAIL] $label: expected the 'could not be read' wording for an unreadable/malformed config"; cat "$logfile"; exit 1; }
+    if grep -qF "$POSTGRES_BRANCH_MARK" "$logfile"; then echo "[FAIL] $label: an unreadable config still got the confident 'Detected a gbrain config' Postgres prose"; cat "$logfile"; exit 1; fi
+    if grep -qF "$PGLITE_BRANCH_MARK" "$logfile"; then echo "[FAIL] $label: an unreadable config took the PGLite branch"; cat "$logfile"; exit 1; fi
+    grep -qF "$PG_PROMPT_MARK" "$logfile" || { echo "[FAIL] $label: an unreadable config (defaulting to Postgres) was not offered --pg"; cat "$logfile"; exit 1; }
   else
     grep -qF "$POSTGRES_BRANCH_MARK" "$logfile" || { echo "[FAIL] $label: expected the Postgres branch"; cat "$logfile"; exit 1; }
     grep -qF "$PG_PROMPT_MARK" "$logfile" || { echo "[FAIL] $label: Postgres brain was not offered --pg (pre-#367 behaviour must be byte-identical here)"; cat "$logfile"; exit 1; }
     if grep -qF "$PGLITE_BRANCH_MARK" "$logfile"; then echo "[FAIL] $label: Postgres brain took the PGLite branch"; cat "$logfile"; exit 1; fi
+    if grep -qF "$UNREADABLE_MARK" "$logfile"; then echo "[FAIL] $label: a genuinely-parsed Postgres config got the 'could not be read' wording"; cat "$logfile"; exit 1; fi
   fi
 }
 
@@ -181,6 +198,24 @@ echo "[PASS] database_path with no engine field -> PGLite: no Postgres prose, no
 wizard_case explicit-pglite "{\"engine\":\"pglite\",\"api_key\":\"$DECOY_SECRET\"}" pglite "$TMP/case-explicit-pglite.log"
 echo "[PASS] an explicit engine=pglite -> PGLite even with no database_path recorded"
 echo "[PASS] no case leaked any other value out of config.json into the transcript (it holds API keys)"
+
+# #534: a PRESENT but unrecognized engine value (a case-mismatched typo, or a hypothetical
+# future gbrain engine type) must NOT fall through to the database_path-implies-pglite
+# heuristic — it must fail toward the safe pre-#367 Postgres default, exactly like the
+# genuinely-no-engine-field case above ("neither"), even with a database_path present that
+# would otherwise imply PGLite. This is the inversion #534 reports: the pre-fix code took
+# the PGLite branch here instead.
+wizard_case case-mismatch "{\"engine\":\"Postgres\",\"database_path\":\"@HOME@/.gbrain/.pglite\",\"api_key\":\"$DECOY_SECRET\"}" postgres "$TMP/case-case-mismatch.log"
+echo "[PASS] #534: engine=\"Postgres\" (capital P, a plausible hand-edit typo) with a database_path present -> Postgres, NOT the database_path heuristic"
+wizard_case unknown-future-engine "{\"engine\":\"sqlite\",\"database_path\":\"@HOME@/.gbrain/.pglite\",\"api_key\":\"$DECOY_SECRET\"}" postgres "$TMP/case-unknown-future-engine.log"
+echo "[PASS] #534: an unrecognized engine value (a hypothetical future gbrain engine type) with a database_path present -> Postgres, NOT the database_path heuristic"
+
+# #543: a config that exists but cannot be read/parsed at all (invalid JSON here) falls
+# back to the SAME 'postgres' verdict as a genuinely-parsed, engine-less config — but the
+# wizard must say so distinctly ("could not be read"), not present the same confident
+# "Detected a gbrain config ... lives in Postgres" claim a real detection gets.
+wizard_case malformed-json "{not valid json at all, missing closing brace and quotes" postgres-unreadable "$TMP/case-malformed-json.log"
+echo "[PASS] #543: invalid JSON in config.json -> the distinct 'could not be read (defaulting to Postgres)' wording, not the confident detection claim"
 
 # gbrain's OWN runtime resolution lets a DATABASE_URL-style env var win outright and
 # force Postgres. Copying that here would be a bug, not fidelity: cypher-brain is asking
@@ -269,6 +304,70 @@ grep -qF "$UNKNOWN_PATH_MARK" "$TMP/case-explicit-pglite.log" \
   || { echo "[FAIL] a PGLite brain with no database_path did not say the store location is unknown"; cat "$TMP/case-explicit-pglite.log"; exit 1; }
 if grep -qF "$COVERED_MARK" "$TMP/case-explicit-pglite.log"; then echo "[FAIL] a PGLite brain with no database_path still claimed the store was covered"; cat "$TMP/case-explicit-pglite.log"; exit 1; fi
 echo "[PASS] a PGLite brain with no database_path is told the location is unknown, and no coverage claim is made"
+
+# ---------------------------------------------------------------------------
+# (a2) detectGbrainEngine() unit-level: edge cases not easily reachable through the
+# wizard's own prompt-driving harness above (a directory in place of the config file, a
+# parsed-but-non-object JSON value, and the FALSY engine values #534's fix must still
+# fall through to the database_path heuristic for, matching gbrain's own `||` semantics).
+# ---------------------------------------------------------------------------
+echo "== (a2) detectGbrainEngine(): readError (#543) and falsy-vs-truthy engine (#534) edge cases =="
+UNIT_HOME="$TMP/unit-detect"; mkdir -p "$UNIT_HOME"
+node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs -e "
+import('./src/lib/gbrain.ts').then(async (m) => {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const dir = '$UNIT_HOME';
+  const assertEq = (label, actual, expected) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new Error(label + ': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual));
+    }
+  };
+
+  // #543: the config PATH ITSELF is a directory, not a file — readFile() throws EISDIR.
+  const dirAsConfig = path.join(dir, 'dir-as-config.json');
+  await fs.mkdir(dirAsConfig);
+  assertEq('directory-as-config', await m.detectGbrainEngine(dirAsConfig), { engine: 'postgres', readError: true });
+
+  // #543: valid JSON that parses to a non-object (a bare string) — same readError
+  // treatment as a hard parse failure, not folded into the ordinary engine-less read.
+  const nonObject = path.join(dir, 'non-object.json');
+  await fs.writeFile(nonObject, JSON.stringify('just-a-string'));
+  assertEq('non-object JSON', await m.detectGbrainEngine(nonObject), { engine: 'postgres', readError: true });
+
+  // #543: JSON null also parses to a non-object per the same 'object'-typeof/null check.
+  const jsonNull = path.join(dir, 'null.json');
+  await fs.writeFile(jsonNull, 'null');
+  assertEq('JSON null', await m.detectGbrainEngine(jsonNull), { engine: 'postgres', readError: true });
+
+  // #534, negative space: a config that genuinely lacks an engine field (undefined, or an
+  // explicit empty string — both FALSY) must still fall through to the database_path
+  // heuristic, matching gbrain's own fileConfig?.engine || (...) short-circuit exactly.
+  // This is the case the #534 fix must NOT break while fixing the truthy-unrecognized one.
+  const emptyEngine = path.join(dir, 'empty-engine.json');
+  await fs.writeFile(emptyEngine, JSON.stringify({ engine: '', database_path: '/srv/store.pglite' }));
+  assertEq('empty-string engine falls through to the heuristic', await m.detectGbrainEngine(emptyEngine), {
+    engine: 'pglite',
+    dataPath: '/srv/store.pglite',
+  });
+  const nullEngine = path.join(dir, 'null-engine.json');
+  await fs.writeFile(nullEngine, JSON.stringify({ engine: null, database_path: '/srv/store.pglite' }));
+  assertEq('null engine falls through to the heuristic', await m.detectGbrainEngine(nullEngine), {
+    engine: 'pglite',
+    dataPath: '/srv/store.pglite',
+  });
+
+  // #534, positive space (unit-level companion to the wizard-level (a) cases above): a
+  // TRUTHY but unrecognized engine value never reaches the heuristic, even with a
+  // database_path present — no readError either, since this config parsed just fine.
+  const badEngine = path.join(dir, 'bad-engine.json');
+  await fs.writeFile(badEngine, JSON.stringify({ engine: 'Postgres', database_path: '/srv/store.pglite' }));
+  assertEq('truthy unrecognized engine -> postgres, no readError', await m.detectGbrainEngine(badEngine), { engine: 'postgres' });
+
+  console.log('detectGbrainEngine unit checks OK');
+});
+" | grep -q 'detectGbrainEngine unit checks OK' || { echo "[FAIL] detectGbrainEngine() unit-level edge cases"; exit 1; }
+echo "[PASS] detectGbrainEngine(): directory-as-config/non-object-JSON/null all set readError; falsy engine ('', null) still falls through to the database_path heuristic; a truthy unrecognized engine does not"
 
 # ---------------------------------------------------------------------------
 # (b) end-to-end: a PGLite brain goes init -> snapshot -> push -> kit with no --pg
