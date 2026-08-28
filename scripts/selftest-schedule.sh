@@ -824,6 +824,100 @@ else
   echo "[PASS] uninstall: trigger + runner removed, data kept, idempotent; status exits 0 and reports 'not installed' (plain + --json, #426)"
 fi
 
+echo "== (e1) uninstall reports launchd plist DRIFT explicitly instead of silently omitting the 'removed:' line (#529) =="
+# #529 repro: install (writes schedule.json + the plist, --no-load or not — see
+# CYPHER_BRAIN_LAUNCHD_DIR in --help), then the plist gets deleted OUT OF BAND (another
+# tool, a human, whatever) while schedule.json still says it should be there. A plain
+# `uninstall` used to just have one fewer 'removed:' line than normal, with nothing
+# calling attention to it — indistinguishable-looking from an ordinary clean uninstall.
+# --json is NOT covered here: `schedule uninstall` has no --json output at all (only
+# `schedule status` does, #211/#426) — global `--json` bool flag parses but uninstall()
+# never reads o.json, so there is no existing JSON shape to keep parity with; nothing to
+# add here without inventing an unrequested new feature.
+if [ "$OS" != "Darwin" ]; then
+  echo "[SKIP] plist-drift reporting — the launchd plist only exists on Darwin"
+else
+  DRIFT_HOME="$TMP/drift-home"; DRIFT_SCHED="$TMP/drift-sched"; DRIFT_LAUNCHD="$TMP/drift-launchagents"
+  DRIFT_SRC="$DRIFT_HOME/src"; mkdir -p "$DRIFT_SRC" "$DRIFT_LAUNCHD"
+  echo drift > "$DRIFT_SRC/f.txt"
+  DRIFT_PLIST="$DRIFT_LAUNCHD/dev.cypher-brain.nightly.$(home_hash "$DRIFT_HOME").plist"
+
+  # --- normal case first: plist present, real uninstall (safe for real — home-scoped
+  # LABEL per #114 can never match a real, machine-wide schedule). Locks down that the
+  # ORIGINAL 'removed: launchd plist <path>' line is unchanged by this fix (no regression),
+  # and that no drift note is printed when there was no drift.
+  CYPHER_BRAIN_HOME="$DRIFT_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$DRIFT_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$DRIFT_LAUNCHD" \
+    cb schedule install --backend file --dir "$DRIFT_SRC" --no-load > "$TMP/drift-install1.log" 2>&1 \
+    || { echo "[FAIL] #529 test setup: install 1 exited non-zero"; cat "$TMP/drift-install1.log"; exit 1; }
+  [ -f "$DRIFT_PLIST" ] || { echo "[FAIL] #529 test setup: plist missing right after install"; exit 1; }
+  CYPHER_BRAIN_HOME="$DRIFT_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$DRIFT_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$DRIFT_LAUNCHD" \
+    cb schedule uninstall > "$TMP/drift-uninstall-normal.log" 2>&1 \
+    || { echo "[FAIL] #529: normal-case (plist present) uninstall exited non-zero"; cat "$TMP/drift-uninstall-normal.log"; exit 1; }
+  grep -qF "removed: launchd plist $DRIFT_PLIST" "$TMP/drift-uninstall-normal.log" \
+    || { echo "[FAIL] #529 regression: normal uninstall (plist WAS present) no longer prints 'removed: launchd plist <path>'"; cat "$TMP/drift-uninstall-normal.log"; exit 1; }
+  grep -q 'was already missing' "$TMP/drift-uninstall-normal.log" \
+    && { echo "[FAIL] #529: normal uninstall (plist WAS present) wrongly printed a drift note"; cat "$TMP/drift-uninstall-normal.log"; exit 1; }
+  [ ! -f "$DRIFT_PLIST" ] || { echo "[FAIL] #529: normal uninstall left the plist behind"; exit 1; }
+
+  # --- drift case: reinstall, then delete ONLY the plist (simulating #529's repro) before
+  # uninstalling again. schedule.json still exists (this home's own recorded bookkeeping),
+  # so the plist WAS expected — this must surface as an explicit note, exit 0 either way
+  # (the end state — no plist, no bookkeeping — is reached regardless of whether THIS run
+  # is the one that deleted the file).
+  CYPHER_BRAIN_HOME="$DRIFT_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$DRIFT_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$DRIFT_LAUNCHD" \
+    cb schedule install --backend file --dir "$DRIFT_SRC" --no-load > "$TMP/drift-install2.log" 2>&1 \
+    || { echo "[FAIL] #529 test setup: install 2 (re-install after normal uninstall) exited non-zero"; cat "$TMP/drift-install2.log"; exit 1; }
+  [ -f "$DRIFT_PLIST" ] || { echo "[FAIL] #529 test setup: plist missing right after re-install"; exit 1; }
+  [ -f "$DRIFT_SCHED/schedule.json" ] || { echo "[FAIL] #529 test setup: schedule.json missing right after re-install"; exit 1; }
+  rm -f "$DRIFT_PLIST" # simulate out-of-band drift: ONLY the plist disappears, bookkeeping stays
+  CYPHER_BRAIN_HOME="$DRIFT_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$DRIFT_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$DRIFT_LAUNCHD" \
+    cb schedule uninstall > "$TMP/drift-uninstall-drifted.log" 2>&1 \
+    || { echo "[FAIL] #529: drifted uninstall exited non-zero — must still succeed (uninstall's own end state is reached either way)"; cat "$TMP/drift-uninstall-drifted.log"; exit 1; }
+  grep -q "removed: launchd plist" "$TMP/drift-uninstall-drifted.log" \
+    && { echo "[FAIL] #529: drifted uninstall claims it removed a plist that was already gone"; cat "$TMP/drift-uninstall-drifted.log"; exit 1; }
+  grep -qF "launchd plist $DRIFT_PLIST was already missing on uninstall" "$TMP/drift-uninstall-drifted.log" \
+    || { echo "[FAIL] #529: drifted uninstall did NOT report the plist as already missing — silently omitted, the exact bug this issue is about"; cat "$TMP/drift-uninstall-drifted.log"; exit 1; }
+  # #529: this note goes through warn() (#347's single warning chokepoint), not a plain
+  # console.error — it must be ⚠-prefixed AND repeated in the end-of-run "run summary"
+  # block, exactly like every other must-reach-a-human runtime warning.
+  grep -qF "⚠  launchd plist $DRIFT_PLIST was already missing on uninstall" "$TMP/drift-uninstall-drifted.log" \
+    || { echo "[FAIL] #529: drift note was not printed through warn() (missing ⚠ prefix)"; cat "$TMP/drift-uninstall-drifted.log"; exit 1; }
+  grep -q '⚠  run summary — 1 warning(s)' "$TMP/drift-uninstall-drifted.log" \
+    || { echo "[FAIL] #529: drift note did not reach the end-of-run warning summary (#347) — an agent relaying only fragments could drop it"; cat "$TMP/drift-uninstall-drifted.log"; exit 1; }
+  [ ! -f "$DRIFT_SCHED/schedule.json" ] || { echo "[FAIL] #529: drifted uninstall left schedule.json behind"; exit 1; }
+  [ ! -f "$DRIFT_SCHED/nightly.sh" ] || { echo "[FAIL] #529: drifted uninstall left the runner behind"; exit 1; }
+  echo "[PASS] uninstall distinguishes plist drift (explicit warn()'d note, #529) from an ordinary removal ('removed:' line unchanged); exits 0 either way"
+
+  # --- moved case: schedule.json's recorded trigger.path differs from the CURRENT PLIST
+  # (CYPHER_BRAIN_LAUNCHD_DIR changed between install and uninstall) — legacyLaunchd()
+  # below already reports the file at its RECORDED (stale) location; the never-installed
+  # CURRENT-dir PLIST must NOT ALSO be flagged as drift. (Codex review, #529: an earlier
+  # version of this fix treated "schedule.json exists" as sufficient for drift, which
+  # false-alarmed here — narrowed to "trigger.path === PLIST", the same test
+  # legacyLaunchd() itself uses to tell "current" from "moved/legacy".)
+  MOVED_HOME="$TMP/moved-home"; MOVED_SCHED="$TMP/moved-sched"
+  MOVED_L1="$TMP/moved-launchagents-1"; MOVED_L2="$TMP/moved-launchagents-2"
+  MOVED_SRC="$MOVED_HOME/src"; mkdir -p "$MOVED_SRC" "$MOVED_L1" "$MOVED_L2"
+  echo moved > "$MOVED_SRC/f.txt"
+  CYPHER_BRAIN_HOME="$MOVED_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$MOVED_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$MOVED_L1" \
+    cb schedule install --backend file --dir "$MOVED_SRC" --no-load > "$TMP/moved-install.log" 2>&1 \
+    || { echo "[FAIL] #529 moved-plist test setup: install exited non-zero"; cat "$TMP/moved-install.log"; exit 1; }
+  MOVED_P1="$MOVED_L1/dev.cypher-brain.nightly.$(home_hash "$MOVED_HOME").plist"
+  [ -f "$MOVED_P1" ] || { echo "[FAIL] #529 moved-plist test setup: plist missing after install"; exit 1; }
+  # uninstall from a DIFFERENT CYPHER_BRAIN_LAUNCHD_DIR than install used (operator moved
+  # it) — schedule.json still points at $MOVED_P1, so the current-dir PLIST was never
+  # installed at all, and must not be reported as if it had drifted away.
+  CYPHER_BRAIN_HOME="$MOVED_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$MOVED_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$MOVED_L2" \
+    cb schedule uninstall > "$TMP/moved-uninstall.log" 2>&1 \
+    || { echo "[FAIL] #529: moved-plist uninstall exited non-zero"; cat "$TMP/moved-uninstall.log"; exit 1; }
+  grep -qF "removed: legacy launchd plist $MOVED_P1" "$TMP/moved-uninstall.log" \
+    || { echo "[FAIL] #529: moved-plist uninstall did not remove the plist at its RECORDED (moved) location"; cat "$TMP/moved-uninstall.log"; exit 1; }
+  grep -q 'was already missing' "$TMP/moved-uninstall.log" \
+    && { echo "[FAIL] #529 false positive: moved-plist uninstall wrongly flagged the never-installed current-dir plist as drift"; cat "$TMP/moved-uninstall.log"; exit 1; }
+  [ ! -f "$MOVED_P1" ] || { echo "[FAIL] #529: moved-plist uninstall left the recorded plist behind"; exit 1; }
+  echo "[PASS] uninstall with a moved CYPHER_BRAIN_LAUNCHD_DIR removes the plist at its recorded (stale) location without a false drift alarm (#529)"
+fi
+
 echo "== (f) two different CYPHER_BRAIN_HOME schedules never collide: distinct LABEL/CRON_MARKER, installing/uninstalling one never touches the other's REAL registration (#114) =="
 if [ "$OS" != "Darwin" ] && [ "$HAS_CRONTAB" = "0" ]; then
   echo "[SKIP] multi-home collision check — this host has no crontab binary"

@@ -53,6 +53,7 @@ import {
 } from './secrets-scan.js';
 import { exists } from './util.js';
 import { printJson } from './ui.js';
+import { warn } from './warn.js';
 import { assertExportRequiresO2bProfile, assertKnownProfile } from './profiles.js';
 import { tonWalletConfigured } from './wallet.js';
 import { didYouMean, nearestName } from './suggest.js';
@@ -1490,11 +1491,28 @@ async function uninstall(o: CliOptions): Promise<void> {
   }
 
   const removed: string[] = [];
+  let plistDrift = false; // #529: set below when the plist was expected but missing
   if (process.platform === 'darwin') {
     sh('launchctl', ['bootout', `gui/${process.getuid?.()}/${LABEL}`]); // failure = was not loaded, fine
     if (await exists(PLIST)) {
       await rm(PLIST);
       removed.push(`launchd plist ${PLIST}`);
+    } else if (priorCfg?.trigger.type === 'launchd' && priorCfg.trigger.path === PLIST) {
+      // #529: schedule.json recording trigger.path === the CURRENT PLIST (same test
+      // legacyLaunchd() below uses to tell "current" from "moved/legacy") means install
+      // wrote the plist right here — unconditionally, --no-load or not (see
+      // CYPHER_BRAIN_LAUNCHD_DIR in --help) — so its absence now IS drift (deleted
+      // manually, by another tool, or by a prior uninstall that already removed it). The
+      // bare `if` above used to just skip this silently, making a clean teardown
+      // indistinguishable from "the trigger vanished and nobody knows why" in the output
+      // — this is the whole fix for #529.
+      //
+      // Deliberately narrower than "priorCfg exists": if trigger.path is instead a
+      // DIFFERENT path (e.g. CYPHER_BRAIN_LAUNCHD_DIR changed since install, or a
+      // pre-#114 legacy scheme), legacyLaunchd() below already reports THAT file — a
+      // moved/legacy plist is not "gone", so flagging the never-installed current-path
+      // PLIST here too would be a false alarm (Codex review, #529).
+      plistDrift = true;
     }
     const legacy = legacyLaunchd(priorCfg);
     if (legacy) {
@@ -1535,10 +1553,22 @@ async function uninstall(o: CliOptions): Promise<void> {
       removed.push(`${what} ${p}`);
     }
   }
-  if (removed.length === 0) {
+  if (removed.length === 0 && !plistDrift) {
     console.error('nothing to remove — schedule is not installed');
   } else {
     for (const r of removed) console.error(`removed: ${r}`);
+    // #529: warn(), not a plain `removed:` line — nothing was actually removed here, the
+    // file was already gone, and this is exactly the class of thing warn() exists for
+    // (#347): an incidental hazard that must survive an agent relaying this run, not just
+    // this one stderr line among several. Distinct wording (and the ⚠ warn() prefixes it
+    // with) lets a caller — human or doctor/monitoring — tell "cleanly tore down a live
+    // trigger" apart from "the trigger's registration artifact silently vanished
+    // out-of-band and nobody knows why". Exit code/end state are unchanged either way —
+    // this only makes the drift VISIBLE.
+    if (plistDrift)
+      warn(
+        `launchd plist ${PLIST} was already missing on uninstall (removed manually, or drift from a prior uninstall?)`,
+      );
     console.error(
       `kept: logs (${LOGS_DIR}), snapshots (${SNAPS_DIR}) and index.tsv — they are your data, delete manually if unwanted`,
     );
