@@ -111,15 +111,15 @@ func parseNotifyFlags(args []string) (*notifyParams, error) {
 	if fs.NArg() > 0 {
 		return nil, fmt.Errorf("unexpected extra arguments: %v", fs.Args())
 	}
-	if *providerPubkeyRaw == "" {
-		return nil, fmt.Errorf("notify requires --provider-pubkey <64hex>")
+	if err := checkRequiredFlags("notify",
+		requiredFlag{"--provider-pubkey <64hex>", *providerPubkeyRaw},
+		requiredFlag{"--contract <raw-addr>", *contractRaw},
+	); err != nil {
+		return nil, err
 	}
 	providerPubkey, err := parseHex32("--provider-pubkey", *providerPubkeyRaw)
 	if err != nil {
 		return nil, err
-	}
-	if *contractRaw == "" {
-		return nil, fmt.Errorf("notify requires --contract <raw-addr>")
 	}
 	contractAddr, err := parseRawAddr("--contract", *contractRaw, 0, -1)
 	if err != nil {
@@ -145,7 +145,7 @@ func parseNotifyFlags(args []string) (*notifyParams, error) {
 func runNotify(ctx context.Context, args []string, stdout io.Writer) error {
 	p, err := parseNotifyFlags(args)
 	if errIsHelp(err) {
-		fmt.Fprint(stdout, helpText)
+		fmt.Fprint(stdout, subHelpText("notify"))
 		return nil
 	}
 	if err != nil {

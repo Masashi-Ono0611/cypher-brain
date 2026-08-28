@@ -172,36 +172,31 @@ func parseDeployFlagSet(args []string) (*deployFlags, error) {
 // three given, resolveDeployParams never touches the network, which is what
 // deploy_test.go exploits for full offline `deploy` coverage.
 func resolveDeployParams(ctx context.Context, f *deployFlags) (*deployParams, error) {
-	if f.bagIDHex == "" {
-		return nil, fmt.Errorf("deploy requires --bag-id <64hex>")
+	if err := checkRequiredFlags("deploy",
+		requiredFlag{"--bag-id <64hex>", f.bagIDHex},
+		requiredFlag{"--provider-pubkey <64hex>", f.providerPubkeyRaw},
+		requiredFlag{"--owner <raw-addr>", f.ownerRaw},
+		requiredFlag{"--rate-nano-per-mb-day <int>", f.rateRaw},
+		requiredFlag{"--span-days <int>", f.spanDaysRaw},
+	); err != nil {
+		return nil, err
 	}
+
 	bagID, err := parseHex32("--bag-id", f.bagIDHex)
 	if err != nil {
 		return nil, err
-	}
-	if f.providerPubkeyRaw == "" {
-		return nil, fmt.Errorf("deploy requires --provider-pubkey <64hex>")
 	}
 	providerPubkey, err := parseHex32("--provider-pubkey", f.providerPubkeyRaw)
 	if err != nil {
 		return nil, err
 	}
-	if f.ownerRaw == "" {
-		return nil, fmt.Errorf("deploy requires --owner <raw-addr>")
-	}
 	owner, err := parseRawAddr("--owner", f.ownerRaw, 0, -1)
 	if err != nil {
 		return nil, err
 	}
-	if f.rateRaw == "" {
-		return nil, fmt.Errorf("deploy requires --rate-nano-per-mb-day <int>")
-	}
 	rate, err := parsePositiveUint64Flag("--rate-nano-per-mb-day", f.rateRaw)
 	if err != nil {
 		return nil, err
-	}
-	if f.spanDaysRaw == "" {
-		return nil, fmt.Errorf("deploy requires --span-days <int>")
 	}
 	spanDays, err := parsePositiveUint64Flag("--span-days", f.spanDaysRaw)
 	if err != nil {
@@ -276,7 +271,7 @@ func resolveDeployParams(ctx context.Context, f *deployFlags) (*deployParams, er
 func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 	f, err := parseDeployFlagSet(args)
 	if errIsHelp(err) {
-		fmt.Fprint(stdout, helpText)
+		fmt.Fprint(stdout, subHelpText("deploy"))
 		return nil
 	}
 	if err != nil {

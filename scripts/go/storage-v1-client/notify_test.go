@@ -91,6 +91,21 @@ func TestParseNotifyFlagsErrors(t *testing.T) {
 	}
 }
 
+// TestParseNotifyFlagsReportsAllMissingRequiredFlags pins the fix for the
+// "reports missing required flags one at a time" UX issue.
+func TestParseNotifyFlagsReportsAllMissingRequiredFlags(t *testing.T) {
+	_, err := parseNotifyFlags(nil)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{"--provider-pubkey <64hex>", "--contract <raw-addr>"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not mention missing flag %q", msg, want)
+		}
+	}
+}
+
 func TestGlobalConfigURL(t *testing.T) {
 	if globalConfigURL(true) != testnetGlobalConfigURL {
 		t.Fatalf("globalConfigURL(true) = %s, want %s", globalConfigURL(true), testnetGlobalConfigURL)

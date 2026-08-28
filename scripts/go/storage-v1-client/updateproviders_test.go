@@ -221,6 +221,26 @@ func TestParseUpdateProvidersFlagsRequired(t *testing.T) {
 	}
 }
 
+// TestParseUpdateProvidersFlagsReportsAllMissingRequiredFlags pins the fix
+// for the "reports missing required flags one at a time" UX issue.
+func TestParseUpdateProvidersFlagsReportsAllMissingRequiredFlags(t *testing.T) {
+	_, err := parseUpdateProvidersFlags(nil)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"--contract <raw-addr>",
+		"--provider-pubkey <64hex>",
+		"--rate-nano-per-mb-day <int>",
+		"--span-days <int>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not mention missing flag %q", msg, want)
+		}
+	}
+}
+
 // TestParseUpdateProvidersFlagsDefaults pins the 0.05 TON gas / 0.1 TON
 // max-spend defaults so a future edit that changes them is a visible,
 // deliberate diff rather than a silent behavior change.
@@ -246,11 +266,14 @@ func TestParseUpdateProvidersFlagsDefaults(t *testing.T) {
 }
 
 // TestParseUpdateProvidersFlagsMaxSpendGuardIsCheckedAtRunTime documents
-// that gas-vs-max-spend is validated in runUpdateProviders (network-touching,
-// since it also checks on-chain state first), not in the pure flag parser —
-// parseUpdateProvidersFlags accepts a --gas-ton that exceeds --max-spend-ton
-// syntactically; this mirrors deploy's max-spend guard placement (buildDeploy,
-// not parseDeployFlagSet) and is intentional, not an oversight.
+// that gas-vs-max-spend is validated in runUpdateProviders via
+// checkUpdateProvidersGasGuard (a separate, network-free step that
+// runUpdateProviders runs BEFORE the on-chain state check — see updateproviders.go
+// — so a bad --gas-ton fails fast without a tonapi round trip), not in the
+// pure flag parser — parseUpdateProvidersFlags accepts a --gas-ton that
+// exceeds --max-spend-ton syntactically; this mirrors deploy's max-spend
+// guard placement (buildDeploy, not parseDeployFlagSet) and is intentional,
+// not an oversight.
 func TestParseUpdateProvidersFlagsMaxSpendGuardIsCheckedAtRunTime(t *testing.T) {
 	p, err := parseUpdateProvidersFlags([]string{
 		"--contract", "0:" + strings.Repeat("a", 64),

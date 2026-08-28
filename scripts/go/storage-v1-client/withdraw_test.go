@@ -186,3 +186,25 @@ func TestBuildWithdrawFieldLengthValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestParseWithdrawFlagsReportsAllMissingRequiredFlags pins the fix for the
+// "reports missing required flags one at a time" UX issue.
+func TestParseWithdrawFlagsReportsAllMissingRequiredFlags(t *testing.T) {
+	_, err := parseWithdrawFlags(nil)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"--contract <raw-addr>",
+		"--bag-id <64hex>",
+		"--merkle-hash <64hex>",
+		"--size-bytes <n>",
+		"--piece-size <n>",
+		"--owner <raw-addr>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not mention missing flag %q", msg, want)
+		}
+	}
+}
