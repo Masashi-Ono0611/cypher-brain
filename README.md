@@ -297,6 +297,9 @@ cypher-brain keygen                 # one-time: creates ~/.cypher-brain/{identit
 # cluster's files are being copied without pg_dump's point-in-time consistency, so
 # the copy may be inconsistent — stop gbrain first when you can. See MANAGEMENT.md
 # "Avoid the write window", which also states how deep the detection looks.
+# --dir here assumes the default ~/.gbrain. If gbrain's OWN GBRAIN_HOME env var
+# relocates its home elsewhere, gbrain actually lives at $GBRAIN_HOME/.gbrain —
+# use that path instead (cypher-brain doctor/init already detect this).
 cypher-brain snapshot \
   --pg "postgres://user@localhost:5432/gbrain" \
   --dir ~/.gbrain \

@@ -142,6 +142,10 @@ CYPHER_BRAIN_FILE_DIR=/Volumes/backup/cypher-brain-store
   (so it can be reported) but never enters the environment — a stray `TMPDIR` or
   proxy variable in there cannot reach the `tar`, `pg_dump` or `rclone` processes
   cypher-brain spawns.
+- **The pre-rename `CIPHER_BRAIN_*` spelling also works**, in the file exactly as
+  in the environment — same names, `cipher` instead of `cypher`. Setting the same
+  key under both spellings in the same file is refused as ambiguous, same as
+  setting both in the environment.
 
 **What it does not change is the nightly run.** `schedule install` still bakes the
 values that were in effect *at install time* into the runner, because launchd and
@@ -163,6 +167,9 @@ a `launchd` agent on macOS, a `crontab` entry on Linux:
 
 ```sh
 # runs on the machine that holds gbrain (it has the public key only)
+# --dir here assumes gbrain's default ~/.gbrain. If gbrain's OWN GBRAIN_HOME env
+# var relocates its home elsewhere, gbrain actually lives at $GBRAIN_HOME/.gbrain
+# (not $GBRAIN_HOME itself) — point --dir there instead.
 cypher-brain schedule install --backend turbo \
   --pg "postgres://you@localhost:5432/gbrain" --dir "$HOME/.gbrain" \
   --recipient ~/.cypher-brain/recipient.txt \
