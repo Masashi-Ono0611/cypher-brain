@@ -517,6 +517,9 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       form. Set CYPHER_BRAIN_TON_WALLET to the written path afterward so 'push --backend
       ton-provider' signs and broadcasts deploys itself instead of printing a Tonkeeper
       deeplink for a human to approve — see push's --backend ton-provider section below.
+      The printed address is the bounceable ("EQ...") encoding; some wallets/explorers
+      may show the same account as its non-bounceable ("UQ...") counterpart — both refer
+      to the same address (issue #483).
 
   cypher-brain wallet address [--wallet <path>] [--chain arweave|ton]
       Derive and print the address a wallet spends from, without uploading/deploying

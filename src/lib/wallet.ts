@@ -161,6 +161,11 @@ async function tonWalletCreate(o: CliOptions): Promise<void> {
   await createKeyFile(outPath, usingDefaultPath, !!o.force, JSON.stringify(payload));
   console.log(`TON wallet (PRIVATE, keep offline): ${outPath}`);
   console.log(`address (PUBLIC, safe to share — fund THIS address): ${address}`);
+  // #483: this is the bounceable (EQ...) encoding of the address; other TON tooling
+  // may render the SAME account as its non-bounceable (UQ...) counterpart. Both refer
+  // to the same address — first-time TON users otherwise have no way to know that.
+  console.log('  (this is the bounceable "EQ..." encoding; some wallets/explorers may show the same account as');
+  console.log('  "UQ..." instead — both refer to the same address)');
   console.log(
     `\n⚠  Back up the mnemonic now. Fund the address above with TON, then set CYPHER_BRAIN_TON_WALLET=${outPath} ` +
       'so ton-provider push auto-signs deploys with it instead of printing a Tonkeeper deeplink.',

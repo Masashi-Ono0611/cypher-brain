@@ -169,6 +169,24 @@ fi
 grep -q -- '--wait must be a non-negative whole number of seconds' "$TMP/badwait.err" || { echo "[FAIL] wrong malformed-wait refusal message"; cat "$TMP/badwait.err"; exit 1; }
 echo "[PASS] malformed --wait refused"
 
+echo "== positive control (#482): missing --from-locator-file is REFUSED with a distinct message =="
+MISSING_LOC="$TMP/does-not-exist.tsv"
+if cb publish-latest --domain test.ton --from-locator-file "$MISSING_LOC" --yes 2>"$TMP/missingloc.err"; then
+  echo "[FAIL] a nonexistent --from-locator-file was accepted"; exit 1
+fi
+grep -qF "no such locator file: $MISSING_LOC" "$TMP/missingloc.err" || { echo "[FAIL] wrong missing-file refusal message"; cat "$TMP/missingloc.err"; exit 1; }
+echo "[PASS] missing locator file refused with 'no such locator file'"
+
+echo "== positive control (#482): locator file with no locator line is REFUSED with a distinct message =="
+EMPTY_LOC="$TMP/empty-loc.tsv"
+printf '# just a comment, no locator line\n' > "$EMPTY_LOC"
+if cb publish-latest --domain test.ton --from-locator-file "$EMPTY_LOC" --yes 2>"$TMP/emptyloc.err"; then
+  echo "[FAIL] a locator file with no locator line was accepted"; exit 1
+fi
+grep -qF "$EMPTY_LOC has no locator line" "$TMP/emptyloc.err" || { echo "[FAIL] wrong no-locator-line refusal message"; cat "$TMP/emptyloc.err"; exit 1; }
+grep -qF 'run a push with --save-locator first, and point --from-locator-file at the file it wrote' "$TMP/emptyloc.err" || { echo "[FAIL] no-locator-line refusal is missing the recovery guidance"; cat "$TMP/emptyloc.err"; exit 1; }
+echo "[PASS] locator file with no locator line refused with 'has no locator line' + recovery guidance, distinct from the missing-file message"
+
 echo "== skipped control: missing @ton/ton install advice (not testable here) =="
 echo "  @ton/ton is a real, installed optionalDependency in this checkout (moved here from"
 echo "  devDependencies) — there is no way to make the dynamic import() fail without"

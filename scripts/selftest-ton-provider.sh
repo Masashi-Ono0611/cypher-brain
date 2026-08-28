@@ -472,6 +472,13 @@ TON_WALLET_ADDR=$(cb wallet address --chain ton --wallet "$TMP/ton-wallet.json")
 grep -q "$TON_WALLET_ADDR" "$TMP/ton-wallet-create.out" || { echo "[FAIL] wallet create/address --chain ton disagree on the derived address"; exit 1; }
 echo "[PASS] wallet create --chain ton writes a mnemonic file; wallet address derives the SAME address"
 
+# Issue #483: the printed address is the bounceable (EQ...) encoding, and first-time TON
+# users get no other signal that a UQ... rendering of the SAME account is equivalent —
+# `wallet create --chain ton` must say so.
+grep -qF 'EQ...' "$TMP/ton-wallet-create.out" || { echo "[FAIL] wallet create --chain ton did not mention the EQ... bounceable encoding (#483)"; cat "$TMP/ton-wallet-create.out"; exit 1; }
+grep -qF 'UQ...' "$TMP/ton-wallet-create.out" || { echo "[FAIL] wallet create --chain ton did not mention the UQ... non-bounceable counterpart (#483)"; cat "$TMP/ton-wallet-create.out"; exit 1; }
+echo "[PASS] wallet create --chain ton explains the EQ.../UQ... address encoding (#483)"
+
 # Codex review, xhigh pass: prove the REFUSED create left the original mnemonic byte-for-byte
 # untouched, not just that it exited non-zero with the right message (a "write then fail"
 # clobber would still pass a message-only check).
