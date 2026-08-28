@@ -32,6 +32,16 @@
 #       followed and truncated — its original target is left untouched.
 #   (m) an explicitly-configured but missing CYPHER_BRAIN_AR_WALLET is a FAIL, not the
 #       same SKIP an unconfigured wallet gets.
+#   (o) audit-chain-integrity / receipt-ledger-readability (#456): SKIP on a machine that
+#       has never run push/restore/verify or a paid push — no false WARN/FAIL for a
+#       normal, not-yet-used state.
+#   (p) a well-formed audit log entry / receipt ledger line: both checks PASS.
+#   (q) POSITIVE CONTROL — a hand-corrupted audit log entry (content changed, hash not
+#       recomputed, breaking the chain) is a FAIL naming the broken index, and doctor's
+#       overall VERDICT is FAIL (exit 1) — the exact false-100/100 gap #456 was filed for.
+#   (r) POSITIVE CONTROL — an unreadable line appended to the receipt ledger is a WARN
+#       (not a FAIL — a data-quality issue, not a broken security boundary), and
+#       doctor's overall VERDICT is PARTIAL (exit 2), never a silent PASS.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -316,6 +326,148 @@ import('./src/lib/buildinfo.ts').then((m) => {
 });
 " | grep -q "boundaries OK" || { echo "[FAIL] buildAgeDays boundary/edge cases"; exit 1; }
 echo "[PASS] buildAgeDays: 90-day boundary, unparseable-date null, future-date clamp"
+
+echo "== (o) audit-chain-integrity / receipt-ledger-readability (#456): SKIP on a machine that has never run push/restore/verify or a paid push =="
+export CYPHER_BRAIN_HOME="$TMP/audit-ledger-home"
+[ ! -e "$CYPHER_BRAIN_HOME" ] || { echo "[FAIL] test setup: $CYPHER_BRAIN_HOME already exists"; exit 1; }
+cb doctor --json > "$TMP/o.json" 2>&1 || { echo "[FAIL] doctor --json exited non-zero on a never-used home"; cat "$TMP/o.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const byId = Object.fromEntries(j.checks.map((c) => [c.id, c]));
+for (const id of ['audit-chain-integrity', 'receipt-ledger-readability']) {
+  if (!byId[id] || byId[id].status !== 'skip') {
+    throw new Error(id + ' expected status skip on a never-used machine, got ' + JSON.stringify(byId[id]));
+  }
+}
+" "$TMP/o.json"
+[ ! -e "$CYPHER_BRAIN_HOME" ] \
+  || { echo "[FAIL] doctor CREATED $CYPHER_BRAIN_HOME while checking the audit log/receipt ledger — both reads must stay side-effect-free"; exit 1; }
+echo "[PASS] no audit log / receipt ledger yet: both checks SKIP, no side effect"
+
+echo "== (p) a well-formed audit log entry / receipt ledger line: both checks PASS =="
+node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs -e "
+Promise.all([import('./src/lib/audit.ts'), import('./src/lib/receipt.ts')]).then(async ([audit, receipt]) => {
+  await audit.appendAuditEntry({
+    timestamp: new Date().toISOString(),
+    command: 'push',
+    backend: 'file',
+    locator: 'selftest-locator',
+    artifact_sha256: 'a'.repeat(64),
+    machine: 'selftest-host',
+    recipients_fingerprint: null,
+    exit_code: 0,
+    duration_ms: 1,
+  });
+  await receipt.appendReceipt({
+    timestamp: new Date().toISOString(),
+    backend: 'turbo',
+    locator: 'selftest-locator',
+    artifact_sha256: 'a'.repeat(64),
+    size_bytes: 123,
+    payer_address: null,
+    cost: '1000',
+    unit: 'winc',
+    raw: {},
+  });
+});
+"
+# The appends above created $CYPHER_BRAIN_HOME via mkdir(..., {recursive:true}) with
+# whatever mode the process umask leaves — chmod it to 0700 so the UNRELATED
+# home-dir-perms check does not also FAIL here and muddy this test's own assertions
+# (this test is only about the two new #456 checks).
+chmod 700 "$CYPHER_BRAIN_HOME"
+cb doctor --json > "$TMP/p.json" 2>&1 || true
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const byId = Object.fromEntries(j.checks.map((c) => [c.id, c]));
+const ac = byId['audit-chain-integrity'];
+if (!ac || ac.status !== 'pass') throw new Error('expected audit-chain-integrity pass, got ' + JSON.stringify(ac));
+if (!/1 entry/.test(ac.message)) throw new Error('expected the entry count in the message: ' + ac.message);
+const rl = byId['receipt-ledger-readability'];
+if (!rl || rl.status !== 'pass') throw new Error('expected receipt-ledger-readability pass, got ' + JSON.stringify(rl));
+if (!/1 receipt/.test(rl.message)) throw new Error('expected the receipt count in the message: ' + rl.message);
+" "$TMP/p.json"
+echo "[PASS] well-formed audit entry / receipt line: both checks PASS"
+
+echo "== (q) POSITIVE CONTROL — a hand-corrupted audit log entry breaks the hash chain: FAIL, doctor VERDICT FAIL (exit 1) =="
+export CYPHER_BRAIN_HOME="$TMP/audit-broken-home"
+[ ! -e "$CYPHER_BRAIN_HOME" ] || { echo "[FAIL] test setup: $CYPHER_BRAIN_HOME already exists"; exit 1; }
+node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs -e "
+import('./src/lib/audit.ts').then(async (m) => {
+  const base = {
+    backend: 'file',
+    locator: null,
+    artifact_sha256: 'a'.repeat(64),
+    machine: 'selftest-host',
+    recipients_fingerprint: null,
+    duration_ms: 1,
+  };
+  await m.appendAuditEntry({ ...base, timestamp: '2026-08-01T00:00:00.000Z', command: 'push', exit_code: 0 });
+  await m.appendAuditEntry({ ...base, timestamp: '2026-08-01T00:01:00.000Z', command: 'restore', exit_code: 0 });
+});
+"
+chmod 700 "$CYPHER_BRAIN_HOME"
+AUDIT_LOG="$CYPHER_BRAIN_HOME/audit-log.jsonl"
+[ -f "$AUDIT_LOG" ] || { echo "[FAIL] test setup: $AUDIT_LOG was not written"; exit 1; }
+# Content changed, hash NOT recomputed — the exact "in-place edit of an entry" tamper
+# verifyAuditChain() exists to catch (mirrors scripts/selftest-audit.mjs's own positive
+# control for the same library function).
+node -e "
+const fs = require('node:fs');
+const path = process.argv[1];
+const lines = fs.readFileSync(path, 'utf8').trim().split('\n');
+const first = JSON.parse(lines[0]);
+first.exit_code = 999;
+lines[0] = JSON.stringify(first);
+fs.writeFileSync(path, lines.join('\n') + '\n');
+" "$AUDIT_LOG"
+RC=0
+cb doctor > "$TMP/q.log" 2>&1 || RC=$?
+[ "$RC" = "1" ] || { echo "[FAIL] doctor with a hand-corrupted audit log exited $RC, expected 1"; cat "$TMP/q.log"; exit 1; }
+grep -qE '^\[FAIL\].*audit log integrity check failed: chain broken at entry index 0' "$TMP/q.log" \
+  || { echo "[FAIL] expected a FAIL naming the broken chain index"; cat "$TMP/q.log"; exit 1; }
+grep -qF "remediation: run 'cypher-brain audit' for full detail" "$TMP/q.log" \
+  || { echo "[FAIL] expected the audit-chain-integrity remediation pointing at 'cypher-brain audit'"; cat "$TMP/q.log"; exit 1; }
+grep -q '^VERDICT: FAIL$' "$TMP/q.log" || { echo "[FAIL] expected doctor's overall VERDICT to be FAIL, not a false PASS (the exact #456 gap)"; cat "$TMP/q.log"; exit 1; }
+# cypher-brain audit itself must agree — doctor's check reuses its exact verdict logic.
+RC2=0
+cb audit > "$TMP/q-audit.log" 2>&1 || RC2=$?
+[ "$RC2" = "1" ] || { echo "[FAIL] 'cypher-brain audit' itself did not also report FAIL on the same corrupted log (exit $RC2)"; cat "$TMP/q-audit.log"; exit 1; }
+grep -q '^VERDICT: FAIL' "$TMP/q-audit.log" || { echo "[FAIL] 'cypher-brain audit' did not print VERDICT: FAIL"; cat "$TMP/q-audit.log"; exit 1; }
+echo "[PASS] hand-corrupted audit log: audit-chain-integrity FAIL naming the broken index, doctor VERDICT FAIL (exit 1), agrees with 'cypher-brain audit'"
+
+echo "== (r) POSITIVE CONTROL — an unreadable receipt ledger line: WARN (not FAIL), doctor VERDICT PARTIAL (exit 2) =="
+export CYPHER_BRAIN_HOME="$TMP/receipt-warn-home"
+[ ! -e "$CYPHER_BRAIN_HOME" ] || { echo "[FAIL] test setup: $CYPHER_BRAIN_HOME already exists"; exit 1; }
+node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs -e "
+import('./src/lib/receipt.ts').then(async (m) => {
+  await m.appendReceipt({
+    timestamp: new Date().toISOString(),
+    backend: 'arweave',
+    locator: 'selftest-locator',
+    artifact_sha256: 'a'.repeat(64),
+    size_bytes: 42,
+    payer_address: null,
+    cost: '500',
+    unit: 'winston',
+    raw: {},
+  });
+});
+"
+chmod 700 "$CYPHER_BRAIN_HOME"
+RECEIPT_LEDGER_PATH="$CYPHER_BRAIN_HOME/receipt-ledger.jsonl"
+[ -f "$RECEIPT_LEDGER_PATH" ] || { echo "[FAIL] test setup: $RECEIPT_LEDGER_PATH was not written"; exit 1; }
+printf 'not json at all\n' >> "$RECEIPT_LEDGER_PATH"
+RC=0
+cb doctor > "$TMP/r.log" 2>&1 || RC=$?
+[ "$RC" = "2" ] || { echo "[FAIL] doctor with an unreadable receipt ledger line exited $RC, expected 2 (PARTIAL — WARN only)"; cat "$TMP/r.log"; exit 1; }
+grep -qE '^\[WARN\].*1 unreadable line\(s\) in the receipt ledger' "$TMP/r.log" \
+  || { echo "[FAIL] expected a WARN naming the unreadable receipt ledger line"; cat "$TMP/r.log"; exit 1; }
+if grep -qE '^\[FAIL\]' "$TMP/r.log"; then
+  echo "[FAIL] an unreadable receipt ledger line must never escalate to FAIL — it is a data-quality issue, not a broken security boundary"; cat "$TMP/r.log"; exit 1
+fi
+grep -q '^VERDICT: PARTIAL$' "$TMP/r.log" || { echo "[FAIL] expected doctor's overall VERDICT to be PARTIAL, not a silent PASS"; cat "$TMP/r.log"; exit 1; }
+echo "[PASS] unreadable receipt ledger line: receipt-ledger-readability WARN (not FAIL), doctor VERDICT PARTIAL (exit 2)"
 
 echo
 echo "all cypher-brain doctor selftests passed"
