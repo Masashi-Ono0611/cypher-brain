@@ -14,7 +14,7 @@
 // stamp and derives the same facts live from git; a stampless, gitless run answers
 // null, which doctor reports as "unknown" — never as "fresh".
 import { execFileSync } from 'node:child_process';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 declare const __CYPHER_BRAIN_BUILD_INFO__: string | undefined; // injected by scripts/build.ts (#348)
@@ -28,7 +28,18 @@ export interface BuildInfo {
 
 function fromGit(): BuildInfo | null {
   try {
-    const here = dirname(fileURLToPath(import.meta.url));
+    // #614: the same "genuinely the source file it claims to be" guard runbook.ts
+    // already applies to its own dev-fallback read — a bundled dist/mcp.mjs's relative
+    // path resolution could otherwise walk up and run `git log`/`git status` inside an
+    // UNRELATED parent directory's git tree, silently reporting that foreign repo's
+    // commit/date as this tool's own build provenance (exactly the "wrong build-
+    // freshness signal" this file exists to prevent — see header comment). Returning
+    // null here (not throwing, unlike runbook.ts) matches every other failure mode in
+    // this function: buildInfo() already reports a null fromGit() as "unknown", never
+    // as "fresh".
+    const filePath = fileURLToPath(import.meta.url);
+    if (!filePath.endsWith(join('src', 'lib', 'buildinfo.ts'))) return null;
+    const here = dirname(filePath);
     const out = execFileSync('git', ['log', '-1', '--format=%H %cI'], { cwd: here, encoding: 'utf8' }).trim();
     const [commit, commitDate] = out.split(' ');
     if (!commit || !commitDate) return null;
