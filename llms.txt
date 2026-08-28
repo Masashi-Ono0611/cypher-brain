@@ -86,11 +86,15 @@ stderr is load-bearing, not decoration. If you run cypher-brain on a human's beh
 cypher-brain --version                                          # the installed version, bare, on stdout
 cypher-brain <command> --help                                   # just that command's flags (--help alone = everything)
 cypher-brain keygen                                             # one-time identity + recipient
+cypher-brain wallet create                                      # one-time JWK/TON wallet setup for paid backends
+cypher-brain doctor                                             # environment, keys, dependencies health check
 cypher-brain snapshot --dir <path> --recipient <file> --out <f.age>
 cypher-brain verify --in <f.age>                                # real ciphertext? wrong key rejected?
 cypher-brain push --in <f.age> --backend turbo --yes             # pays a one-time bundler fee
 cypher-brain pull --locator <id> --backend turbo --out <f.age>   # plain gateway fetch, no wallet
 cypher-brain restore --in <f.age> --out-dir <dir>
+cypher-brain ledger                                             # spend history and storage cost ledger
+cypher-brain audit                                              # tamper detection and integrity verification
 cypher-brain schedule install --backend turbo --dir <path> --max-spend <n>   # unattended nightly
 ```
 
