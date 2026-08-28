@@ -184,7 +184,8 @@ if cb publish-latest --domain test.ton --from-locator-file "$EMPTY_LOC" --yes 2>
   echo "[FAIL] a locator file with no locator line was accepted"; exit 1
 fi
 grep -qF "$EMPTY_LOC has no locator line" "$TMP/emptyloc.err" || { echo "[FAIL] wrong no-locator-line refusal message"; cat "$TMP/emptyloc.err"; exit 1; }
-echo "[PASS] locator file with no locator line refused with 'has no locator line', distinct from the missing-file message"
+grep -qF 'run a push with --save-locator first, and point --from-locator-file at the file it wrote' "$TMP/emptyloc.err" || { echo "[FAIL] no-locator-line refusal is missing the recovery guidance"; cat "$TMP/emptyloc.err"; exit 1; }
+echo "[PASS] locator file with no locator line refused with 'has no locator line' + recovery guidance, distinct from the missing-file message"
 
 echo "== skipped control: missing @ton/ton install advice (not testable here) =="
 echo "  @ton/ton is a real, installed optionalDependency in this checkout (moved here from"
