@@ -125,8 +125,13 @@ export async function detectGbrainEngine(configPath: string): Promise<GbrainEngi
     const parsed: unknown = JSON.parse(await readFile(configPath, 'utf8'));
     // A parsed-but-non-object JSON value (null, an array, a bare string/number) is just
     // as much "not a real config" as a read/parse failure below — flagged the same way
-    // (#543), not silently folded into the ordinary "no engine field" read.
-    if (typeof parsed !== 'object' || parsed === null) return { engine: 'postgres', readError: true };
+    // (#543), not silently folded into the ordinary "no engine field" read. `Array.isArray`
+    // is checked explicitly: `typeof [] === 'object'` and `[] !== null`, so a bare JSON
+    // array would otherwise slip past this guard and read back as an ordinary,
+    // confidently-detected engine-less config (multi-model review).
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { engine: 'postgres', readError: true };
+    }
     const cfg = parsed as { engine?: unknown; database_path?: unknown };
     const raw = typeof cfg.database_path === 'string' && cfg.database_path.length > 0 ? cfg.database_path : null;
     // Absolute: knowable, hand it over. Relative: quotable but NOT resolvable — see above.

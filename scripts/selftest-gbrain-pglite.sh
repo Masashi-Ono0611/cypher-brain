@@ -105,6 +105,11 @@ printf 'gbrain-pglite-selftest\n' > "$CB_SRC/note.txt"
 # holds API keys, so detectGbrainEngine reads the engine fields and nothing else —
 # asserting the decoy never reaches the transcript is what keeps that true.
 DECOY_SECRET="sk-selftest-decoy-DO-NOT-LOG-8f2a1c"
+# #540 (multi-model review, Suggestion): gbrain's config.json can carry a `database_url`
+# field embedding real Postgres credentials — the wizard's --pg prefill is deliberately
+# NOT read from it (see wizard.ts's own #540 comment), so a decoy credential planted here
+# must never reach the transcript, confirming the privacy decision holds in practice.
+DECOY_DB_URL="postgres://realuser:s3cr3t-pw-DO-NOT-LOG@db.internal.example:5432/prod"
 
 # Extra environment for the next wizard_case call, as literal KEY=VALUE argv elements
 # (never an interpolated string — see scripts/dev-node-flags.sh on why argv arrays are
@@ -191,8 +196,50 @@ JSON
 echo "== (a) the wizard resolves the gbrain engine in gbrain's own order, and only offers --pg on Postgres =="
 wizard_case neither "{\"schema_pack\":\"gbrain-base-v2\",\"api_key\":\"$DECOY_SECRET\"}" postgres "$TMP/case-neither.log"
 echo "[PASS] no engine and no database_path -> Postgres (the pre-#367 assumption, unchanged: prose + --pg prompt)"
-wizard_case explicit-pg "{\"engine\":\"postgres\",\"database_path\":\"/somewhere/.pglite\",\"api_key\":\"$DECOY_SECRET\"}" postgres "$TMP/case-explicit-pg.log"
+wizard_case explicit-pg "{\"engine\":\"postgres\",\"database_path\":\"/somewhere/.pglite\",\"database_url\":\"$DECOY_DB_URL\",\"api_key\":\"$DECOY_SECRET\"}" postgres "$TMP/case-explicit-pg.log"
 echo "[PASS] an explicit engine=postgres WINS over a stale database_path (gbrain's own precedence)"
+# #540: the decoy database_url planted above must never reach the transcript, even on the
+# "n" (skip --pg) path every wizard_case call above exercises.
+if grep -qF "$DECOY_DB_URL" "$TMP/case-explicit-pg.log"; then
+  echo "[FAIL] explicit-pg: config.json's database_url reached the transcript — the --pg prefill must never read it"; exit 1
+fi
+echo "[PASS] #540: a database_url decoy credential in config.json never reaches the transcript on the --pg-declined path"
+
+# #540, the other half: answer "y" to --pg so the prefill prompt itself actually prints
+# (every wizard_case call above answers "n" there), and assert the prefill is labeled a
+# generic guess — never the decoy database_url — even though this fixture HAS one.
+PG_YES_HOME="$TMP/case-pg-yes-home"; mkdir -p "$PG_YES_HOME/.gbrain"
+printf '{"engine":"postgres","database_url":"%s","api_key":"%s"}\n' "$DECOY_DB_URL" "$DECOY_SECRET" > "$PG_YES_HOME/.gbrain/config.json"
+PG_YES_CBHOME="$TMP/case-pg-yes-cb-home"
+cat > "$TMP/qa-pg-yes.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$CB_SRC"],
+  ["$PG_PROMPT_MARK", "y"],
+  ["Postgres connection string", ""],
+  ["Choose a backend", "\u001b[A"]
+]
+JSON
+CYPHER_BRAIN_HOME="$PG_YES_CBHOME" HOME="$PG_YES_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-pg-yes.json" --out "$TMP/case-pg-yes.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] pg-yes: init did not stop cleanly at the ton-provider prerequisites guard"; cat "$TMP/case-pg-yes.log"; exit 1; }
+grep -qF "CYPHER_BRAIN_TON_PROVIDER_OWNER" "$TMP/case-pg-yes.log" || { echo "[FAIL] pg-yes: the run ended for some reason other than the scripted stop"; cat "$TMP/case-pg-yes.log"; exit 1; }
+if grep -qF "$DECOY_DB_URL" "$TMP/case-pg-yes.log"; then
+  echo "[FAIL] pg-yes: the decoy database_url reached the transcript (as the prefill or otherwise)"; cat "$TMP/case-pg-yes.log"; exit 1
+fi
+if grep -qF "$DECOY_SECRET" "$TMP/case-pg-yes.log"; then
+  echo "[FAIL] pg-yes: config.json's api_key reached the transcript"; cat "$TMP/case-pg-yes.log"; exit 1
+fi
+grep -qF 'generic guess' "$TMP/case-pg-yes.log" \
+  || { echo "[FAIL] pg-yes: expected the --pg prefill to be labeled a generic guess"; cat "$TMP/case-pg-yes.log"; exit 1; }
+grep -qF 'read from your gbrain setup' "$TMP/case-pg-yes.log" \
+  || { echo "[FAIL] pg-yes: expected the --pg prefill wording to say it is not read from gbrain's setup"; cat "$TMP/case-pg-yes.log"; exit 1; }
+echo "[PASS] #540: with --pg accepted, the connection-string prefill is labeled a generic guess (not read from gbrain's config), and the decoy database_url/api_key never reach the transcript"
 wizard_case dbpath "{\"database_path\":\"/somewhere/.pglite\",\"api_key\":\"$DECOY_SECRET\"}" pglite "$TMP/case-dbpath.log"
 echo "[PASS] database_path with no engine field -> PGLite: no Postgres prose, no --pg prompt"
 wizard_case explicit-pglite "{\"engine\":\"pglite\",\"api_key\":\"$DECOY_SECRET\"}" pglite "$TMP/case-explicit-pglite.log"
@@ -339,6 +386,14 @@ import('./src/lib/gbrain.ts').then(async (m) => {
   const jsonNull = path.join(dir, 'null.json');
   await fs.writeFile(jsonNull, 'null');
   assertEq('JSON null', await m.detectGbrainEngine(jsonNull), { engine: 'postgres', readError: true });
+
+  // #543 (multi-model review, Warning): a bare JSON ARRAY also parses to 'object' under
+  // typeof (arrays are objects in JS) and is not null — without an explicit Array.isArray
+  // guard it would slip past the check above and read back as an ordinary, confidently
+  // engine-less config instead of a readError.
+  const jsonArray = path.join(dir, 'array.json');
+  await fs.writeFile(jsonArray, JSON.stringify(['not', 'a', 'config']));
+  assertEq('JSON array', await m.detectGbrainEngine(jsonArray), { engine: 'postgres', readError: true });
 
   // #534, negative space: a config that genuinely lacks an engine field (undefined, or an
   // explicit empty string — both FALSY) must still fall through to the database_path
