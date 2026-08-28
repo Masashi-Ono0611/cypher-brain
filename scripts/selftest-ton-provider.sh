@@ -133,6 +133,7 @@ const seqnoFilePath = process.argv[6]; // if present, its CONTENTS are the seqno
 const broadcastLogPath = process.argv[7]; // every accepted POST /v2/blockchain/message body is appended here, one BOC per line
 const neverActiveFlagPath = process.argv[8]; // if present, every NON-owner address (i.e. a just-deployed contract) reports 'uninitialized' forever — issue #480's waitForContractActive() timeout positive control
 const unfundedAddrFlagPath = process.argv[9]; // if present, its CONTENTS name an address to report 'nonexist'/balance:0 for on plain /v2/accounts/<addr>
+const lookupFailAddrFlagPath = process.argv[10]; // issue #640: if present, its CONTENTS name an address for which GET /v2/blockchain/accounts/<addr> (fetchAccountState's own endpoint) answers HTTP 500 -- a TRANSIENT lookup failure, distinct from every 200-with-status response above (which are all real, non-error account states)
 
 createServer((req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
@@ -158,6 +159,15 @@ createServer((req, res) => {
     res.end(JSON.stringify({ success: true, exit_code: 0, decoded: { state: Number(seqno) } }));
     return;
   }
+  const blockchainAccountMatch = url.pathname.match(/^\/v2\/blockchain\/accounts\/([^/]+)$/);
+  if (blockchainAccountMatch) {
+    const lookupFailAddr = lookupFailAddrFlagPath && existsSync(lookupFailAddrFlagPath) ? readFileSync(lookupFailAddrFlagPath, 'utf8').trim() : null;
+    if (lookupFailAddr && blockchainAccountMatch[1] === lookupFailAddr) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'simulated transient tonapi failure (issue #640 positive control)' }));
+      return;
+    }
+  }
   const plainAccountMatch = url.pathname.match(/^\/v2\/accounts\/([^/]+)$/);
   if (plainAccountMatch) {
     const unfundedAddr = unfundedAddrFlagPath && existsSync(unfundedAddrFlagPath) ? readFileSync(unfundedAddrFlagPath, 'utf8').trim() : null;
@@ -181,8 +191,9 @@ SEQNO_FILE="$TMP/seqno-value"
 BROADCAST_LOG="$TMP/broadcast-log"
 NEVER_ACTIVE_FLAG="$TMP/never-active-flag"
 UNFUNDED_ADDR_FLAG="$TMP/unfunded-addr-flag"
+LOOKUP_FAIL_ADDR_FLAG="$TMP/lookup-fail-addr-flag"
 TONAPI_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" "$UNFUNDED_ADDR_FLAG" &
+node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" "$UNFUNDED_ADDR_FLAG" "$LOOKUP_FAIL_ADDR_FLAG" &
 TONAPI_PID=$!
 export CYPHER_BRAIN_TON_TONAPI_URL="http://127.0.0.1:$TONAPI_PORT"
 
@@ -628,6 +639,18 @@ grep -q 'is frozen on-chain' "$TMP/frozen.err" || { echo "[FAIL] wrong frozen-wa
 rm -f "$FROZEN_ADDR_FLAG"
 echo "[PASS] frozen-wallet guard fired before any broadcast attempt"
 
+echo "== issue #640: a TRANSIENT tonapi lookup failure on the auto-sign wallet's own account-state check must NOT be treated as 'unused wallet, seqno 0' — it must fail loudly instead =="
+printf '%s' "$TON_WALLET_ADDR_RAW" > "$LOOKUP_FAIL_ADDR_FLAG"
+: > "$BROADCAST_LOG" # the whole point of this guard is that broadcast must never be reached on a lookup failure
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/lookup-fail.err"; then
+  echo "[FAIL] push succeeded despite a transient tonapi lookup failure on the wallet's own account state"; cat "$TMP/lookup-fail.err"; exit 1
+fi
+grep -q 'could not look up local wallet' "$TMP/lookup-fail.err" || { echo "[FAIL] wrong lookup-failure message"; cat "$TMP/lookup-fail.err"; exit 1; }
+[ -s "$BROADCAST_LOG" ] && { echo "[FAIL] a wallet whose lookup failed still reached broadcast — this would have signed with a GUESSED seqno"; exit 1; }
+rm -f "$LOOKUP_FAIL_ADDR_FLAG"
+echo "[PASS] transient tonapi lookup failure refuses the push instead of guessing seqno 0"
+
 # ========================================================================
 # issue #480: waitForContractActive()'s timeout message must match the path that
 # actually ran (auto-sign vs. Tonkeeper-deeplink) instead of always pointing at "the
@@ -711,5 +734,56 @@ for needle in 'CYPHER_BRAIN_TON_WALLET=' 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND=' 
   grep -q "$needle" "$RUNNER" || { echo "[FAIL] generated runner is missing $needle"; cat "$RUNNER"; exit 1; }
 done
 echo "[PASS] the generated nightly runner carries CYPHER_BRAIN_TON_WALLET/_MAX_SPEND/_NOTIFY_BIN"
+
+# ========================================================================
+# issue #639: a SIGNED push calls put() TWICE (ciphertext, then its ".minisig" sidecar),
+# each deploying its OWN StorageV1 contract — CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND must
+# bound what BOTH deploys spend TOGETHER, not check each in isolation. Run last (not
+# earlier, alongside the many unsigned pushes above): enabling a signing key here makes
+# EVERY `cb snapshot` from this point on emit a ".minisig" sidecar, which would change
+# every push() call after it — safe only because nothing else in this script runs after.
+echo "== issue #639: combined ciphertext+signature spend is checked against ONE cap, not two independent ones =="
+cb keygen --sign >/dev/null
+mkdir -p "$TMP/combined-spend-src"
+printf 'ton-provider combined-spend (#639) selftest payload\n' > "$TMP/combined-spend-src/note.txt"
+cb snapshot --dir "$TMP/combined-spend-src" --out "$TMP/combined-spend.age" >/dev/null
+[ -f "$TMP/combined-spend.age.minisig" ] || { echo "[FAIL] cb keygen --sign did not make snapshot write a .minisig sidecar"; exit 1; }
+CS_SIZE=$(stat -f%z "$TMP/combined-spend.age" 2>/dev/null || stat -c%s "$TMP/combined-spend.age")
+echo "$CS_SIZE" > "$TMP/notify-downloaded" # >= both files' sizes; the SAME control file backs both put() calls this push makes
+# Both the ciphertext and its tiny .minisig sidecar fall under buildDeploy()'s 0.1MB
+# MIN_SIZE_MB_BYTES floor, so — against the SAME selected provider/rate/span — each
+# deploy's own amountNano (a PER-CALL, single-deploy computation) works out to the
+# SAME value X. A cap of exactly X therefore lets the FIRST (ciphertext) deploy through
+# on its own merits while leaving NO room for the second (signature) deploy — exactly
+# the "each deploy clears the cap in isolation, their sum does not" shape #639 reports.
+X=$(cb estimate --in "$TMP/combined-spend.age" --backend ton-provider --json | node -e '
+  const j = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+  if (typeof j.cost !== "string" || !/^[0-9]+$/.test(j.cost)) { console.error("no numeric cost in estimate: " + JSON.stringify(j)); process.exit(1); }
+  console.log(j.cost);
+')
+
+echo "-- a cap equal to ONE deploy's cost lets the ciphertext through, then refuses the signature deploy (no budget left) --"
+RECEIPT_COUNT_BEFORE=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+if CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND="$X" cb push --in "$TMP/combined-spend.age" --backend ton-provider \
+  >/dev/null 2>"$TMP/combined-spend-under.err"; then
+  echo "[FAIL] push succeeded despite the combined ciphertext+signature spend exceeding a cap of exactly one deploy's cost"; cat "$TMP/combined-spend-under.err"; exit 1
+fi
+grep -q 'ciphertext upload succeeded' "$TMP/combined-spend-under.err" \
+  || { echo "[FAIL] expected the ciphertext deploy to have already succeeded before the signature deploy was refused"; cat "$TMP/combined-spend-under.err"; exit 1; }
+grep -q "already committed $X nanoTON toward CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND=$X nanoTON" "$TMP/combined-spend-under.err" \
+  || { echo "[FAIL] the combined-spend guard's own message did not fire"; cat "$TMP/combined-spend-under.err"; exit 1; }
+RECEIPT_COUNT_AFTER=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+[ "$((RECEIPT_COUNT_AFTER - RECEIPT_COUNT_BEFORE))" = "1" ] \
+  || { echo "[FAIL] expected exactly ONE new ton-provider receipt (the ciphertext deploy only) — got $((RECEIPT_COUNT_AFTER - RECEIPT_COUNT_BEFORE))"; exit 1; }
+echo "[PASS] combined-spend guard refuses the signature deploy once the ciphertext deploy already spent the whole cap, and only ONE deploy's worth was actually spent"
+
+echo "-- a cap covering BOTH deploys combined lets the whole signed push succeed --"
+OVER_CAP=$(node -e 'console.log((BigInt(process.argv[1]) * 3n).toString())' "$X") # comfortably >= 2X
+CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND="$OVER_CAP" cb push --in "$TMP/combined-spend.age" --backend ton-provider \
+  >/dev/null 2>"$TMP/combined-spend-ok.err" \
+  || { echo "[FAIL] signed push failed despite a cap comfortably covering BOTH deploys combined"; cat "$TMP/combined-spend-ok.err"; exit 1; }
+grep -q "pushed $TMP/combined-spend.age.minisig -> ton-provider:" "$TMP/combined-spend-ok.err" \
+  || { echo "[FAIL] expected the .minisig sidecar to also be pushed once the combined cap allows it"; cat "$TMP/combined-spend-ok.err"; exit 1; }
+echo "[PASS] a cap covering the combined ciphertext+signature spend lets both deploys succeed"
 
 echo "ALL PASS"

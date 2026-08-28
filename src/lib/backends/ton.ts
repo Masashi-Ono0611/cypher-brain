@@ -41,6 +41,7 @@ import { run } from '../proc.js';
 import { sha256, sleep, readHead, rmrf, errMsg, makeBagLocator } from '../util.js';
 import { progressReporter } from '../progress.js';
 import { tonAdd, tonDetails, startLocalTonDaemon, type TonBagDetails } from './ton-client.js';
+import { installStageSignalGuard, addActiveTonTmpDir, removeActiveTonTmpDir } from '../signal-guard.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 // Locator shape (see header comment). Anchored + exact-length, same "narrow validated
@@ -250,15 +251,24 @@ const P2P_STALL_TIMEOUT_MS = 300_000;
 // fallback of its own (it never operates a seeder), so it reuses this P2P-only phase and
 // surfaces a failure directly rather than duplicating this logic.
 export async function p2pFetch(bagId: string, expect: FetchShape, out: string): Promise<void> {
+  // #644: push/pull never install the signal guard themselves (unlike snapshot()/
+  // restore()'s own self-install) — installStageSignalGuard() is idempotent, so calling
+  // it here, before the tmp dir even exists, is what makes a SIGINT/SIGTERM/SIGHUP mid-
+  // P2P-fetch actually kill the ephemeral daemon (ACTIVE_CHILDREN, already registered by
+  // ton-client.ts's spawnDaemon) and sweep this directory, instead of the signal falling
+  // through to Node's default "terminate with nothing cleaned up" behavior.
+  installStageSignalGuard();
   // The WHOLE body sits inside the tmpRoot try/finally — a daemon that fails to start
   // must not leak the temp tree it was about to use (review W2). What is downloaded
   // here is ciphertext, so the leak class is disk garbage, not secrets — but garbage
   // that accumulates one directory per failed pull is still a leak.
   const tmpRoot = await mkdtemp(join(tmpdir(), 'cypher-brain-ton-'));
+  addActiveTonTmpDir(tmpRoot);
   try {
     await p2pFetchInto(tmpRoot, bagId, expect, out);
   } finally {
     await rmrf(tmpRoot).catch(() => undefined);
+    removeActiveTonTmpDir(tmpRoot);
   }
 }
 
@@ -360,14 +370,18 @@ export function tonBackend(): StorageBackend {
       const p = remotePathsFor(sha);
 
       // Idempotency (the sha IS the key): a re-push of the same ciphertext returns the
-      // recorded locator — after confirming the seeder still actually holds the bag,
-      // because an inventory line whose bag is gone would otherwise hand back a
-      // locator nothing can serve.
+      // recorded locator — after confirming the seeder still actually holds AND is
+      // actively seeding the bag (the SAME completed && active gate the initial-create
+      // path below waits for), because an inventory line whose bag is gone, or merely
+      // retained-but-inactive (seeder daemon restarted, disk pressure evicted the piece
+      // cache, ...), would otherwise hand back a locator nothing can currently serve
+      // (#643: `completed` alone was true for a bag that had gone inactive, so a
+      // re-push reported "already seeded" without actually restoring availability).
       const recorded = (await sshRun(`cat -- '${p.inventory}' 2>/dev/null || true`)).trim();
       if (isTonLocator(recorded)) {
         try {
           const d = await seederDetails(bagIdFrom(recorded));
-          if (d.completed) {
+          if (d.completed && d.active) {
             console.error(`ton: unchanged ciphertext already seeded as ${recorded} (idempotent re-push)`);
             return recorded;
           }

@@ -95,6 +95,7 @@ import {
 import { run } from '../proc.js';
 import { sleep, rmrf, errMsg, throwForSdkImport, makeBagLocator } from '../util.js';
 import { warn } from '../warn.js';
+import { installStageSignalGuard, addActiveTonTmpDir, removeActiveTonTmpDir } from '../signal-guard.js';
 import { tonApi, startLocalTonDaemon, type TonBagDetails, type LocalTonDaemon } from './ton-client.js';
 import { p2pFetch, entryNameFor } from './ton.js';
 import { progressReporter } from '../progress.js';
@@ -519,13 +520,33 @@ async function autoSignAndBroadcastDeploy(
     );
   }
 
-  const walletState = await fetchAccountState(wallet.address).catch(() => null);
-  if (walletState?.status === 'frozen') {
+  // #640: tonapi answers a genuinely-never-used wallet with an ORDINARY 200 (status
+  // "uninitialized"/"nonexist", balance 0 — confirmed against both the mock and the
+  // real API, see scripts/selftest-ton-provider.sh's unfunded-address mock) — it does
+  // NOT throw. fetchAccountState() therefore only throws on an ACTUAL lookup failure
+  // (network/timeout/5xx), which must never be treated the same as "unused": letting
+  // that error collapse to `null` here (the previous `.catch(() => null)`) silently
+  // selected seqno 0 for a wallet that may well already be active, producing a
+  // doomed on-chain transaction (wrong seqno) that tonapi's broadcast endpoint still
+  // accepts with HTTP 200. Fail loudly instead — a transient failure right before
+  // signing is worth a retry, not a guess.
+  let walletState: AccountState;
+  try {
+    walletState = await fetchAccountState(wallet.address);
+  } catch (e) {
+    throw new Error(
+      `ton-provider backend: could not look up local wallet ${wallet.address.toRawString()}'s on-chain state ` +
+        `(${errMsg(e)}) — this may be a transient tonapi failure, not proof the wallet has never been used; ` +
+        'refusing to guess seqno 0 and risk broadcasting a message the wallet contract will reject. Retry once ' +
+        'tonapi is reachable.',
+    );
+  }
+  if (walletState.status === 'frozen') {
     throw new Error(
       `ton-provider backend: local wallet ${wallet.address.toRawString()} is frozen on-chain — cannot auto-sign`,
     );
   }
-  const walletActive = walletState?.status === 'active';
+  const walletActive = walletState.status === 'active';
   const seqno = walletActive ? await fetchWalletSeqno(wallet.address) : 0;
 
   const transferBody = wallet.createTransfer({
@@ -899,6 +920,26 @@ export function tonProviderBackend(): StorageBackend {
             '(a StorageV1 deploy spends real funds) — see `estimate --backend ton-provider` for a preview first',
         );
       }
+      // #639: a SIGNED push calls put() TWICE — once for the ciphertext, once for its
+      // ".minisig" sidecar — each deploying its OWN StorageV1 contract. Checking
+      // TON_PROVIDER_MAX_SPEND against each deploy's amountNano IN ISOLATION (as
+      // buildDeploy() alone did before this) lets the two calls' spends each individually
+      // clear the cap while their SUM blows well past it, and the operator only ever saw
+      // the ciphertext's estimate before consenting (pushpull.ts's pre-consent display).
+      // pushpull.ts's push() passes the SAME `spendTracker` object reference to both
+      // put() calls (types.ts's PutOpts) — this deploy's REMAINING budget is what gets
+      // handed to buildDeploy() as its cap below, and spendTracker.spentNano is charged
+      // the moment this deploy's own amount is known, so the SECOND call sees the FIRST
+      // call's spend already counted against the same cap.
+      const spentSoFarNano = opts.spendTracker?.spentNano ?? 0n;
+      const remainingMaxSpendNano = TON_PROVIDER_MAX_SPEND - spentSoFarNano;
+      if (remainingMaxSpendNano <= 0n) {
+        throw new Error(
+          `ton-provider backend: this push already committed ${spentSoFarNano} nanoTON toward ` +
+            `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND=${TON_PROVIDER_MAX_SPEND} nanoTON (ciphertext + ".minisig" ` +
+            'signature spend is checked TOGETHER) — no budget remains for this deploy',
+        );
+      }
       // Checked up front, not just inside notifyProvider(): a missing/misconfigured
       // binary is a PERMANENT failure, not a transient one — surfacing it only once
       // notifyProviderWithRetry() is already inside its retry loop would make that loop
@@ -930,7 +971,13 @@ export function tonProviderBackend(): StorageBackend {
       }
 
       const entry = entryNameFor(file);
+      // #644: push/pull never install the signal guard themselves — see ton.ts's
+      // p2pFetch() for the identical rationale (installStageSignalGuard() is idempotent,
+      // called here before the tmp dir exists so a signal mid-hash/mid-deploy actually
+      // kills the ephemeral daemon this put() is about to spawn AND sweeps its dir).
+      installStageSignalGuard();
       const tmpRoot = await mkdtemp(join(tmpdir(), 'cypher-brain-ton-provider-'));
+      addActiveTonTmpDir(tmpRoot);
       const dbDir = join(tmpRoot, 'db');
       const bagDir = join(tmpRoot, 'bag');
       let daemon: LocalTonDaemon | null = null;
@@ -956,8 +1003,17 @@ export function tonProviderBackend(): StorageBackend {
           providerPubkey: Buffer.from(provider.pubkey, 'hex'),
           rateNanoPerMB,
           spanDays,
-          maxSpendNano: TON_PROVIDER_MAX_SPEND,
+          // #639: the REMAINING budget (TON_PROVIDER_MAX_SPEND minus whatever this same
+          // push already committed via an earlier put() call), not the full cap — see
+          // the comment above spentSoFarNano/remainingMaxSpendNano for why.
+          maxSpendNano: remainingMaxSpendNano,
         });
+        // Charge this deploy's amount against the shared tracker THE MOMENT it is known
+        // to be within budget — before autoSignAndBroadcastDeploy()/the Tonkeeper deeplink
+        // below even run — so a SECOND put() call in the same push (the ".minisig"
+        // sidecar) sees this one counted regardless of how far the current call gets
+        // afterward (#639).
+        if (opts.spendTracker) opts.spendTracker.spentNano += deploy.amountNano;
 
         console.error(
           `ton-provider: selected provider ${provider.pubkey} (rating ${provider.rating.toFixed(2)}, uptime ${provider.uptime.toFixed(1)}%)`,
@@ -1075,6 +1131,7 @@ export function tonProviderBackend(): StorageBackend {
         // paid-for push leaves both the daemon and its temp directory behind.
         if (daemon) await daemon.stop().catch(() => undefined);
         await rmrf(tmpRoot).catch(() => undefined);
+        removeActiveTonTmpDir(tmpRoot); // #644: deregister only after rmrf() settles, same discipline as mcp.ts's discardFetchDir
       }
     },
 

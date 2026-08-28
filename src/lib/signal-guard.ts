@@ -50,6 +50,21 @@ let ACTIVE_VERIFY_SCRATCH_DIR: string | null = null; // verify --level remote/dr
 // That is the same "two unrelated resources must not share one slot" reasoning that gave
 // ACTIVE_RESTORE_SCRATCH_DIR its own field, applied WITHIN one resource kind.
 const ACTIVE_MCP_FETCH_DIRS = new Set<string>();
+// #644: the ephemeral temp trees src/lib/backends/ton.ts's p2pFetch(),
+// src/lib/backends/ton-provider.ts's put(), and src/lib/ton-dns.ts's
+// assertBagAvailable() each mkdtemp() to hold a LOCAL tonutils-storage daemon's db
+// (ADNL key + piece cache) plus, for ton.ts/ton-provider.ts, a copy of the ciphertext
+// itself — potentially multi-gigabyte for a large brain. All three already register
+// the daemon CHILD PROCESS they spawn in ACTIVE_CHILDREN (proc.ts, via
+// ton-client.ts's spawnDaemon), which the handler below already kills first — but
+// until this set existed nothing tracked the DIRECTORY, so a signal left both a
+// zombie-adjacent orphaned daemon (its process killed, but its db/output never swept)
+// and the temp tree itself sitting under os.tmpdir() forever. A Set for the same
+// "two unrelated resources must not share one slot" reason ACTIVE_MCP_FETCH_DIRS is
+// one: ton.ts's put()+get() and ton-provider.ts's own put() can each have their own
+// tmpRoot in flight in the same process (MCP server, or `schedule install`'s cron
+// running push then immediately pull).
+const ACTIVE_TON_TMP_DIRS = new Set<string>();
 let SIGNAL_GUARD_INSTALLED = false;
 
 // fs.rmSync({force: true}) only swallows ENOENT (already gone) — it does NOT retry past
@@ -154,6 +169,20 @@ export const addActiveMcpFetchDir = (dir: string): void => {
 export const removeActiveMcpFetchDir = (dir: string): void => {
   ACTIVE_MCP_FETCH_DIRS.delete(dir);
 };
+// #644: ton.ts/ton-provider.ts/ton-dns.ts call these the SAME way mcp.ts's
+// makeFetchDir/discardFetchDir do — register in the same tick mkdtemp() returns (no
+// await in between), deregister only after their own rmrf() has actually finished —
+// and, critically, call installStageSignalGuard() themselves at that same point
+// (idempotent), since push/pull/publish-latest never install it on their own (unlike
+// snapshot()/restore()'s own self-install). Without that self-install here, ACTIVE_CHILDREN
+// already held the daemon child (ton-client.ts's spawnDaemon) but no signal HANDLER
+// existed to ever look at it.
+export const addActiveTonTmpDir = (dir: string): void => {
+  ACTIVE_TON_TMP_DIRS.add(dir);
+};
+export const removeActiveTonTmpDir = (dir: string): void => {
+  ACTIVE_TON_TMP_DIRS.delete(dir);
+};
 
 export function installStageSignalGuard(): void {
   if (SIGNAL_GUARD_INSTALLED) return;
@@ -225,6 +254,13 @@ export function installStageSignalGuard(): void {
       // itself, never a caller-owned path.
       for (const dir of ACTIVE_MCP_FETCH_DIRS) forceRmSync(dir);
       ACTIVE_MCP_FETCH_DIRS.clear();
+      // #644: same "always ours, always safe to erase outright" reasoning as every set/
+      // slot above — each dir here is one ton.ts/ton-provider.ts/ton-dns.ts mkdtemp()'d
+      // itself. The daemon CHILD living inside one of these dirs was already SIGKILLed
+      // by the ACTIVE_CHILDREN loop at the very top of this handler, before this runs —
+      // so there is no still-writing process left to race with removing its directory.
+      for (const dir of ACTIVE_TON_TMP_DIRS) forceRmSync(dir);
+      ACTIVE_TON_TMP_DIRS.clear();
       // adding a listener suppressed Node's default auto-terminate — remove only our
       // own handler (not any unrelated listener) and re-raise so the process exits
       // with the correct signal code instead of hanging.

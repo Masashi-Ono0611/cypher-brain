@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { TON_BIN, TON_NETWORK_CONFIG, TON_TONAPI_URL, CIPHER_YES } from './config.js';
 import { errMsg, exists, rmrf, sdkImportAdvice, sleep } from './util.js';
 import { warn } from './warn.js';
+import { installStageSignalGuard, addActiveTonTmpDir, removeActiveTonTmpDir } from './signal-guard.js';
 import { readSavedLocatorLine } from './pushpull.js';
 import { bagIdFrom, tonLocator } from './backends/ton.js';
 import { tonAdd, tonDetails, startLocalTonDaemon } from './backends/ton-client.js';
@@ -223,11 +224,18 @@ async function resolvedStorageBagId(domain: string): Promise<string | null> {
 // poll, stacked" reading would suggest.
 async function assertBagAvailable(bagId: string): Promise<void> {
   const deadline = Date.now() + AVAILABILITY_PROBE_TIMEOUT_MS;
+  // #644: publish-latest never installs the signal guard on its own (unlike snapshot()/
+  // restore()'s own self-install) — installStageSignalGuard() is idempotent, so calling
+  // it here, before the tmp dir even exists, is what makes a SIGINT/SIGTERM/SIGHUP mid-
+  // probe actually kill the ephemeral daemon this probe spawns (ACTIVE_CHILDREN, already
+  // registered by ton-client.ts's spawnDaemon) and sweep this directory.
+  installStageSignalGuard();
   // Same outer-try-owns-tmp-dir / inner-try-owns-daemon-stop shape as ton.ts's own
   // p2pFetch/p2pFetchInto (multi-model review W2 there, mirrored here): the tmp dir is
   // created BEFORE the daemon starts and removed only AFTER daemon.stop() has been
   // awaited — a still-dying daemon writing into a directory mid-removal is a race.
   const tmpRoot = await mkdtemp(join(tmpdir(), 'cypher-brain-ton-dns-'));
+  addActiveTonTmpDir(tmpRoot);
   try {
     await probeInto(tmpRoot, bagId, deadline);
   } catch (e) {
@@ -240,6 +248,7 @@ async function assertBagAvailable(bagId: string): Promise<void> {
     // not change the PASS/FAIL verdict above (already decided), but an operator running
     // many publish-latest calls deserves to know disk is being left behind.
     await rmrf(tmpRoot).catch((e) => warn(`publish-latest: could not remove temp probe dir ${tmpRoot}: ${errMsg(e)}`));
+    removeActiveTonTmpDir(tmpRoot);
   }
 }
 

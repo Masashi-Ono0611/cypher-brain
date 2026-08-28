@@ -349,6 +349,28 @@ async function pushCore(
     // header must never produce a false match of that check.
     console.error(`${o.backend}: cost estimate (shown before the upload-consent check below):`);
     for (const line of formatEstimate(est)) console.error(`  ${line}`);
+    // #639: ton-provider is the ONLY backend where CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND
+    // must bound the ciphertext deploy AND (if a signed artifact) the ".minisig" sidecar
+    // deploy TOGETHER (ton-provider.ts's put() enforces this via a shared spendTracker
+    // passed below) — so a signed push's pre-consent display must also show the
+    // sidecar's own estimate and the combined total, or an operator could consent
+    // against a number the actual combined spend goes on to exceed. Best-effort only,
+    // same staleness caveat as the ciphertext estimate above: a real, independent
+    // provider-search query, not a shared computation with put()'s own.
+    if (o.backend === 'ton-provider' && (await exists(`${o.in}.minisig`))) {
+      const { size: sigSizeBytes } = await stat(`${o.in}.minisig`);
+      const sigEst = await estimateCost(o.backend, sigSizeBytes);
+      console.error(
+        `${o.backend}: a ".minisig" signature sidecar will ALSO be deployed, as a SECOND contract — its own cost estimate:`,
+      );
+      for (const line of formatEstimate(sigEst)) console.error(`  ${line}`);
+      if (est.cost !== null && sigEst.cost !== null) {
+        console.error(
+          `${o.backend}: combined ciphertext+signature spend is checked TOGETHER against ` +
+            `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (≈${BigInt(est.cost) + BigInt(sigEst.cost)} nanoTON total)`,
+        );
+      }
+    }
   }
   const yes = !!o.yes || CIPHER_YES;
   // arweave and turbo are paid, permanent stores — require an explicit opt-in so
@@ -430,11 +452,18 @@ async function pushCore(
   // then a no-op for it. `force` (#533) is likewise rclone-only — its own no-clobber
   // check over an existing --remote object, deliberately the SAME o.force that opted
   // resolveSkipUnchanged() past the digest check above, not a second flag.
+  //
+  // `spendTracker` (#639) is ton-provider-only — a mutable box passed BY REFERENCE to
+  // this call and the ".minisig" sidecar's put() call further down, so ton-provider.ts
+  // can enforce CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND against their COMBINED spend rather
+  // than checking each deploy in isolation. Every other backend ignores it.
   const receiptBox = newReceiptBox();
+  const spendTracker = { spentNano: 0n };
   const locator = await backend.put(o.in, {
     yes,
     remote: o.remote,
     force: o.force,
+    spendTracker,
     onReceipt: (raw, cost) => {
       receiptBox.value = { raw, cost };
     },
@@ -471,6 +500,10 @@ async function pushCore(
         yes,
         remote: o.remote ? `${o.remote}.minisig` : undefined,
         force: o.force,
+        // #639: the SAME spendTracker reference the ciphertext upload above used — this
+        // is what lets ton-provider.ts see the ciphertext deploy's already-committed
+        // spend and enforce the cap against the combined total.
+        spendTracker,
         onReceipt: (raw, cost) => {
           sigReceiptBox.value = { raw, cost };
         },
