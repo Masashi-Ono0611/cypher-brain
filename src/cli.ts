@@ -716,7 +716,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       when unchanged. (The digest is plaintext-side by necessity: age's ephemeral file
       key makes identical content encrypt to different ciphertext bytes every run.)
 
-  cypher-brain estimate --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--json] [--out <path.json>]
+  cypher-brain estimate --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--json] [--out <path.json>] [--remote <name>:<path>]
       Read-only preview: print what pushing --in to --backend would cost WITHOUT
       uploading anything. turbo/arweave show the native unit (winc/winston) plus
       an approximate USD line when a USD/AR rate is fetchable; ton-provider shows
@@ -746,6 +746,14 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       Terraform plan/apply pattern, binding what push actually validates before its
       consent gate to what "estimate --out" reviewed (see "push --plan" above for what
       that guarantee does and does not cover).
+      --remote <name>:<path> (rclone only; the SAME value push/pull's --remote takes —
+      see "push" above): REQUIRED alongside --out when --backend rclone, since the
+      plan written above pins whatever --remote was given (null when omitted), and a
+      null remote can never validate against "push --plan" (push always has a real
+      --remote to compare it to for that backend) — omitting it here refuses up front
+      with an error, rather than writing a plan that is a dead end until re-run with
+      --remote (#468). Without --out, --remote has no effect on the estimate itself
+      (rclone's cost is always free regardless of destination).
 
   cypher-brain pull (--locator <id> --backend <…> | --remote <name>:<path> --backend rclone | --from-locator-file <path>) --out <file.age> [--wait <seconds>] [--sha256 <hex>] [--sig-locator <id>] [--force]
       Fetch ciphertext by locator into --out. --from-locator-file reads the locator, its

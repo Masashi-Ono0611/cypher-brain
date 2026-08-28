@@ -406,6 +406,19 @@ export async function estimate(o: CliOptions): Promise<void> {
   // module: see wallet.ts's payerAddressFor doc comment for why a static one here
   // would be circular (wallet.ts statically imports this module's own rate functions).
   if (o.out) {
+    // #468: without --remote, an rclone plan would pin remote: null — and "push
+    // --plan" always has a REAL --remote to compare against (rclone requires it,
+    // src/lib/backends/rclone.ts's put()), so that plan can never validate; it fails
+    // later, mid-push, with a "re-run estimate --out" suggestion the reader has no
+    // way to act on since --help never documented this flag existed. Refuse HERE,
+    // before doing any of the network-bound work below, so the mistake is caught at
+    // the point it was made rather than surfacing as a confusing push-time error.
+    if (o.backend === 'rclone' && !o.remote) {
+      throw new Error(
+        '--remote <name>:<path> required when --out is used with --backend rclone ' +
+          '(the plan would otherwise pin remote: null, which "push --plan" can never validate against a real --remote)',
+      );
+    }
     const { payerAddressFor } = await import('./wallet.js');
     // Re-stat here (not the earlier `st` above) rather than reuse it: `st` was read
     // before estimateCost()'s network-bound price query, which can take real wall-clock
