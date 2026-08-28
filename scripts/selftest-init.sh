@@ -291,29 +291,37 @@ echo "[PASS] init wizard's profile o2b path prompts for the bundle and actually 
 
 echo "== (e4) a former profile TYPO no longer errors or rolls back anything — select() closed the path (#462) =="
 # Before the fix, this exact keystroke sequence — "obsidan" (a typo of "obsidian")
-# submitted at the free-text Profile prompt — threw "unknown profile \"obsidan\"" AFTER
-# steps 1-5 had already written the primary identity, the offline backup keypair and
-# the signing keypair to disk, and the catch block a few hundred lines down in
-# wizard.ts rolled ALL of that back (the exact repro in issue #462). The Profile prompt
-# is now a select() menu (same fix shape as #396 Phase B's backend prompt, see its own
-# doc comment in wizard.ts): typed characters that are not the vim-style up/down/left/
-# right aliases (k/j/h/l — none of which "obsidan" contains, see @clack/core's default
-# `settings.aliases`) do not move the highlighted option and are not otherwise
-# collected anywhere, so they are simply inert keystrokes at a menu, not free text
-# fed to a parser. Driving the wizard with literally the SAME "obsidan" answer at
-# this step must now complete successfully with the highlighted default (none) still
-# selected — proving the typo path is structurally gone, not just re-worded.
+# submitted at the free-text Profile prompt, with the SAME backup=yes/signing=yes
+# answers issue #462 itself used to repro it — threw "unknown profile \"obsidan\""
+# AFTER steps 1-5 had already written the primary identity, the offline backup
+# keypair and the signing keypair to disk, and the catch block a few hundred lines
+# down in wizard.ts rolled ALL THREE back (Codex review round 1 on this PR flagged
+# that the original version of this test answered backup/signing "n"/"n" and so
+# never actually exercised that three-artifact rollback the issue reports — fixed
+# here to "y"/"y", matching the repro exactly). The Profile prompt is now a
+# select() menu (same fix shape as #396 Phase B's backend prompt, see its own doc
+# comment in wizard.ts): typed characters that are not the vim-style up/down/left/
+# right aliases (k/j/h/l — none of which "obsidan" contains, see @clack/core's
+# default `settings.aliases`) do not move the highlighted option and are not
+# otherwise collected anywhere, so they are simply inert keystrokes at a menu, not
+# free text fed to a parser. Driving the wizard with literally the SAME "obsidan"
+# answer at this step must now complete successfully with the highlighted default
+# (none) still selected, and — the actual point of #462 — ALL THREE artifacts
+# (primary identity, backup identity, signing identity) must survive, proving the
+# typo path is structurally gone, not just re-worded.
 TYPO_HOME="$TMP/typo-home"; mkdir -p "$TYPO_HOME"
 TYPO_CB_HOME="$TMP/typo-cb-home"
 TYPO_STORE="$TMP/typo-store"
 TYPO_SRC="$TMP/typo-src"; mkdir -p "$TYPO_SRC"
 printf 'typo-marker\n' > "$TYPO_SRC/note.txt"
 TYPO_KIT_PATH="$TYPO_HOME/recovery-kit.txt"
+TYPO_BACKUP_HOME="${TYPO_CB_HOME}-backup" # the default sibling path the wizard suggests for the backup key
 
 cat > "$TMP/qa-typo.json" <<JSON
 [
-  ["Generate an offline backup keypair now?", "n"],
-  ["Generate a signing keypair now?", "n"],
+  ["Generate an offline backup keypair now?", "y"],
+  ["Path for the backup keypair", ""],
+  ["Generate a signing keypair now?", "y"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile (what to back up)", "obsidan"],
@@ -331,7 +339,9 @@ grep -q 'cypher-brain init: complete' "$TMP/wizard-typo.log" || { echo "[FAIL] t
 grep -qi "unknown profile" "$TMP/wizard-typo.log" && { echo "[FAIL] typed 'obsidan' still reached the unknown-profile error — select() did not close the typo path"; cat "$TMP/wizard-typo.log"; exit 1; }
 grep -q "Directory path(s) to back up" "$TMP/wizard-typo.log" || { echo "[FAIL] 'obsidan' keystrokes did not fall through to profile=none's directory prompt as expected (menu should have stayed on its default)"; cat "$TMP/wizard-typo.log"; exit 1; }
 [ -f "$TYPO_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity is missing — a no-op typo should never roll anything back"; exit 1; }
-echo "[PASS] typing a former profile typo at the select() menu is inert (no error, no rollback) — issue #462 fixed"
+[ -f "$TYPO_BACKUP_HOME/identity.age" ] || { echo "[FAIL] backup identity is missing — the #462 repro's own rollback target must survive a no-op typo"; exit 1; }
+[ -f "$TYPO_CB_HOME/sign-identity.key" ] || { echo "[FAIL] signing identity is missing — the #462 repro's own rollback target must survive a no-op typo"; exit 1; }
+echo "[PASS] typing a former profile typo at the select() menu is inert — primary, backup AND signing identities all survive (issue #462 fixed)"
 
 echo "== (f) passphrase=yes path completes end-to-end (readline/promptHidden interaction fix) =="
 # CYPHER_BRAIN_PASSPHRASE (crypt.ts's own automation escape hatch) makes
