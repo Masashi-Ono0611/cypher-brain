@@ -14,7 +14,7 @@
 // stamp and derives the same facts live from git; a stampless, gitless run answers
 // null, which doctor reports as "unknown" — never as "fresh".
 import { execFileSync } from 'node:child_process';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 declare const __CYPHER_BRAIN_BUILD_INFO__: string | undefined; // injected by scripts/build.ts (#348)
@@ -28,11 +28,15 @@ export interface BuildInfo {
 
 function fromGit(): BuildInfo | null {
   try {
-    const here = dirname(fileURLToPath(import.meta.url));
-    const out = execFileSync('git', ['log', '-1', '--format=%H %cI'], { cwd: here, encoding: 'utf8' }).trim();
+    const here = fileURLToPath(import.meta.url);
+    if (!here.endsWith(join('src', 'lib', 'buildinfo.ts'))) {
+      return null;
+    }
+    const dir = dirname(here);
+    const out = execFileSync('git', ['log', '-1', '--format=%H %cI'], { cwd: dir, encoding: 'utf8' }).trim();
     const [commit, commitDate] = out.split(' ');
     if (!commit || !commitDate) return null;
-    const dirty = execFileSync('git', ['status', '--porcelain'], { cwd: here, encoding: 'utf8' }).trim() !== '';
+    const dirty = execFileSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf8' }).trim() !== '';
     return { commit, commit_date: commitDate, dirty, source: 'git' };
   } catch {
     return null;
