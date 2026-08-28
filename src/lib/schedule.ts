@@ -655,11 +655,17 @@ async function readOwnCronEntry(): Promise<string | null> {
 // this compiling with the exact same runtime guarantees the single function had.
 
 // ---------- (1) input validation ----------
-// Returns the validated backend name (narrowed from CliOptions' `backend?: string`) so
-// every helper below can take a plain `string` instead of re-deriving it from `o`.
+// The `--backend` presence check itself stays in install(), BEFORE scheduleableBackends()
+// is even called (see install() below) — scheduleableBackends() does a filesystem check
+// (does a TON wallet exist), and the original single function never paid for that when
+// `--backend` was missing outright (Codex review: reordering it after would have made a
+// plain usage error do extra I/O it never did before). `backend` is therefore guaranteed
+// non-empty by the time this runs; only its MEMBERSHIP in `backends` still needs checking
+// here. Returns the validated backend name (narrowed from CliOptions' `backend?: string`)
+// so every helper below can take a plain `string` instead of re-deriving it from `o`.
 function validateInstallInputs(o: CliOptions, backends: Set<string>): string {
-  if (!o.backend) throw new Error('--backend <file|arweave|turbo|ton-provider> required');
-  if (!backends.has(o.backend)) {
+  const backend = o.backend as string;
+  if (!backends.has(backend)) {
     // #434: ton-provider IS a recognized, documented backend name — it's just
     // excluded from `backends` above until a TON wallet is configured. Routing
     // that case through the generic "unknown backend" message below reads as if
@@ -668,10 +674,10 @@ function validateInstallInputs(o: CliOptions, backends: Set<string>): string {
     // here. Name it specifically instead; every OTHER rejected name (rclone/ton,
     // which are real but intentionally never scheduleable, or a genuine typo)
     // still falls through to the generic message unchanged.
-    if (o.backend === 'ton-provider') {
+    if (backend === 'ton-provider') {
       throw new Error("ton-provider requires CYPHER_BRAIN_TON_WALLET=<path> — see 'wallet create --chain ton'");
     }
-    throw new Error(`unknown backend: ${o.backend} (expected one of ${[...backends].join('|')})`);
+    throw new Error(`unknown backend: ${backend} (expected one of ${[...backends].join('|')})`);
   }
   // #461: install() never calls resolveProfilePaths() itself (it only reaches profiles.ts
   // through the --export/o2b check just below) — so a misspelled --profile used to sail
@@ -719,7 +725,7 @@ function validateInstallInputs(o: CliOptions, backends: Set<string>): string {
       );
     }
   }
-  return o.backend;
+  return backend;
 }
 
 // ---------- (2) environment probing/resolution (pg_dump, gitleaks paths) ----------
@@ -1063,6 +1069,10 @@ function printInstallSummary(cfg: ScheduleConfig): void {
 
 // ---------- install() — orchestrates the above in the ORIGINAL sequential order ----------
 async function install(o: CliOptions): Promise<void> {
+  // Checked here, BEFORE scheduleableBackends() (which does a filesystem check for a TON
+  // wallet) — same order the original single function had: a plain "--backend missing"
+  // usage error must never pay for that extra I/O (Codex review).
+  if (!o.backend) throw new Error('--backend <file|arweave|turbo|ton-provider> required');
   const backends = await scheduleableBackends();
   const backend = validateInstallInputs(o, backends);
   const { gitleaksBin, effectiveScan } = resolveScheduleEnv(o);
@@ -1133,9 +1143,16 @@ async function readConfig(): Promise<ScheduleConfig> {
   if (!(await exists(CONFIG))) {
     throw new ScheduleNotInstalledError(`schedule not installed (no ${CONFIG}) — run: cypher-brain schedule install`);
   }
+  // Only JSON.parse() is wrapped — NOT the readFile() above it (Codex review): a
+  // filesystem failure reading an EXISTING file (permission denied, a delete race between
+  // the exists() check and this read) is a different problem than a malformed file, and
+  // labeling it "not valid JSON" would be actively misleading. That class of failure is
+  // left to propagate exactly as it did before this fix (unwrapped, whatever Node's own
+  // fs error says) — only a genuine parse failure gets the structured message below.
+  const raw = await readFile(CONFIG, 'utf8');
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await readFile(CONFIG, 'utf8'));
+    parsed = JSON.parse(raw);
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
     throw new Error(
