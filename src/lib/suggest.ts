@@ -19,12 +19,22 @@
 /** The one phrasing, so every surface asks it with the same words. */
 export const didYouMean = (name: string): string => `did you mean ${name}?`;
 
-// Levenshtein edit distance, iterative two-row DP (no dependency for ~20 lines,
+// Damerau-Levenshtein edit distance (restricted/"optimal string alignment"
+// variant: an adjacent-character transposition costs 1, like a substitution,
+// instead of the 2 that plain Levenshtein charges it as a delete+insert or
+// two substitutions). Iterative three-row DP (no dependency for ~25 lines,
 // and this runs once per rejected call — on a handful of short identifiers).
+//
+// Plain Levenshtein's 2-cost transposition was enough to push a common typo
+// like `quikc` (for `quick`) outside nearEnough()'s 1-edit threshold, so a
+// textbook "swapped two adjacent letters" mistake got no suggestion at all
+// (#537) — the restricted variant is the standard, cheap fix, and exact for
+// the single-typo case this function exists to catch.
 function editDistance(a: string, b: string): number {
   if (a === b) return 0;
   if (a.length === 0) return b.length;
   if (b.length === 0) return a.length;
+  let prevPrev = new Array<number>(b.length + 1).fill(0);
   let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
   let curr = new Array<number>(b.length + 1);
   for (let i = 1; i <= a.length; i++) {
@@ -32,8 +42,11 @@ function editDistance(a: string, b: string): number {
     for (let j = 1; j <= b.length; j++) {
       const substitution = prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1);
       curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, substitution);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        curr[j] = Math.min(curr[j], prevPrev[j - 2] + 1);
+      }
     }
-    [prev, curr] = [curr, prev];
+    [prevPrev, prev, curr] = [prev, curr, prevPrev];
   }
   return prev[b.length];
 }
