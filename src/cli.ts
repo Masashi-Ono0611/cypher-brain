@@ -545,6 +545,18 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       That is restore's own behavior, not a flag you pass — it uses tar's own
       --skip-old-files on GNU tar and --keep-old-files on bsdtar, which are those
       two tars' spellings of the same thing.
+      #527: one exception — a component's own <name>.tar.gz archive (the file the
+      auto-expand step below re-reads and reports as coming from a specific manifest-
+      recorded source) is compared byte-for-byte against what this restore just
+      decrypted. If a pre-existing file at that name does NOT match, restore refuses
+      the WHOLE run instead of silently expanding stale/unrelated data below and
+      reporting it as if it came from that source. Restoring the exact same snapshot
+      into the same --out-dir again still matches and proceeds normally. Nothing else
+      in --out-dir gets this treatment (a mismatched manifest.json, db.dump, etc. keeps
+      the plain no-clobber behavior above). Separately, a component archive that fails
+      to auto-expand for any other reason (e.g. it does not actually parse as gzip)
+      makes restore's own exit code non-zero, never masked behind a "restored
+      components into ..." success line.
       Every --dir/--profile component's staged tarball is then auto-expanded into
       "<out-dir>/expanded/<NNN>-<source basename>-<digest>/", keyed to the component's
       ORIGINAL absolute source path (from manifest.json) rather than its on-disk name —

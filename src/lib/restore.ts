@@ -514,6 +514,93 @@ async function mergeNoClobber(src: string, dest: string): Promise<void> {
   }
 }
 
+// #527: one STALE component archive findStaleComponentArchives() below found — `name` is
+// the manifest-recorded `<component>.tar.gz` filename (for display in the refusal error
+// restoreImpl throws).
+interface StaleComponentArchive {
+  name: string;
+}
+
+// Read-only pre-check for the outer restore's own scratchDir -> --out-dir merge
+// (restoreImpl, below), run BEFORE mergeNoClobber() is allowed to touch --out-dir at all.
+//
+// #527: mergeNoClobber()'s plain "leave it, no-clobber" fallthrough is silent — it never
+// says WHICH names it skipped. For most of --out-dir that silence is exactly the
+// long-documented, TESTED behavior ("an existing file is left untouched... the collision
+// itself is not an error" — see the "#112 regression: --keep-old-files" test, which
+// deliberately plants an unrelated sentinel AT manifest.json's own name and asserts restore
+// still succeeds with it untouched). Re-scoping that general promise would break real,
+// intentional behavior — this function does NOT do that.
+//
+// One specific case is different, though: a component's own `<name>.tar.gz` — the file
+// manifest.json's `components[]` entries name via their `source`/`name` fields — is staged
+// directly under --out-dir by THIS SAME extract step, then read back and blindly
+// `tar -xzf`'d by expandComponents() below, whose mapping table claims the result came
+// from that manifest-recorded source path. If a no-clobber skip left a STALE, UNRELATED
+// file at that exact name (a leftover from an earlier/aborted restore, or anything else
+// that merely happens to share the name), expandComponents() has no way to tell — it just
+// extracts whatever is on disk and reports it as if it were this restore's own
+// freshly-decrypted data. Exit code 0, zero warning anywhere (the bug this function exists
+// to close). Nothing else in --out-dir (manifest.json itself, db.dump, a *.minisig
+// sidecar, ...) gets this treatment — nothing downstream re-reads THOSE names back and
+// attributes their content to a recorded source path the way expandComponents() does for a
+// component archive, so a stale collision there stays the ordinary, silent, tested
+// no-clobber case it always was.
+//
+// The list of "this restore's own component archive names" is read from the FRESHLY-
+// decrypted manifest.json sitting in `scratchDir` — never from whatever manifest.json (if
+// any) is already in `outDir`, which may itself be the stale/unrelated file this whole
+// check exists to catch.
+//
+// A colliding archive is compared byte-for-byte (size, then sha256) rather than flagged on
+// sight — restoring the exact SAME snapshot into the SAME --out-dir a second time (a
+// documented, supported workflow — see the "#181: re-running restore..." test) reproduces
+// byte-identical content at every colliding name, and must NOT start refusing just because
+// it is a re-run. Only a name whose on-disk content genuinely differs from what this
+// restore just decrypted counts as a collision.
+async function findStaleComponentArchives(scratchDir: string, outDir: string): Promise<StaleComponentArchive[]> {
+  const manifestPath = join(scratchDir, 'manifest.json');
+  if (!(await exists(manifestPath))) return []; // nothing to key this check off of
+  let components: RestoreManifestComponent[];
+  try {
+    const parsed: unknown = JSON.parse(await readFile(manifestPath, 'utf8'));
+    const raw = (parsed as { components?: unknown })?.components;
+    components = Array.isArray(raw) ? raw : [];
+  } catch {
+    return []; // an unparsable manifest is expandComponents()'s concern to warn about below, not this pre-check's
+  }
+  const candidates = components.filter(
+    (c): c is { name: string; source: string } =>
+      typeof c.source === 'string' &&
+      typeof c.name === 'string' &&
+      c.name.endsWith('.tar.gz') &&
+      isSafeComponentName(c.name), // never join() a forged/unsafe name — same guard expandComponents() applies
+  );
+  const stale: StaleComponentArchive[] = [];
+  for (const c of candidates) {
+    const s = join(scratchDir, c.name);
+    if (!(await exists(s))) continue; // this component's own archive did not land in scratchDir — nothing to compare
+    const d = join(outDir, c.name);
+    let dStat: Awaited<ReturnType<typeof lstat>> | undefined;
+    try {
+      dStat = await lstat(d);
+    } catch {
+      dStat = undefined;
+    }
+    if (!dStat) continue; // nothing at `d` yet — mergeNoClobber() will rename() this in; no collision
+    // A pre-existing non-file at this exact name (a directory, a symlink, ...) is left to
+    // mergeNoClobber()'s existing defenses (e.g. the pre-existing-symlink protection
+    // scripts/selftest-restore-security.sh's "(p)" case exercises) rather than compared
+    // here — a legitimate component archive is always a plain file, so anything else at
+    // its name is already an anomaly those defenses are built for.
+    if (!dStat.isFile()) continue;
+    const sStat = await lstat(s);
+    const same = sStat.size === dStat.size && (await sha256(s)) === (await sha256(d));
+    if (!same) stale.push({ name: c.name });
+  }
+  return stale;
+}
+
 // #225 forward-compat guard: a manifest.json declaring a `schema` this build does not
 // recognize describes a shape restore has never been taught to read. Arweave's storage
 // is meant to outlive any one build of this tool — a decades-old binary silently
@@ -568,9 +655,20 @@ function assertSupportedManifestSchema(manifestText: string, manifestPath: strin
 // *.tar.gz in --out-dir) — a problem here (a malformed manifest, one corrupt archive) is
 // reported on stderr and skipped rather than failing the whole restore; the raw tarballs
 // restore already extracted remain there as the fallback either way.
-async function expandComponents(outDir: string): Promise<void> {
+//
+// #527 "Related finding": best-effort does NOT mean silent, though — a component whose
+// archive fails to expand (e.g. it is not actually a valid gzip, a raw bsdtar/tar stderr
+// string used to be the ONLY sign anything went wrong) must still be visible in the
+// OVERALL restore's exit code, so a scripted caller checking $? alone can detect a
+// partial failure instead of seeing exit 0 identical to a fully successful run. Returns
+// true when every candidate component that was actually attempted expanded cleanly
+// (including the trivial case of nothing to expand at all), false if at least one
+// attempted expansion failed — restoreImpl turns a false return into a non-zero exit,
+// AFTER letting every other step (including any remaining components, and --pg) still
+// run to completion.
+async function expandComponents(outDir: string): Promise<boolean> {
   const manifestPath = join(outDir, 'manifest.json');
-  if (!(await exists(manifestPath))) return; // nothing to key expansion off of
+  if (!(await exists(manifestPath))) return true; // nothing to key expansion off of
   let components: RestoreManifestComponent[];
   try {
     const parsed: unknown = JSON.parse(await readFile(manifestPath, 'utf8'));
@@ -580,23 +678,26 @@ async function expandComponents(outDir: string): Promise<void> {
     console.error(
       `warning: could not parse ${manifestPath} — skipping component auto-expand (${sanitizeForDisplay(errMsg(e))})`,
     );
-    return;
+    return true; // a manifest restore itself already accepted (assertSupportedManifestSchema ran above)
+    // failing to re-parse it here is not a per-component expansion failure — nothing was
+    // ever attempted, so there is nothing to report as failed.
   }
   const candidates = components.filter(
     (c): c is { name: string; source: string } =>
       typeof c.source === 'string' && typeof c.name === 'string' && c.name.endsWith('.tar.gz'),
   );
-  if (candidates.length === 0) return;
+  if (candidates.length === 0) return true;
 
   const expandedRoot = join(outDir, 'expanded');
   try {
     await refuseIfSymlink(expandedRoot, 'expand root');
   } catch (e) {
     console.error(`warning: ${errMsg(e)} — skipping component auto-expand entirely`);
-    return;
+    return true; // nothing was attempted (defense-in-depth refusal, not an expand failure)
   }
   mkdirSync(expandedRoot, { recursive: true });
   const rows: ExpandedRow[] = [];
+  let hadFailures = false;
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
     // A forged manifest `name` (e.g. "../../../etc/cron.d/evil.tar.gz") must never be
@@ -611,8 +712,13 @@ async function expandComponents(outDir: string): Promise<void> {
       continue;
     }
     const archivePath = join(outDir, c.name);
-    // Absent when the outer extract's own no-clobber skip left it out (a pre-existing
-    // --out-dir already held a same-named file) — nothing to expand in that case.
+    // Absent when this manifest entry's own archive genuinely never made it into the
+    // decrypted --out-dir (e.g. a forged manifest listing a component with no backing
+    // archive). #527: this is NOT what a no-clobber skip on a pre-existing --out-dir
+    // looks like — a no-clobber skip leaves the OLD file in place, so `archivePath`
+    // still exists (just with stale content); that case is now refused earlier, in
+    // restoreImpl's own findStaleComponentArchives() check, before expandComponents() ever
+    // runs. Nothing was attempted here, so this is not counted as an expand failure.
     if (!(await exists(archivePath))) continue;
 
     // The "<NNN>-" prefix EXACTLY guarantees uniqueness WITHIN this manifest; the
@@ -661,6 +767,7 @@ async function expandComponents(outDir: string): Promise<void> {
       console.error(
         `warning: could not expand ${sanitizeForDisplay(c.name)} into ${targetDir} (${sanitizeForDisplay(errMsg(e))}) — the raw ${sanitizeForDisplay(c.name)} is still in ${outDir}`,
       );
+      hadFailures = true; // #527: this component was ATTEMPTED and failed — the overall restore must not exit 0
       continue;
     } finally {
       await rm(scratchDir, { recursive: true, force: true }); // no-op once rename() has already moved it away
@@ -671,7 +778,7 @@ async function expandComponents(outDir: string): Promise<void> {
       source: sanitizeForDisplay(c.source),
     });
   }
-  if (rows.length === 0) return;
+  if (rows.length === 0) return !hadFailures;
 
   const readmePath = join(expandedRoot, 'README.txt');
   try {
@@ -700,6 +807,7 @@ async function expandComponents(outDir: string): Promise<void> {
 
   console.log(`expanded ${rows.length} component(s) into ${expandedRoot} (see expanded/README.txt):`);
   for (const r of rows) console.log(`  ${r.dir}  <-  ${r.source}`);
+  return !hadFailures;
 }
 
 // restore() is shared by cli.ts AND mcp.ts's restore_now tool (mcp.ts calls it
@@ -882,8 +990,28 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   // component below, converged here for the outer extract too.
   setActiveRestoreOutDir(o.out_dir, outDirPreExisted);
   try {
-    if (!outDirPreExisted) await rename(scratchDir, o.out_dir);
-    else await mergeNoClobber(scratchDir, o.out_dir);
+    if (!outDirPreExisted) {
+      await rename(scratchDir, o.out_dir);
+    } else {
+      // #527: scan for a component archive whose pre-existing --out-dir content does NOT
+      // match what this restore just decrypted, BEFORE mergeNoClobber() is allowed to
+      // touch anything — see findStaleComponentArchives()'s own doc comment above for why
+      // this is scoped to component archives specifically, not every file in --out-dir.
+      // Refusing the WHOLE restore here (rather than merging what doesn't collide and only
+      // warning about what does) means a failed run leaves --out-dir exactly as it was
+      // found, and never reaches expandComponents() below on ambiguous ground.
+      const stale = await findStaleComponentArchives(scratchDir, o.out_dir);
+      if (stale.length > 0) {
+        const names = stale.map((c) => sanitizeForDisplay(c.name)).join(', ');
+        throw new Error(
+          `refusing to restore into ${o.out_dir}: it already contains ${stale.length} component archive(s) whose on-disk content does not match this snapshot (${names}). ` +
+            "restore's no-clobber promise means these existing files would be left untouched rather than overwritten with the freshly-decrypted bytes — " +
+            'continuing would let the component auto-expand step silently treat that stale/unrelated on-disk content as if it belonged to this restore. ' +
+            `Clear the listed path(s) from ${o.out_dir}, or restore into an empty/different --out-dir.`,
+        );
+      }
+      await mergeNoClobber(scratchDir, o.out_dir);
+    }
   } finally {
     await rm(scratchDir, { recursive: true, force: true }); // no-op once rename() has already moved it away
     // the promotion is settled (cleanly, or the above already threw) — a later signal
@@ -913,7 +1041,8 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   // flows never race or duplicate work, and neither has to run before the other. --no-
   // expand-components is the opt-out for anyone who wants exactly the pre-#181 behavior
   // (raw *.tar.gz files only, manual untar).
-  if (!o.no_expand_components) await expandComponents(o.out_dir);
+  let expandedCleanly = true;
+  if (!o.no_expand_components) expandedCleanly = await expandComponents(o.out_dir);
   if (o.pg) {
     const dump = join(o.out_dir, 'db.dump');
     if (!(await exists(dump))) throw new Error(`--pg given but no db.dump in snapshot`);
@@ -921,6 +1050,18 @@ async function restoreImpl(o: CliOptions): Promise<void> {
       timeoutMs: PIPE_TIMEOUT_MS,
     });
     console.log(`pg_restore -> ${redactPgConn(o.pg)} done`);
+  }
+  // #527 "Related finding": run this LAST, after --pg above (still best-effort — every
+  // other step above already ran to completion, including any component whose expand did
+  // NOT fail) so the overall exit code reflects a partial expand failure instead of the
+  // 0 a scripted caller's `$?` check used to see identically on a fully clean run. The
+  // "warning:" line(s) expandComponents() already printed say which component(s) failed
+  // and why; the raw *.tar.gz archives remain in --out-dir either way.
+  if (!expandedCleanly) {
+    throw new Error(
+      `restore completed, but auto-expanding one or more components failed (see the "warning:" line(s) above) — ` +
+        `the raw *.tar.gz archive(s) remain in ${o.out_dir} for you to inspect or expand manually`,
+    );
   }
 }
 

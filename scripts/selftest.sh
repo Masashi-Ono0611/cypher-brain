@@ -214,6 +214,97 @@ cb restore --in "$TMP/collide.age" --out-dir "$EXP_OUT" >/dev/null
 [ "$(cat "$ALPHA_DIR/note.txt")" = "$SENTINEL_EXP" ] || { echo "FAIL: re-running restore into the same --out-dir clobbered a previously-expanded file"; exit 1; }
 echo "[PASS] re-running restore into an out-dir with an existing expansion does not clobber it"
 
+echo "== #527: a pre-existing UNRELATED (but valid) tar.gz at a component's on-disk name refuses the whole restore instead of silently expanding stale data =="
+# Reproduces issue #527's exact repro: mkdir out-dir, drop a VALID-but-unrelated tar.gz
+# at the exact on-disk name this snapshot's own component wants to use, THEN restore
+# into that dir -- the freshly-decrypted bytes for that name must never be silently
+# discarded (no-clobber) and then blindly expanded by the auto-expand step as if they
+# were this restore's own data, with zero warning and exit 0. This is a REFUSE-the-
+# whole-restore fix (findMergeCollisions() in src/lib/restore.ts), not a warn-and-
+# continue one -- see restoreImpl's own comment for why.
+STALE_SRC="$TMP/stale-src"; mkdir -p "$STALE_SRC"
+printf 'this is the REAL snapshot content\n' > "$STALE_SRC/note.txt"
+cb snapshot --dir "$STALE_SRC" --out "$TMP/stale.age" >/dev/null
+STALE_COMPONENT_NAME="$(basename "$STALE_SRC").tar.gz"   # "stale-src.tar.gz"
+
+UNRELATED_SRC="$TMP/unrelated-content"; mkdir -p "$UNRELATED_SRC"
+printf 'totally different content, not from this snapshot at all\n' > "$UNRELATED_SRC/other.txt"
+
+STALE_OUT="$TMP/stale-out"; mkdir -p "$STALE_OUT"
+tar czf "$STALE_OUT/$STALE_COMPONENT_NAME" -C "$TMP" "$(basename "$UNRELATED_SRC")"
+STALE_ARCHIVE_SHA_BEFORE=$(shasum -a 256 "$STALE_OUT/$STALE_COMPONENT_NAME" | cut -d' ' -f1)
+
+set +e
+STALE_ERR=$(cb restore --in "$TMP/stale.age" --out-dir "$STALE_OUT" 2>&1); STALE_RC=$?
+set -e
+[ "$STALE_RC" != "0" ] || { echo "FAIL: restore into an out-dir with a stale/unrelated same-named archive exited 0"; echo "$STALE_ERR"; exit 1; }
+printf '%s' "$STALE_ERR" | grep -qF "$STALE_COMPONENT_NAME" || { echo "FAIL: refusal error does not name the colliding path"; echo "$STALE_ERR"; exit 1; }
+test ! -d "$STALE_OUT/expanded" || { echo "FAIL: component auto-expand ran despite the refusal (would have expanded the WRONG data)"; exit 1; }
+STALE_ARCHIVE_SHA_AFTER=$(shasum -a 256 "$STALE_OUT/$STALE_COMPONENT_NAME" | cut -d' ' -f1)
+[ "$STALE_ARCHIVE_SHA_BEFORE" = "$STALE_ARCHIVE_SHA_AFTER" ] || { echo "FAIL: the pre-existing unrelated archive's bytes changed -- restore's no-clobber promise was violated"; exit 1; }
+echo "[PASS] a pre-existing unrelated (but valid) same-named tar.gz refuses the whole restore instead of silently expanding stale data"
+
+echo "== #527 related finding: a pre-existing GARBAGE (non-tar) file at that name also refuses the whole restore, with a non-zero exit code =="
+GARBAGE_OUT="$TMP/garbage-out"; mkdir -p "$GARBAGE_OUT"
+printf 'SENTINEL-NOT-A-TARBALL\n' > "$GARBAGE_OUT/$STALE_COMPONENT_NAME"
+set +e
+GARBAGE_ERR=$(cb restore --in "$TMP/stale.age" --out-dir "$GARBAGE_OUT" 2>&1); GARBAGE_RC=$?
+set -e
+[ "$GARBAGE_RC" != "0" ] || { echo "FAIL: restore into an out-dir with a garbage same-named file exited 0 (a scripted caller's \$? check could not detect the partial failure)"; echo "$GARBAGE_ERR"; exit 1; }
+test ! -d "$GARBAGE_OUT/expanded" || { echo "FAIL: component auto-expand ran against garbage data despite the refusal"; exit 1; }
+echo "[PASS] a pre-existing garbage (non-tar) file at a component's on-disk name also refuses the whole restore, non-zero exit"
+
+echo "== #527: the normal happy path (empty --out-dir, no collisions) is unaffected =="
+HAPPY_OUT="$TMP/stale-happy-out"
+cb restore --in "$TMP/stale.age" --out-dir "$HAPPY_OUT" >/dev/null
+diff -r "$STALE_SRC" "$HAPPY_OUT/expanded/001-$(basename "$STALE_SRC")-$(src_digest "$STALE_SRC")/$(basename "$STALE_SRC")" \
+  || { echo "FAIL: happy-path restore into an empty --out-dir did not correctly expand"; exit 1; }
+echo "[PASS] restoring into a fresh, empty --out-dir still works with no false-positive refusal"
+
+echo "== #527: re-running restore into the SAME --out-dir twice (idempotent) must NOT start refusing =="
+IDEMPOTENT_OUT="$TMP/stale-idempotent-out"
+cb restore --in "$TMP/stale.age" --out-dir "$IDEMPOTENT_OUT" >/dev/null
+set +e
+IDEMPOTENT_ERR=$(cb restore --in "$TMP/stale.age" --out-dir "$IDEMPOTENT_OUT" 2>&1); IDEMPOTENT_RC=$?
+set -e
+[ "$IDEMPOTENT_RC" = "0" ] || { echo "FAIL: re-running restore into the SAME --out-dir with the SAME snapshot started refusing (should be a no-op idempotent re-run)"; echo "$IDEMPOTENT_ERR"; exit 1; }
+echo "[PASS] re-running restore into the SAME --out-dir with the SAME snapshot does not trigger the new collision refusal"
+
+echo "== #527 related finding: a component archive that fails to expand for a NON-collision reason also makes the OVERALL restore exit non-zero =="
+# Isolates the "Related finding" fix from the stale-collision fix above: a component
+# archive that is corrupt from the moment it is decrypted (no pre-existing --out-dir, so
+# findMergeCollisions() above never even runs) used to fail ONLY that component -- silently,
+# with the whole restore still exiting 0, so a scripted caller checking $? alone could not
+# tell. expandComponents() now reports this back to restoreImpl, which exits non-zero.
+if ! command -v age >/dev/null 2>&1; then
+  echo "[SKIP] non-collision partial-expand-failure test: no \`age\` binary on PATH (CI installs it; install age locally to exercise this)"
+else
+  CORRUPT_STAGE="$TMP/corrupt-stage"; mkdir -p "$CORRUPT_STAGE"
+  printf 'SENTINEL-NOT-A-GZIP-EITHER\n' > "$CORRUPT_STAGE/corrupt.tar.gz"
+  cat > "$CORRUPT_STAGE/manifest.json" <<MANIFEST
+{
+  "tool": "cypher-brain",
+  "schema": 1,
+  "host": "forged-test-fixture",
+  "created_at": "2026-01-01T00:00:00.000Z",
+  "content_digest": "0",
+  "recipients_fingerprint": "0",
+  "components": [
+    { "name": "corrupt.tar.gz", "kind": "dir", "source": "/does/not/matter/corrupt", "content_digest": "0", "captured_at": "2026-01-01T00:00:00.000Z" }
+  ]
+}
+MANIFEST
+  ( cd "$CORRUPT_STAGE" && tar -cf - manifest.json corrupt.tar.gz ) | age -r "$(cat "$TMP/keys/recipient.txt")" -o "$TMP/corrupt.age"
+  CORRUPT_OUT="$TMP/corrupt-out"   # fresh, empty --out-dir -- no collision possible
+  set +e
+  CORRUPT_ERR=$(cb restore --in "$TMP/corrupt.age" --out-dir "$CORRUPT_OUT" 2>&1); CORRUPT_RC=$?
+  set -e
+  [ "$CORRUPT_RC" != "0" ] || { echo "FAIL: restore with a corrupt (non-collision) component archive exited 0"; echo "$CORRUPT_ERR"; exit 1; }
+  printf '%s' "$CORRUPT_ERR" | grep -qi "could not expand" || { echo "FAIL: no 'could not expand' warning for the corrupt component"; echo "$CORRUPT_ERR"; exit 1; }
+  test -f "$CORRUPT_OUT/corrupt.tar.gz" || { echo "FAIL: the raw (corrupt) component archive should still be left in --out-dir as a fallback"; exit 1; }
+  echo "[PASS] a component archive that fails to expand for a non-collision reason also makes the overall restore exit non-zero"
+fi
+
 echo "== #181 hardening: a forged manifest component 'name' containing a path separator is refused, not followed (path-traversal guard) =="
 # age is public-key encryption -- anyone holding a recipient's PUBLIC key can construct
 # ciphertext encrypted to it, so a crafted manifest.json inside otherwise-valid
