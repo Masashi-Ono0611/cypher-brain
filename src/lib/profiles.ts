@@ -31,7 +31,7 @@ export const PROFILE_NAMES = ['claude-code', 'obsidian', 'chatgpt-export', 'o2b'
 // already here.
 export function assertKnownProfile(profile: string | undefined): void {
   if (profile === undefined) return;
-  if ((PROFILE_NAMES as readonly string[]).includes(profile)) return;
+  if (PROFILE_NAMES.includes(profile)) return;
   const suggestion = nearestName(profile, PROFILE_NAMES);
   throw new Error(
     `unknown profile "${profile}"${suggestion ? ` (${didYouMean(suggestion)})` : ''} — valid profiles: ${PROFILE_NAMES.join(', ')}`,
