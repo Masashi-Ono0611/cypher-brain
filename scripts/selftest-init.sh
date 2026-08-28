@@ -83,7 +83,7 @@ cat > "$TMP/qa-nodir.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", ""]
 ]
 JSON
@@ -118,7 +118,7 @@ cat > "$TMP/qa-tonprov.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$TONPROV_SRC"],
   ["Choose a backend", "\u001b[A"]
 ]
@@ -161,7 +161,7 @@ cat > "$TMP/qa.json" <<JSON
   ["Generate a signing keypair now?", "y"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$SRC"],
   ["Choose a backend", ""],
   ["Path to write the recovery kit", "$KIT_PATH"]
@@ -261,7 +261,7 @@ cat > "$TMP/qa-o2b.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", "o2b"],
+  ["Profile (what to back up)", "\u001b[A"],
   ["Path to the o2b bank-export bundle", "$O2B_BUNDLE"],
   ["Choose a backend", ""],
   ["Path to write the recovery kit", "$O2B_KIT_PATH"]
@@ -288,6 +288,60 @@ tar -xzf "$TMP/o2b-wiz-restore/o2b-bank-export.json.tar.gz" -C "$TMP/o2b-wiz-res
 O2B_RESTORED_SHA=$(shasum -a 256 "$TMP/o2b-wiz-restore/o2b-bank-export.json" | cut -d' ' -f1)
 [ "$O2B_SHA" = "$O2B_RESTORED_SHA" ] || { echo "[FAIL] wizard's o2b snapshot did not archive the bundle byte-identical"; exit 1; }
 echo "[PASS] init wizard's profile o2b path prompts for the bundle and actually snapshots it byte-identical (manifest records profile o2b)"
+
+echo "== (e4) a former profile TYPO no longer errors or rolls back anything — select() closed the path (#462) =="
+# Before the fix, this exact keystroke sequence — "obsidan" (a typo of "obsidian")
+# submitted at the free-text Profile prompt, with the SAME backup=yes/signing=yes
+# answers issue #462 itself used to repro it — threw "unknown profile \"obsidan\""
+# AFTER steps 1-5 had already written the primary identity, the offline backup
+# keypair and the signing keypair to disk, and the catch block a few hundred lines
+# down in wizard.ts rolled ALL THREE back (Codex review round 1 on this PR flagged
+# that the original version of this test answered backup/signing "n"/"n" and so
+# never actually exercised that three-artifact rollback the issue reports — fixed
+# here to "y"/"y", matching the repro exactly). The Profile prompt is now a
+# select() menu (same fix shape as #396 Phase B's backend prompt, see its own doc
+# comment in wizard.ts): typed characters that are not the vim-style up/down/left/
+# right aliases (k/j/h/l — none of which "obsidan" contains, see @clack/core's
+# default `settings.aliases`) do not move the highlighted option and are not
+# otherwise collected anywhere, so they are simply inert keystrokes at a menu, not
+# free text fed to a parser. Driving the wizard with literally the SAME "obsidan"
+# answer at this step must now complete successfully with the highlighted default
+# (none) still selected, and — the actual point of #462 — ALL THREE artifacts
+# (primary identity, backup identity, signing identity) must survive, proving the
+# typo path is structurally gone, not just re-worded.
+TYPO_HOME="$TMP/typo-home"; mkdir -p "$TYPO_HOME"
+TYPO_CB_HOME="$TMP/typo-cb-home"
+TYPO_STORE="$TMP/typo-store"
+TYPO_SRC="$TMP/typo-src"; mkdir -p "$TYPO_SRC"
+printf 'typo-marker\n' > "$TYPO_SRC/note.txt"
+TYPO_KIT_PATH="$TYPO_HOME/recovery-kit.txt"
+TYPO_BACKUP_HOME="${TYPO_CB_HOME}-backup" # the default sibling path the wizard suggests for the backup key
+
+cat > "$TMP/qa-typo.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "y"],
+  ["Path for the backup keypair", ""],
+  ["Generate a signing keypair now?", "y"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", "obsidan"],
+  ["Directory path(s) to back up", "$TYPO_SRC"],
+  ["Choose a backend", ""],
+  ["Path to write the recovery kit", "$TYPO_KIT_PATH"]
+]
+JSON
+
+CYPHER_BRAIN_HOME="$TYPO_CB_HOME" CYPHER_BRAIN_FILE_DIR="$TYPO_STORE" HOME="$TYPO_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-typo.json" --out "$TMP/wizard-typo.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] the former profile-typo keystrokes made init fail (typo path should be structurally unreachable now)"; cat "$TMP/wizard-typo.log"; exit 1; }
+grep -q 'cypher-brain init: complete' "$TMP/wizard-typo.log" || { echo "[FAIL] typo-keystrokes wizard log lacks its own completion marker"; cat "$TMP/wizard-typo.log"; exit 1; }
+grep -qi "unknown profile" "$TMP/wizard-typo.log" && { echo "[FAIL] typed 'obsidan' still reached the unknown-profile error — select() did not close the typo path"; cat "$TMP/wizard-typo.log"; exit 1; }
+grep -q "Directory path(s) to back up" "$TMP/wizard-typo.log" || { echo "[FAIL] 'obsidan' keystrokes did not fall through to profile=none's directory prompt as expected (menu should have stayed on its default)"; cat "$TMP/wizard-typo.log"; exit 1; }
+[ -f "$TYPO_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity is missing — a no-op typo should never roll anything back"; exit 1; }
+[ -f "$TYPO_BACKUP_HOME/identity.age" ] || { echo "[FAIL] backup identity is missing — the #462 repro's own rollback target must survive a no-op typo"; exit 1; }
+[ -f "$TYPO_CB_HOME/sign-identity.key" ] || { echo "[FAIL] signing identity is missing — the #462 repro's own rollback target must survive a no-op typo"; exit 1; }
+echo "[PASS] typing a former profile typo at the select() menu is inert — primary, backup AND signing identities all survive (issue #462 fixed)"
 
 echo "== (f) passphrase=yes path completes end-to-end (readline/promptHidden interaction fix) =="
 # CYPHER_BRAIN_PASSPHRASE (crypt.ts's own automation escape hatch) makes
@@ -321,7 +375,7 @@ cat > "$TMP/qa-pass.json" <<JSON
   ["Protect the primary identity with a passphrase now?", "y"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "y"],
   ["Suggested line (edit or press Enter to accept)", ""],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$F_SRC"],
   ["Choose a backend", ""],
   ["Path to write the recovery kit", "$F_KIT_PATH"]
@@ -428,7 +482,7 @@ cat > "$TMP/qa-rollback-fail.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$RB_SRC"],
   ["Choose a backend", "\u001b[A\u001b[A"],
   ["PAID, PERMANENT store", "n"]
@@ -454,7 +508,7 @@ cat > "$TMP/qa-rollback-retry.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$RB_SRC"],
   ["Choose a backend", ""],
   ["Path to write the recovery kit", "$RB_KIT_PATH"]
@@ -490,7 +544,7 @@ cat > "$TMP/qa-tilde.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "~/$TILDE_SRC_REL"],
   ["Choose a backend", ""],
   ["Path to write the recovery kit", "~/tilde-recovery-kit.txt"]
@@ -531,7 +585,7 @@ cat > "$TMP/qa-prepush-rollback-fail.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$J0_SRC"],
   ["Choose a backend", ""]
 ]
@@ -577,7 +631,7 @@ cat > "$TMP/qa-snap-preserve-fail.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$SNAP_SRC"],
   ["Choose a backend", ""],
   ["Path to write the recovery kit", "$BLOCKED_KIT_PATH"]
@@ -638,7 +692,7 @@ cat > "$TMP/qa-locator-preserve-fail.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$K_SRC"],
   ["Choose a backend", ""]
 ]
@@ -737,7 +791,7 @@ cat > "$TMP/qa-backup-partial-retry.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$L_SRC"],
   ["Choose a backend", ""],
   ["Path to write the recovery kit", "$L_HOME/recovery-kit.txt"]
@@ -882,7 +936,7 @@ cat > "$TMP/qa-pg.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$PG_SRC"],
   ["Include a Postgres database dump", ""],
   ["Postgres connection string", "$TEST_PG_CONN"],
@@ -940,7 +994,7 @@ cat > "$TMP/qa-pg-decline.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$PG_SRC"],
   ["Include a Postgres database dump", "n"],
   ["Choose a backend", ""],
@@ -983,7 +1037,7 @@ cat > "$TMP/qa-pg-whitespace.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$PG_SRC"],
   ["Include a Postgres database dump", ""],
   ["Postgres connection string", "   "],
@@ -1036,7 +1090,7 @@ cat > "$TMP/qa-confirm-default.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", ""]
 ]
 JSON
@@ -1071,7 +1125,7 @@ cat > "$TMP/qa-wallet-precheck.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$O_SRC"],
   ["Choose a backend", "\u001b[A\u001b[A"]
 ]
@@ -1118,7 +1172,7 @@ cat > "$TMP/qa-wallet-precheck-missing.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$O2_SRC"],
   ["Choose a backend", "\u001b[A\u001b[A\u001b[A"]
 ]
@@ -1147,7 +1201,7 @@ cat > "$TMP/qa-wallet-precheck-present.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$O3_SRC"],
   ["Choose a backend", "\u001b[A\u001b[A"],
   ["PAID, PERMANENT store", "n"]
