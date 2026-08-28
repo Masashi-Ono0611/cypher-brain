@@ -202,6 +202,20 @@ class ToolError extends Error {
   }
 }
 
+// #560 (multi-model review finding): a catch block that reclassifies a caught error into
+// a NEW ToolError — e.g. "this ERR_INTERNAL is actually bad input" — otherwise drops
+// whatever captureCall() had already bound onto the ORIGINAL error's `cbWarnings`
+// (line ~175 above): a warning the failed call recorded before it failed would silently
+// vanish from the structured error result instead of riding it (the exact relay hole
+// #347 exists to close). Copying it onto the replacement preserves that regardless of
+// which ToolError the caller ends up seeing.
+function reclassify(code: string, message: string, original: Error): ToolError {
+  const replacement = new ToolError(code, message);
+  const cbWarnings = (original as Error & { cbWarnings?: string[] }).cbWarnings;
+  if (cbWarnings) (replacement as ToolError & { cbWarnings?: string[] }).cbWarnings = cbWarnings;
+  return replacement;
+}
+
 // #347: module-load warnings, preserved by main()'s startup drain — attached to every
 // structured result below (session-scoped facts like a deprecated env var).
 let startupWarnings: string[] = [];
@@ -820,7 +834,7 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
       // #560: a bad recipient (neither an age1... pubkey nor an existing file) is bad
       // INPUT, not a server fault — see NO_RECIPIENT_AT_PATTERN's own comment above.
       if (e instanceof Error && NO_RECIPIENT_AT_PATTERN.test(e.message)) {
-        throw new ToolError('ERR_INVALID_INPUT', e.message);
+        throw reclassify('ERR_INVALID_INPUT', e.message, e);
       }
       throw e;
     }
@@ -1404,7 +1418,7 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
       // carry-forward logic below, rather than falling through to it (which would only
       // trigger when `signature` happens to be set) or past it to plain ERR_INTERNAL.
       if (e instanceof Error && OUT_DIR_NOT_A_DIRECTORY_PATTERN.test(e.message)) {
-        throw new ToolError('ERR_INVALID_INPUT', e.message);
+        throw reclassify('ERR_INVALID_INPUT', e.message, e);
       }
       // A refusal under require_signature throws, so the structured result below — and with
       // it the `signature` object #312 added — never gets built. The caller would then read
@@ -1412,9 +1426,10 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
       // a recorded sidecar failed to fetch, and knows why.
       // Carry that diagnosis onto the error rather than losing it.
       if (!signature) throw e;
-      throw new ToolError(
+      throw reclassify(
         'ERR_INVALID_INPUT',
         `${errMsg(e)} — note: ${String(signature.note ?? '')} (${String(signature.reason ?? 'no reason recorded')})`,
+        e instanceof Error ? e : new Error(errMsg(e)),
       );
     }
     // #559: non-blocking — see outsideHomeWarning()'s own comment for why restore_now
@@ -1664,7 +1679,7 @@ async function handleWalletAddress(args: ToolArgs): Promise<CallToolResult> {
     // #560: a missing wallet file at a caller-given path is bad INPUT, not a server
     // fault — see NO_WALLET_AT_PATTERN's own comment above.
     if (e instanceof Error && NO_WALLET_AT_PATTERN.test(e.message)) {
-      throw new ToolError('ERR_INVALID_INPUT', e.message);
+      throw reclassify('ERR_INVALID_INPUT', e.message, e);
     }
     throw e;
   }
