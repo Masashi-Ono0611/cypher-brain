@@ -53,6 +53,7 @@ import {
 } from './secrets-scan.js';
 import { exists } from './util.js';
 import { printJson } from './ui.js';
+import { warn } from './warn.js';
 import { assertExportRequiresO2bProfile, assertKnownProfile } from './profiles.js';
 import { tonWalletConfigured } from './wallet.js';
 import { didYouMean, nearestName } from './suggest.js';
@@ -1496,14 +1497,21 @@ async function uninstall(o: CliOptions): Promise<void> {
     if (await exists(PLIST)) {
       await rm(PLIST);
       removed.push(`launchd plist ${PLIST}`);
-    } else if (priorCfg) {
-      // #529: priorCfg (schedule.json) existing means THIS home recorded an installed
-      // schedule — install writes the plist unconditionally, --no-load or not (see
-      // CYPHER_BRAIN_LAUNCHD_DIR in --help) — so the file was expected here and its
-      // absence is drift (deleted manually, by another tool, or by a prior uninstall
-      // that already removed it). The bare `if` above used to just skip this silently,
-      // making a clean teardown indistinguishable from "the trigger vanished and nobody
-      // knows why" in the output — this is the whole fix for #529.
+    } else if (priorCfg?.trigger.type === 'launchd' && priorCfg.trigger.path === PLIST) {
+      // #529: schedule.json recording trigger.path === the CURRENT PLIST (same test
+      // legacyLaunchd() below uses to tell "current" from "moved/legacy") means install
+      // wrote the plist right here — unconditionally, --no-load or not (see
+      // CYPHER_BRAIN_LAUNCHD_DIR in --help) — so its absence now IS drift (deleted
+      // manually, by another tool, or by a prior uninstall that already removed it). The
+      // bare `if` above used to just skip this silently, making a clean teardown
+      // indistinguishable from "the trigger vanished and nobody knows why" in the output
+      // — this is the whole fix for #529.
+      //
+      // Deliberately narrower than "priorCfg exists": if trigger.path is instead a
+      // DIFFERENT path (e.g. CYPHER_BRAIN_LAUNCHD_DIR changed since install, or a
+      // pre-#114 legacy scheme), legacyLaunchd() below already reports THAT file — a
+      // moved/legacy plist is not "gone", so flagging the never-installed current-path
+      // PLIST here too would be a false alarm (Codex review, #529).
       plistDrift = true;
     }
     const legacy = legacyLaunchd(priorCfg);
@@ -1549,14 +1557,17 @@ async function uninstall(o: CliOptions): Promise<void> {
     console.error('nothing to remove — schedule is not installed');
   } else {
     for (const r of removed) console.error(`removed: ${r}`);
-    // #529: a note, not a `removed:` line — nothing was actually removed here, the file
-    // was already gone. Distinct wording so a caller (human or doctor/monitoring) can
-    // tell "cleanly tore down a live trigger" apart from "the trigger's registration
-    // artifact silently vanished out-of-band and nobody knows why". Exit code/end state
-    // are unchanged either way — this only makes the drift VISIBLE.
+    // #529: warn(), not a plain `removed:` line — nothing was actually removed here, the
+    // file was already gone, and this is exactly the class of thing warn() exists for
+    // (#347): an incidental hazard that must survive an agent relaying this run, not just
+    // this one stderr line among several. Distinct wording (and the ⚠ warn() prefixes it
+    // with) lets a caller — human or doctor/monitoring — tell "cleanly tore down a live
+    // trigger" apart from "the trigger's registration artifact silently vanished
+    // out-of-band and nobody knows why". Exit code/end state are unchanged either way —
+    // this only makes the drift VISIBLE.
     if (plistDrift)
-      console.error(
-        `note: launchd plist ${PLIST} was already missing (removed manually, or drift from a prior uninstall?)`,
+      warn(
+        `launchd plist ${PLIST} was already missing on uninstall (removed manually, or drift from a prior uninstall?)`,
       );
     console.error(
       `kept: logs (${LOGS_DIR}), snapshots (${SNAPS_DIR}) and index.tsv — they are your data, delete manually if unwanted`,
