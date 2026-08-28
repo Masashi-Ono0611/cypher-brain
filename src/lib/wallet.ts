@@ -211,10 +211,19 @@ async function tonWalletBalance(o: CliOptions): Promise<void> {
   // the address that just got funded from an exchange/another wallet is precisely the
   // one this machine may not hold a mnemonic for.
   const address = o.address ?? (await addressFromTonWallet(o, 'wallet balance'));
-  const res = await fetch(`${TON_TONAPI_URL}/v2/blockchain/accounts/${address}`, {
+  // Deliberately the PLAIN /v2/accounts endpoint, not /v2/blockchain/accounts (which
+  // ton-provider.ts's fetchAccountState() uses for its own purposes) — the blockchain-
+  // prefixed one 404s for any address that has never sent/received a transaction, which
+  // is exactly the state a freshly generated, never-funded wallet is in and precisely
+  // the case --help documents as the primary use case ("no funds needed"). /v2/accounts
+  // returns 200 with {"balance":0,"status":"nonexist",...} for that same identical
+  // address instead (confirmed directly against tonapi.io for both a never-active and an
+  // already-active address — issue #479).
+  const url = `${TON_TONAPI_URL}/v2/accounts/${address}`;
+  const res = await fetch(url, {
     signal: AbortSignal.timeout(15_000),
   });
-  if (!res.ok) throw new Error(`wallet balance: GET tonapi accounts/${address} -> HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`wallet balance: GET ${url} -> HTTP ${res.status}`);
   const body = (await res.json()) as { balance?: unknown; status?: unknown };
   const balanceNano = typeof body.balance === 'number' ? body.balance : 0;
   if (o.json) return printJson({ address, balance_nanoton: balanceNano, status: body.status ?? 'unknown' });
