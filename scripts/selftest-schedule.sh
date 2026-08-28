@@ -145,9 +145,16 @@ echo "== (a3) relative --vault/--zip/--export/--recipient file paths resolve to 
 # unrelated cwd). Run install FROM a subdirectory so cwd truly differs from $TMP.
 # --export (issue #206, profile o2b) is resolved the exact same way as --vault/--zip, so
 # it is folded into this same regression check rather than duplicating the whole test.
-# --profile o2b is required alongside it (see the (a3e) refusal test below) — --vault/
-# --zip stay on this same install call purely to exercise their OWN absolute-path
-# resolution; o2b never reads them, so their presence here is inert.
+#
+# #525/#526: --vault/--zip/--export each now require their OWN matching --profile
+# (assertVaultRequiresObsidianProfile/assertZipRequiresChatgptExportProfile/
+# assertExportRequiresO2bProfile, all called before buildScheduleConfig() ever resolves
+# these to absolute — see profiles.ts) — a single install combining all three under ONE
+# --profile (the old --profile o2b call this block used to make, relying on o2b simply
+# never READING the other two) is refused outright now, before path resolution even
+# runs. Exercised as three separate installs below instead, one per matching profile,
+# each still invoked from the SAME subdirectory cwd so the regression this test guards
+# against is still covered for every one of the three flags.
 mkdir -p "$TMP/subdir/vaultdir"
 touch "$TMP/subdir/exportdata.zip"
 printf '{"schema":"1"}\n' > "$TMP/subdir/bank-export.json"
@@ -157,17 +164,23 @@ INLINE_KEY="age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqcexskr"
 # in (macOS mktemp dirs live under a symlinked /var/folders -> /private/var/folders, so a
 # naive string comparison against the raw $TMP/subdir would false-fail here).
 REALSUB="$(cd "$TMP/subdir" && pwd -P)"
-(cd "$TMP/subdir" && cb schedule install --backend file --dir "$SRC" --profile o2b --vault vaultdir --zip exportdata.zip --export bank-export.json --recipient recipients.txt --recipient "$INLINE_KEY" --no-load) \
-  > "$TMP/install-a3.log" 2>&1 || { echo "[FAIL] install (relative paths, invoked from a different cwd) exited non-zero"; cat "$TMP/install-a3.log"; exit 1; }
+(cd "$TMP/subdir" && cb schedule install --backend file --dir "$SRC" --profile obsidian --vault vaultdir --recipient recipients.txt --recipient "$INLINE_KEY" --no-load) \
+  > "$TMP/install-a3-vault.log" 2>&1 || { echo "[FAIL] install (relative --vault, invoked from a different cwd) exited non-zero"; cat "$TMP/install-a3-vault.log"; exit 1; }
 grep -qF -- "--vault '$REALSUB/vaultdir'" "$RUNNER" || { echo "[FAIL] runner does not bake the ABSOLUTE resolved --vault path"; cat "$RUNNER"; exit 1; }
-grep -qF -- "--zip '$REALSUB/exportdata.zip'" "$RUNNER" || { echo "[FAIL] runner does not bake the ABSOLUTE resolved --zip path"; cat "$RUNNER"; exit 1; }
-grep -qF -- "--export '$REALSUB/bank-export.json'" "$RUNNER" || { echo "[FAIL] runner does not bake the ABSOLUTE resolved --export path"; cat "$RUNNER"; exit 1; }
 grep -qF -- "--recipient '$REALSUB/recipients.txt'" "$RUNNER" || { echo "[FAIL] runner does not bake the ABSOLUTE resolved --recipient FILE path"; cat "$RUNNER"; exit 1; }
 grep -qF -- "--recipient '$INLINE_KEY'" "$RUNNER" || { echo "[FAIL] runner does not bake the inline age1... --recipient value UNCHANGED"; cat "$RUNNER"; exit 1; }
 if grep -qF -- "--vault 'vaultdir'" "$RUNNER"; then echo "[FAIL] runner still contains the RELATIVE --vault string"; exit 1; fi
-if grep -qF -- "--zip 'exportdata.zip'" "$RUNNER"; then echo "[FAIL] runner still contains the RELATIVE --zip string"; exit 1; fi
-if grep -qF -- "--export 'bank-export.json'" "$RUNNER"; then echo "[FAIL] runner still contains the RELATIVE --export string"; exit 1; fi
 if grep -qF -- "--recipient 'recipients.txt'" "$RUNNER"; then echo "[FAIL] runner still contains the RELATIVE --recipient FILE string"; exit 1; fi
+
+(cd "$TMP/subdir" && cb schedule install --backend file --dir "$SRC" --profile chatgpt-export --zip exportdata.zip --recipient recipients.txt --recipient "$INLINE_KEY" --no-load) \
+  > "$TMP/install-a3-zip.log" 2>&1 || { echo "[FAIL] install (relative --zip, invoked from a different cwd) exited non-zero"; cat "$TMP/install-a3-zip.log"; exit 1; }
+grep -qF -- "--zip '$REALSUB/exportdata.zip'" "$RUNNER" || { echo "[FAIL] runner does not bake the ABSOLUTE resolved --zip path"; cat "$RUNNER"; exit 1; }
+if grep -qF -- "--zip 'exportdata.zip'" "$RUNNER"; then echo "[FAIL] runner still contains the RELATIVE --zip string"; exit 1; fi
+
+(cd "$TMP/subdir" && cb schedule install --backend file --dir "$SRC" --profile o2b --export bank-export.json --recipient recipients.txt --recipient "$INLINE_KEY" --no-load) \
+  > "$TMP/install-a3-export.log" 2>&1 || { echo "[FAIL] install (relative --export, invoked from a different cwd) exited non-zero"; cat "$TMP/install-a3-export.log"; exit 1; }
+grep -qF -- "--export '$REALSUB/bank-export.json'" "$RUNNER" || { echo "[FAIL] runner does not bake the ABSOLUTE resolved --export path"; cat "$RUNNER"; exit 1; }
+if grep -qF -- "--export 'bank-export.json'" "$RUNNER"; then echo "[FAIL] runner still contains the RELATIVE --export string"; exit 1; fi
 echo "[PASS] relative --vault/--zip/--export/--recipient(file) resolved to absolute in the runner; inline age1... --recipient left unchanged"
 
 echo "== (a3b) relative CYPHER_BRAIN_AR_WALLET / CYPHER_BRAIN_PIN_RECIPIENTS set before install (from a subdirectory) resolve to ABSOLUTE in the runner (same launchd/cron-different-cwd hazard as --vault/--zip/--recipient — Codex review round 4, #69 P2) =="
@@ -299,6 +312,161 @@ CYPHER_BRAIN_HOME="$BADHOME" CYPHER_BRAIN_SCHEDULE_DIR="$BADSCHED" CYPHER_BRAIN_
 [ -f "$BADRUNNER" ] || { echo "[FAIL] a valid --profile no longer installs a runner"; exit 1; }
 grep -q -- "--profile 'o2b'" "$BADRUNNER" || { echo "[FAIL] valid-profile runner does not bake --profile o2b"; cat "$BADRUNNER"; exit 1; }
 echo "[PASS] a VALID --profile (o2b) still installs correctly (no regression)"
+
+echo "== (a3g) schedule install: --vault/--zip without the matching --profile, and --pg-table/--pg-filter/--pg-exclude-table-data without --pg, are refused BEFORE writing any runner/plist/cron/config artifact (issues #525/#526) =="
+# Same bug class (a3e)/(a3f) already cover for --export/--profile: install() bakes
+# cfg.vault/cfg.zip/cfg.tables/cfg.pg_filter/cfg.pg_exclude_table_data into the runner's
+# snapshot line UNCONDITIONALLY — it never calls resolveProfilePaths() itself — so any of
+# these given without their required companion (--profile obsidian/chatgpt-export, or
+# --pg) used to install cleanly and only turn out to be a permanent, unattended no-op once
+# the nightly actually ran snapshot() (which DOES refuse — see selftest-profiles.sh). Each
+# case below gets its own throwaway home/sched/store/launchd dirs (same pattern as
+# (a3f)'s BADHOME) so "wrote NO files" can be asserted precisely.
+VLTHOME="$TMP/novault-home"; VLTSCHED="$TMP/novault-sched"; VLTSTORE="$TMP/novault-store"
+VLTLAUNCHD="$TMP/novault-launchagents"
+VLTSRC="$TMP/novault-src"; mkdir -p "$VLTSRC"; echo "a-thought" > "$VLTSRC/note.txt"
+VLTRUNNER="$VLTSCHED/nightly.sh"; VLTCONFIG="$VLTSCHED/schedule.json"
+VLTPLIST="$VLTLAUNCHD/dev.cypher-brain.nightly.$(home_hash "$VLTHOME").plist"
+CYPHER_BRAIN_HOME="$VLTHOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] keygen for the no-vault-profile home exited non-zero"; exit 1; }
+set +e
+ERR=$(CYPHER_BRAIN_HOME="$VLTHOME" CYPHER_BRAIN_SCHEDULE_DIR="$VLTSCHED" CYPHER_BRAIN_FILE_DIR="$VLTSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$VLTLAUNCHD" \
+  cb schedule install --backend file --dir "$VLTSRC" --vault "$TMP/subdir/vaultdir" --no-load 2>&1); RC=$?
+set -e
+[ "$RC" != "0" ] || { echo "[FAIL] schedule install accepted --vault with no --profile at all"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--vault" || { echo "[FAIL] install's no-profile --vault refusal does not mention --vault"; echo "$ERR"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--profile obsidian" || { echo "[FAIL] install's no-profile --vault refusal does not mention --profile obsidian"; echo "$ERR"; exit 1; }
+[ ! -e "$VLTRUNNER" ] || { echo "[FAIL] runner was written despite the dangling --vault (#526)"; exit 1; }
+[ ! -e "$VLTCONFIG" ] || { echo "[FAIL] schedule.json was written despite the dangling --vault (#526)"; exit 1; }
+[ ! -e "$VLTPLIST" ] || { echo "[FAIL] launchd plist was written despite the dangling --vault (#526)"; exit 1; }
+echo "[PASS] schedule install refuses --vault with no --profile obsidian before writing any artifact"
+
+ZIPHOME="$TMP/nozip-home"; ZIPSCHED="$TMP/nozip-sched"; ZIPSTORE="$TMP/nozip-store"
+ZIPLAUNCHD="$TMP/nozip-launchagents"
+ZIPSRC="$TMP/nozip-src"; mkdir -p "$ZIPSRC"; echo "a-thought" > "$ZIPSRC/note.txt"
+ZIPRUNNER="$ZIPSCHED/nightly.sh"; ZIPCONFIG="$ZIPSCHED/schedule.json"
+ZIPPLIST="$ZIPLAUNCHD/dev.cypher-brain.nightly.$(home_hash "$ZIPHOME").plist"
+CYPHER_BRAIN_HOME="$ZIPHOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] keygen for the no-zip-profile home exited non-zero"; exit 1; }
+set +e
+ERR2=$(CYPHER_BRAIN_HOME="$ZIPHOME" CYPHER_BRAIN_SCHEDULE_DIR="$ZIPSCHED" CYPHER_BRAIN_FILE_DIR="$ZIPSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$ZIPLAUNCHD" \
+  cb schedule install --backend file --dir "$ZIPSRC" --zip "$TMP/subdir/exportdata.zip" --no-load 2>&1); RC2=$?
+set -e
+[ "$RC2" != "0" ] || { echo "[FAIL] schedule install accepted --zip with no --profile at all"; exit 1; }
+printf '%s' "$ERR2" | grep -q -- "--zip" || { echo "[FAIL] install's no-profile --zip refusal does not mention --zip"; echo "$ERR2"; exit 1; }
+printf '%s' "$ERR2" | grep -q -- "--profile chatgpt-export" || { echo "[FAIL] install's no-profile --zip refusal does not mention --profile chatgpt-export"; echo "$ERR2"; exit 1; }
+[ ! -e "$ZIPRUNNER" ] || { echo "[FAIL] runner was written despite the dangling --zip (#526)"; exit 1; }
+[ ! -e "$ZIPCONFIG" ] || { echo "[FAIL] schedule.json was written despite the dangling --zip (#526)"; exit 1; }
+[ ! -e "$ZIPPLIST" ] || { echo "[FAIL] launchd plist was written despite the dangling --zip (#526)"; exit 1; }
+echo "[PASS] schedule install refuses --zip with no --profile chatgpt-export before writing any artifact"
+
+PGTHOME="$TMP/nopg-home"; PGTSCHED="$TMP/nopg-sched"; PGTSTORE="$TMP/nopg-store"
+PGTLAUNCHD="$TMP/nopg-launchagents"
+PGTSRC="$TMP/nopg-src"; mkdir -p "$PGTSRC"; echo "a-thought" > "$PGTSRC/note.txt"
+PGTRUNNER="$PGTSCHED/nightly.sh"; PGTCONFIG="$PGTSCHED/schedule.json"
+PGTPLIST="$PGTLAUNCHD/dev.cypher-brain.nightly.$(home_hash "$PGTHOME").plist"
+CYPHER_BRAIN_HOME="$PGTHOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] keygen for the no-pg-table home exited non-zero"; exit 1; }
+set +e
+ERR3=$(CYPHER_BRAIN_HOME="$PGTHOME" CYPHER_BRAIN_SCHEDULE_DIR="$PGTSCHED" CYPHER_BRAIN_FILE_DIR="$PGTSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$PGTLAUNCHD" \
+  cb schedule install --backend file --dir "$PGTSRC" --pg-table users --no-load 2>&1); RC3=$?
+set -e
+[ "$RC3" != "0" ] || { echo "[FAIL] schedule install accepted --pg-table with no --pg"; exit 1; }
+printf '%s' "$ERR3" | grep -q -- "--pg-table" || { echo "[FAIL] install's no-pg --pg-table refusal does not mention --pg-table"; echo "$ERR3"; exit 1; }
+printf '%s' "$ERR3" | grep -q -- "--pg <conn>" || { echo "[FAIL] install's no-pg --pg-table refusal does not mention --pg <conn>"; echo "$ERR3"; exit 1; }
+[ ! -e "$PGTRUNNER" ] || { echo "[FAIL] runner was written despite the dangling --pg-table (#526)"; exit 1; }
+[ ! -e "$PGTCONFIG" ] || { echo "[FAIL] schedule.json was written despite the dangling --pg-table (#526)"; exit 1; }
+[ ! -e "$PGTPLIST" ] || { echo "[FAIL] launchd plist was written despite the dangling --pg-table (#526)"; exit 1; }
+echo "[PASS] schedule install refuses --pg-table with no --pg before writing any artifact"
+
+# Same coverage for --pg-filter/--pg-exclude-table-data without --pg (distinct code path
+# from --pg-table above: a different branch of assertPgFiltersRequirePg's `given` list).
+PGFHOME="$TMP/nopgfilter-home"; PGFSCHED="$TMP/nopgfilter-sched"; PGFSTORE="$TMP/nopgfilter-store"
+PGFLAUNCHD="$TMP/nopgfilter-launchagents"
+PGFSRC="$TMP/nopgfilter-src"; mkdir -p "$PGFSRC"; echo "a-thought" > "$PGFSRC/note.txt"
+PGFRUNNER="$PGFSCHED/nightly.sh"; PGFCONFIG="$PGFSCHED/schedule.json"
+PGFPLIST="$PGFLAUNCHD/dev.cypher-brain.nightly.$(home_hash "$PGFHOME").plist"
+PGFFILTERFILE="$TMP/subdir/pg-filter.txt"; printf 'exclude table x\n' > "$PGFFILTERFILE"
+CYPHER_BRAIN_HOME="$PGFHOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] keygen for the no-pg-filter home exited non-zero"; exit 1; }
+set +e
+ERR4=$(CYPHER_BRAIN_HOME="$PGFHOME" CYPHER_BRAIN_SCHEDULE_DIR="$PGFSCHED" CYPHER_BRAIN_FILE_DIR="$PGFSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$PGFLAUNCHD" \
+  cb schedule install --backend file --dir "$PGFSRC" --pg-filter "$PGFFILTERFILE" --pg-exclude-table-data cache --no-load 2>&1); RC4=$?
+set -e
+[ "$RC4" != "0" ] || { echo "[FAIL] schedule install accepted --pg-filter/--pg-exclude-table-data with no --pg"; exit 1; }
+printf '%s' "$ERR4" | grep -q -- "--pg-filter" || { echo "[FAIL] install's no-pg --pg-filter refusal does not mention --pg-filter"; echo "$ERR4"; exit 1; }
+printf '%s' "$ERR4" | grep -q -- "--pg-exclude-table-data" || { echo "[FAIL] install's no-pg --pg-filter refusal does not mention --pg-exclude-table-data"; echo "$ERR4"; exit 1; }
+[ ! -e "$PGFRUNNER" ] || { echo "[FAIL] runner was written despite the dangling --pg-filter/--pg-exclude-table-data (#526)"; exit 1; }
+[ ! -e "$PGFCONFIG" ] || { echo "[FAIL] schedule.json was written despite the dangling --pg-filter/--pg-exclude-table-data (#526)"; exit 1; }
+[ ! -e "$PGFPLIST" ] || { echo "[FAIL] launchd plist was written despite the dangling --pg-filter/--pg-exclude-table-data (#526)"; exit 1; }
+echo "[PASS] schedule install refuses --pg-filter/--pg-exclude-table-data with no --pg before writing any artifact"
+
+# An EMPTY --pg '' (not just an absent --pg) must refuse identically — the CLI parser
+# accepts an empty string as a value, so o.pg is '' (!== undefined) but exactly as
+# un-usable as no --pg at all (same multi-model-review catch as selftest-profiles.sh's
+# equivalent case; assertPgFiltersRequirePg() must use the SAME truthy `if (o.pg)` check
+# the pg_dump block itself uses, not an undefined-only check).
+EPGHOME="$TMP/emptypg-home"; EPGSCHED="$TMP/emptypg-sched"; EPGSTORE="$TMP/emptypg-store"
+EPGLAUNCHD="$TMP/emptypg-launchagents"
+EPGSRC="$TMP/emptypg-src"; mkdir -p "$EPGSRC"; echo "a-thought" > "$EPGSRC/note.txt"
+EPGRUNNER="$EPGSCHED/nightly.sh"; EPGCONFIG="$EPGSCHED/schedule.json"
+EPGPLIST="$EPGLAUNCHD/dev.cypher-brain.nightly.$(home_hash "$EPGHOME").plist"
+CYPHER_BRAIN_HOME="$EPGHOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] keygen for the empty-pg home exited non-zero"; exit 1; }
+set +e
+ERR5=$(CYPHER_BRAIN_HOME="$EPGHOME" CYPHER_BRAIN_SCHEDULE_DIR="$EPGSCHED" CYPHER_BRAIN_FILE_DIR="$EPGSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$EPGLAUNCHD" \
+  cb schedule install --backend file --dir "$EPGSRC" --pg "" --pg-table users --no-load 2>&1); RC5=$?
+set -e
+[ "$RC5" != "0" ] || { echo "[FAIL] schedule install accepted --pg-table with an EMPTY --pg ''"; exit 1; }
+printf '%s' "$ERR5" | grep -q -- "--pg-table" || { echo "[FAIL] install's empty-pg --pg-table refusal does not mention --pg-table"; echo "$ERR5"; exit 1; }
+[ ! -e "$EPGRUNNER" ] || { echo "[FAIL] runner was written despite the empty --pg '' (#526)"; exit 1; }
+[ ! -e "$EPGCONFIG" ] || { echo "[FAIL] schedule.json was written despite the empty --pg '' (#526)"; exit 1; }
+[ ! -e "$EPGPLIST" ] || { echo "[FAIL] launchd plist was written despite the empty --pg '' (#526)"; exit 1; }
+echo "[PASS] schedule install refuses --pg-table with an empty --pg '' exactly like an absent --pg"
+
+# --profile obsidian/chatgpt-export with an EMPTY --vault/--zip '' (multi-model review
+# round 2 catch): install() never calls resolveProfilePaths()/obsidianPaths(), so unlike
+# snapshot() there was nothing else here to reject `--vault ''` even though it is exactly
+# as useless as an absent --vault — buildScheduleConfig()'s `o.vault ? ... : {}` (truthy)
+# would bake NO --vault into the runner at all, installing a nightly that fails "requires
+# --vault" every night, unattended, never refused at install time. Fresh throwaway dirs so
+# "wrote NO files" can be asserted precisely.
+EVLTHOME="$TMP/emptyvault-home"; EVLTSCHED="$TMP/emptyvault-sched"; EVLTSTORE="$TMP/emptyvault-store"
+EVLTLAUNCHD="$TMP/emptyvault-launchagents"
+EVLTSRC="$TMP/emptyvault-src"; mkdir -p "$EVLTSRC"; echo "a-thought" > "$EVLTSRC/note.txt"
+EVLTRUNNER="$EVLTSCHED/nightly.sh"; EVLTCONFIG="$EVLTSCHED/schedule.json"
+EVLTPLIST="$EVLTLAUNCHD/dev.cypher-brain.nightly.$(home_hash "$EVLTHOME").plist"
+CYPHER_BRAIN_HOME="$EVLTHOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] keygen for the empty-vault home exited non-zero"; exit 1; }
+set +e
+ERR6=$(CYPHER_BRAIN_HOME="$EVLTHOME" CYPHER_BRAIN_SCHEDULE_DIR="$EVLTSCHED" CYPHER_BRAIN_FILE_DIR="$EVLTSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$EVLTLAUNCHD" \
+  cb schedule install --backend file --dir "$EVLTSRC" --profile obsidian --vault "" --no-load 2>&1); RC6=$?
+set -e
+[ "$RC6" != "0" ] || { echo "[FAIL] schedule install accepted --profile obsidian --vault ''"; exit 1; }
+printf '%s' "$ERR6" | grep -q "requires --vault" || { echo "[FAIL] install's empty --vault refusal does not say requires --vault"; echo "$ERR6"; exit 1; }
+[ ! -e "$EVLTRUNNER" ] || { echo "[FAIL] runner was written despite the empty --vault '' (#525/#526)"; exit 1; }
+[ ! -e "$EVLTCONFIG" ] || { echo "[FAIL] schedule.json was written despite the empty --vault '' (#525/#526)"; exit 1; }
+[ ! -e "$EVLTPLIST" ] || { echo "[FAIL] launchd plist was written despite the empty --vault '' (#525/#526)"; exit 1; }
+echo "[PASS] schedule install refuses --profile obsidian --vault '' before writing any artifact"
+
+EZIPHOME="$TMP/emptyzip-home"; EZIPSCHED="$TMP/emptyzip-sched"; EZIPSTORE="$TMP/emptyzip-store"
+EZIPLAUNCHD="$TMP/emptyzip-launchagents"
+EZIPSRC="$TMP/emptyzip-src"; mkdir -p "$EZIPSRC"; echo "a-thought" > "$EZIPSRC/note.txt"
+EZIPRUNNER="$EZIPSCHED/nightly.sh"; EZIPCONFIG="$EZIPSCHED/schedule.json"
+EZIPPLIST="$EZIPLAUNCHD/dev.cypher-brain.nightly.$(home_hash "$EZIPHOME").plist"
+CYPHER_BRAIN_HOME="$EZIPHOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] keygen for the empty-zip home exited non-zero"; exit 1; }
+set +e
+ERR7=$(CYPHER_BRAIN_HOME="$EZIPHOME" CYPHER_BRAIN_SCHEDULE_DIR="$EZIPSCHED" CYPHER_BRAIN_FILE_DIR="$EZIPSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$EZIPLAUNCHD" \
+  cb schedule install --backend file --dir "$EZIPSRC" --profile chatgpt-export --zip "" --no-load 2>&1); RC7=$?
+set -e
+[ "$RC7" != "0" ] || { echo "[FAIL] schedule install accepted --profile chatgpt-export --zip ''"; exit 1; }
+printf '%s' "$ERR7" | grep -q "requires --zip" || { echo "[FAIL] install's empty --zip refusal does not say requires --zip"; echo "$ERR7"; exit 1; }
+[ ! -e "$EZIPRUNNER" ] || { echo "[FAIL] runner was written despite the empty --zip '' (#525/#526)"; exit 1; }
+[ ! -e "$EZIPCONFIG" ] || { echo "[FAIL] schedule.json was written despite the empty --zip '' (#525/#526)"; exit 1; }
+[ ! -e "$EZIPPLIST" ] || { echo "[FAIL] launchd plist was written despite the empty --zip '' (#525/#526)"; exit 1; }
+echo "[PASS] schedule install refuses --profile chatgpt-export --zip '' before writing any artifact"
+
+# Regression: a VALID --profile obsidian + --vault must still install cleanly.
+CYPHER_BRAIN_HOME="$VLTHOME" CYPHER_BRAIN_SCHEDULE_DIR="$VLTSCHED" CYPHER_BRAIN_FILE_DIR="$VLTSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$VLTLAUNCHD" \
+  cb schedule install --backend file --profile obsidian --vault "$TMP/subdir/vaultdir" --no-load > "$TMP/install-a3g-valid.log" 2>&1 \
+  || { echo "[FAIL] schedule install with a VALID --profile obsidian --vault regressed"; cat "$TMP/install-a3g-valid.log"; exit 1; }
+[ -f "$VLTRUNNER" ] || { echo "[FAIL] a valid --profile obsidian --vault no longer installs a runner"; exit 1; }
+grep -q -- "--profile 'obsidian'" "$VLTRUNNER" || { echo "[FAIL] valid-profile runner does not bake --profile obsidian"; cat "$VLTRUNNER"; exit 1; }
+echo "[PASS] a VALID --profile obsidian --vault still installs correctly (no regression)"
 
 echo "== (a4) --pg without CYPHER_BRAIN_PG_BIN resolves pg_dump on PATH at install time and bakes its DIRECTORY as CYPHER_BRAIN_PG_BIN (config.mjs's PG_BIN is a dir joined with the tool name via pgTool(), not the pg_dump binary path itself — baking the binary path verbatim would break both pg_dump AND pg_restore); install fails clearly when pg_dump cannot be resolved =="
 FAKE_PGBIN="$TMP/fake-pgbin"; mkdir -p "$FAKE_PGBIN"

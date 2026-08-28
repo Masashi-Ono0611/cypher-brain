@@ -20,7 +20,13 @@ import { warn } from './warn.js';
 import { findPgDataDirs, pgDataDirCopyWarning, pgDataDirTruncatedWarning } from './gbrain.js';
 import { recipientEntries, resolvePinnedRecipients } from './keys.js';
 import { loadSignIdentity, signDetached } from './minisign.js';
-import { assertExportRequiresO2bProfile, resolveProfilePaths } from './profiles.js';
+import {
+  assertExportRequiresO2bProfile,
+  assertPgFiltersRequirePg,
+  assertVaultRequiresObsidianProfile,
+  assertZipRequiresChatgptExportProfile,
+  resolveProfilePaths,
+} from './profiles.js';
 import { installStageSignalGuard, setActiveStage, setActiveOutPart } from './signal-guard.js';
 import {
   assertGitleaksAvailable,
@@ -324,10 +330,26 @@ export async function snapshot(o: CliOptions): Promise<void> {
   // rather than silently drop it when --profile o2b is missing or wrong (see
   // profiles.ts's assertExportRequiresO2bProfile doc comment).
   assertExportRequiresO2bProfile(o);
+  // #525: --pg-table/--pg-filter/--pg-exclude-table-data only feed the `if (o.pg)` pg_dump
+  // block far below — refuse up front, same reasoning as assertExportRequiresO2bProfile
+  // just above (see profiles.ts's assertPgFiltersRequirePg doc comment). No --profile
+  // interaction, so (unlike the --vault/--zip guards just below) there is no reason to
+  // wait for resolveProfilePaths() first.
+  assertPgFiltersRequirePg(o);
   // --profile is a thin veneer over --dir: it resolves to concrete source paths
   // (see profiles.ts) staged exactly like explicit --dir flags. Profile paths
   // come first; any extra --dir flags the user passed are appended after them.
   if (o.profile) o.dirs = [...(await resolveProfilePaths(o)), ...o.dirs];
+  // #525/#535: --vault only feeds profile obsidian, --zip only feeds profile
+  // chatgpt-export — refuse a mismatch here, AFTER resolveProfilePaths() above (not
+  // before, unlike assertPgFiltersRequirePg), so that when --profile DOES match (e.g.
+  // obsidian given --vault) but that profile's OWN required flag is what's actually
+  // missing, obsidianPaths()'s more specific "requires --vault" refusal (#535) is what
+  // the user sees instead of a generic mismatch message about some unrelated flag. Still
+  // strictly before any staging/archiving work: resolveProfilePaths() only stats/resolves
+  // paths. See profiles.ts's doc comment on these two guards for the full reasoning.
+  assertVaultRequiresObsidianProfile(o);
+  assertZipRequiresChatgptExportProfile(o);
   if (!o.pg && o.dirs.length === 0)
     throw new Error('nothing to snapshot: pass --profile <name>, --pg <conn> and/or --dir <path>');
   // #267: check every source path up front — before the --dry-run branch, before
