@@ -32,8 +32,8 @@ SRC="$TMP/src"; mkdir -p "$SRC"; printf 'hello\n' > "$SRC/a.md"
 # carry — each selftest here is standalone, so it is copied rather than shared.
 with_timeout() {
   local s=$1; shift
-  "$@" & local c=$!
-  ( sleep "$s"; kill -9 "$c" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
+  ( set -m; "$@" ) & local c=$!
+  ( sleep "$s"; kill -9 -- "-$c" 2>/dev/null || kill -9 "$c" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
   wait "$c" 2>/dev/null; local rc=$?
   kill -9 "$w" 2>/dev/null; wait "$w" 2>/dev/null
   return $rc

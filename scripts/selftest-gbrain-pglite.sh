@@ -34,8 +34,8 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # inside a bounded time rather than hang the whole suite.
 with_timeout() {
   local s=$1; shift
-  "$@" & local c=$!
-  ( sleep "$s"; kill -9 "$c" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
+  ( set -m; "$@" ) & local c=$!
+  ( sleep "$s"; kill -9 -- "-$c" 2>/dev/null || kill -9 "$c" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
   wait "$c" 2>/dev/null; local rc=$?
   kill -9 "$w" 2>/dev/null; wait "$w" 2>/dev/null
   return $rc
