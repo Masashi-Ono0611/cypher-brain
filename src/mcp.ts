@@ -66,34 +66,23 @@ import { lookupIdempotencyResult, recordIdempotencyResult, IdempotencyStoreError
 import { schedule, scheduleStatusReport, ScheduleNotInstalledError } from './lib/schedule.js';
 import { estimateCost } from './lib/estimate.js';
 import { keygenAt } from './lib/keys.js';
-import { wallet, tonWalletConfigured } from './lib/wallet.js';
+import { wallet } from './lib/wallet.js';
 import { SCAN_SECRETS_MODES, isScanSecretsMode } from './lib/secrets-scan.js';
 import { exists, requireFile, MissingPathError, sha256, errMsg } from './lib/util.js';
 import { annotateErrorMessage, matchErrorCode } from './lib/errors.js';
 import { installStageSignalGuard, addActiveMcpFetchDir, removeActiveMcpFetchDir } from './lib/signal-guard.js';
 import { didYouMean, nearestName } from './lib/suggest.js';
 import type { CliOptions } from './lib/types.js';
+// #507: the ten `Tool` schema constants + the derived BACKENDS/PAID_BACKENDS enums they
+// advertise now live in src/mcp-tool-schemas.ts (pure declarative data, split out of this
+// file's handler implementation). BACKENDS/PAID_BACKENDS are re-exported from there because
+// the handlers below need them too (requireBackend, the spend gates); SNAPSHOT_NOW_TOOL is
+// needed for its `.name` in the #220 idempotency-key lock.
+import { ALL_TOOLS, BACKENDS, PAID_BACKENDS, SNAPSHOT_NOW_TOOL } from './mcp-tool-schemas.js';
 
 const SERVER_NAME = 'cypher-brain-mcp';
 const SERVER_VERSION = '0.0.1'; // keep in sync with package.json "version"
 
-// rclone (#204) and the self-hosted `ton` backend stay CLI-only: each needs
-// operator-side setup (--remote / a configured seeder box) an MCP host cannot collect,
-// so a caller offering either would sail past this list into a "missing config" error
-// deep inside push() with no way to have supplied what was missing. `ton-provider`
-// used to be excluded for a THIRD, different reason — no local TON wallet existed at
-// all, so every deploy needed a HUMAN to sign a Tonkeeper deeplink mid-push, which an
-// MCP tool call has no way to pause for. PR2 (issue #396) added that wallet
-// (src/lib/wallet.ts's `wallet create --chain ton`), so `ton-provider` is now listed
-// HERE precisely when one is configured (tonWalletConfigured(), the same presence-check
-// arweave/turbo's own wallet already uses) — an MCP host that never got one configured
-// still never sees it offered, so it can't get stuck waiting on a signature nobody is
-// there to give. Computed once at module load (top-level await), same as every other
-// env-derived constant in this file — matches how AR_WALLET etc. are already frozen for
-// the process's lifetime; creating a wallet mid-session needs an MCP server restart to
-// be picked up here, same as changing any other env-backed setting would.
-const BACKENDS = ['file', 'arweave', 'turbo', ...((await tonWalletConfigured()) ? ['ton-provider'] : [])];
-const PAID_BACKENDS = new Set(['arweave', 'turbo', 'ton-provider']); // ton-provider always spends real funds when reachable at all (#396 PR2) — safe to list unconditionally even when BACKENDS above omits it (an unreachable value can never trigger this check)
 // NON_CONTENT_ADDRESSED_BACKENDS: arweave/turbo locators are post-assigned tx/upload ids
 // and rclone's is an operator-chosen remote path — none of the three are content hashes,
 // so pulling by bare locator cannot detect a rolled-back/substituted (yet still
@@ -331,609 +320,9 @@ function requireBackend(value: unknown, what: string): asserts value is string {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tool descriptors (JSON Schemas advertised via tools/list)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const SNAPSHOT_NOW_TOOL: Tool = {
-  name: 'snapshot_now',
-  description:
-    '⚠ CAN SPEND MONEY (only tool in this server that can). Take an encrypted age snapshot of ' +
-    'directories and/or a Postgres database, and optionally push the ciphertext to a storage ' +
-    'backend. Backend "file" is free; "arweave" and "turbo" are PAID, PERMANENT stores; ' +
-    '"ton-provider" is also PAID, but weaker-durability than arweave/turbo (depends on a live ' +
-    'provider continuing to renew/serve the contract) — and, UNLIKE arweave/turbo, this MCP server ' +
-    'has NO tool that can create the TON wallet ton-provider needs: "ton-provider" only appears in ' +
-    "this tool's backend enum at all when CYPHER_BRAIN_TON_WALLET was already set to an existing " +
-    'wallet file when this server started. There is no in-MCP way to bootstrap one — an operator ' +
-    'must run `cypher-brain wallet create --chain ton` from a shell, set CYPHER_BRAIN_TON_WALLET to ' +
-    'the printed path in this server\'s environment, and RESTART the server before "ton-provider" ' +
-    'shows up here at all; wallet_create/wallet_address in this server are Arweave-only and cannot ' +
-    'do this. Pushing to any of arweave/turbo/ton-provider REQUIRES confirm_paid=true (the MCP equivalent of the CLI --yes ' +
-    'guard; the CYPHER_BRAIN_YES env escape hatch is NOT honored here, so nothing can be spent ' +
-    'without an explicit confirm_paid in the call). Snapshotting itself needs only the PUBLIC ' +
-    'recipient key(s); storage only ever sees ciphertext. Pass idempotency_key to make a RETRY ' +
-    'safe (issue #220, the Stripe idempotency-key pattern): a repeat call with the SAME key ' +
-    "returns the FIRST call's result (no new snapshot, no new spend) instead of re-executing — " +
-    "the fix for an agent's own retry logic (a network blip after the upload already succeeded, " +
-    "say) double-spending on arweave/turbo. The key is scoped to THIS call's dirs/pg/recipients/" +
-    'out/backend/scan_secrets: reusing it for a call that differs in any of those is refused ' +
-    'rather than silently answered with the wrong result. Cached results expire after ' +
-    'CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS (default 24h) — a repeat past that is a fresh call.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      dirs: {
-        type: 'array',
-        items: { type: 'string' },
-        description: 'Directories to include (tar.gz each). At least one of dirs/pg is required.',
-      },
-      pg: { type: 'string', description: 'Postgres connection string to pg_dump into the snapshot.' },
-      recipients: {
-        type: 'array',
-        items: { type: 'string' },
-        minItems: 1,
-        description:
-          'age recipients (age1… pubkey or a recipients file path). Pass 2+ (primary + offline backup) for key recovery.',
-      },
-      out: {
-        type: 'string',
-        description: 'Output path for the .age ciphertext (must not already exist — no-clobber).',
-      },
-      backend: {
-        type: 'string',
-        enum: BACKENDS,
-        description:
-          'When given, push the snapshot: file (free) or arweave|turbo|ton-provider (PAID — needs confirm_paid; ' +
-          'ton-provider only appears when a local TON wallet is configured — no tool on this server can create ' +
-          "one; see this tool's own description for the CLI-bootstrap-then-restart steps).",
-      },
-      locator_file: {
-        type: 'string',
-        description:
-          'Path for push --save-locator: writes "<locator>\\t<backend>\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]" (the durable recovery pointer; back it up off-box).',
-      },
-      confirm_paid: {
-        type: 'boolean',
-        description:
-          'REQUIRED true to push to a PAID backend (arweave/turbo/ton-provider). Confirms you accept an irreversible, real-money upload.',
-      },
-      scan_secrets: {
-        type: 'string',
-        enum: [...SCAN_SECRETS_MODES],
-        description:
-          'Run gitleaks over each dirs source\'s staged plaintext BEFORE it is archived+encrypted (the CLI --scan-secrets, #215): "warn" logs findings (rule ID + count only, never the secret) and proceeds, "deny" refuses the whole snapshot if any source has findings. Omitted = no scan (same default as the CLI). Requires the gitleaks binary on PATH: when set and gitleaks cannot be resolved, the call FAILS rather than silently skipping the scan.',
-      },
-      idempotency_key: {
-        type: 'string',
-        description:
-          "Caller-chosen key making a RETRY safe (issue #220, Stripe's idempotency-key pattern): a repeat " +
-          'call with the SAME key AND the same dirs/pg/recipients/out/backend/scan_secrets returns the ' +
-          "FIRST call's result — no new snapshot, no new spend — instead of re-executing. The same key " +
-          'with DIFFERENT values in any of those fields is refused rather than answered with the wrong ' +
-          'result. Cached results expire after CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS (default 24h).',
-      },
-    },
-    required: ['recipients', 'out'],
-    additionalProperties: false,
-  },
-  annotations: {
-    // Creates a new snapshot file (and, with backend, pushes it) — never
-    // overwrites (out is no-clobber), so it adds state rather than destroying
-    // existing state. Each call produces a distinct snapshot/spend, so it is
-    // not idempotent BY DEFAULT. #220's idempotency_key is an opt-in exception to
-    // that (a repeat call with the same key replays rather than re-executes), but
-    // this hint describes the tool's default posture — a caller that omits the
-    // key gets exactly the non-idempotent behavior this says.
-    readOnlyHint: false,
-    destructiveHint: false,
-    idempotentHint: false,
-    openWorldHint: true,
-  },
-};
-
-const LAST_SNAPSHOT_STATUS_TOOL: Tool = {
-  name: 'last_snapshot_status',
-  description:
-    'Read-only, spends nothing. Report the most recent snapshot push: locator, backend, sha256, ' +
-    'timestamp and age, read from the save-locator file (written by snapshot_now/push ' +
-    'locator_file — "<locator>\\t<backend>\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]", ' +
-    'legacy 3/4/5/6-field lines accepted, timestamped by file mtime) and/or an ' +
-    'append-only index.tsv ("<timestamp>\\t<locator>\\t<sha256>" per line, newest last). With no ' +
-    'arguments it tries the default save-locator path $CYPHER_BRAIN_HOME/latest-locator.tsv.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      locator_file: {
-        type: 'string',
-        description: 'Path to a push --save-locator file. Default: <CYPHER_BRAIN_HOME>/latest-locator.tsv',
-      },
-      index_file: {
-        type: 'string',
-        description: 'Path to an append-only index.tsv (timestamp<TAB>locator<TAB>sha256 lines).',
-      },
-    },
-    additionalProperties: false,
-  },
-  annotations: {
-    // Reads a local locator/index file only — no writes, no network calls.
-    readOnlyHint: true,
-    destructiveHint: false,
-    idempotentHint: true,
-    openWorldHint: false,
-  },
-};
-
-const VERIFY_RESTORE_TOOL: Tool = {
-  name: 'verify_restore',
-  description:
-    'Read-only for your wallet (downloads only, never uploads or spends). Prove a snapshot is ' +
-    'restorable: pull the ciphertext by locator, or verify a local file, or pass locator_file ' +
-    '(a push --save-locator file) which supplies the locator, its backend AND the sha256 ' +
-    'integrity pin in one — the same fail-closed recovery path as the CLI --from-locator-file. ' +
-    'Then run the verify checks (age header, wrong-key rejection, and — when a private ' +
-    'identity is available — a full decrypt proof). IMPORTANT: arweave/turbo locators are NOT ' +
-    'content hashes, so verifying a bare locator without a sha256 pin cannot detect a gateway ' +
-    'rollback/substitution that still decrypts with your key — pass sha256 (or use ' +
-    'locator_file) to pin the fetched bytes; an unpinned arweave/turbo pull returns a warning ' +
-    'field. Returns the HONEST verdict mirroring the CLI exit codes: PASS (exit 0, restorable ' +
-    'by you), FAIL (exit 1), or PARTIAL (exit 2 — decryptability NOT proven, e.g. no private ' +
-    'identity on this box; PARTIAL is never inflated to PASS).',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      locator: {
-        type: 'string',
-        description: 'Storage locator to pull first (requires backend). Exactly one of locator/file/locator_file.',
-      },
-      file: {
-        type: 'string',
-        description: 'Local .age file to verify directly. Exactly one of locator/file/locator_file.',
-      },
-      locator_file: {
-        type: 'string',
-        description:
-          'Path to a push --save-locator file ("<locator>\\t<backend>\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]"; legacy 3/4/5/6-field lines accepted): pull using its recorded locator + backend, with its saved sha256 applied as the integrity pin (the CLI --from-locator-file recovery path). Exactly one of locator/file/locator_file; do not also pass backend.',
-      },
-      backend: {
-        type: 'string',
-        enum: BACKENDS,
-        description:
-          'Backend to pull the locator from (required with locator; not allowed with locator_file — the file records it).',
-      },
-      sha256: {
-        type: 'string',
-        description:
-          'Optional integrity pin: 64-hex sha256 of the expected ciphertext, sourced from a TRUSTED off-box record (index.tsv / a backed-up save-locator file). A pulled artifact that does not match is deleted and the call fails closed (no verdict); with file the mismatch is a hard FAIL verdict. Overrides the pin recorded in locator_file.',
-      },
-      identity: {
-        type: 'string',
-        description: 'Private identity file for the decrypt proof. Default: <CYPHER_BRAIN_HOME>/identity.age',
-      },
-      require_signature: {
-        type: 'boolean',
-        description:
-          'REQUIRED true to turn an ABSENT .minisig from a [SKIP] check into a FAIL verdict ' +
-          "(#214's --require-signature). Deleting a sidecar — rather than forging one — is the downgrade this " +
-          'closes; an INVALID signature already fails without it.',
-      },
-    },
-    additionalProperties: false,
-  },
-  annotations: {
-    // Never uploads or spends (per description); a pulled artifact only lands
-    // in a temp dir that this handler removes before returning. Pulling from
-    // arweave/turbo/a gateway is a network call to an external store.
-    readOnlyHint: true,
-    destructiveHint: false,
-    idempotentHint: true,
-    openWorldHint: true,
-  },
-};
-
-const RESTORE_NOW_TOOL: Tool = {
-  name: 'restore_now',
-  description:
-    '⚠ WRITES decrypted files to disk, and can irreversibly clobber a database. The actual disaster-' +
-    'recovery step verify_restore stops short of (issue #183): verify_restore only PROVES a snapshot is ' +
-    'restorable, this tool actually restores it. Pull the ciphertext by locator, or restore a local file, ' +
-    'or pass locator_file (a push --save-locator file) which supplies the locator, its backend AND the ' +
-    'sha256 integrity pin in one — the SAME dual-mode input as verify_restore (exactly one of ' +
-    'locator/file/locator_file). Decrypts with the PRIVATE identity and extracts into out_dir; extraction ' +
-    'never clobbers a file already present there (tar --keep-old-files/--skip-old-files, same as the CLI). ' +
-    'REQUIRES confirm_write=true before ANY work happens (pull/decrypt/extract): confirms writing decrypted ' +
-    'files into out_dir, and — when pg is given — that pg_restore --clean --if-exists will ALSO DROP and ' +
-    'replace objects in that database, an irreversible operation (the MCP equivalent of the CLI --yes/' +
-    'CYPHER_BRAIN_YES guard on restore --pg; the CYPHER_BRAIN_YES env escape hatch is NOT honored here, so ' +
-    'nothing can be restored/clobbered without an explicit confirm_write in the call).',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      locator: {
-        type: 'string',
-        description: 'Storage locator to pull first (requires backend). Exactly one of locator/file/locator_file.',
-      },
-      file: {
-        type: 'string',
-        description: 'Local .age file to restore directly. Exactly one of locator/file/locator_file.',
-      },
-      locator_file: {
-        type: 'string',
-        description:
-          'Path to a push --save-locator file ("<locator>\\t<backend>\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]"; legacy 3/4/5/6-field lines accepted): pull using its recorded locator + backend, with its saved sha256 applied as the integrity pin (the CLI --from-locator-file recovery path). Exactly one of locator/file/locator_file; do not also pass backend.',
-      },
-      backend: {
-        type: 'string',
-        enum: BACKENDS,
-        description:
-          'Backend to pull the locator from (required with locator; not allowed with locator_file — the file records it).',
-      },
-      sha256: {
-        type: 'string',
-        description:
-          'Optional integrity pin: 64-hex sha256 of the expected ciphertext, sourced from a TRUSTED off-box record (index.tsv / a backed-up save-locator file). A pulled artifact that does not match is deleted and the call fails closed (no restore happens); with file the mismatch refuses before any decrypt/extract work. Overrides the pin recorded in locator_file.',
-      },
-      out_dir: {
-        type: 'string',
-        description:
-          'Directory to extract the decrypted snapshot into (created if missing). Existing files already there are never clobbered.',
-      },
-      identity: {
-        type: 'string',
-        description: 'Private identity file to decrypt with. Default: <CYPHER_BRAIN_HOME>/identity.age',
-      },
-      require_signature: {
-        type: 'boolean',
-        description:
-          'REQUIRED true to refuse an artifact whose .minisig is ABSENT, rather than warning and continuing ' +
-          "(#214's --require-signature). Deleting a sidecar — rather than forging one — is the downgrade this " +
-          'closes; an INVALID signature is always refused regardless. Checked before anything is decrypted or ' +
-          'written, so it gates pg_restore rather than reporting on it afterwards.',
-      },
-      pg: {
-        type: 'string',
-        description:
-          "Postgres connection string to pg_restore the snapshot's db.dump into. pg_restore --clean --if-exists " +
-          'DROPS and replaces objects in that database — irreversible — so this ALSO requires confirm_write=true ' +
-          '(the MCP equivalent of the CLI --yes/CYPHER_BRAIN_YES guard on restore --pg).',
-      },
-      confirm_write: {
-        type: 'boolean',
-        description:
-          'REQUIRED true to execute the restore. Confirms you accept decrypted files being written into out_dir, ' +
-          'and — when pg is given — objects in that database being DROPPED and replaced via pg_restore --clean --if-exists.',
-      },
-    },
-    required: ['out_dir'],
-    additionalProperties: false,
-  },
-  annotations: {
-    // The file extraction itself is no-clobber (like snapshot_now's --out), but
-    // when pg is given, pg_restore --clean --if-exists DROPS and replaces
-    // existing objects in that database — genuinely destructive, unlike
-    // snapshot_now which never destroys existing state. Pulls from a storage
-    // backend over the network.
-    readOnlyHint: false,
-    destructiveHint: true,
-    idempotentHint: false,
-    openWorldHint: true,
-  },
-};
-
-const ESTIMATE_COST_TOOL: Tool = {
-  name: 'estimate_cost',
-  description:
-    'Read-only, spends nothing (price queries only). Estimate what pushing a payload of the ' +
-    'given size to a backend would cost: turbo → Turbo upload cost in winc via @ardrive/turbo-sdk ' +
-    '(<100KB is free; a clear note is returned when that optional dependency is not installed); ' +
-    'arweave → network price in winston from the gateway /price endpoint; ton-provider → nanoTON ' +
-    'cost from a real priced query against the live mytonprovider.org registry (only listed when a ' +
-    'local TON wallet is configured — the estimate itself never spends, but the underlying push ' +
-    "would; no tool on this server can create that wallet — see snapshot_now's description for the " +
-    'CLI-bootstrap-then-restart steps); file → free (local disk), returned with a zero-cost note. All seven fields (backend, size_bytes, cost, ' +
-    'unit, approx_ar, usd_estimate, note) are ALWAYS present — null, never absent, where they do ' +
-    'not apply (#268), so do not test for a key to decide whether a value exists. For ' +
-    'turbo/arweave, usd_estimate carries an approximate USD figure when a USD/AR rate is ' +
-    'fetchable — a direct HTTP call to the public Turbo rate endpoint, so it works with or ' +
-    'without @ardrive/turbo-sdk installed — and is null on any rate failure; the native estimate ' +
-    'in cost/unit never fails because of it.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      file: { type: 'string', description: 'Path of the payload to size (exactly one of file/size_bytes).' },
-      size_bytes: {
-        type: 'number',
-        minimum: 0,
-        description: 'Payload size in bytes (exactly one of file/size_bytes).',
-      },
-      backend: { type: 'string', enum: BACKENDS, description: 'Backend to estimate for.' },
-    },
-    required: ['backend'],
-    additionalProperties: false,
-  },
-  annotations: {
-    // Price queries only (per description) — reads a local file's size at
-    // most, then calls the gateway/turbo rate endpoints for pricing.
-    readOnlyHint: true,
-    destructiveHint: false,
-    idempotentHint: true,
-    openWorldHint: true,
-  },
-};
-
-const SCHEDULE_INSTALL_TOOL: Tool = {
-  name: 'schedule_install',
-  description:
-    '⚠ WRITES a REAL, PERSISTENT system file (a launchd plist under ~/Library/LaunchAgents on ' +
-    'macOS, or a crontab entry on Linux) and, unless no_load is set, REGISTERS it so the nightly ' +
-    'snapshot+push runs unattended from now on (issue #174 follow-up — the MCP equivalent of the ' +
-    "CLI's `schedule install`). A PAID backend (arweave/turbo) gets CYPHER_BRAIN_YES=1 baked into " +
-    'the generated runner for unattended consent, so it ALSO REQUIRES max_spend (a positive integer ' +
-    'cap in native units — winston for arweave, winc for turbo): an uncapped unattended spender is ' +
-    'refused, same as the CLI. backend=ton-provider (only listed when a local TON wallet is ' +
-    "configured — no tool on this server can create one; see snapshot_now's description for the " +
-    'CLI-bootstrap-then-restart steps) is ALSO paid and unattended-capable, but its spend cap is a SEPARATE, env-only ' +
-    'mechanism (CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND, in nanoTON — must already be set in the ' +
-    "environment before this call; this tool's own max_spend argument does not apply to it and is " +
-    'refused if passed for it, matching the CLI). Requires confirm_install=true before ANY work happens — the MCP ' +
-    'equivalent of consenting to both the real-system-file write and (for a paid backend) the ' +
-    'ongoing capped spend risk every future unattended run carries; there is no environment escape ' +
-    'hatch honored here. Only ONE schedule can be installed at a time; re-calling replaces the prior ' +
-    'configuration (same as re-running the CLI command). Uses `cypher-brain schedule status` to ' +
-    'read this back, and `schedule uninstall` — not exposed as a tool — to remove it by hand.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      backend: {
-        type: 'string',
-        enum: BACKENDS,
-        description:
-          'Where the nightly push goes: file (free), arweave|turbo (PAID — requires max_spend), or ' +
-          'ton-provider (PAID — requires CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND set in the environment ' +
-          'instead, not the max_spend argument; only listed when a local TON wallet is configured — ' +
-          "no tool on this server can create one; see snapshot_now's description for the " +
-          'CLI-bootstrap-then-restart steps).',
-      },
-      dirs: {
-        type: 'array',
-        items: { type: 'string' },
-        description: 'Directories to include in every nightly snapshot. At least one of dirs/pg is required.',
-      },
-      pg: { type: 'string', description: 'Postgres connection string to pg_dump into every nightly snapshot.' },
-      recipients: {
-        type: 'array',
-        items: { type: 'string' },
-        description:
-          'age recipients (age1… pubkey or a recipients file path) to encrypt every nightly snapshot to. ' +
-          "Defaults to the keypair's own recipient when omitted (same as the CLI's snapshot/schedule install).",
-      },
-      at: {
-        type: 'string',
-        description: 'Local time "HH:MM" to run nightly. Default 03:30 (after the source re-settles overnight).',
-      },
-      max_spend: {
-        type: 'string',
-        description:
-          'REQUIRED for backend arweave|turbo: a positive integer cap (native units — winston/winc) on ' +
-          "EVERY unattended run's spend. Not allowed for backend file (nothing to cap) or backend " +
-          'ton-provider (its own env-only CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND applies instead — see the tool description).',
-      },
-      no_load: {
-        type: 'boolean',
-        description:
-          'Write the runner + plist/cron entry WITHOUT registering the trigger (launchctl/crontab left ' +
-          'untouched) — a preview. The written file(s) still persist on disk; see the tool description.',
-      },
-      ping_url: {
-        type: 'string',
-        description:
-          "Optional healthchecks.io-style dead man's switch: the runner curl's this URL (best-effort, " +
-          "never affects the run's own outcome) on every successful run.",
-      },
-      ping_url_fail: {
-        type: 'string',
-        description: 'Failure-ping URL override (default: ping_url + "/fail"). Requires ping_url to also be set.',
-      },
-      scan_secrets: {
-        type: 'string',
-        enum: [...SCAN_SECRETS_MODES],
-        description:
-          'Bake the gitleaks gate into the generated nightly runner (the CLI --scan-secrets, #215/#307): ' +
-          '"warn" logs findings and proceeds, "deny" refuses the whole snapshot on a finding. Omitted = the ' +
-          'nightly does not scan (same default as the CLI). Requires at least one dirs entry — the scan covers ' +
-          'staged directory plaintext, not the pg dump. Install RESOLVES gitleaks now and PINS the absolute ' +
-          'path into the runner as CYPHER_BRAIN_GITLEAKS_BIN (launchd/cron do not inherit a useful PATH, and a ' +
-          'different gitleaks on theirs must not take its place), and FAILS if it cannot be resolved, rather ' +
-          'than installing a schedule that cannot scan.',
-      },
-      confirm_install: {
-        type: 'boolean',
-        description:
-          'REQUIRED true to install. Confirms accepting a real, persistent system-file write and — for a ' +
-          'paid backend — the ongoing capped spend risk every future unattended run carries.',
-      },
-    },
-    required: ['backend'],
-    additionalProperties: false,
-  },
-  annotations: {
-    // Writes a real system file (plist/crontab) OUTSIDE CYPHER_BRAIN_HOME and,
-    // unless no_load, registers it with launchd/cron — genuinely destructive in
-    // the sense that re-installing replaces the prior configuration, and for a
-    // paid backend it commits to an ongoing (capped) unattended spend. Not
-    // idempotent: re-calling with different args produces a different runner/
-    // trigger. Talks to launchctl/crontab (and, at run time, storage backends),
-    // not just the local filesystem.
-    readOnlyHint: false,
-    destructiveHint: true,
-    idempotentHint: false,
-    openWorldHint: true,
-  },
-};
-
-const SCHEDULE_STATUS_TOOL: Tool = {
-  name: 'schedule_status',
-  description:
-    'Read-only, spends nothing, mutates nothing. Report the state of the nightly schedule set up ' +
-    'by `cypher-brain schedule install`: the configured time + backend, whether the launchd/cron ' +
-    'trigger is actually registered, the last run\'s log filename and its final "OK rc=0"/"FAILED ' +
-    'rc=N" line, and the next scheduled run — the SAME report `cypher-brain schedule status` prints ' +
-    'on the CLI, verbatim (one string per line). No arguments. Fails with ERR_NOT_CONFIGURED if no ' +
-    'schedule is installed yet — call schedule_install first.',
-  inputSchema: {
-    type: 'object',
-    properties: {},
-    additionalProperties: false,
-  },
-  annotations: {
-    // Reads the launchd/cron registration + the last run's log file — spends
-    // and mutates nothing (per description).
-    readOnlyHint: true,
-    destructiveHint: false,
-    idempotentHint: true,
-    openWorldHint: false,
-  },
-};
-
-const KEYGEN_TOOL: Tool = {
-  name: 'keygen',
-  description:
-    '⚠ WRITES a new identity/recipient keypair — the FIRST-RUN setup step a shell-less agent otherwise ' +
-    'cannot do (issue #174): snapshot_now/verify_restore need this keypair to already exist, and there ' +
-    'was no MCP tool that could create one. Spends no money, but is destructive the same way a ' +
-    'money-gated call is: it refuses if an identity/recipient already exists at ' +
-    '<CYPHER_BRAIN_HOME>/{identity.age,recipient.txt} UNLESS force=true, and force=true DISCARDS the old ' +
-    'keypair — every snapshot already encrypted to it becomes permanently unrecoverable. ' +
-    'passphrase=true additionally wraps the new identity at rest; since MCP has no interactive TTY this ' +
-    'REQUIRES CYPHER_BRAIN_PASSPHRASE to be set in the server environment (fails closed with a clear ' +
-    'error otherwise — never prompts blindly).',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      force: {
-        type: 'boolean',
-        description:
-          'Delete and overwrite an existing identity/recipient. DESTRUCTIVE — the old identity is ' +
-          'discarded, so every snapshot already encrypted to it becomes unrecoverable.',
-      },
-      passphrase: {
-        type: 'boolean',
-        description:
-          'Wrap the new identity with a passphrase (scrypt). Requires CYPHER_BRAIN_PASSPHRASE set in ' +
-          'the server environment (no TTY is available over MCP to prompt for one).',
-      },
-      pq: {
-        type: 'boolean',
-        description:
-          'Generate a POST-QUANTUM HYBRID keypair (ML-KEM-768 + X25519, #205) instead of plain X25519 ' +
-          '— mitigates "harvest now, decrypt later" (see README Threat model), at the cost of a much ' +
-          'bigger recipient/identity and per-recipient ciphertext overhead.',
-      },
-    },
-    additionalProperties: false,
-  },
-  annotations: {
-    // force=true discards the existing identity/recipient — every snapshot
-    // already encrypted to it becomes permanently unrecoverable — so this is
-    // destructive the same way keygen's description frames it. Each call
-    // generates a fresh random keypair, so repeat calls are not idempotent.
-    // Purely local key generation, no network calls.
-    readOnlyHint: false,
-    destructiveHint: true,
-    idempotentHint: false,
-    openWorldHint: false,
-  },
-};
-
-const WALLET_CREATE_TOOL: Tool = {
-  name: 'wallet_create',
-  description:
-    '⚠ WRITES a new Arweave JWK wallet — the funding half of first-run setup (issue #174): ' +
-    'arweave/turbo pushes need CYPHER_BRAIN_AR_WALLET to point at a JWK file, and there was no MCP tool ' +
-    'that could create one. Spends no money by itself, but is destructive the same way keygen is: it ' +
-    'refuses if a wallet already exists at the target path UNLESS force=true, and force=true DISCARDS ' +
-    'the old JWK — the only credential able to spend any AR/Turbo Credits already sent to its address. ' +
-    'Writes to <CYPHER_BRAIN_HOME>/wallet.json by default (out overrides the path). ARWEAVE ONLY (issue ' +
-    '#439): this tool has no chain parameter and cannot create a TON wallet. To use snapshot_now/' +
-    'schedule_install\'s backend="ton-provider", instead run `cypher-brain wallet create --chain ton` ' +
-    "from a shell, set CYPHER_BRAIN_TON_WALLET to the printed path in this MCP server's own environment, " +
-    'and restart the server — only then does "ton-provider" appear in those tools\' backend enum.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      out: {
-        type: 'string',
-        description:
-          'Output path for the wallet JWK file — must be inside CYPHER_BRAIN_HOME. Default: ' +
-          '<CYPHER_BRAIN_HOME>/wallet.json',
-      },
-      force: {
-        type: 'boolean',
-        description:
-          'Delete and overwrite an existing wallet file at the target path. DESTRUCTIVE — discards spend ' +
-          'authority over any AR/Turbo Credits already sent to its address.',
-      },
-    },
-    additionalProperties: false,
-  },
-  annotations: {
-    // force=true discards the existing wallet — the only credential able to
-    // spend any AR/Turbo Credits already sent to its address — so this is
-    // destructive the same way keygen's force is. Each call generates a fresh
-    // random JWK, so repeat calls are not idempotent. Purely local
-    // key/file generation, no network calls.
-    readOnlyHint: false,
-    destructiveHint: true,
-    idempotentHint: false,
-    openWorldHint: false,
-  },
-};
-
-const WALLET_ADDRESS_TOOL: Tool = {
-  name: 'wallet_address',
-  description:
-    'Read-only, spends nothing — derives and shows the Arweave address for a JWK wallet file (the ' +
-    'address to FUND, e.g. via app.ardrive.io / turbo.ar.io, before pushing to arweave/turbo). Defaults ' +
-    'to $CYPHER_BRAIN_AR_WALLET, then <CYPHER_BRAIN_HOME>/wallet.json (the same default wallet_create ' +
-    'writes to) when wallet is omitted. ARWEAVE ONLY (issue #439): there is no TON equivalent of this ' +
-    "tool over MCP — a TON wallet's address is printed once by `cypher-brain wallet create --chain ton` " +
-    "at creation time (see wallet_create's description for the full CLI-bootstrap-then-restart steps " +
-    'needed to reach backend="ton-provider").',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      wallet: {
-        type: 'string',
-        description:
-          'Path to the JWK wallet file. Default: $CYPHER_BRAIN_AR_WALLET, then <CYPHER_BRAIN_HOME>/wallet.json',
-      },
-    },
-    additionalProperties: false,
-  },
-  annotations: {
-    // Read-only, spends nothing (per description) — derives the address from
-    // a local JWK file with no side effects; the same wallet always yields
-    // the same address, and there is no network call.
-    readOnlyHint: true,
-    destructiveHint: false,
-    idempotentHint: true,
-    openWorldHint: false,
-  },
-};
-
-const ALL_TOOLS: Tool[] = [
-  SNAPSHOT_NOW_TOOL,
-  LAST_SNAPSHOT_STATUS_TOOL,
-  VERIFY_RESTORE_TOOL,
-  RESTORE_NOW_TOOL,
-  ESTIMATE_COST_TOOL,
-  SCHEDULE_INSTALL_TOOL,
-  SCHEDULE_STATUS_TOOL,
-  KEYGEN_TOOL,
-  WALLET_CREATE_TOOL,
-  WALLET_ADDRESS_TOOL,
-];
-
+// ALL_TOOLS itself is imported from mcp-tool-schemas.ts (#507); this index over it is a
+// dispatcher-side concern (the switch below reads it), not a schema declaration, so it
+// stays here rather than moving with the schemas.
 const TOOLS_BY_NAME = new Map(ALL_TOOLS.map((t) => [t.name, t]));
 
 // #300: every schema above advertises `additionalProperties: false`, but the
@@ -1709,78 +1098,24 @@ async function handleVerifyRestore(args: ToolArgs): Promise<CallToolResult> {
   }
 }
 
-// restore_now shares its dual-mode locator/file/locator_file input resolution with
-// verify_restore above (pull into a scratch tmpdir, or use a local file directly),
-// then hands the resolved .age path to restore() (src/lib/restore.ts) — the SAME
-// function the CLI's `restore` subcommand dispatches to — instead of re-implementing
-// the decrypt+extract(+pg_restore) logic here.
-async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
-  const {
-    locator,
-    file,
-    locator_file: locatorFile,
-    backend,
-    sha256: pin,
-    out_dir: outDir,
-    identity,
-    pg,
-    confirm_write: confirmWrite,
-    require_signature: requireSignature,
-  } = args;
+// #509: the resolved input restore_now hands to restore() — its dual-mode
+// locator/file/locator_file resolution (pull into a scratch tmpdir, or use a local file
+// directly, with the same sha256 pin applied either way) extracted out of
+// handleRestoreNow so that function reads as validate → resolve target → restore →
+// format result instead of interleaving all four. `tdir` is returned rather than torn
+// down here on the SUCCESS path — restore() still needs the file sitting in it — but on
+// resolveRestoreTarget's OWN throw (pull failed, sha256 mismatch, ...) it tears down
+// whatever tmpdir it created itself, since the caller never receives one to clean up.
+interface ResolvedRestoreTarget {
+  target: string | undefined;
+  tdir: string | null;
+  pulled?: Record<string, unknown>;
+  signature?: Record<string, unknown>;
+  effectivePin?: string;
+}
 
-  // Validated rather than coerced: `requireSignature === true` alone would read
-  // require_signature: "true" — a plausible thing for a client to send — as FALSE, silently
-  // handing back the permissive posture to a caller who asked for the strict one (multi-model
-  // review finding). Every neighbouring typed field is checked the same way.
-  if (requireSignature !== undefined && !isBool(requireSignature))
-    throw new ToolError('ERR_INVALID_INPUT', 'require_signature must be a boolean');
-  const given = [locator, file, locatorFile].filter((v) => v !== undefined).length;
-  if (given !== 1) {
-    throw new ToolError(
-      'ERR_INVALID_INPUT',
-      'pass exactly one of locator (pull first), file (restore a local .age), or locator_file (a push --save-locator file: locator + backend + sha256 pin in one)',
-    );
-  }
-  if (locatorFile !== undefined) {
-    if (!isStr(locatorFile)) throw new ToolError('ERR_INVALID_INPUT', 'locator_file must be a string path');
-    if (backend !== undefined)
-      throw new ToolError(
-        'ERR_INVALID_INPUT',
-        'backend cannot be combined with locator_file — the file records the backend itself',
-      );
-  }
-  if (pin !== undefined && !(isStr(pin) && SHA256_HEX.test(pin))) {
-    throw new ToolError(
-      'ERR_INVALID_INPUT',
-      'sha256 must be a 64-char hex string (the expected ciphertext digest, from a trusted off-box record)',
-    );
-  }
-  if (!isStr(outDir)) throw new ToolError('ERR_INVALID_INPUT', 'out_dir (string path) is required');
-  if (identity !== undefined && !isStr(identity))
-    throw new ToolError('ERR_INVALID_INPUT', 'identity must be a string path');
-  if (pg !== undefined && !isStr(pg)) throw new ToolError('ERR_INVALID_INPUT', 'pg must be a string connection URI');
-  if (confirmWrite !== undefined && !isBool(confirmWrite))
-    throw new ToolError('ERR_INVALID_INPUT', 'confirm_write must be a boolean');
-
-  // Consequential-action gate FIRST — before any pull/decrypt/extract work happens,
-  // same "check before work" discipline as snapshot_now's confirm_paid gate above.
-  // Restoring writes decrypted files into out_dir, and when pg is given ALSO runs
-  // pg_restore --clean --if-exists (DROPS and replaces objects in that database).
-  // The CLI accepts CYPHER_BRAIN_YES=1 for unattended runs, but via MCP the consent
-  // must be in the call itself — the env escape hatch is deliberately NOT honored here.
-  if (confirmWrite !== true) {
-    throw new ToolError(
-      'ERR_CONFIRM_REQUIRED',
-      'restore_now writes decrypted files into out_dir' +
-        (pg
-          ? ', and pg is given so pg_restore --clean --if-exists will DROP and replace objects in that database'
-          : '') +
-        ' — re-call restore_now with confirm_write=true to consent (the MCP equivalent of the CLI --yes guard). ' +
-        'The CYPHER_BRAIN_YES environment escape hatch is not honored over MCP, so no call can restore/clobber ' +
-        'without this flag.',
-    );
-  }
-
+async function resolveRestoreTarget(args: ToolArgs): Promise<ResolvedRestoreTarget> {
+  const { locator, file, locator_file: locatorFile, backend, sha256: pin } = args;
   let target: string | undefined = isStr(file) ? file : undefined;
   // #293: validate a caller-given `file` BEFORE any branch below, so a path that is
   // not there is reported as bad input rather than failing later inside the pin copy
@@ -1864,7 +1199,87 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
         );
       }
     }
+    return { target, tdir, pulled, signature, effectivePin };
+  } catch (e) {
+    await discardFetchDir(tdir);
+    throw e;
+  }
+}
 
+// restore_now shares its dual-mode locator/file/locator_file input resolution with
+// verify_restore above (pull into a scratch tmpdir, or use a local file directly),
+// then hands the resolved .age path to restore() (src/lib/restore.ts) — the SAME
+// function the CLI's `restore` subcommand dispatches to — instead of re-implementing
+// the decrypt+extract(+pg_restore) logic here.
+async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
+  const {
+    locator,
+    file,
+    locator_file: locatorFile,
+    backend,
+    sha256: pin,
+    out_dir: outDir,
+    identity,
+    pg,
+    confirm_write: confirmWrite,
+    require_signature: requireSignature,
+  } = args;
+
+  // Validated rather than coerced: `requireSignature === true` alone would read
+  // require_signature: "true" — a plausible thing for a client to send — as FALSE, silently
+  // handing back the permissive posture to a caller who asked for the strict one (multi-model
+  // review finding). Every neighbouring typed field is checked the same way.
+  if (requireSignature !== undefined && !isBool(requireSignature))
+    throw new ToolError('ERR_INVALID_INPUT', 'require_signature must be a boolean');
+  const given = [locator, file, locatorFile].filter((v) => v !== undefined).length;
+  if (given !== 1) {
+    throw new ToolError(
+      'ERR_INVALID_INPUT',
+      'pass exactly one of locator (pull first), file (restore a local .age), or locator_file (a push --save-locator file: locator + backend + sha256 pin in one)',
+    );
+  }
+  if (locatorFile !== undefined) {
+    if (!isStr(locatorFile)) throw new ToolError('ERR_INVALID_INPUT', 'locator_file must be a string path');
+    if (backend !== undefined)
+      throw new ToolError(
+        'ERR_INVALID_INPUT',
+        'backend cannot be combined with locator_file — the file records the backend itself',
+      );
+  }
+  if (pin !== undefined && !(isStr(pin) && SHA256_HEX.test(pin))) {
+    throw new ToolError(
+      'ERR_INVALID_INPUT',
+      'sha256 must be a 64-char hex string (the expected ciphertext digest, from a trusted off-box record)',
+    );
+  }
+  if (!isStr(outDir)) throw new ToolError('ERR_INVALID_INPUT', 'out_dir (string path) is required');
+  if (identity !== undefined && !isStr(identity))
+    throw new ToolError('ERR_INVALID_INPUT', 'identity must be a string path');
+  if (pg !== undefined && !isStr(pg)) throw new ToolError('ERR_INVALID_INPUT', 'pg must be a string connection URI');
+  if (confirmWrite !== undefined && !isBool(confirmWrite))
+    throw new ToolError('ERR_INVALID_INPUT', 'confirm_write must be a boolean');
+
+  // Consequential-action gate FIRST — before any pull/decrypt/extract work happens,
+  // same "check before work" discipline as snapshot_now's confirm_paid gate above.
+  // Restoring writes decrypted files into out_dir, and when pg is given ALSO runs
+  // pg_restore --clean --if-exists (DROPS and replaces objects in that database).
+  // The CLI accepts CYPHER_BRAIN_YES=1 for unattended runs, but via MCP the consent
+  // must be in the call itself — the env escape hatch is deliberately NOT honored here.
+  if (confirmWrite !== true) {
+    throw new ToolError(
+      'ERR_CONFIRM_REQUIRED',
+      'restore_now writes decrypted files into out_dir' +
+        (pg
+          ? ', and pg is given so pg_restore --clean --if-exists will DROP and replace objects in that database'
+          : '') +
+        ' — re-call restore_now with confirm_write=true to consent (the MCP equivalent of the CLI --yes guard). ' +
+        'The CYPHER_BRAIN_YES environment escape hatch is not honored over MCP, so no call can restore/clobber ' +
+        'without this flag.',
+    );
+  }
+
+  const { target, tdir, pulled, signature } = await resolveRestoreTarget(args);
+  try {
     const restoreOpts: CliOptions = {
       in: target,
       out_dir: outDir,
