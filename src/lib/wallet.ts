@@ -17,15 +17,7 @@ import { mkdir, chmod, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { HOME, AR_WALLET, AR_PAID_BY, TON_WALLET, TON_TONAPI_URL, TON_PROVIDER_OWNER } from './config.js';
 import { writeKeyFile } from './keys.js';
-import {
-  exists,
-  errMsg,
-  warnIfLooseKeyPerms,
-  SdkMissingError,
-  isWalletAddress,
-  sameWalletAddress,
-  sdkImportAdvice,
-} from './util.js';
+import { exists, errMsg, warnIfLooseKeyPerms, isWalletAddress, sameWalletAddress, throwForSdkImport } from './util.js';
 import { fetchBalance, type CreditApproval } from './balance.js';
 import { warn } from './warn.js';
 import { arUsdRate, turboUsdRate, usdApprox, tonUsdRate } from './estimate.js';
@@ -50,14 +42,12 @@ async function getArweave(): Promise<ArweaveWalletClient> {
   try {
     ArweaveCtor = (await import('arweave')).default as unknown as typeof ArweaveCtor;
   } catch (e) {
-    const problem = sdkImportAdvice(e, 'arweave');
     // 'absent' keeps SdkMissingError (its semantics everywhere are "the OPTIONAL thing
     // is not installed"); 'broken' must NOT — an installed-but-unusable package is a
     // real failure, and dressing it as "missing" invites skip-it handling (Codex
-    // review, Critical on the arweave chunk-fallback path).
-    if (problem?.kind === 'absent') throw new SdkMissingError(`wallet: ${problem.advice}`);
-    if (problem !== null) throw new Error(`wallet: ${problem.advice}`);
-    throw e;
+    // review, Critical on the arweave chunk-fallback path). See throwForSdkImport()
+    // (util.ts, #500) for the shared classify-and-throw logic.
+    throwForSdkImport(e, 'arweave', 'wallet');
   }
   // No host/port/protocol needed: wallets.generate()/jwkToAddress() are local RSA
   // keypair generation + a hash of the public modulus — neither ever calls the network.
@@ -99,18 +89,12 @@ async function getTonSigning(): Promise<TonSigningModule> {
   try {
     crypto = await import('@ton/crypto');
   } catch (e) {
-    const problem = sdkImportAdvice(e, '@ton/crypto');
-    if (problem?.kind === 'absent') throw new SdkMissingError(`wallet: ${problem.advice}`);
-    if (problem !== null) throw new Error(`wallet: ${problem.advice}`);
-    throw e;
+    throwForSdkImport(e, '@ton/crypto', 'wallet');
   }
   try {
     ton = await import('@ton/ton');
   } catch (e) {
-    const problem = sdkImportAdvice(e, '@ton/ton');
-    if (problem?.kind === 'absent') throw new SdkMissingError(`wallet: ${problem.advice}`);
-    if (problem !== null) throw new Error(`wallet: ${problem.advice}`);
-    throw e;
+    throwForSdkImport(e, '@ton/ton', 'wallet');
   }
   return {
     mnemonicNew: crypto.mnemonicNew,

@@ -311,6 +311,26 @@ export function sdkImportAdvice(e: unknown, pkg: string): SdkImportProblem | nul
   };
 }
 
+// Classify-and-throw wrapper around sdkImportAdvice() for the common case (#500): a
+// caller's lazy `import(pkg)` failed, and the caller has no more to do with `e` than
+// translate it per sdkImportAdvice()'s own kind semantics (see its doc comment above)
+// and throw. 'absent' becomes SdkMissingError so callers like the arweave L1
+// chunk-fallback can keep treating it as "optional path, skip it"; 'broken' becomes a
+// plain Error specifically so it CANNOT get that skip-it treatment; anything else
+// (sdkImportAdvice returned null — not an import-resolution failure at all) rethrows
+// `e` untouched. `ctx` is prepended to `advice` the same way every call site already
+// did by hand (e.g. `${ctx}: ${problem.advice}`). This was identical, byte-for-byte
+// duplicated code across wallet.ts (x3)/arweave.ts/ton-provider.ts before the collapse
+// — not every `sdkImportAdvice` caller wants this: turbo.ts/ton-dns.ts skip the
+// 'absent' special-case on purpose (they don't need the SdkMissingError-skip
+// semantics), and otel.ts/estimate.ts don't throw at all — those stay as they are.
+export function throwForSdkImport(e: unknown, pkg: string, ctx: string): never {
+  const problem = sdkImportAdvice(e, pkg);
+  if (problem?.kind === 'absent') throw new SdkMissingError(`${ctx}: ${problem.advice}`);
+  if (problem !== null) throw new Error(`${ctx}: ${problem.advice}`);
+  throw e;
+}
+
 // Some lazily-imported dependencies log to console.warn at MODULE LOAD time (top-level code a
 // caller's try/catch cannot intercept), with no cypher-brain prefix — indistinguishable from a
 // real error on first read. bigint-buffer@1.1.5 (pulled in via @ardrive/turbo-sdk ->
