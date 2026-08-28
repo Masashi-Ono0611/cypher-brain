@@ -20,10 +20,10 @@
 //    CYPHER_BRAIN_MAX_SPEND, enforced INSIDE put(), remains the sole hard cap on actual
 //    spend (#105) — --plan narrows what price/identity was reviewed, it does not
 //    replace that final backstop.
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
-import { randomBytes } from 'node:crypto';
 import type { CostEstimate } from './estimate.js';
+import { writeKeyFile } from './keys.js';
 import { errMsg, sameWalletAddress } from './util.js';
 
 export const PLAN_VERSION = 1;
@@ -120,19 +120,22 @@ export function buildPlan(args: {
   };
 }
 
-// Atomic write (tmp + rename), same pattern push()'s own --save-locator uses
-// (pushpull.ts) — a crash/ENOSPC mid-write must never leave a half-written plan
-// file that a later `push --plan` could misread as valid.
-export async function writePlanFile(path: string, plan: PushPlan): Promise<void> {
+// Atomic write, delegated to keys.ts's writeKeyFile (#470, Codex review): reusing the
+// SAME fail-closed, no-clobber-unless-force write wallet.ts's own `wallet create`
+// already uses for the JWK wallet, rather than a third hand-rolled copy of it. Without
+// `force`, the write itself is an exclusive create ('wx') — the OS refuses if `path`
+// already exists, closing the TOCTOU window a caller-side exists()-then-write would
+// leave open (estimate.ts's own pre-flight exists() check exists only to fail fast
+// with a friendly message in the common case; this is the real backstop, the same
+// division of labor keygenAt()/wallet.ts's writeKeyFile callers already rely on). With
+// `force`, the new payload is written to an exclusively-created temp sibling first and
+// only THEN rename()'d over `path` — a crash/ENOSPC mid-write still never leaves a
+// half-written plan file a later `push --plan` could misread as valid. Plan files
+// carry no secrets (unlike the wallet/identity files writeKeyFile also serves), so
+// mode 0o644 rather than those callers' 0o600.
+export async function writePlanFile(path: string, plan: PushPlan, opts?: { force?: boolean }): Promise<void> {
   await mkdir(dirname(resolve(path)), { recursive: true });
-  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  try {
-    await writeFile(tmp, `${JSON.stringify(plan, null, 2)}\n`, { flag: 'w' });
-    await rename(tmp, path);
-  } catch (e) {
-    await rm(tmp, { force: true });
-    throw e;
-  }
+  await writeKeyFile(path, `${JSON.stringify(plan, null, 2)}\n`, 0o644, !!opts?.force);
 }
 
 // Parses and shape-checks a plan file. Deliberately strict — a plan is a consent

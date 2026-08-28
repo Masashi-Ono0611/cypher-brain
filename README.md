@@ -999,10 +999,10 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       (same no-clobber posture as "snapshot --out", #470) — pass --force to overwrite
       it anyway. Feed the path to
       "push --plan <path.json>" to have push refuse instead of proceeding if the
-      artifact, backend, remote, price, or payer drifted since the plan was made — the
-      Terraform plan/apply pattern, binding what push actually validates before its
-      consent gate to what "estimate --out" reviewed (see "push --plan" above for what
-      that guarantee does and does not cover).
+      artifact, backend, remote, price, payer, or recipients fingerprint (#469) drifted
+      since the plan was made — the Terraform plan/apply pattern, binding what push
+      actually validates before its consent gate to what "estimate --out" reviewed
+      (see "push --plan" above for what that guarantee does and does not cover).
       --remote <name>:<path> (rclone only; the SAME value push/pull's --remote takes —
       see "push" above): REQUIRED alongside --out when --backend rclone, since the
       plan written above pins whatever --remote was given (null when omitted), and a

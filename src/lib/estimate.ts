@@ -413,7 +413,12 @@ export async function estimate(o: CliOptions): Promise<void> {
     // second "estimate --out" at the same path silently discarded whatever plan a
     // prior run wrote there (and anything already relying on it via "push --plan"),
     // no warning, no error. --force overwrites anyway, the same escape hatch
-    // push/pull/wallet create already use for this exact refusal.
+    // push/pull/wallet create already use for this exact refusal. This check is a
+    // fast, friendly pre-flight for the common case (same wording every other
+    // no-clobber refusal in this codebase uses) — the REAL enforcement, including
+    // against a concurrent "estimate --out" racing this one, is writePlanFile()
+    // below's exclusive-create write (Codex review, #470 follow-up), the same
+    // division of labor keygenAt()/wallet.ts's writeKeyFile callers already rely on.
     if (!o.force && (await exists(o.out))) {
       throw new Error(
         `${o.out} already exists — refusing to overwrite a prior plan (move it aside, choose a new --out, or pass --force)`,
@@ -456,7 +461,7 @@ export async function estimate(o: CliOptions): Promise<void> {
       remote: o.remote ?? null,
       estimate: result,
     });
-    await writePlanFile(o.out, plan);
+    await writePlanFile(o.out, plan, { force: !!o.force });
     console.error(`plan saved -> ${o.out} (valid until ${plan.expires_at})`);
   }
 }
