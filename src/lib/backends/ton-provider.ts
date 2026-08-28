@@ -651,9 +651,12 @@ export interface NotifyResult {
 // UP past Number.MAX_SAFE_INTEGER, which would make the "under-count, never over-count"
 // guarantee above false for a large enough bag.
 function parseNotifyOutput(out: string): NotifyResult {
-  const status = /^\s*status:\s*(\S+)/m.exec(out)?.[1] ?? 'unknown';
-  const downloadedRaw = /^\s*downloaded:\s*(\d+)\s*bytes/m.exec(out)?.[1];
-  const reason = /^\s*reason:\s*(.*)$/m.exec(out)?.[1]?.trim() ?? '';
+  const notifySection = out.includes('== notify response ==')
+    ? out.split('== notify response ==')[1]
+    : out;
+  const status = /^\s*status:\s*(\S+)/m.exec(notifySection)?.[1] ?? 'unknown';
+  const downloadedRaw = /^\s*downloaded:\s*(\d+)\s*bytes/m.exec(notifySection)?.[1];
+  const reason = /^\s*reason:\s*(.*)$/m.exec(notifySection)?.[1]?.trim() ?? '';
   return { status, downloaded: downloadedRaw ? BigInt(downloadedRaw) : 0n, reason };
 }
 
