@@ -372,7 +372,7 @@ async function pushCore(
   }
   const backend = await backendFor(o.backend);
   type ReceiptBox = {
-    value: { raw: unknown; cost: { amount: string; unit: 'winston' | 'winc' } | null } | null;
+    value: { raw: unknown; cost: { amount: string; unit: 'winston' | 'winc' | 'nanoton' } | null } | null;
   };
   // A mutable PROPERTY, not a bare `let`: TS's control-flow narrowing sees no direct
   // assignment to a box's field itself outside the closure and so keeps its declared
@@ -424,9 +424,10 @@ async function pushCore(
 
   // `remote` is only meaningful to the rclone backend (its --remote <name>:<path>
   // destination — types.ts's PutOpts) — every other backend's put() ignores it, same
-  // as `yes` is only meaningful to arweave/turbo. `onReceipt` (#232) is likewise only
-  // ever called by arweave/turbo — every other backend's receiptBox stays null, and
-  // persistReceiptIfAny() above is then a no-op for it.
+  // as `yes` is only meaningful to arweave/turbo/ton-provider. `onReceipt` (#232, and
+  // #484 for ton-provider) is likewise only ever called by arweave/turbo/ton-provider —
+  // every other backend's receiptBox stays null, and persistReceiptIfAny() above is
+  // then a no-op for it.
   const receiptBox = newReceiptBox();
   const locator = await backend.put(o.in, {
     yes,

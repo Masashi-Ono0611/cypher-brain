@@ -100,19 +100,21 @@ export type FetchShape = 'age' | 'minisig';
 export interface PutOpts {
   yes?: boolean;
   remote?: string; // rclone backend only: the "<remote>:<path>" destination (put() throws without it)
-  // #232: paid backends (arweave, turbo) call this, right after a successful upload,
-  // with a response object and the best available native-unit cost that upload paid,
-  // if the backend can name one — turbo's is its SDK response verbatim (its own
-  // official receipt-persistence recommendation); arweave's raw L1 backend has no
-  // analogous receipt object, so it passes a small normalized summary instead (see
-  // backends/arweave.ts's onReceipt call, and src/lib/receipt.ts's header comment for
-  // the full per-backend honesty note on both `raw` and `cost`). pushpull.ts's push()
-  // uses it to persist a receipt (src/lib/receipt.ts) SEPARATE from estimate.ts's
-  // pre-flight forecast — never conflated. Backends with no concept of a paid receipt
-  // (file/rclone/ton) never call it, so no entry, cost, or unit field here is ever
+  // #232 (arweave/turbo), #484 (ton-provider): paid backends call this, right after a
+  // successful upload, with a response object and the best available native-unit cost
+  // that upload paid, if the backend can name one — turbo's is its SDK response
+  // verbatim (its own official receipt-persistence recommendation); arweave's raw L1
+  // backend has no analogous receipt object, so it passes a small normalized summary
+  // instead (see backends/arweave.ts's onReceipt call, and src/lib/receipt.ts's header
+  // comment for the full per-backend honesty note on both `raw` and `cost`);
+  // ton-provider passes the deploy amount actually locked into the confirmed on-chain
+  // transfer (see backends/ton-provider.ts's onReceipt call). pushpull.ts's push() uses
+  // it to persist a receipt (src/lib/receipt.ts) SEPARATE from estimate.ts's pre-flight
+  // forecast — never conflated. Backends with no concept of a paid receipt (file/
+  // rclone/ton) never call it, so no entry, cost, or unit field here is ever
   // optional-but-lying: absence means "this backend has nothing to report", not
   // "reporting failed".
-  onReceipt?: (raw: unknown, cost: { amount: string; unit: 'winston' | 'winc' } | null) => void;
+  onReceipt?: (raw: unknown, cost: { amount: string; unit: 'winston' | 'winc' | 'nanoton' } | null) => void;
 }
 
 export interface StorageBackend {

@@ -1,5 +1,5 @@
 // ---------- utils ----------
-import { access, chmod, lstat, readdir, rm, stat } from 'node:fs/promises';
+import { access, chmod, lstat, readdir, readFile, rm, stat } from 'node:fs/promises';
 import { createReadStream, statSync, constants as FS, type Dirent } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -158,6 +158,60 @@ export function readHead(path: string, n: number): Promise<string> {
 // instead of an `as Error` cast (or worse, `any`) at every call site.
 export function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+export interface ReadJsonlLogResult<T> {
+  items: T[];
+  // Lines that existed but could not be used — malformed JSON, or `validateAndParse`
+  // rejected the shape (wrong type, missing field, future version). Never conflated
+  // with "the file doesn't exist yet" (that returns `{items: [], skippedLines: 0}`
+  // straight from the ENOENT branch below) — a caller needs to tell "nothing has ever
+  // been recorded" apart from "something exists here that couldn't be read".
+  skippedLines: number;
+}
+
+// #503: the JSONL-log-reading skeleton receipt.ts's readReceipts() and audit.ts's
+// readAuditLog() each hand-rolled a second time (audit.ts's own comments cite
+// receipt.ts as the precedent it consciously reimplemented rather than shared) —
+// read -> ENOENT means "empty, not an error" -> any OTHER read failure THROWS (an
+// audit/cost tool must never let "could not read the log" read the same as "there is
+// nothing to read") -> split lines -> skip blanks -> parse each line, counting a
+// skipped line for either malformed JSON or a shape `validateAndParse` rejects.
+// `validateAndParse` is deliberately the ONLY thing callers vary: receipt.ts and
+// audit.ts have genuinely different, independently-evolved per-entry validation
+// (audit.ts's is stricter — exact null-vs-string checks on every nullable field,
+// Codex review, Critical — see its own header comment for why), which stays local to
+// each module rather than being forced into a shared shape here.
+export async function readJsonlLog<T>(
+  path: string,
+  label: string,
+  validateAndParse: (parsed: unknown) => T | null,
+): Promise<ReadJsonlLogResult<T>> {
+  let text: string;
+  try {
+    text = await readFile(path, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { items: [], skippedLines: 0 };
+    throw new Error(`cannot read ${label} at ${path}: ${errMsg(e)}`);
+  }
+  const items: T[] = [];
+  let skippedLines = 0;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      const item = validateAndParse(parsed);
+      if (item === null) {
+        skippedLines++; // wrong shape (foreign line, future version) — skip, don't crash a read
+        continue;
+      }
+      items.push(item);
+    } catch {
+      skippedLines++; // malformed JSON on this one line — skip it, keep reading the rest
+    }
+  }
+  return { items, skippedLines };
 }
 
 export function fmtBytes(n: number): string {

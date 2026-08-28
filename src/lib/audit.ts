@@ -17,12 +17,12 @@
 // was ALREADY `null` be tampered to any other value and silently launder back to the
 // SAME `null` the stored hash was computed against; every nullable field here must be
 // exactly `null` or a `string`, or the whole line is rejected).
-import { appendFile, mkdir, readFile } from 'node:fs/promises';
+import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
 import { AUDIT_LOG } from './config.js';
-import { errMsg, sha256 } from './util.js';
+import { errMsg, readJsonlLog, sha256 } from './util.js';
 import { readRecipientsFingerprint } from './plan.js';
 import { printJson } from './ui.js';
 import { warn } from './warn.js';
@@ -98,75 +98,62 @@ export interface ReadAuditLogResult {
 // should be, ...) THROWS instead of silently reporting an empty log: this is an audit
 // tool, and "no history" must never be indistinguishable from "could not read the
 // history" (the exact Critical fix receipt.ts's readReceipts() needed in #232 —
-// applied here from the start).
+// applied here from the start). The read/ENOENT/split/parse/skippedLines scaffolding
+// itself is util.ts's shared readJsonlLog() (#503) — only the per-entry shape
+// validation below (deliberately STRICTER than receipt.ts's own, see this file's
+// header comment) is specific to an audit entry.
 export async function readAuditLog(): Promise<ReadAuditLogResult> {
-  let text: string;
-  try {
-    text = await readFile(AUDIT_LOG, 'utf8');
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { entries: [], skippedLines: 0 };
-    throw new Error(`cannot read audit log at ${AUDIT_LOG}: ${errMsg(e)}`);
-  }
-  const entries: AuditEntry[] = [];
-  let skippedLines = 0;
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed) as Partial<AuditEntry> | null;
-      // Every nullable field is checked as EXACTLY null-or-string here, not coerced —
-      // Codex review, Critical: the original version accepted ANY wrong-typed value
-      // for a nullable field (e.g. an object, or the key deleted entirely) and folded
-      // it down to `null` when rebuilding the entry. For a field that was ALREADY
-      // `null` in the original entry (restore/verify's `backend`, or any command's
-      // `locator`/`artifact_sha256`/`recipients_fingerprint` when unavailable), this
-      // let a tampered value launder back to the SAME `null` the stored hash was
-      // computed against — verifyAuditChain() then recomputed the identical hash and
-      // reported the tampered line as valid. Rejecting (skipping) anything that is
-      // not exactly `null` or a `string` closes that hole: a line altered this way is
-      // now unreadable rather than silently normalized, and audit()'s VERDICT below
-      // treats any skipped line as a possible tamper, not a benign gap.
-      if (
-        !parsed ||
-        typeof parsed !== 'object' ||
-        parsed.cypher_brain_audit_version !== AUDIT_VERSION ||
-        typeof parsed.timestamp !== 'string' ||
-        (parsed.command !== 'push' && parsed.command !== 'restore' && parsed.command !== 'verify') ||
-        (parsed.backend !== null && typeof parsed.backend !== 'string') ||
-        (parsed.locator !== null && typeof parsed.locator !== 'string') ||
-        (parsed.artifact_sha256 !== null && typeof parsed.artifact_sha256 !== 'string') ||
-        typeof parsed.machine !== 'string' ||
-        (parsed.recipients_fingerprint !== null && typeof parsed.recipients_fingerprint !== 'string') ||
-        typeof parsed.exit_code !== 'number' ||
-        typeof parsed.duration_ms !== 'number' ||
-        typeof parsed.hash !== 'string' ||
-        (parsed.prev_hash !== null && typeof parsed.prev_hash !== 'string')
-      ) {
-        skippedLines++; // wrong shape (foreign line, future version, or a tampered field) — skip, don't crash a read
-        continue;
-      }
-      entries.push({
-        cypher_brain_audit_version: AUDIT_VERSION,
-        timestamp: parsed.timestamp,
-        command: parsed.command,
-        // `?? null` here is SAFE (not a normalization) only because the guard above
-        // already proved each of these is exactly `null` or a `string` — this is a
-        // type narrowing, not a coercion of a wrong-typed value.
-        backend: parsed.backend ?? null,
-        locator: parsed.locator ?? null,
-        artifact_sha256: parsed.artifact_sha256 ?? null,
-        machine: parsed.machine,
-        recipients_fingerprint: parsed.recipients_fingerprint ?? null,
-        exit_code: parsed.exit_code,
-        duration_ms: parsed.duration_ms,
-        prev_hash: parsed.prev_hash ?? null,
-        hash: parsed.hash,
-      });
-    } catch {
-      skippedLines++; // malformed JSON on this one line — skip it, keep reading the rest
+  const { items, skippedLines } = await readJsonlLog<AuditEntry>(AUDIT_LOG, 'audit log', (parsed) => {
+    const p = parsed as Partial<AuditEntry> | null;
+    // Every nullable field is checked as EXACTLY null-or-string here, not coerced —
+    // Codex review, Critical: the original version accepted ANY wrong-typed value
+    // for a nullable field (e.g. an object, or the key deleted entirely) and folded
+    // it down to `null` when rebuilding the entry. For a field that was ALREADY
+    // `null` in the original entry (restore/verify's `backend`, or any command's
+    // `locator`/`artifact_sha256`/`recipients_fingerprint` when unavailable), this
+    // let a tampered value launder back to the SAME `null` the stored hash was
+    // computed against — verifyAuditChain() then recomputed the identical hash and
+    // reported the tampered line as valid. Rejecting (skipping) anything that is
+    // not exactly `null` or a `string` closes that hole: a line altered this way is
+    // now unreadable rather than silently normalized, and audit()'s VERDICT below
+    // treats any skipped line as a possible tamper, not a benign gap.
+    if (
+      !p ||
+      typeof p !== 'object' ||
+      p.cypher_brain_audit_version !== AUDIT_VERSION ||
+      typeof p.timestamp !== 'string' ||
+      (p.command !== 'push' && p.command !== 'restore' && p.command !== 'verify') ||
+      (p.backend !== null && typeof p.backend !== 'string') ||
+      (p.locator !== null && typeof p.locator !== 'string') ||
+      (p.artifact_sha256 !== null && typeof p.artifact_sha256 !== 'string') ||
+      typeof p.machine !== 'string' ||
+      (p.recipients_fingerprint !== null && typeof p.recipients_fingerprint !== 'string') ||
+      typeof p.exit_code !== 'number' ||
+      typeof p.duration_ms !== 'number' ||
+      typeof p.hash !== 'string' ||
+      (p.prev_hash !== null && typeof p.prev_hash !== 'string')
+    ) {
+      return null; // wrong shape (foreign line, future version, or a tampered field) — skip, don't crash a read
     }
-  }
-  return { entries, skippedLines };
+    return {
+      cypher_brain_audit_version: AUDIT_VERSION,
+      timestamp: p.timestamp,
+      command: p.command,
+      // `?? null` here is SAFE (not a normalization) only because the guard above
+      // already proved each of these is exactly `null` or a `string` — this is a
+      // type narrowing, not a coercion of a wrong-typed value.
+      backend: p.backend ?? null,
+      locator: p.locator ?? null,
+      artifact_sha256: p.artifact_sha256 ?? null,
+      machine: p.machine,
+      recipients_fingerprint: p.recipients_fingerprint ?? null,
+      exit_code: p.exit_code,
+      duration_ms: p.duration_ms,
+      prev_hash: p.prev_hash ?? null,
+      hash: p.hash,
+    };
+  });
+  return { entries: items, skippedLines };
 }
 
 // Append one entry, hash-chained to the log's current LAST line. No lock (unlike

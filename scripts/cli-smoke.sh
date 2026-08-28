@@ -482,6 +482,34 @@ grep -Fq -- 'did you mean --out-dir?' "$TMP/m.err" \
 grep -Fq -- 'does not read --out' "$TMP/m.err" \
   || { echo "[FAIL] restore --out was not refused as unread — it is being answered by a downstream check instead"; cat "$TMP/m.err"; exit 1; }
 
+### (m1b) #460: ledger/audit REFUSE a sibling command's flag instead of silently
+# accepting and ignoring it. --backend is push/pull/restore/estimate's own flag,
+# naturally reached for on ledger (whose report groups by backend); --level is
+# verify's own quick/remote/drill depth flag, naturally reached for on audit (whose
+# own --help block sits right after verify's). Both used to run normally and produce
+# the SAME output as without the flag — this proves they are refused instead.
+node "$DIST" ledger --backend file > "$TMP/m1b-ledger.out" 2> "$TMP/m1b-ledger.err"
+LEDGER_BACKEND_RC=$?
+[ "$LEDGER_BACKEND_RC" != "0" ] || { echo "[FAIL] ledger --backend file exited 0 — it is still being silently accepted (#460)"; exit 1; }
+grep -Fq -- 'does not read --backend' "$TMP/m1b-ledger.err" \
+  || { echo "[FAIL] ledger --backend file was not refused as unread"; cat "$TMP/m1b-ledger.err"; exit 1; }
+[ ! -s "$TMP/m1b-ledger.out" ] || { echo "[FAIL] ledger --backend file wrote to stdout on the error path"; cat "$TMP/m1b-ledger.out"; exit 1; }
+node "$DIST" audit --level drill > "$TMP/m1b-audit.out" 2> "$TMP/m1b-audit.err"
+AUDIT_LEVEL_RC=$?
+[ "$AUDIT_LEVEL_RC" != "0" ] || { echo "[FAIL] audit --level drill exited 0 — it is still being silently accepted (#460)"; exit 1; }
+grep -Fq -- 'does not read --level' "$TMP/m1b-audit.err" \
+  || { echo "[FAIL] audit --level drill was not refused as unread"; cat "$TMP/m1b-audit.err"; exit 1; }
+[ ! -s "$TMP/m1b-audit.out" ] || { echo "[FAIL] audit --level drill wrote to stdout on the error path"; cat "$TMP/m1b-audit.out"; exit 1; }
+# A genuinely unknown flag on either command must still be refused the SAME pre-#460
+# way (a global "unknown flag" error) — this is not the flag-relevance mechanism, it
+# is the check #460 says stayed correct all along (the issue's own contrast case).
+node "$DIST" audit --bogus-flag-xyz > /dev/null 2> "$TMP/m1b-bogus.err"
+BOGUS_RC=$?
+[ "$BOGUS_RC" != "0" ] || { echo "[FAIL] audit --bogus-flag-xyz exited 0"; exit 1; }
+grep -Fq -- 'unknown flag: --bogus-flag-xyz' "$TMP/m1b-bogus.err" \
+  || { echo "[FAIL] audit --bogus-flag-xyz did not get the plain unknown-flag error"; cat "$TMP/m1b-bogus.err"; exit 1; }
+echo "[PASS] dist ledger --backend / audit --level: refused as unread flags, not silently ignored (#460)"
+
 ### (m2) #277: every command the SWITCH can dispatch has answered the flag-relevance
 # question. A STATIC comparison of two things read out of src/cli.ts — the dispatch switch's
 # case labels and FLAG_IRRELEVANT's keys — rather than a runtime probe. It has to be static:

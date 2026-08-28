@@ -825,7 +825,7 @@ async function notifyProviderWithRetry(
 
 export function tonProviderBackend(): StorageBackend {
   return {
-    async put(file: string, _opts: PutOpts = {}): Promise<string> {
+    async put(file: string, opts: PutOpts = {}): Promise<string> {
       const { Address } = await getTon();
       // PR2: when a local TON wallet is configured, IT is the owner — auto-signing
       // requires sender===owner (storage-contract.fc's modify_providers throws
@@ -1017,6 +1017,45 @@ export function tonProviderBackend(): StorageBackend {
 
         await notifyProviderWithRetry(provider.pubkey, deploy.contractAddress.toRawString(), bag.dataSizeBytes);
         console.error(`ton-provider: provider ${provider.pubkey} has the full bag — safe to stop the local seed`);
+
+        // #484: ledger's cumulative-cost tracking was arweave/turbo-only despite
+        // ton-provider being a real paid backend with its own MAX_SPEND cap (doctor/
+        // audit/estimate/schedule already treat it on par with the other backends —
+        // ledger was the one place it diverged). `deploy.amountNano` (storage cost +
+        // deploy buffer, see the console.error just above buildDeploy()'s call) is the
+        // AUTHORITATIVE actual spend, not a pre-flight estimate: by this point
+        // waitForContractActive() has already confirmed the contract is live on-chain,
+        // which only happens once the transfer carrying this exact amount has been
+        // processed — same "confirmed, not just requested" posture as arweave's signed
+        // tx.reward (receipt.ts's own header comment). `raw` is a small normalized
+        // summary (ton-provider has no single SDK response object to defer to, same
+        // reasoning as arweave's own raw L1 backend).
+        //
+        // Known gap (Codex review): if notifyProviderWithRetry() above throws (the
+        // provider never confirms a full download within CYPHER_BRAIN_TON_PROVIDER_
+        // NOTIFY_RETRY_MS), this line is never reached — the deploy transfer is already
+        // confirmed on-chain (real funds committed) but no receipt gets recorded, since
+        // this push did not COMPLETE (receipt.ts's own contract: a receipt is "the best
+        // available ACTUAL-cost record for a completed paid push", matching arweave's/
+        // turbo's own receipts, each recorded at the last step of an upload that fully
+        // succeeds). pushpull.ts's push() only ever persists a receipt for a put() call
+        // that RESOLVES, so recording one for this specific failure path would need a
+        // partial-success signal analogous to PushSignatureUploadError's, threaded back
+        // through pushpull.ts — a deliberately separate follow-up, not folded in here.
+        // The thrown error's own message already tells the operator the contract IS
+        // deployed and may still complete on its own; audit.ts's own log still records
+        // this run (backend=ton-provider, non-zero exit_code) either way.
+        opts.onReceipt?.(
+          {
+            contract_address: deploy.contractAddress.toRawString(),
+            bag_id: bag.bagId,
+            provider_pubkey: provider.pubkey,
+            cost_nano: deploy.costNano.toString(),
+            deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
+            amount_nano: deploy.amountNano.toString(),
+          },
+          { amount: deploy.amountNano.toString(), unit: 'nanoton' },
+        );
 
         return tonProviderLocator(bag.bagId);
       } finally {
