@@ -45,6 +45,7 @@ export interface CliOptions {
   sign?: boolean; // keygen --sign: generate a minisign-compatible Ed25519 signing keypair instead of an age identity (#214)
   no_sign?: boolean; // snapshot --no-sign: skip writing a <out>.minisig sidecar even when a signing identity is present (#214)
   require_signature?: boolean; // restore/verify: an absent/unverifiable signature is a hard failure, not just a warning (#214)
+  skip_signature_check?: boolean; // INTERNAL ONLY, never a CLI/MCP flag (not in cli.ts's BOOL_FLAGS/VALUE_FLAGS): verify --level drill sets this on the restoreImpl() call it makes from src/lib/restore.ts, after its own runFileChecks() already ran (and printed) this exact signature check against this exact fetched artifact — restoreImpl skips re-running (and re-printing) it rather than reporting the same check twice (#530)
 
   // value flags — always a string when passed (argv is untyped text)
   out?: string;
@@ -100,6 +101,13 @@ export type FetchShape = 'age' | 'minisig';
 export interface PutOpts {
   yes?: boolean;
   remote?: string; // rclone backend only: the "<remote>:<path>" destination (put() throws without it)
+  // rclone backend only (#533): opts out of that backend's own refuse-by-default
+  // overwrite check (an object already sitting at the exact --remote path). This is
+  // the SAME CliOptions.force push already threads through for --skip-unchanged's
+  // digest override (pushpull.ts) — deliberately reused rather than a second flag,
+  // since both mean "push anyway despite a safety net", not two unrelated behaviors.
+  // Every other backend's put() ignores it, same as `remote` above.
+  force?: boolean;
   // #232 (arweave/turbo), #484 (ton-provider): paid backends call this, right after a
   // successful upload, with a response object and the best available native-unit cost
   // that upload paid, if the backend can name one — turbo's is its SDK response

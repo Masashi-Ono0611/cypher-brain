@@ -158,7 +158,8 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     pattern: /already exists — refusing to overwrite/,
     origin: 'ours',
     source:
-      'src/lib/pushpull.ts (push/pull) + src/lib/snapshot.ts (snapshot), "… already exists — refusing to overwrite …"',
+      'src/lib/pushpull.ts (push/pull) + src/lib/snapshot.ts (snapshot) + src/lib/backends/rclone.ts (put, #533), ' +
+      '"… already exists — refusing to overwrite …"',
   },
   {
     code: 'CB-E010',
@@ -206,7 +207,9 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     title: 'identity file not found (cannot decrypt)',
     pattern: /cannot decrypt without the private key/,
     origin: 'ours',
-    source: 'src/lib/restore.ts (restoreImpl, "no identity at … — cannot decrypt without the private key")',
+    source:
+      'src/lib/restore.ts (restoreImpl, and runFileChecks for an EXPLICIT --identity path on verify, #531), ' +
+      '"no identity at … — cannot decrypt without the private key"',
   },
   {
     code: 'CB-E016',
@@ -223,6 +226,15 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     origin: 'ours',
     source:
       'src/lib/schedule.ts (readConfig, "schedule config is corrupt (… is not valid JSON: …" / "… is missing required field …")',
+  },
+  {
+    code: 'CB-E018',
+    title: 'no object at the given locator/remote path (nothing was ever pushed there)',
+    pattern: /no object at /,
+    origin: 'ours',
+    source:
+      'src/lib/backends/file.ts (get, "file backend: no object at …") + src/lib/backends/rclone.ts (runRclone, ' +
+      '"rclone backend: no object at …", #539 — translated from rclone\'s own raw "directory not found" retry-loop text)',
   },
 ];
 

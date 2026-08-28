@@ -628,14 +628,39 @@ export async function init(_o: CliOptions): Promise<void> {
           console.log('writing may be internally inconsistent. Stop gbrain for the duration of the snapshot when');
           console.log('you can. snapshot warns whenever it sees such a store.');
         } else {
-          console.log(`\nDetected a gbrain config at ${gbrainConfigPath} — gbrain's actual data (pages, embeddings,`);
-          console.log('timeline, graph) lives in Postgres, not in that directory alone. Requires pg_dump/pg_restore');
-          console.log('on PATH — see README "Prerequisites for --pg".');
+          // #543: a read/parse FAILURE (invalid JSON, the path being a directory, etc.)
+          // falls back to this same 'postgres' verdict as a genuinely-parsed config with
+          // no engine field — but the two are not equally confident, and the prose used
+          // to say "Detected a gbrain config" for both. readError distinguishes them so
+          // an operator with a corrupted config.json is told their engine is UNKNOWN
+          // (defaulting, not detected), not given the same confident Postgres claim as
+          // someone whose config was actually read.
+          if (gbrain.readError) {
+            console.log(`\ngbrain config at ${gbrainConfigPath} could not be read (defaulting to Postgres) — if`);
+            console.log("you know your engine, answer the prompt below accordingly; PGLite (gbrain's zero-config");
+            console.log('default) needs no --pg at all.');
+          } else {
+            console.log(`\nDetected a gbrain config at ${gbrainConfigPath} — gbrain's actual data (pages, embeddings,`);
+            console.log('timeline, graph) lives in Postgres, not in that directory alone. Requires pg_dump/pg_restore');
+            console.log('on PATH — see README "Prerequisites for --pg".');
+          }
           if (await askYesNo('Include a Postgres database dump (--pg) for gbrain in this backup?', true)) {
             // Default to the CURRENT machine's OS user — local Postgres setups commonly use
             // peer auth keyed to it (matches README's own --pg examples), so this is a real
             // guess rather than a literal "you" placeholder nobody's account is ever named
             // (Fugu review finding: a bare-Enter accept should not likely fail pg_dump).
+            //
+            // #540: this is deliberately NOT read from the detected gbrain config's own
+            // `database_url` field, even though that field exists and would give a real
+            // value instead of a guess. detectGbrainEngine's doc comment states, as a hard
+            // constraint (not an implementation detail), that it reads exactly `engine` and
+            // `database_path` out of config.json and nothing else — config.json holds API
+            // keys, and `database_url` typically embeds a credential too (unlike
+            // `database_path`, which is a filesystem path). Widening that boundary for a
+            // one-time prefill convenience is a real tradeoff the maintainer has not signed
+            // off on, so the safer fix is just making the prompt's own wording honest about
+            // what it is: a generic guess the operator must confirm or correct, not
+            // something read from their gbrain setup.
             let osUser = 'you';
             try {
               osUser = userInfo().username;
@@ -645,6 +670,8 @@ export async function init(_o: CliOptions): Promise<void> {
             // percent-encode: a username with '@', ':', '/', or a space would otherwise
             // corrupt the URI's own authority parsing (Fugu review finding).
             const defaultPg = `postgres://${encodeURIComponent(osUser)}@localhost:5432/gbrain`;
+            console.log(`(This is a generic guess — this OS user @ the default local port/database name — not`);
+            console.log('read from your gbrain setup. Edit it if your Postgres connection differs.)');
             snapshotOpts.pg = await askLine(`Postgres connection string [${defaultPg}]`, defaultPg);
           }
         }

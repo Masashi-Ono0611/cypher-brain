@@ -822,7 +822,12 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
                        [--level quick|remote|drill] [--verbose]
       Assert it is real age ciphertext, a wrong key cannot open it, AND (when the
       private identity is on this box) that YOUR key decrypts it into a well-formed
-      bundle. --sha256 also pins the artifact to an expected hash. Authenticity (#214):
+      bundle. --identity overrides the default identity path
+      ($CYPHER_BRAIN_HOME/identity.age) — an EXPLICITLY-given --identity path that does
+      not exist is a hard error (a typo, same as restore's own --identity), never the
+      silent PARTIAL/[SKIP] a genuinely absent private identity gets when --identity is
+      omitted entirely and the default path is also absent (#531). --sha256 also pins
+      the artifact to an expected hash. Authenticity (#214):
       if "<in>.minisig" exists and a signing public key is configured (default
       $CYPHER_BRAIN_HOME/sign-recipient.pub; --sign-recipient overrides), verifies it
       too — an INVALID signature is a hard FAIL and skips the positive-control decrypt
@@ -836,13 +841,19 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       --level (issue #209) picks how deep the check goes, restic/kopia-style — each
       level is a strictly deeper (slower, more expensive) proof than the one before:
         quick  (default, unchanged): everything above, against the LOCAL --in file —
-               no network access. Refuses --locator/--backend/--from-locator-file
-               (those name something to FETCH; quick never fetches anything).
+               no network access. Refuses --locator/--backend/--from-locator-file/
+               --sig-locator (those name something to FETCH; quick never fetches
+               anything).
         remote: pulls the artifact by --locator <id> --backend <name> (or
                --from-locator-file <path>, same contract as "pull") into a scratch temp
                file, then runs the SAME checks above against THAT — proving the object
                is still actually retrievable from storage and unchanged, not merely
                that a local copy still parses. Rejects --in (remote fetches instead).
+               --sig-locator <id> (or the 6th --from-locator-file field, read
+               automatically — same contract as "pull") ALSO fetches the "<in>.minisig"
+               authenticity sidecar before running the checks above, so the signature
+               check (and --require-signature) has something to verify against; omit it
+               and remote/drill behave exactly as before #214 (ciphertext only).
         drill:  does everything remote does, and — only once those checks reach
                PASS — ALSO decrypts and extracts the pulled artifact into a scratch
                out-dir (the same code path "restore" runs), the full
@@ -859,12 +870,14 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       error — retrievability itself is what those two levels test.
       --json prints one JSON object to stdout instead of the human-readable report.
       quick: {file, size_bytes, checks: {age_header, sha256_match, signature,
-      wrong_key_rejected, positive_control}, verdict, exit_code} — the SAME checks
-      computed above, so it never disagrees with the human-readable report or the MCP
-      verify_restore tool. remote adds {level, pulled: {backend, locator, sha256_pin,
-      fetched}} alongside checks. drill replaces positive_control's role with a
-      {full_restore: true|false|"skip", full_restore_error?} pair once the pulled
-      checks reach PASS. The exit code is unchanged either way. If the command ERRORS
+      wrong_key_rejected, positive_control}, level, verdict, exit_code} — the SAME
+      checks computed above, so it never disagrees with the human-readable report or the
+      MCP verify_restore tool ("level" is "quick" — #536, matching remote/drill below;
+      the plain-text report's first line is "level: quick" for the same reason). remote
+      adds {pulled: {backend, locator, sha256_pin, fetched}} alongside checks. drill
+      replaces positive_control's role with a {full_restore: true|false|"skip",
+      full_restore_error?} pair once the pulled checks reach PASS. The exit code is
+      unchanged either way. If the command ERRORS
       instead (#270 — a missing file, an unreadable identity), stdout carries an error
       object ({error, code, exit_code}) rather than nothing, so a --json caller never
       has to fall back to scraping stderr; "code" is the CB-E0xx identifier when the failure
@@ -909,6 +922,15 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       brain implements none of them itself. Free (like file); needs rclone on
       PATH and a remote already set up via 'rclone config' (or a config-less
       on-the-fly remote, e.g. --remote ":local:/path"). --remote is required.
+      No-clobber for rclone (#533): refuses to upload when an object already
+      exists at that exact --remote path — unlike file's <sha256>.age locator
+      (content-addressed, so a same-path "overwrite" is always byte-identical)
+      or arweave/turbo's (assigned fresh after upload), an rclone --remote is an
+      operator-named, free-form destination (NON_CONTENT_ADDRESSED_BACKENDS in
+      src/lib/config.ts), so reusing one across two DIFFERENT snapshots would
+      otherwise silently replace the earlier one. Pass --force to overwrite it
+      anyway — the SAME flag --skip-unchanged's digest override uses below (both
+      mean "push despite this safety net"); does not apply to any other backend.
       --backend ton stores the ciphertext as a TON Storage bag SEEDED FROM YOUR OWN
       always-on box (the "seeder": a machine running tonutils-storage, reached over
       SSH — CYPHER_BRAIN_TON_SSH_HOST etc., see Settings below). The bag is created
@@ -1047,7 +1069,10 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       one's result) — pass --force to overwrite it anyway.
       --backend rclone accepts --remote <name>:<path> in place of --locator (the
       rclone backend's locator IS that string — see push's rclone section above);
-      an explicit --locator still wins if both are given.
+      an explicit --locator still wins if both are given. A locator/--remote with
+      no object at it fails with a clean "no object at <locator>" error (#539) —
+      not rclone's own raw, 3x-repeated retry-loop text (which used to mislabel a
+      missing FILE as a missing "directory").
       Authenticity (#214): --sig-locator <id> (or the 6th --from-locator-file field,
       read automatically) ALSO fetches the "<in>.minisig" sidecar push uploaded, into
       "<out>.minisig" — best-effort, never fails the pull itself (restore/verify treat a
@@ -1176,7 +1201,15 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
 
   cypher-brain schedule uninstall
       Unregister the trigger and remove the generated runner/plist/cron entry (idempotent;
-      logs, snapshots and index.tsv are kept — they are your data).
+      logs, snapshots and index.tsv are kept — they are your data). macOS: if the launchd
+      plist this home recorded as installed (schedule.json's trigger.path, exactly where
+      install would have written it) is ALREADY gone — deleted manually, or by another
+      tool — that is reported as a ⚠ warning ("was already missing on uninstall") rather
+      than silently dropped from the "removed:" list, still exits 0 either way, the end
+      state (no plist, no bookkeeping) is reached regardless (#529). A plist found at a
+      DIFFERENT recorded path (CYPHER_BRAIN_LAUNCHD_DIR changed since install, or a
+      pre-#114 legacy scheme) is a "legacy launchd plist" removal instead, never a drift
+      warning — that file is still right where it was left.
 
 Config file: every setting below can also live in $CYPHER_BRAIN_HOME/config.env (KEY=value
      per line, "#" comments) instead of the environment — the same names, one place, read by
