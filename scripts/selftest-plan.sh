@@ -268,4 +268,17 @@ fi
 grep -q "plan was built for --remote" "$TMP/remote-mismatch.err" || { echo "[FAIL] wrong remote-mismatch message"; cat "$TMP/remote-mismatch.err"; exit 1; }
 echo "[PASS] remote-mismatch guard fired"
 
+# positive control: #468 — `estimate --out` with --backend rclone but NO --remote must
+# refuse up front (a plan with remote: null can never validate against push --plan,
+# which always has a real --remote for that backend), rather than silently writing a
+# dead-end plan.json.
+if cb estimate --in "$TMP/snap.age" --backend rclone --out "$TMP/rclone-no-remote-plan.json" >"$TMP/rclone-no-remote.out" 2>"$TMP/rclone-no-remote.err"; then
+  echo "[FAIL] estimate --out --backend rclone without --remote unexpectedly succeeded"; exit 1
+fi
+grep -q -- "--remote <name>:<path> required" "$TMP/rclone-no-remote.err" || {
+  echo "[FAIL] wrong missing-remote message"; cat "$TMP/rclone-no-remote.err"; exit 1
+}
+[ -e "$TMP/rclone-no-remote-plan.json" ] && { echo "[FAIL] a plan.json was written despite the refusal"; exit 1; }
+echo "[PASS] estimate --out --backend rclone without --remote refuses cleanly (#468)"
+
 echo "== plan/apply selftest: ALL PASS =="
