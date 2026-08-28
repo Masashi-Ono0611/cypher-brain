@@ -4,10 +4,17 @@ name: Publish
 # trusted publishing (no token, no manual 2FA), then create the GitHub Release.
 # The package must have this repo + `publish.yml` registered as a Trusted
 # Publisher on npmjs.com (one-time setup).
+#
+# workflow_dispatch (#599): this pipeline had never run end to end (no v* tag has
+# ever been pushed), so its build/gate/publish logic was entirely unverified. A
+# manual run exercises everything up through `npm publish --dry-run` -- build,
+# verify gate, tarball smoke -- without cutting a real tag/release or touching the
+# registry or GitHub Releases.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch: {}
 
 permissions:
   contents: write # create the GitHub Release
@@ -19,10 +26,21 @@ concurrency:
 
 jobs:
   publish:
+    # A tag push is inherently restricted to the tag it targets. workflow_dispatch
+    # has no such restriction -- the UI/API lets the caller pick ANY ref -- and this
+    # job runs with contents:write + id-token:write for its entire duration (every
+    # step, including bun/npm install's lifecycle scripts, before the --dry-run
+    # guard is ever reached). Pinning manual runs to main keeps that elevated
+    # access on the same trust boundary a real release already relies on: whoever
+    # can get code into main can already cut a real tag against it (multi-model
+    # review finding, #599).
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # the release itself authenticates via GH_TOKEN below
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -37,7 +55,14 @@ jobs:
           node-version: 22
           registry-url: "https://registry.npmjs.org"
 
-      - run: npm install -g npm@latest # OIDC trusted publishing needs npm >= 11.5.1
+      # Pinned: this is the highest-privilege workflow (the one that actually
+      # publishes releases). It used to be that the one unpinned line here only
+      # ran at real-release time, where an unexpected npm behavior change would
+      # surface with no routine CI coverage to catch it first -- the
+      # workflow_dispatch dry-run path above now exercises it on manual runs too.
+      # 12.0.2 is the current npm release, verified working locally; OIDC trusted
+      # publishing needs npm >= 11.5.1.
+      - run: npm install -g npm@12.0.2
       - run: bun install --frozen-lockfile
 
       # selftest-interop.sh asserts CLI<->age-binary format interop; without
@@ -45,8 +70,10 @@ jobs:
       - name: install age (interop assertion only)
         run: sudo apt-get update && sudo apt-get install -y age
 
-      # Guard: never release a version the tag does not match.
+      # Guard: never release a version the tag does not match. Only meaningful for
+      # an actual tag push -- a workflow_dispatch run has no tag to check against.
       - name: Verify tag matches package.json version
+        if: github.event_name == 'push'
         run: |
           PKG="$(node -p "require('./package.json').version")"
           TAG="${GITHUB_REF_NAME#v}"
@@ -67,16 +94,23 @@ jobs:
       # unaffected.
       #
       # Prerelease tags (v1.2.3-rc1) go under the `next` dist-tag so they never
-      # become `npm install`'s default; only GA tags take `latest`.
+      # become `npm install`'s default; only GA tags take `latest`. A manual
+      # workflow_dispatch run (#599) takes neither branch -- `--dry-run` packs the
+      # tarball and reports what would publish without contacting the registry.
       - name: Release to the npm registry
         run: |
-          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            NPM_CONFIG_PROVENANCE=false npm publish --dry-run
+          elif [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             NPM_CONFIG_PROVENANCE=false npm publish --tag next
           else
             NPM_CONFIG_PROVENANCE=false npm publish
           fi
 
+      # No tag exists on a workflow_dispatch run, so there is nothing to attach a
+      # GitHub Release to -- the dry-run publish step above is the last one for it.
       - name: Create GitHub Release
+        if: github.event_name == 'push'
         run: |
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes --prerelease
