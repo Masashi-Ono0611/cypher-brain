@@ -5,8 +5,10 @@
 Fixes #502: `pull()`'s `--from-locator-file` handling reimplemented the same
 read-file/find-first-non-comment-line/split-on-tab parsing that
 `readSavedLocatorLine()` already provides (used by `push --skip-unchanged`), instead
-of calling it. Now reuses the shared parser; the distinct "no such locator file"
-(missing file) and "must contain ..." (malformed line) error messages are unchanged.
+of calling it. Now reuses the shared parser; the "no such locator file" (missing
+file) and "must contain ..." (malformed line) error messages both still fire on the
+same conditions — only the malformed-line message's trailing debug detail changed,
+from echoing the raw offending line to echoing the parsed fields.
 
 Fixes #510: `pushCore`'s self-contained `--skip-unchanged` three-signal comparison
 (content digest / recipients fingerprint / signing state) is now its own
