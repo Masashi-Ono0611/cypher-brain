@@ -76,9 +76,11 @@ export async function resolveProfilePaths(o: CliOptions): Promise<string[]> {
       return o2bPaths(o);
     default:
       // Unreachable: assertKnownProfile() above already refused anything not in
-      // PROFILE_NAMES. This default only exists to satisfy TS's return-type check on
-      // the switch (o.profile is typed `string | undefined`, not a literal union of
-      // PROFILE_NAMES, so the compiler can't see the cases are exhaustive on its own).
+      // PROFILE_NAMES (with its own did-you-mean suggestion, shared with #463 — see
+      // that function's comment). This default only exists to satisfy TS's return-type
+      // check on the switch (o.profile is typed `string | undefined`, not a literal
+      // union of PROFILE_NAMES, so the compiler can't see the cases are exhaustive on
+      // its own).
       throw new Error(`unknown profile "${o.profile}" — valid profiles: ${PROFILE_NAMES.join(', ')}`);
   }
 }

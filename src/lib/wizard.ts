@@ -486,7 +486,30 @@ export async function init(_o: CliOptions): Promise<void> {
       console.log('\n== 6/7: what to back up ==');
       console.log(`Available profiles (one-flag source presets): ${PROFILE_NAMES.join(', ')}. Or "none" to point at`);
       console.log('directories yourself (the same as passing --dir manually to snapshot later).');
-      const profileChoice = await askLine(`Profile [none/${PROFILE_NAMES.join('/')}] (default none)`, 'none');
+      // #462: this used to be askLine() free text, so a single typo (e.g. "obsidan")
+      // threw AFTER steps 1-5 had already written the primary identity, the offline
+      // backup keypair, and the signing keypair to disk — and the catch block a few
+      // hundred lines down rolls ALL of that back on any throw from inside this try,
+      // since from its perspective an invalid answer here is indistinguishable from a
+      // declined-consent abort. The backend step below already solved exactly this
+      // shape of problem with askSelect() (#396 Phase B, see its own doc comment): a
+      // clack select() menu can only ever return one of the `value`s it was given, so
+      // there is no "invalid answer" path left for this step to throw on at all — the
+      // typo becomes structurally impossible instead of caught-and-rolled-back.
+      const PROFILE_HINTS: Record<string, string> = {
+        'claude-code': 'every ~/.claude/projects/*/memory/ dir plus ~/.claude/CLAUDE.md',
+        obsidian: 'an Obsidian vault directory (needs --vault at the next prompt)',
+        'chatgpt-export': 'the official ChatGPT data-export .zip, as-is',
+        o2b: 'an Open Second Brain bank-export bundle, as-is',
+      };
+      const profileChoice = await askSelect(
+        'Profile (what to back up)',
+        [
+          { value: 'none', label: 'none', hint: 'pick directories yourself, like passing --dir manually' },
+          ...PROFILE_NAMES.map((name) => ({ value: name, label: name, hint: PROFILE_HINTS[name] })),
+        ],
+        'none',
+      );
       const snapshotOpts: CliOptions = { dirs: [], tables: [], recipients: [] };
       if (profileChoice === 'none') {
         const dirsInput = await askLine('Directory path(s) to back up, comma-separated (at least one, required)');
@@ -499,7 +522,11 @@ export async function init(_o: CliOptions): Promise<void> {
             'no directory given — "cypher-brain init" cannot produce an empty snapshot; re-run and pass at least one path, or pick a profile',
           );
         snapshotOpts.dirs = dirs;
-      } else if (PROFILE_NAMES.includes(profileChoice)) {
+      } else {
+        // askSelect()/clack's select() can only return one of the `value`s it was
+        // given, and every value above besides 'none' came straight from
+        // PROFILE_NAMES itself — so this is always one of the known profile names,
+        // no re-validation needed (unlike the old free-text prompt).
         snapshotOpts.profile = profileChoice;
         if (profileChoice === 'obsidian')
           snapshotOpts.vault = expandHome(await askLine('Path to your Obsidian vault (must contain .obsidian/)'));
@@ -509,8 +536,6 @@ export async function init(_o: CliOptions): Promise<void> {
           snapshotOpts.export = expandHome(
             await askLine('Path to the o2b bank-export bundle ("o2b brain bank-export --out <path>.json")'),
           );
-      } else {
-        throw new Error(`unknown profile "${profileChoice}" — valid choices: none, ${PROFILE_NAMES.join(', ')}`);
       }
 
       // gbrain (this project's headline use case — README/MANAGEMENT.md) stores its

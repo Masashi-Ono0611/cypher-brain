@@ -227,5 +227,26 @@ printf '%s' "$ERR" | grep -q "claude-code, obsidian, chatgpt-export, o2b" \
   || { echo "[FAIL] unknown-profile error does not list valid profiles"; echo "$ERR"; exit 1; }
 echo "[PASS] unknown profile fails, listing the valid names"
 
+echo "== #463: a near-miss --profile typo gets a did-you-mean suggestion, not just the bare list =="
+# #425 already generalized nearestName()/didYouMean() (src/lib/suggest.ts) across
+# --backend, --chain, schedule subcommands and --level; #463 was the one direct-CLI
+# validator it missed — resolveProfilePaths()'s own default branch (profiles.ts).
+# claude-cod -> claude-code and obsidan -> obsidian are both single-edit-distance,
+# exactly what nearestName() is built to catch.
+set +e
+ERR=$(cb snapshot --profile claude-cod --out "$TMP/typo1.age" 2>&1); RC=$?
+set -e
+[ "$RC" != "0" ] || { echo "[FAIL] --profile claude-cod was accepted"; exit 1; }
+printf '%s' "$ERR" | grep -q "did you mean claude-code?" \
+  || { echo "[FAIL] --profile claude-cod did not suggest claude-code"; echo "$ERR"; exit 1; }
+
+set +e
+ERR=$(cb snapshot --profile obsidan --out "$TMP/typo2.age" 2>&1); RC=$?
+set -e
+[ "$RC" != "0" ] || { echo "[FAIL] --profile obsidan was accepted"; exit 1; }
+printf '%s' "$ERR" | grep -q "did you mean obsidian?" \
+  || { echo "[FAIL] --profile obsidan did not suggest obsidian"; echo "$ERR"; exit 1; }
+echo "[PASS] a near-miss --profile typo gets a did-you-mean suggestion (#463)"
+
 echo
 echo "PROFILES SELFTEST PASS"
