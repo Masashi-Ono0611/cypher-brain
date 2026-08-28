@@ -113,6 +113,14 @@ if printf '%s' "$NOWAIT_ERR" | grep -q -- '--wait has no effect'; then
 fi
 echo "[PASS] no --wait warning when --wait is unset/0"
 
+echo "== issue #465: --wait 0 explicit (same as unset) does not warn =="
+EXPLICIT0_ERR=$(cb pull --locator "$LOC" --backend file --out "$TMP/wait-explicit0.age" --wait 0 2>&1); EXPLICIT0_RC=$?
+[ "$EXPLICIT0_RC" = "0" ] || { echo "[FAIL] pull with --wait 0 should succeed"; echo "$EXPLICIT0_ERR"; exit 1; }
+if printf '%s' "$EXPLICIT0_ERR" | grep -q -- '--wait has no effect'; then
+  echo "[FAIL] unexpected --wait warning with an explicit --wait 0"; echo "$EXPLICIT0_ERR"; exit 1
+fi
+echo "[PASS] no --wait warning when --wait is explicitly 0"
+
 echo "== issue #93: a locator outside FILE_DIR must be rejected (path traversal / arbitrary local file read) =="
 touch "$TMP/outside.age"
 set +e
