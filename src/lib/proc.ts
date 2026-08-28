@@ -44,6 +44,11 @@ export function run(cmd: string, args: string[], { input, timeoutMs, onStderrLin
     const doneChild = () => ACTIVE_CHILDREN.delete(p);
     let out = '',
       err = '';
+    // Set when the stdin pipe errors (EPIPE from a child that exited before consuming
+    // its input) — a child that then happens to exit 0 without having read all of
+    // `input` must NOT read as success (multi-model review finding, #602): the exit
+    // code alone can't tell "read everything" from "exited early and we never noticed".
+    let stdinFailed: Error | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     if (timeoutMs) {
       // a stuck child (e.g. a pg_dump call that never returns) must not hang us
@@ -98,9 +103,19 @@ export function run(cmd: string, args: string[], { input, timeoutMs, onStderrLin
         onStderrLine(pending);
         pending = '';
       }
-      code === 0 ? res({ out, err }) : rej(new Error(`${cmd} exited ${code}: ${err.trim() || out.trim()}`));
+      if (code === 0 && !stdinFailed) return res({ out, err });
+      if (code === 0)
+        return rej(new Error(`${cmd}: stdin write failed before it read all input: ${stdinFailed?.message}`));
+      rej(new Error(`${cmd} exited ${code}: ${err.trim() || out.trim()}`));
     });
     if (input) {
+      // EPIPE when the child exits before consuming its input — swallow on the pipe
+      // end (uncaught otherwise, same hazard crypt.ts's decryptToChild() already
+      // guards) but remember it, so an exit-0 child that never actually finished
+      // reading doesn't get reported as success by the close handler above.
+      p.stdin?.on('error', (e) => {
+        stdinFailed = e;
+      });
       p.stdin?.write(input);
       p.stdin?.end();
     }

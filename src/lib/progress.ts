@@ -12,6 +12,7 @@
 //  - IT WRITES WITH console.error, NOT process.stderr.write. mcp.ts rebinds console.error
 //    and captures it; a direct write bypasses that and never reaches the MCP client, which
 //    is the caller least able to go look at a terminal instead.
+import { installEpipeGuard } from './ui.js';
 import { fmtBytes } from './util.js';
 
 /** How often to report, by whether a human is watching. */
@@ -55,7 +56,15 @@ export const progressIntervalMs = (): number => (process.stderr.isTTY ? TTY_INTE
 export function progressReporter(component: string, opts: ProgressOpts = {}): ProgressReporter {
   const now = opts.now ?? (() => Date.now());
   const interval = opts.intervalMs ?? progressIntervalMs();
-  const write = opts.write ?? ((line: string) => console.error(line));
+  // console.error is a raw stderr write under the hood — a downstream reader that
+  // closes its end early (e.g. `| head`) turns an uncaught EPIPE into a process
+  // crash mid-transfer without this guard (same hazard as ui.ts's printMascot()).
+  const write =
+    opts.write ??
+    ((line: string) => {
+      installEpipeGuard();
+      console.error(line);
+    });
 
   // Anchored at construction, not at the first sample: anchoring later would leave the
   // first emitted line with zero elapsed time and so no rate and no ETA — and at the 30s
