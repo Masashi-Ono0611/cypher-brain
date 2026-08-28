@@ -421,6 +421,16 @@ if grep -qi "did you mean" "$TMP/enum-level-unrelated.err"; then
 fi
 echo "[PASS] dist enum-valued flag typos: '--level remtoe'/'--backend fille'/'--chain tona' suggest the real value, '--level bogus' correctly gets no spurious suggestion"
 
+# #537: nearestName()'s editDistance() moved from plain to (restricted)
+# Damerau-Levenshtein so an adjacent-letter TRANSPOSITION (not just a
+# substitution like 'remtoe' above) also gets a suggestion — 'quikc' (the
+# 'ck'/'kc' swap in 'quick') used to fall outside the 1-edit threshold and
+# get no suggestion at all, unlike a same-distance case typo ('QUICK').
+node "$DIST" verify --level quikc --in "$TMP/does-not-exist.age" > /dev/null 2> "$TMP/enum-level-transposed.err"
+grep -Fq 'did you mean --level quick?' "$TMP/enum-level-transposed.err" \
+  || { echo "[FAIL] '--level quikc' (transposition typo) did not suggest '--level quick'"; cat "$TMP/enum-level-transposed.err"; exit 1; }
+echo "[PASS] dist enum-valued flag transposition typo: '--level quikc' suggests '--level quick' (#537)"
+
 # (k) estimate --json (#268): all seven documented keys are ALWAYS present, whichever
 # backend was asked about — the free ones used to drop unit/approx_ar/usd_estimate
 # entirely, so `est.unit` was undefined and the caller could not tell "no unit" from
