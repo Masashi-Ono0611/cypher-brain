@@ -270,6 +270,15 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     source:
       'src/lib/snapshot.ts (snapshot, "--sign-identity … does not exist — refusing to write an unsigned snapshot", #601)',
   },
+  // Prefix-only, not "--sign-recipient .*does not exist": the interpolated path sits
+  // between the two invariant halves of this message, and scripts/selftest-error-
+  // codes.mjs's literal-extraction only understands plain substrings — a wildcard
+  // spanning the path makes it fail closed with "cannot extract literals" (verified),
+  // not silently skip. The trade-off (same one CB-E019's "no wallet at " prefix and
+  // CB-E020's "no recipient at " prefix already accept) is a false-positive risk if some
+  // future unrelated throw site's message also happened to contain this literal; today it
+  // does not (grep confirms only restore.ts's two "--sign-recipient … does not exist"
+  // throw sites contain it).
   {
     code: 'CB-E023',
     title: '--sign-recipient path does not exist',
