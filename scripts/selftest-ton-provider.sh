@@ -115,6 +115,15 @@ export CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL="http://127.0.0.1:$MYTONPROVI
 # Address.parse(...).toRawString() round-trips it unchanged) — any OTHER address
 # (i.e. the deployed contract's own address, polled by waitForContractActive())
 # keeps returning the generous fixed balance, so that polling path is unaffected.
+# Issue #479: wallet.ts's tonWalletBalance() queries the PLAIN /v2/accounts/<addr>
+# endpoint (no blockchain/ prefix — ton-provider.ts's fetchAccountState() above is the
+# only caller of the blockchain/ one). This mock distinguishes the two prefixes so a
+# never-active-wallet balance check can be exercised deterministically: the unfunded
+# flag file's CONTENTS name a single address to answer 'nonexist'/balance:0 for on that
+# plain endpoint (matching tonapi.io's real /v2/accounts response for an address that
+# has never sent/received a transaction, confirmed directly against the live API), while
+# any other /v2/accounts/<addr> query — and every /v2/blockchain/accounts/<addr> one —
+# keeps falling through to the generic active/frozen/low-balance handling below.
 cat > "$TMP/mock-tonapi.mjs" <<'MOCKEOF'
 import { createServer } from 'node:http';
 import { existsSync, appendFileSync, readFileSync } from 'node:fs';
@@ -125,6 +134,8 @@ const frozenAddrFlagPath = process.argv[5]; // if present, its CONTENTS name an 
 const seqnoFilePath = process.argv[6]; // if present, its CONTENTS are the seqno to answer /methods/seqno with (default 0)
 const broadcastLogPath = process.argv[7]; // every accepted POST /v2/blockchain/message body is appended here, one BOC per line
 const neverActiveFlagPath = process.argv[8]; // if present, every NON-owner address (i.e. a just-deployed contract) reports 'uninitialized' forever — issue #480's waitForContractActive() timeout positive control
+const unfundedAddrFlagPath = process.argv[9]; // if present, its CONTENTS name an address to report 'nonexist'/balance:0 for on plain /v2/accounts/<addr>
+
 createServer((req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (url.pathname === '/v2/rates') {
@@ -149,6 +160,15 @@ createServer((req, res) => {
     res.end(JSON.stringify({ success: true, exit_code: 0, decoded: { state: Number(seqno) } }));
     return;
   }
+  const plainAccountMatch = url.pathname.match(/^\/v2\/accounts\/([^/]+)$/);
+  if (plainAccountMatch) {
+    const unfundedAddr = unfundedAddrFlagPath && existsSync(unfundedAddrFlagPath) ? readFileSync(unfundedAddrFlagPath, 'utf8').trim() : null;
+    if (unfundedAddr && plainAccountMatch[1] === unfundedAddr) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ address: unfundedAddr, balance: 0, status: 'nonexist' }));
+      return;
+    }
+  }
   const frozenAddr = frozenAddrFlagPath && existsSync(frozenAddrFlagPath) ? readFileSync(frozenAddrFlagPath, 'utf8').trim() : null;
   const isFrozenTarget = frozenAddr && url.pathname.includes(frozenAddr);
   const lowBalance = lowBalanceFlagPath && existsSync(lowBalanceFlagPath) && url.pathname.includes(ownerAddr);
@@ -162,8 +182,9 @@ FROZEN_ADDR_FLAG="$TMP/frozen-addr-flag"
 SEQNO_FILE="$TMP/seqno-value"
 BROADCAST_LOG="$TMP/broadcast-log"
 NEVER_ACTIVE_FLAG="$TMP/never-active-flag"
+UNFUNDED_ADDR_FLAG="$TMP/unfunded-addr-flag"
 TONAPI_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" &
+node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" "$UNFUNDED_ADDR_FLAG" &
 TONAPI_PID=$!
 export CYPHER_BRAIN_TON_TONAPI_URL="http://127.0.0.1:$TONAPI_PORT"
 
@@ -458,6 +479,23 @@ echo "[PASS] wallet create --chain ton no-clobber guard fired, original mnemonic
 BAL=$(cb wallet balance --chain ton --wallet "$TMP/ton-wallet.json" --json)
 echo "$BAL" | grep -q '"balance_nanoton":5000000000' || { echo "[FAIL] wallet balance --chain ton did not read the mock tonapi balance: $BAL"; exit 1; }
 echo "[PASS] wallet balance --chain ton reads the (mocked) on-chain balance"
+
+# Issue #479: a freshly generated, never-funded wallet must read as a clean zero
+# balance, not a raw HTTP 404 — exactly the case --help documents as the primary use
+# case ("no funds needed"). Uses its OWN separate wallet (not $TMP/ton-wallet.json,
+# which every OTHER test in this script relies on being reported 'active') so marking
+# it 'nonexist' in the mock cannot affect anything else here.
+cb wallet create --chain ton --out "$TMP/ton-wallet-fresh.json" > /dev/null
+FRESH_ADDR=$(cb wallet address --chain ton --wallet "$TMP/ton-wallet-fresh.json")
+printf '%s' "$FRESH_ADDR" > "$UNFUNDED_ADDR_FLAG"
+FRESH_BAL=$(cb wallet balance --chain ton --wallet "$TMP/ton-wallet-fresh.json" --json)
+echo "$FRESH_BAL" | grep -q '"balance_nanoton":0' || { echo "[FAIL] a never-active wallet's balance did not read as 0: $FRESH_BAL"; exit 1; }
+echo "$FRESH_BAL" | grep -q '"status":"nonexist"' || { echo "[FAIL] a never-active wallet's status was not 'nonexist': $FRESH_BAL"; exit 1; }
+echo "[PASS] wallet balance --chain ton --json reads a never-active wallet as a clean 0, not an error (#479)"
+FRESH_BAL_PLAIN=$(cb wallet balance --chain ton --wallet "$TMP/ton-wallet-fresh.json")
+echo "$FRESH_BAL_PLAIN" | grep -q '^balance : 0 nanoTON' || { echo "[FAIL] a never-active wallet's plain balance output was not a clean 0: $FRESH_BAL_PLAIN"; exit 1; }
+echo "[PASS] wallet balance --chain ton (plain output) reads a never-active wallet as a clean 0, not an error (#479)"
+rm -f "$UNFUNDED_ADDR_FLAG"
 
 # Raw "workchain:hex" form — what ton-provider.ts's fetchAccountState()/fetchWalletSeqno()
 # key their tonapi URLs on (Address#toRawString()) — needed to target the frozen-wallet
