@@ -334,6 +334,13 @@ echo "[PASS] P2P pull round-trip"
 cb verify --in "$TMP/got.age" >/dev/null
 echo "[PASS] pulled ciphertext verifies"
 
+echo "== issue #496: --wait warns (but does not error) for --backend ton-provider, same as file (#465) =="
+WAIT_ERR=$(cb pull --backend ton-provider --locator "$LOC" --out "$TMP/wait-warn.age" --wait 2 2>&1); WAIT_RC=$?
+[ "$WAIT_RC" = "0" ] || { echo "[FAIL] pull with --wait on ton-provider backend should still succeed when the bag is reachable"; echo "$WAIT_ERR"; exit 1; }
+[ "$(sha "$TMP/wait-warn.age")" = "$ORIG" ] || { echo "[FAIL] --wait pull returned wrong bytes"; exit 1; }
+printf '%s' "$WAIT_ERR" | grep -q -- '--wait has no effect for --backend ton-provider' || { echo "[FAIL] no --wait/ton-provider warning printed"; echo "$WAIT_ERR"; exit 1; }
+echo "[PASS] --wait on the ton-provider backend (which delegates to ton.ts's p2pFetch, throwing a plain Error on a not-yet-retrievable bag) warns"
+
 echo "== positive control: malformed locator is REJECTED (shape guard fires) =="
 if cb pull --backend ton-provider --locator "ton-provider:v1:not-a-bag-id" --out "$TMP/never.age" 2>"$TMP/bad-loc.err"; then
   echo "[FAIL] malformed locator was accepted"; exit 1
