@@ -305,6 +305,83 @@ MANIFEST
   echo "[PASS] a component archive that fails to expand for a non-collision reason also makes the overall restore exit non-zero"
 fi
 
+echo "== #527 (multi-model review finding): a STALE pre-existing manifest.json must not drive auto-expand -- restore reads the manifest it JUST decrypted, not whatever's already in --out-dir =="
+# Codex review finding on the first cut of this fix: expandComponents() used to re-read
+# manifest.json back OFF DISK from --out-dir, AFTER the outer merge -- but a stale,
+# unrelated manifest.json is exactly what the general no-clobber promise deliberately
+# leaves untouched (same as the "#112 regression" test above). Restoring a SECOND,
+# DIFFERENT snapshot into an out-dir that already holds a first snapshot's own manifest.json
+# must still correctly auto-expand the second snapshot's own component -- keyed off the
+# manifest THIS restore itself just decrypted, never a stale bystander already on disk.
+MANIFEST_A_SRC="$TMP/manifest-a-src"; mkdir -p "$MANIFEST_A_SRC"
+printf 'component A content\n' > "$MANIFEST_A_SRC/note.txt"
+cb snapshot --dir "$MANIFEST_A_SRC" --out "$TMP/manifest-a.age" >/dev/null
+
+MANIFEST_B_SRC="$TMP/manifest-b-src"; mkdir -p "$MANIFEST_B_SRC"
+printf 'component B content\n' > "$MANIFEST_B_SRC/note.txt"
+cb snapshot --dir "$MANIFEST_B_SRC" --out "$TMP/manifest-b.age" >/dev/null
+
+STALE_MANIFEST_OUT="$TMP/stale-manifest-out"
+cb restore --in "$TMP/manifest-a.age" --out-dir "$STALE_MANIFEST_OUT" >/dev/null
+# out-dir now holds snapshot A's own manifest.json (+ its own component + expansion).
+# Restoring snapshot B's own DIFFERENTLY-NAMED component (manifest-b-src.tar.gz) does NOT
+# collide with anything findStaleComponentArchives() would refuse -- manifest.json itself
+# DOES collide (A's vs B's content) and is correctly left untouched by the general
+# no-clobber promise. The bug this test guards against: expandComponents() using THAT
+# stale (A's) manifest to decide what to auto-expand, silently missing B's own freshly-
+# restored component entirely despite it being written to disk correctly.
+cb restore --in "$TMP/manifest-b.age" --out-dir "$STALE_MANIFEST_OUT" >/dev/null
+test -f "$STALE_MANIFEST_OUT/manifest-b-src.tar.gz" || { echo "FAIL: snapshot B's own component archive was not written"; exit 1; }
+diff -r "$MANIFEST_B_SRC" "$STALE_MANIFEST_OUT/expanded/001-$(basename "$MANIFEST_B_SRC")-$(src_digest "$MANIFEST_B_SRC")/$(basename "$MANIFEST_B_SRC")" \
+  || { echo "FAIL: snapshot B's component was not auto-expanded -- expandComponents() likely used the STALE manifest.json from snapshot A instead of the freshly-decrypted one"; find "$STALE_MANIFEST_OUT/expanded" 2>&1; exit 1; }
+echo "[PASS] restoring a second, different snapshot into an out-dir with a stale manifest.json still correctly auto-expands using the manifest THIS restore just decrypted"
+
+echo "== #527 (multi-model review finding): a manifest that NAMES a component with no backing archive must not make a pre-existing same-named file look safe to expand =="
+# Codex review finding: findStaleComponentArchives() originally skipped comparing a
+# candidate component when scratchDir had no backing archive for it (only possible via a
+# forged/mismatched manifest -- a legitimate manifest and its own archive are always
+# written together by snapshot()). That let a pre-existing, VALID tar.gz already sitting in
+# --out-dir survive the merge untouched and then be blindly expanded by expandComponents()
+# under the forged manifest's own (attacker-chosen) source path -- the exact silent-wrong-
+# data outcome #527 is about, reached via a different vector than the direct collision case.
+if ! command -v age >/dev/null 2>&1; then
+  echo "[SKIP] phantom-component hardening test: no \`age\` binary on PATH (CI installs it; install age locally to exercise this)"
+else
+  PHANTOM_LEFTOVER_SRC="$TMP/phantom-leftover-src"; mkdir -p "$PHANTOM_LEFTOVER_SRC"
+  printf 'leftover unrelated content, a VALID tar.gz, already sitting in --out-dir\n' > "$PHANTOM_LEFTOVER_SRC/other.txt"
+  PHANTOM_OUT="$TMP/phantom-out"; mkdir -p "$PHANTOM_OUT"
+  tar czf "$PHANTOM_OUT/phantom.tar.gz" -C "$TMP" "$(basename "$PHANTOM_LEFTOVER_SRC")"
+  PHANTOM_SHA_BEFORE=$(shasum -a 256 "$PHANTOM_OUT/phantom.tar.gz" | cut -d' ' -f1)
+
+  PHANTOM_STAGE="$TMP/phantom-stage"; mkdir -p "$PHANTOM_STAGE"
+  cat > "$PHANTOM_STAGE/manifest.json" <<MANIFEST
+{
+  "tool": "cypher-brain",
+  "schema": 1,
+  "host": "forged-test-fixture",
+  "created_at": "2026-01-01T00:00:00.000Z",
+  "content_digest": "0",
+  "recipients_fingerprint": "0",
+  "components": [
+    { "name": "phantom.tar.gz", "kind": "dir", "source": "/attacker/chosen/path", "content_digest": "0", "captured_at": "2026-01-01T00:00:00.000Z" }
+  ]
+}
+MANIFEST
+  # NOTE: this bundle deliberately does NOT include a "phantom.tar.gz" file -- only
+  # manifest.json itself -- simulating a manifest that names a component whose own archive
+  # never actually landed in scratchDir.
+  ( cd "$PHANTOM_STAGE" && tar -cf - manifest.json ) | age -r "$(cat "$TMP/keys/recipient.txt")" -o "$TMP/phantom.age"
+  set +e
+  PHANTOM_ERR=$(cb restore --in "$TMP/phantom.age" --out-dir "$PHANTOM_OUT" 2>&1); PHANTOM_RC=$?
+  set -e
+  [ "$PHANTOM_RC" != "0" ] || { echo "FAIL: restore into an out-dir with a pre-existing file at a PHANTOM component's name exited 0"; echo "$PHANTOM_ERR"; exit 1; }
+  printf '%s' "$PHANTOM_ERR" | grep -qF "phantom.tar.gz" || { echo "FAIL: refusal error does not name the phantom-component collision"; echo "$PHANTOM_ERR"; exit 1; }
+  test ! -d "$PHANTOM_OUT/expanded" || { echo "FAIL: component auto-expand ran despite the phantom-component refusal (would have expanded unrelated data under an attacker-chosen source label)"; exit 1; }
+  PHANTOM_SHA_AFTER=$(shasum -a 256 "$PHANTOM_OUT/phantom.tar.gz" | cut -d' ' -f1)
+  [ "$PHANTOM_SHA_BEFORE" = "$PHANTOM_SHA_AFTER" ] || { echo "FAIL: the pre-existing file at the phantom component's name was modified"; exit 1; }
+  echo "[PASS] a manifest naming a component with no backing archive refuses to treat a pre-existing same-named file as safe to expand"
+fi
+
 echo "== #181 hardening: a forged manifest component 'name' containing a path separator is refused, not followed (path-traversal guard) =="
 # age is public-key encryption -- anyone holding a recipient's PUBLIC key can construct
 # ciphertext encrypted to it, so a crafted manifest.json inside otherwise-valid

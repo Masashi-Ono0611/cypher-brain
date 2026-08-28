@@ -558,6 +558,18 @@ interface StaleComponentArchive {
 // byte-identical content at every colliding name, and must NOT start refusing just because
 // it is a re-run. Only a name whose on-disk content genuinely differs from what this
 // restore just decrypted counts as a collision.
+//
+// Known, accepted limitation (not this function's threat model — see the "manifest.json is
+// attacker-controlled data" note above for what IS): this check and the merge/expand steps
+// that follow it are not one atomic transaction, so a LOCAL process with write access to
+// --out-dir could in principle replace a file's content in the narrow window between this
+// hash comparison and expandComponents() later reading it back. Every no-clobber decision
+// elsewhere in this file (mergeNoClobber's own lstat-then-act, the symlink checks) has the
+// same class of gap; closing it everywhere would need real transactional isolation (a lock,
+// or re-verifying immediately before each read) this codebase does not otherwise attempt.
+// The threat model this whole file is built around is a hostile ARCHIVE/MANIFEST (age is
+// public-key encryption — anyone holding the recipient's public key can forge one), not a
+// concurrent local attacker racing your own restore process on your own machine.
 async function findStaleComponentArchives(scratchDir: string, outDir: string): Promise<StaleComponentArchive[]> {
   const manifestPath = join(scratchDir, 'manifest.json');
   if (!(await exists(manifestPath))) return []; // nothing to key this check off of
@@ -578,8 +590,6 @@ async function findStaleComponentArchives(scratchDir: string, outDir: string): P
   );
   const stale: StaleComponentArchive[] = [];
   for (const c of candidates) {
-    const s = join(scratchDir, c.name);
-    if (!(await exists(s))) continue; // this component's own archive did not land in scratchDir — nothing to compare
     const d = join(outDir, c.name);
     let dStat: Awaited<ReturnType<typeof lstat>> | undefined;
     try {
@@ -587,13 +597,27 @@ async function findStaleComponentArchives(scratchDir: string, outDir: string): P
     } catch {
       dStat = undefined;
     }
-    if (!dStat) continue; // nothing at `d` yet — mergeNoClobber() will rename() this in; no collision
+    if (!dStat) continue; // nothing at `d` yet — mergeNoClobber() will rename() this in (or nothing lands there at all); no collision
     // A pre-existing non-file at this exact name (a directory, a symlink, ...) is left to
     // mergeNoClobber()'s existing defenses (e.g. the pre-existing-symlink protection
     // scripts/selftest-restore-security.sh's "(p)" case exercises) rather than compared
     // here — a legitimate component archive is always a plain file, so anything else at
     // its name is already an anomaly those defenses are built for.
     if (!dStat.isFile()) continue;
+    const s = join(scratchDir, c.name);
+    if (!(await exists(s))) {
+      // The manifest THIS restore just decrypted names this component, but its own
+      // archive never actually landed in scratchDir (a forged/mismatched manifest —
+      // see this file's own "manifest.json is attacker-controlled data" note above; a
+      // legitimate manifest and its own archive are always written together by
+      // snapshot(), so this should never happen for a real snapshot). Something already
+      // AT this exact name in --out-dir cannot be verified as belonging to THIS restore
+      // at all — fail closed (flag it as stale) rather than let a missing fresh archive
+      // make an existing destination file look safe to blindly expand under this
+      // manifest's own (possibly forged) source attribution.
+      stale.push({ name: c.name });
+      continue;
+    }
     const sStat = await lstat(s);
     const same = sStat.size === dStat.size && (await sha256(s)) === (await sha256(d));
     if (!same) stale.push({ name: c.name });
@@ -663,24 +687,31 @@ function assertSupportedManifestSchema(manifestText: string, manifestPath: strin
 // partial failure instead of seeing exit 0 identical to a fully successful run. Returns
 // true when every candidate component that was actually attempted expanded cleanly
 // (including the trivial case of nothing to expand at all), false if at least one
-// attempted expansion failed — restoreImpl turns a false return into a non-zero exit,
-// AFTER letting every other step (including any remaining components, and --pg) still
-// run to completion.
-async function expandComponents(outDir: string): Promise<boolean> {
-  const manifestPath = join(outDir, 'manifest.json');
-  if (!(await exists(manifestPath))) return true; // nothing to key expansion off of
+// attempted expansion failed, OR the manifest itself could not be parsed (nothing could
+// be attempted at all, which is at least as bad) — restoreImpl turns a false return into
+// a non-zero exit, AFTER letting every other step (including any remaining components,
+// and --pg) still run to completion.
+//
+// `manifestText` is passed in by the caller (restoreImpl) rather than read from
+// `outDir/manifest.json` here — see restoreImpl's own #527 comment on why: reading it
+// back off disk, post-promotion, could pick up a STALE manifest.json a no-clobber merge
+// left untouched (the same posture as any other non-component file), rather than the one
+// THIS restore actually just decrypted.
+async function expandComponents(outDir: string, manifestText: string): Promise<boolean> {
   let components: RestoreManifestComponent[];
   try {
-    const parsed: unknown = JSON.parse(await readFile(manifestPath, 'utf8'));
+    const parsed: unknown = JSON.parse(manifestText);
     const raw = (parsed as { components?: unknown })?.components;
     components = Array.isArray(raw) ? raw : [];
   } catch (e) {
     console.error(
-      `warning: could not parse ${manifestPath} — skipping component auto-expand (${sanitizeForDisplay(errMsg(e))})`,
+      `warning: could not parse the restored manifest — skipping component auto-expand (${sanitizeForDisplay(errMsg(e))})`,
     );
-    return true; // a manifest restore itself already accepted (assertSupportedManifestSchema ran above)
-    // failing to re-parse it here is not a per-component expansion failure — nothing was
-    // ever attempted, so there is nothing to report as failed.
+    // #527: unlike the other early-returns below (nothing to do, or a defense-in-depth
+    // refusal that only skips ITS OWN piece), this means NOTHING could even be attempted —
+    // this restore's own manifest, the thing everything else here is keyed off of, could
+    // not be read. That is a real partial failure, not a no-op.
+    return false;
   }
   const candidates = components.filter(
     (c): c is { name: string; source: string } =>
@@ -981,6 +1012,22 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   }
   setActiveRestoreScratchDir(null);
 
+  // #527 (multi-model review finding): capture the manifest THIS restore itself just
+  // decrypted, straight out of `scratchDir`, before promotion/merge can leave --out-dir's
+  // OWN manifest.json untouched-and-stale (the same plain no-clobber posture as any other
+  // non-component file — see mergeNoClobber()'s doc comment / the "#112 regression" test).
+  // Re-reading manifest.json from --out-dir AFTER promotion (as this used to) would let a
+  // stale, pre-existing manifest.json — left behind by no-clobber exactly like that test
+  // exercises — drive BOTH the schema check below AND expandComponents()'s own component
+  // list, silently re-attributing whatever happens to already be on disk to THAT stale
+  // manifest's recorded sources instead of refusing (or correctly reporting) anything —
+  // precisely the class of bug findStaleComponentArchives() above exists to close, just
+  // one step further downstream. Captured once, in memory, and used for every step below
+  // instead of ever re-reading manifest.json off disk post-promotion.
+  const freshManifestText = (await exists(join(scratchDir, 'manifest.json')))
+    ? await readFile(join(scratchDir, 'manifest.json'), 'utf8')
+    : null;
+
   // #218 phase 3 — promote atomically, only now that extraction of an ALREADY-VETTED
   // archive fully succeeded: a fresh --out-dir gets the whole scratch tree renamed into
   // place in one step (rename() onto a non-existent destination path both creates it and
@@ -1019,9 +1066,7 @@ async function restoreImpl(o: CliOptions): Promise<void> {
     setActiveRestoreOutDir(null);
   }
   console.log(`restored components into ${o.out_dir}`);
-  const manifestPath = join(o.out_dir, 'manifest.json');
-  if (await exists(manifestPath)) {
-    const manifestText = await readFile(manifestPath, 'utf8');
+  if (freshManifestText !== null) {
     // #436: the raw manifest.json (tool/schema/host/created_at, every component's
     // original absolute SOURCE path, digests) used to print here UNCONDITIONALLY,
     // ahead of the actually-useful "expanded N component(s) into …" summary and (for
@@ -1032,9 +1077,11 @@ async function restoreImpl(o: CliOptions): Promise<void> {
     // and each component's original absolute source path ON that machine. --verbose
     // opts back into seeing it; assertSupportedManifestSchema still runs either way —
     // that guard's job (refuse a manifest schema this build can't safely read) has
-    // nothing to do with whether its text gets printed.
-    if (o.verbose) console.log(manifestText);
-    assertSupportedManifestSchema(manifestText, manifestPath);
+    // nothing to do with whether its text gets printed. Uses freshManifestText (captured
+    // above, straight from scratchDir) rather than re-reading --out-dir — see #527 note
+    // above.
+    if (o.verbose) console.log(freshManifestText);
+    assertSupportedManifestSchema(freshManifestText, join(o.out_dir, 'manifest.json'));
   }
   // Auto-expand --dir/--profile components (#181) — independent of --pg below: it only
   // ever touches components that carry a `source`, which pg_dump's never does, so the two
@@ -1042,7 +1089,9 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   // expand-components is the opt-out for anyone who wants exactly the pre-#181 behavior
   // (raw *.tar.gz files only, manual untar).
   let expandedCleanly = true;
-  if (!o.no_expand_components) expandedCleanly = await expandComponents(o.out_dir);
+  if (!o.no_expand_components && freshManifestText !== null) {
+    expandedCleanly = await expandComponents(o.out_dir, freshManifestText);
+  }
   if (o.pg) {
     const dump = join(o.out_dir, 'db.dump');
     if (!(await exists(dump))) throw new Error(`--pg given but no db.dump in snapshot`);
