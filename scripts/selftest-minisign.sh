@@ -385,5 +385,64 @@ else
     || { echo "[FAIL] cypher-brain's verify rejected a genuine minisign-generated signature"; cat "$TMP/verify-real.out"; exit 1; }
 fi
 
+# #532: `keygen --sign --force`'s completion message used to unconditionally claim
+# existing *.minisig files "stay verifiable against the public key above regardless" —
+# false, since --force overwrites sign-recipient.pub IN PLACE at its default path, so
+# verify's default lookup now sees the NEW key and OLD-key signatures correctly FAIL
+# against it. This isolated block (own HOME/SRC, independent of $HOME_DIR/$SK_HOME
+# above) proves the corrected message text matches what actually happens: a fresh
+# keygen --sign gives a plain backup reminder, a --force regen warns that the default
+# path now serves the NEW key and names the --sign-recipient escape hatch, and the
+# underlying crypto behavior (old sig fails by default, passes with the saved old
+# pubkey named explicitly) is exactly what the message describes.
+echo "== keygen --sign --force completion message accurately describes the default-path key swap (#532) =="
+MSG_HOME="$TMP/keys-msg532"
+MSG_SRC="$TMP/src-msg532"
+mkdir -p "$MSG_HOME" "$MSG_SRC"
+printf 'msg532 fixture\n' >"$MSG_SRC/note.txt"
+msgcb() { CYPHER_BRAIN_HOME="$MSG_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
+msgcb keygen >/dev/null
+
+msgcb keygen --sign >"$TMP/msg532-fresh.out" 2>&1
+grep -q 'Losing it means future snapshots can no longer be signed\.$' "$TMP/msg532-fresh.out" \
+  && echo "[PASS] fresh keygen --sign prints the plain backup reminder" \
+  || { echo "[FAIL] fresh keygen --sign message changed unexpectedly"; cat "$TMP/msg532-fresh.out"; exit 1; }
+grep -q 'stay verifiable' "$TMP/msg532-fresh.out" \
+  && { echo "[FAIL] fresh keygen --sign still makes the old unconditional 'stay verifiable' claim"; cat "$TMP/msg532-fresh.out"; exit 1; }
+echo "[PASS] fresh keygen --sign message has no unconditional old-key claim"
+
+# Save the OLD public key before regenerating — mirrors the issue's repro and the
+# message's own advice: this is the ONLY way an old .minisig stays verifiable.
+cp "$MSG_HOME/sign-recipient.pub" "$TMP/msg532-old-sign-recipient.pub"
+msgcb snapshot --dir "$MSG_SRC" --out "$TMP/msg532.age" >/dev/null
+msgcb verify --in "$TMP/msg532.age" --require-signature >/dev/null 2>&1 \
+  && echo "[PASS] msg532.age verifies against the key it was signed with" \
+  || { echo "[FAIL] msg532.age did not verify before key rotation"; exit 1; }
+
+msgcb keygen --sign --force >"$TMP/msg532-force.out" 2>&1
+grep -q -- '--force overwrote the previous signing key at its default path' "$TMP/msg532-force.out" \
+  && echo "[PASS] --force message states the default path was overwritten in place" \
+  || { echo "[FAIL] --force message missing the overwrite-in-place statement"; cat "$TMP/msg532-force.out"; exit 1; }
+grep -q 'will FAIL verification' "$TMP/msg532-force.out" \
+  && echo "[PASS] --force message warns old-key .minisig files will FAIL default verification" \
+  || { echo "[FAIL] --force message does not warn about FAIL verification"; cat "$TMP/msg532-force.out"; exit 1; }
+grep -q -- '--sign-recipient <path-to-saved-old-pubkey>' "$TMP/msg532-force.out" \
+  && echo "[PASS] --force message names the --sign-recipient escape hatch for a saved old pubkey" \
+  || { echo "[FAIL] --force message does not name the --sign-recipient escape hatch"; cat "$TMP/msg532-force.out"; exit 1; }
+grep -q 'stay verifiable.*regardless' "$TMP/msg532-force.out" \
+  && { echo "[FAIL] --force message still makes the old unconditional 'stay verifiable ... regardless' claim"; cat "$TMP/msg532-force.out"; exit 1; }
+echo "[PASS] --force message drops the old unconditional 'stay verifiable ... regardless' claim"
+
+# Prove the message matches reality (the crypto behavior itself is unchanged by #532 —
+# only the text was wrong): the OLD .minisig now FAILS the default-path verify, exactly
+# as the new message says, and PASSES again once told where the saved old pubkey is.
+if msgcb verify --in "$TMP/msg532.age" --require-signature >/dev/null 2>&1; then
+  echo "[FAIL] msg532.age still verifies against the default path after --force rotated the key"; exit 1
+fi
+echo "[PASS] old .minisig FAILs default-path verify after --force, matching the corrected message"
+msgcb verify --in "$TMP/msg532.age" --require-signature --sign-recipient "$TMP/msg532-old-sign-recipient.pub" >/dev/null 2>&1 \
+  && echo "[PASS] old .minisig verifies again via --sign-recipient pointed at the saved old pubkey" \
+  || { echo "[FAIL] old .minisig did not verify even with the saved old pubkey named explicitly"; exit 1; }
+
 echo
 echo "MINISIGN AUTHENTICITY SELFTEST PASS"
