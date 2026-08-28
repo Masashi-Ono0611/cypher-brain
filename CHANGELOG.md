@@ -49,6 +49,50 @@ project's major milestones so far, from the initial proof-of-concept to today.
   build, typecheck, and the full selftest suite (core, profiles, interop,
   storage, recovery, schedule, init, Arweave with and without optional
   deps) plus CLI and MCP smoke tests.
+- **`doctor` / `ledger` / `audit` commands.** Read-only diagnostics:
+  `doctor` is an environment health check (permissions, key/recipient
+  pairing, schedule state, ...) with a PASS/WARN/PARTIAL/FAIL verdict and a
+  health score; `ledger` is a cumulative cost report over every paid push's
+  receipt; `audit` verifies the hash-chained log of every push/restore/verify
+  run. All three support `--json`.
+- **`keygen --sign` and `keygen --pq`.** `--sign` generates a separate,
+  minisign-compatible Ed25519 signing keypair so `snapshot`/`push` can sign
+  ciphertext and `verify`/`pull` can check it, adding authenticity on top of
+  `age`'s confidentiality. `--pq` generates a post-quantum hybrid identity
+  (ML-KEM-768 + X25519) instead of plain X25519, to mitigate
+  "harvest now, decrypt later".
+- **`rclone` backend.** `push`/`pull --backend rclone` delegate to the
+  `rclone` binary, reaching any of its 70+ supported cloud providers without
+  cypher-brain implementing their auth/protocol itself.
+- **`ton` / `ton-provider` backends.** TON Storage support: `ton` seeds the
+  ciphertext bag from your own always-on box over SSH; `ton-provider` pays a
+  live third-party provider (mytonprovider.org) to hold it instead, signed
+  either via a Tonkeeper deeplink or, with a configured local TON wallet,
+  unattended.
+- **`did-you-mean` typo suggestions** (#425, #435, #463) for unknown
+  commands, flags, profile names, and `wallet`/backend arguments.
+- **OpenTelemetry tracing**, opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT`: every
+  CLI command and MCP tool call becomes an exported span, bounded to a short
+  timeout so an unreachable collector never delays a real command.
+- **`config.env` config file.** Every `CYPHER_BRAIN_*` setting can live in
+  `$CYPHER_BRAIN_HOME/config.env` instead of the environment, read by both
+  the CLI and the MCP server.
+- **`verify --level quick|remote|drill`.** restic/kopia-style verification
+  depth: `remote` re-fetches the artifact from storage before checking it;
+  `drill` additionally decrypts and extracts it as a full restore rehearsal.
+- **`.cypherbrainignore`.** A gitignore-syntax file that filters what
+  `snapshot --dir`/`--profile` archives, plus a `--dry-run` preview of the
+  include/exclude file list and its approximate size before anything is
+  written or paid for.
+- **Minimal-recovery Postgres snapshots.** `snapshot`/`schedule install
+  --pg-filter`/`--pg-exclude-table-data` pass through to `pg_dump`'s own
+  filtering flags, for a smaller recovery-focused snapshot alongside the
+  full one.
+- **`recovery-kit` command.** Regenerates the printable recovery kit `init`
+  prints once, pointed at the current latest push instead of the first one.
+- **`publish-latest` command.** Opt-in: points a `.ton` DNS domain's storage
+  record at the `ton` backend's latest bag id, so a fresh machine can
+  discover it by a human-memorable name.
 
 ### Fixed
 
