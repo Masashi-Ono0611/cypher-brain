@@ -184,7 +184,7 @@ export async function lookupIdempotencyResult(
 // it belongs in a follow-up that widens the lock's scope, not a silent assumption here.
 const LOCK_STALE_MS = 10_000; // longer than this and the holder is presumed crashed, not slow
 const LOCK_RETRY_DELAY_MS = 50;
-const LOCK_MAX_WAIT_MS = 5_000;
+const LOCK_MAX_WAIT_MS = 15_000; // comfortably larger than LOCK_STALE_MS so a waiter gets a chance to detect & steal a stale lock before giving up (#617)
 
 async function withLogLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const lockPath = `${path}.lock`;
