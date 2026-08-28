@@ -1492,8 +1492,12 @@ async function uninstall(o: CliOptions): Promise<void> {
   const removed: string[] = [];
   if (process.platform === 'darwin') {
     sh('launchctl', ['bootout', `gui/${process.getuid?.()}/${LABEL}`]); // failure = was not loaded, fine
+    // force: true — exists() above and rm() here are two separate syscalls; something
+    // else winning the race and deleting the file in between must not turn an
+    // idempotent uninstall into an uncaught ENOENT crash (see the loop below for the
+    // same reasoning, shared across all four exists()+rm() pairs in this function).
     if (await exists(PLIST)) {
-      await rm(PLIST);
+      await rm(PLIST, { force: true });
       removed.push(`launchd plist ${PLIST}`);
     }
     const legacy = legacyLaunchd(priorCfg);
@@ -1501,7 +1505,7 @@ async function uninstall(o: CliOptions): Promise<void> {
       // sameLabel: LABEL was booted out just above; only the stale file is left.
       if (!legacy.sameLabel) sh('launchctl', ['bootout', `gui/${process.getuid?.()}/${legacy.label}`]); // failure = was not loaded, fine
       if (await exists(legacy.plist)) {
-        await rm(legacy.plist);
+        await rm(legacy.plist, { force: true });
         removed.push(`legacy launchd plist ${legacy.plist}`);
       }
     }
@@ -1522,7 +1526,7 @@ async function uninstall(o: CliOptions): Promise<void> {
       );
     }
     if (await exists(CRON_ENTRY_FILE)) {
-      await rm(CRON_ENTRY_FILE);
+      await rm(CRON_ENTRY_FILE, { force: true });
       removed.push(`cron entry file ${CRON_ENTRY_FILE}`);
     }
   }
@@ -1531,7 +1535,7 @@ async function uninstall(o: CliOptions): Promise<void> {
     [CONFIG, 'config'],
   ]) {
     if (await exists(p)) {
-      await rm(p);
+      await rm(p, { force: true });
       removed.push(`${what} ${p}`);
     }
   }

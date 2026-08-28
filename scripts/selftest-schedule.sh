@@ -824,6 +824,79 @@ else
   echo "[PASS] uninstall: trigger + runner removed, data kept, idempotent; status exits 0 and reports 'not installed' (plain + --json, #426)"
 fi
 
+echo "== (e2) uninstall's exists()+rm() pairs are TOCTOU-safe: rm(..., { force: true }), so something else deleting the file between the check and the call reports it as already gone instead of crashing uninstall with an uncaught ENOENT =="
+# Source tripwire, not behavior: (e) above proves uninstall is idempotent when it runs
+# TWICE in full — it never exercises a single exists()+rm() pair racing against an
+# external deletion mid-function (that window is nanoseconds wide and cannot be hit
+# reliably by racing a real external process against one `cb schedule uninstall` run).
+# So this checks the actual guard is in place in the source, and the node snippet below
+# proves what that guard does. install()'s OWN legacy-plist rm() (a different exists()+
+# rm() pair, outside uninstall()) is a separate occurrence of the same pre-existing
+# pattern and is intentionally left alone here — flagged, not fixed, to avoid scope creep.
+UNINSTALL_BODY=$(awk '/^async function uninstall\(/,/^}$/' "$ROOT/src/lib/schedule.ts")
+UNINSTALL_RM_CALLS=$(printf '%s\n' "$UNINSTALL_BODY" | grep -c 'await rm(')
+[ "$UNINSTALL_RM_CALLS" = "4" ] \
+  || { echo "[FAIL] expected 4 rm() calls in uninstall(), found $UNINSTALL_RM_CALLS — update this tripwire's expected count if uninstall() legitimately grew or shrank an exists()+rm() pair"; exit 1; }
+UNINSTALL_RM_FORCE=$(printf '%s\n' "$UNINSTALL_BODY" | grep -c 'await rm(.*force: true')
+[ "$UNINSTALL_RM_FORCE" = "4" ] \
+  || { echo "[FAIL] only $UNINSTALL_RM_FORCE/4 of uninstall()'s rm() calls carry { force: true } — a race would crash uninstall with an uncaught ENOENT, breaking the idempotent-uninstall contract (e) above documents"; exit 1; }
+echo "[PASS] all 4 exists()+rm() pairs in uninstall() call rm(..., { force: true })"
+
+# Behavioral proof of what that primitive actually does, isolated from the CLI: exercises
+# node:fs/promises rm() the exact way uninstall() now does, against a target already gone
+# at call time — indistinguishable to rm() from "something else won the race and deleted
+# it first". Plain require('node:fs') (no TS import, matching this script's other inline
+# `node -e` checks above) since this proves the STDLIB PRIMITIVE's behavior, not anything
+# specific to schedule.ts's own code.
+node -e "
+const { rm, writeFile, access } = require('node:fs/promises');
+const { join } = require('node:path');
+(async () => {
+  const dir = process.argv[1];
+
+  // 1) normal delete still works — force:true must not turn rm() into a silent no-op for
+  //    a file that genuinely exists.
+  const normal = join(dir, 'normal.txt');
+  await writeFile(normal, 'x');
+  await rm(normal, { force: true });
+  try {
+    await access(normal);
+    throw new Error('normal delete: file still present after rm(force:true)');
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+
+  // 2) simulated race — the target is ALREADY gone by the time rm() runs, mirroring
+  //    something else deleting it in the window between uninstall()'s exists() check and
+  //    its rm() call. The fixed pattern must swallow this, not throw (an uncaught
+  //    rejection here fails the whole script via the trailing .catch below).
+  const raced = join(dir, 'raced.txt');
+  await writeFile(raced, 'x');
+  await rm(raced); // stand-in for the other process winning the race
+  await rm(raced, { force: true });
+
+  // 3) positive control — the OLD pattern (no force) DOES throw in the identical
+  //    scenario, proving this is a real fix and not a check that would pass either way.
+  const foil = join(dir, 'foil.txt');
+  await writeFile(foil, 'x');
+  await rm(foil);
+  let threwEnoent = false;
+  try {
+    await rm(foil);
+  } catch (e) {
+    threwEnoent = e.code === 'ENOENT';
+  }
+  if (!threwEnoent) throw new Error('positive control failed: plain rm() on an already-gone file did not throw ENOENT in this environment — this run proves nothing about the fix');
+
+  console.log('OK');
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
+" "$TMP" | grep -q '^OK$' \
+  || { echo "[FAIL] rm(..., { force: true }) race-safety check failed — see node output above"; exit 1; }
+echo "[PASS] rm(..., { force: true }) tolerates a target deleted between check and call (simulated race) and still deletes a target that genuinely exists; plain rm() is confirmed to actually throw ENOENT in the identical scenario (positive control)"
+
 echo "== (f) two different CYPHER_BRAIN_HOME schedules never collide: distinct LABEL/CRON_MARKER, installing/uninstalling one never touches the other's REAL registration (#114) =="
 if [ "$OS" != "Darwin" ] && [ "$HAS_CRONTAB" = "0" ]; then
   echo "[SKIP] multi-home collision check — this host has no crontab binary"
