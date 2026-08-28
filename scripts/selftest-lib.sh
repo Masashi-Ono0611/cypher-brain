@@ -98,6 +98,13 @@ with_timeout() {
 # is on that exact command, not merely on the invocation that contains it).
 # Needed by the one selftest-init.sh case that must deliver a real byte
 # (a Ctrl+C keypress) through stdin to a timed, backgrounded wizard run.
+#
+# Only safe when the caller's stdin is a file or pipe (never a real controlling
+# terminal): `set -m` runs the command in its own, non-foreground process
+# group, and a background process group that tries to read from a TTY gets
+# SIGTTIN'd (stopped) rather than actually reading — this selftest suite only
+# ever feeds with_stdin_timeout from a `< file` redirection, so that never
+# applies here, but it is not a general-purpose "read the terminal" helper.
 with_stdin_timeout() {
   [ "$#" -ge 2 ] || return 2
   _with_timeout_core "$1" stdin "${@:2}"
