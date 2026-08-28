@@ -119,6 +119,29 @@ interface TonMnemonicFile {
   mnemonic: string[];
 }
 
+// Shared exists/mkdir/chmod/writeKeyFile skeleton behind `tonWalletCreate`/`walletCreate`
+// below (issue #506): mkdir the containing dir at 0700, re-chmod it too on the DEFAULT
+// path (same fail-closed posture keygenAt() uses for #119 — a pre-existing dir is left
+// at whatever mode it already had, EXCEPT on the default path this tool owns), then
+// writeKeyFile the already-serialized payload. Deliberately does NOT also fold in the
+// exists()+force no-clobber check: the wording differs per credential, and — per the
+// comments at each call site — that check must run BEFORE the credential's keygen work,
+// not after it alongside this write step. The credential-type-specific generation (JWK
+// vs mnemonic) stays at each call site too, untouched — this only extracts the part that
+// was byte-for-byte identical, matching the deliberate choice already made (see file
+// header) not to unify wallet.ts's two credential formats into one abstraction.
+async function createKeyFile(
+  outPath: string,
+  usingDefaultPath: boolean,
+  force: boolean,
+  payload: string,
+): Promise<void> {
+  const dir = dirname(outPath);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  if (usingDefaultPath) await chmod(dir, 0o700);
+  await writeKeyFile(outPath, payload, 0o600, force);
+}
+
 async function tonWalletCreate(o: CliOptions): Promise<void> {
   const usingDefaultPath = !o.out;
   const outPath = o.out || TON_WALLET_DEFAULT_PATH;
@@ -134,11 +157,8 @@ async function tonWalletCreate(o: CliOptions): Promise<void> {
   const keyPair = await ton.mnemonicToPrivateKey(mnemonic);
   const walletContract = ton.WalletContractV4.create({ workchain: 0, publicKey: keyPair.publicKey });
   const address = walletContract.address.toString({ bounceable: true });
-  const dir = dirname(outPath);
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  if (usingDefaultPath) await chmod(dir, 0o700);
   const payload: TonMnemonicFile = { mnemonic };
-  await writeKeyFile(outPath, JSON.stringify(payload), 0o600, !!o.force);
+  await createKeyFile(outPath, usingDefaultPath, !!o.force, JSON.stringify(payload));
   console.log(`TON wallet (PRIVATE, keep offline): ${outPath}`);
   console.log(`address (PUBLIC, safe to share — fund THIS address): ${address}`);
   console.log(
@@ -233,18 +253,9 @@ async function walletCreate(o: CliOptions): Promise<void> {
   const ar = await getArweave();
   const jwk = await ar.wallets.generate();
   const address = await ar.wallets.jwkToAddress(jwk);
-  const dir = dirname(outPath);
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  // mkdir's `mode` is only applied when it actually CREATES the directory — a
-  // pre-existing dir is left at whatever mode it already had. On the DEFAULT path
-  // (HOME, the same directory keygenAt() owns for key material) fail closed the same
-  // way keygenAt() does for #119: re-chmod even if it pre-existed with a looser mode.
-  // A user-chosen --out directory is NOT assumed to be cypher-brain-owned (it could be
-  // a shared dir holding unrelated files), so this re-chmod is scoped to the default
-  // path only — --out still gets a freshly-created dir at 0700, just not a forced
-  // re-chmod of a pre-existing one.
-  if (usingDefaultPath) await chmod(dir, 0o700);
-  await writeKeyFile(outPath, JSON.stringify(jwk), 0o600, !!o.force);
+  // mkdir + conditional re-chmod (default path only) + writeKeyFile — see createKeyFile
+  // above for the rationale (#119).
+  await createKeyFile(outPath, usingDefaultPath, !!o.force, JSON.stringify(jwk));
   console.log(`wallet (PRIVATE, keep offline): ${outPath}`);
   console.log(`address (PUBLIC, safe to share — fund THIS address): ${address}`);
   // #472: CYPHER_BRAIN_AR_WALLET is NOT actually required for push/estimate/wallet

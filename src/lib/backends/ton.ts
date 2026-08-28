@@ -38,7 +38,7 @@ import {
   TON_NETWORK_CONFIG,
 } from '../config.js';
 import { run } from '../proc.js';
-import { sha256, sleep, readHead, rmrf, errMsg } from '../util.js';
+import { sha256, sleep, readHead, rmrf, errMsg, makeBagLocator } from '../util.js';
 import { progressReporter } from '../progress.js';
 import { tonAdd, tonDetails, startLocalTonDaemon, type TonBagDetails } from './ton-client.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
@@ -46,19 +46,16 @@ import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 // Locator shape (see header comment). Anchored + exact-length, same "narrow validated
 // shape" defense file.ts/arweave.ts apply: a locator may arrive over an UNTRUSTED
 // channel (a tampered --save-locator file feeding pull), and everything below embeds
-// it into remote commands and URLs, so nothing but this shape may pass.
-const LOCATOR_RE = /^ton:v1:([0-9a-f]{64})$/;
-export const tonLocator = (bagId: string): string => `ton:v1:${bagId.toLowerCase()}`;
-
-// Exported for src/lib/ton-dns.ts (the `publish-latest` command): the SAME locator
-// shape guard used to gate push/pull, so a non-ton or malformed locator in a
-// --from-locator-file is refused with one identical, already-tested message instead
-// of a second, possibly-diverging regex.
-export function bagIdFrom(locator: string): string {
-  const m = LOCATOR_RE.exec(locator);
-  if (!m) throw new Error(`ton backend: locator does not match the expected ton:v1:<64-hex-bag-id> shape: ${locator}`);
-  return m[1];
-}
+// it into remote commands and URLs, so nothing but this shape may pass. Built via the
+// shared makeBagLocator() factory (util.ts) — ton-provider.ts uses the same factory
+// with the 'ton-provider' schema, so the two locator shapes cannot drift apart (#505).
+//
+// bagIdFrom is exported for src/lib/ton-dns.ts (the `publish-latest` command): the SAME
+// locator shape guard used to gate push/pull, so a non-ton or malformed locator in a
+// --from-locator-file is refused with one identical, already-tested message instead of
+// a second, possibly-diverging regex.
+const { locator: tonLocator, bagIdFrom, test: isTonLocator } = makeBagLocator('ton');
+export { tonLocator, bagIdFrom };
 
 // Everything interpolated into a REMOTE shell command line must pass one of these
 // allowlists first — the remote side is a real shell (that is what ssh executes), so
@@ -367,7 +364,7 @@ export function tonBackend(): StorageBackend {
       // because an inventory line whose bag is gone would otherwise hand back a
       // locator nothing can serve.
       const recorded = (await sshRun(`cat -- '${p.inventory}' 2>/dev/null || true`)).trim();
-      if (LOCATOR_RE.test(recorded)) {
+      if (isTonLocator(recorded)) {
         try {
           const d = await seederDetails(bagIdFrom(recorded));
           if (d.completed) {
