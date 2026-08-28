@@ -734,6 +734,7 @@ async function notifyProvider(providerPubkeyHex: string, contractAddrRaw: string
 export interface LiveRatesResult {
   available: boolean;
   rateNanoPerMB: bigint;
+  minBountyNano: bigint;
   minSpanSeconds: number;
   maxSpanSeconds: number;
 }
@@ -755,14 +756,22 @@ function parseRatesOutput(out: string): LiveRatesResult {
   const response = out.slice(markerIdx + marker.length);
   const availableRaw = /^\s*available:\s*(\S+)/m.exec(response)?.[1];
   const rateRaw = /^\s*rate_nano_per_mb_day:\s*(\d+)/m.exec(response)?.[1];
+  const minBountyRaw = /^\s*min_bounty_nano:\s*(\d+)/m.exec(response)?.[1];
   const minSpanRaw = /^\s*min_span:\s*(\d+)/m.exec(response)?.[1];
   const maxSpanRaw = /^\s*max_span:\s*(\d+)/m.exec(response)?.[1];
-  if (availableRaw === undefined || rateRaw === undefined || minSpanRaw === undefined || maxSpanRaw === undefined) {
+  if (
+    availableRaw === undefined ||
+    rateRaw === undefined ||
+    minBountyRaw === undefined ||
+    minSpanRaw === undefined ||
+    maxSpanRaw === undefined
+  ) {
     throw new Error(`ton-provider backend: could not parse the rates response fields: ${response.trim()}`);
   }
   return {
     available: availableRaw === 'true',
     rateNanoPerMB: BigInt(rateRaw),
+    minBountyNano: BigInt(minBountyRaw),
     minSpanSeconds: Number(minSpanRaw),
     maxSpanSeconds: Number(maxSpanRaw),
   };
@@ -780,7 +789,7 @@ async function checkProviderLiveTerms(
   dataSizeBytes: bigint,
   rateNanoPerMB: bigint,
   spanDays: bigint,
-): Promise<void> {
+): Promise<LiveRatesResult> {
   let out: string;
   try {
     ({ out } = await run(
@@ -793,7 +802,12 @@ async function checkProviderLiveTerms(
         dataSizeBytes.toString(),
         ...(TON_NETWORK_CONFIG ? [] : ['--mainnet']),
       ],
-      { timeoutMs: 30_000 },
+      // 60s, matching notifyProvider()'s own budget above for the SAME Go binary's
+      // connection setup (Codex review): rates.go's two ADNL/DHT phases (DHT client
+      // construction, then the RLDP query itself) each default to a 20s --timeout, so a
+      // legitimately slow-but-succeeding call can take up to ~40s — a shorter Node-side
+      // timeout here would kill a call the Go binary's own bound would have let succeed.
+      { timeoutMs: 60_000 },
     ));
   } catch (e) {
     throw new Error(
@@ -827,6 +841,18 @@ async function checkProviderLiveTerms(
         're-run push to re-search at the current terms.',
     );
   }
+  // live.minBountyNano is returned (not compared here) — see the call site in put():
+  // Codex review (Critical) found it was parsed but never used at all. It is used to
+  // REPLACE the static assumption the existing advisory bounty check (issue #403) used
+  // (PROVIDER_BOUNTY_FLOOR_NANO, tonutils-storage-provider's library default) with this
+  // SAME provider's own LIVE-reported floor (which could be higher OR lower than that
+  // guess) — kept as a WARN there, not a refusal here,
+  // matching that check's own established posture (an under-bounty deploy still succeeds
+  // and gets paid; it is the provider's own subsequent notify that may then refuse to
+  // fetch it, not this broadcast itself), unlike availability/rate/span above, which are
+  // hard refusals because those conditions are exactly what would make the CONTRACT
+  // ITSELF get built with terms this provider does not agree to yet.
+  return live;
 }
 
 // ---------- local ephemeral bag creation (put()'s first phase) ----------
@@ -1098,8 +1124,10 @@ export function tonProviderBackend(): StorageBackend {
         // #651: confirm the provider's CURRENT ADNL-reported terms (rate/span/capacity)
         // still match the registry snapshot above, BEFORE building/broadcasting a deploy
         // against them — see checkProviderLiveTerms()'s own doc comment for why this is
-        // a separate call site from the broadcast step further down.
-        await checkProviderLiveTerms(provider.pubkey, bag.dataSizeBytes, rateNanoPerMB, spanDays);
+        // a separate call site from the broadcast step further down. The returned
+        // liveRates also carries the provider's own live bounty floor, used below in
+        // place of the existing advisory bounty check's static assumption (issue #403).
+        const liveRates = await checkProviderLiveTerms(provider.pubkey, bag.dataSizeBytes, rateNanoPerMB, spanDays);
 
         const deploy = await buildDeploy({
           bagId: Buffer.from(bag.bagId, 'hex'),
@@ -1123,15 +1151,19 @@ export function tonProviderBackend(): StorageBackend {
         // own comment for what this is and why it warns rather than refuses. Placed
         // BEFORE the deploy is signed (both paths below) so the warning is visible to
         // whoever/whatever is about to commit real funds, not discovered only after a
-        // 10-minute notify timeout.
+        // 10-minute notify timeout. Compared against liveRates.minBountyNano — this
+        // SAME provider's own LIVE-reported floor (checkProviderLiveTerms() above,
+        // issue #651) — rather than the static PROVIDER_BOUNTY_FLOOR_NANO assumption,
+        // since an actual measured value is strictly more accurate than a guess about
+        // which tonutils-storage-provider library default this specific provider runs.
         const bounty = estimatedBountyNano(rateNanoPerMB, bag.dataSizeBytes, spanDays);
-        if (bounty < PROVIDER_BOUNTY_FLOOR_NANO) {
+        if (bounty < liveRates.minBountyNano) {
           warn(
             `ton-provider: the computed bounty for this deploy (${bounty} nanoTON, from rate ${rateNanoPerMB} ` +
-              `nanoTON/MB/day × ${bag.dataSizeBytes} bytes × ${spanDays} day(s)) looks BELOW the ~${PROVIDER_BOUNTY_FLOOR_NANO} ` +
-              "nanoTON floor providers built on tonutils-storage-provider enforce — this specific provider's notify " +
-              'may refuse to ever fetch the bag even though the deploy itself will still succeed and be paid for. ' +
-              'A bigger bag, a longer span, or a higher rate would raise this estimate.',
+              `nanoTON/MB/day × ${bag.dataSizeBytes} bytes × ${spanDays} day(s)) looks BELOW the provider's own ` +
+              `LIVE-reported minimum bounty (${liveRates.minBountyNano} nanoTON, via ADNL ratesRequest) — this ` +
+              "specific provider's notify may refuse to ever fetch the bag even though the deploy itself will " +
+              'still succeed and be paid for. A bigger bag, a longer span, or a higher rate would raise this estimate.',
           );
         }
         // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
