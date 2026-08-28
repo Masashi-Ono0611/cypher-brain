@@ -52,12 +52,16 @@ import {
   CONFIG_FILE_PATH,
   AGE_MAGIC,
   AGE_ARMOR_HEADER,
+  AUDIT_LOG,
+  RECEIPT_LEDGER,
 } from './config.js';
 import { exists, errMsg } from './util.js';
 import { recipientEntries, resolvePinnedRecipients } from './keys.js';
 import { WALLET_DEFAULT_PATH, TON_WALLET_DEFAULT_PATH } from './wallet.js';
 import { scheduleStatusReport, ScheduleNotInstalledError } from './schedule.js';
 import { buildInfo, buildAgeDays, BUILD_STALE_DAYS } from './buildinfo.js';
+import { readAuditLog, verifyAuditChain } from './audit.js';
+import { readReceipts } from './receipt.js';
 import { printJson, printMascot, moodForVerdict } from './ui.js';
 import type { CliOptions } from './types.js';
 
@@ -457,6 +461,120 @@ async function checkOfflineBackupDisk(): Promise<DoctorCheck> {
   };
 }
 
+// #456: doctor's own --help has always advertised CYPHER_BRAIN_AUDIT_LOG in its
+// Storage/env section, so a reasonable user assumes doctor would surface a broken hash
+// chain here — but until now nothing ever read the log at all, so doctor could report a
+// healthy 100/100 in the very same $CYPHER_BRAIN_HOME where `cypher-brain audit` reports
+// VERDICT: FAIL. Reuses audit.ts's OWN readAuditLog()/verifyAuditChain() (never
+// re-implements the hash-chain math here) and mirrors its `audit()` command's exact
+// overallOk computation, so this check can never disagree with what `cypher-brain audit`
+// itself reports — same "reuse the source of truth" posture checkSchedule() already
+// takes toward scheduleStatusReport(). No log yet (a machine that has never run
+// push/restore/verify) is a normal, not-yet-used state, same posture the other
+// optional-until-used checks above take — SKIP, not WARN/FAIL.
+async function checkAuditChain(): Promise<DoctorCheck> {
+  const id = 'audit-chain-integrity';
+  let entries: Awaited<ReturnType<typeof readAuditLog>>['entries'];
+  let skippedLines: number;
+  try {
+    ({ entries, skippedLines } = await readAuditLog());
+  } catch (e) {
+    return {
+      id,
+      status: 'fail',
+      message: `could not read the audit log at ${AUDIT_LOG}: ${errMsg(e)}`,
+      remediation: `check that every path component of ${AUDIT_LOG} is accessible, or run 'cypher-brain audit' directly for more detail`,
+    };
+  }
+  // Deliberately NOT the same "explicit path, nothing there = FAIL" convention
+  // checkKeyPerms()'s explicitPath does for a user-supplied wallet/identity path (Codex
+  // review): those are key material the user must have generated BEFORE pointing an env
+  // var at them, so an explicit path with nothing there is itself a misconfiguration.
+  // AUDIT_LOG/RECEIPT_LEDGER are the OPPOSITE — CLI-WRITTEN artifacts (appendAuditEntry/
+  // appendReceipt create them on first push/restore/verify via mkdir+append) — pointing
+  // CYPHER_BRAIN_AUDIT_LOG at a custom path BEFORE ever running one of those commands is
+  // a completely ordinary, forward-looking setup, indistinguishable from (and no less
+  // valid than) the default path never having been used yet. Also deliberately does NOT
+  // try to distinguish "file never existed" from "file exists but is fully empty"
+  // (Codex review, Suggestion): verifyAuditChain() itself treats a zero-entry chain as
+  // trivially ok, and audit.ts's own header comment documents a full truncation of the
+  // log as an ACCEPTED, undetectable-by-design limitation of the underlying mechanism
+  // (only an in-place edit or a middle-of-the-log deletion breaks the hash chain) — this
+  // check must never claim to catch more than `cypher-brain audit` itself can.
+  if (entries.length === 0 && skippedLines === 0) {
+    return {
+      id,
+      status: 'skip',
+      message: `no audit log yet at ${AUDIT_LOG} — nothing has run push/restore/verify on this machine yet`,
+    };
+  }
+  const result = verifyAuditChain(entries);
+  // Same "any skipped line is a POSSIBLE tamper, not a benign gap" reasoning audit.ts's
+  // own audit() command documents (Codex review, #226): a deleted/corrupted entry
+  // vanishes from `entries` entirely rather than show up as a broken link, so
+  // result.ok alone is not sufficient here either.
+  const overallOk = result.ok && skippedLines === 0;
+  if (overallOk) {
+    return {
+      id,
+      status: 'pass',
+      message: `audit log hash chain verifies (${result.totalEntries} ${result.totalEntries === 1 ? 'entry' : 'entries'})`,
+    };
+  }
+  const reasons: string[] = [];
+  if (!result.ok) reasons.push(`chain broken at entry index ${result.brokenAtIndex}`);
+  if (skippedLines > 0) reasons.push(`${skippedLines} unreadable line(s) could hide a deleted/altered entry`);
+  return {
+    id,
+    status: 'fail',
+    message: `audit log integrity check failed: ${reasons.join('; ')}`,
+    remediation: `run 'cypher-brain audit' for full detail — this is a possible tamper of ${AUDIT_LOG} and should be investigated before trusting further push/restore/verify history`,
+  };
+}
+
+// #456, the receipt-ledger half: reuses receipt.ts's OWN readReceipts() rather than
+// re-parsing the ledger here. Unlike the audit log, an unreadable receipt-ledger line is
+// a DATA-QUALITY problem — ledger.ts's own cumulative totals may undercount actual spend
+// (its --json already surfaces this as `skipped_lines`) — not evidence of a broken
+// security boundary the way a broken hash chain is, so this WARNs rather than FAILs. No
+// ledger yet (a machine that has never done a paid arweave/turbo push) is a normal,
+// not-yet-used state — SKIP, same posture the audit-chain check above takes.
+async function checkReceiptLedger(): Promise<DoctorCheck> {
+  const id = 'receipt-ledger-readability';
+  let receipts: Awaited<ReturnType<typeof readReceipts>>['receipts'];
+  let skippedLines: number;
+  try {
+    ({ receipts, skippedLines } = await readReceipts());
+  } catch (e) {
+    return {
+      id,
+      status: 'fail',
+      message: `could not read the receipt ledger at ${RECEIPT_LEDGER}: ${errMsg(e)}`,
+      remediation: `check that every path component of ${RECEIPT_LEDGER} is accessible, or run 'cypher-brain ledger' directly for more detail`,
+    };
+  }
+  if (receipts.length === 0 && skippedLines === 0) {
+    return {
+      id,
+      status: 'skip',
+      message: `no receipt ledger yet at ${RECEIPT_LEDGER} — no paid (arweave/turbo) push has run on this machine yet`,
+    };
+  }
+  if (skippedLines > 0) {
+    return {
+      id,
+      status: 'warn',
+      message: `${skippedLines} unreadable line(s) in the receipt ledger (${RECEIPT_LEDGER}) — 'cypher-brain ledger' totals may undercount actual spend`,
+      remediation: `run 'cypher-brain ledger' for detail, or inspect ${RECEIPT_LEDGER} directly for the malformed line(s)`,
+    };
+  }
+  return {
+    id,
+    status: 'pass',
+    message: `receipt ledger is readable (${receipts.length} receipt${receipts.length === 1 ? '' : 's'})`,
+  };
+}
+
 // How old is the code that is actually running (#348)? The real incident: a
 // hand-copied dist ran the snapshot host for 5+ weeks, silently missing documented
 // features — nothing surfaced its age, and the version string (0.0.1 on every build to
@@ -721,6 +839,8 @@ export async function computeDoctorReport(): Promise<DoctorReport> {
     ...(await checkPinRecipients()),
     await checkOfflineBackupDisk(),
     ...(await checkSchedule()),
+    await checkAuditChain(),
+    await checkReceiptLedger(),
   ];
 
   const statePath = doctorStatePath();

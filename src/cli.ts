@@ -323,13 +323,22 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       identity does not derive), an empty CYPHER_BRAIN_PIN_RECIPIENTS fail-closing every
       snapshot, any recipient.txt entry missing from that same allowlist (not just the
       primary one), an offline backup keypair sharing a disk with the primary identity at
-      its default location, and the last scheduled run's outcome) and reports
+      its default location, the last scheduled run's outcome, the audit log's hash-chain
+      integrity, and the receipt ledger's readability — #456) and reports
       PASS/WARN/FAIL/SKIP per check, each FAIL/WARN paired with the exact command that
       fixes it. Nothing not yet set up (no wallet, no schedule, ...) is treated as a
       failure — it SKIPs instead, EXCEPT a path explicitly configured via an environment
       variable (e.g. CYPHER_BRAIN_AR_WALLET) pointing at nothing, which is a FAIL. A
       permission-denied path, a symlink loop, or an unexpected file type (e.g. a FIFO) is
       its own FAIL rather than folded into the same result an absent path gets.
+      audit-chain-integrity/receipt-ledger-readability (#456) reuse 'audit'/'ledger''s
+      own reading+verification logic (never a re-implementation), so doctor can never
+      report a healthy score in a $CYPHER_BRAIN_HOME where those commands themselves
+      report a problem: a broken audit-log hash chain, or any unreadable line in it that
+      could hide a deleted/altered entry, is a FAIL (a security-critical trust-boundary
+      break); an unreadable line in the receipt ledger is only a WARN (a data-quality
+      issue — 'ledger' totals may undercount, nothing security-critical). Neither file
+      existing yet is SKIP, same posture every other not-yet-set-up check above takes.
       Keeps a small bookkeeping file ($CYPHER_BRAIN_HOME/doctor-state.json — check ids and
       timestamps only, never key material) between runs so a WARN/FAIL you have already
       seen is marked "known" rather than re-surprising you every time you run this, while
@@ -926,8 +935,8 @@ Env: CYPHER_BRAIN_HOME (default ~/.cypher-brain; an existing ~/.cipher-brain is 
      CYPHER_BRAIN_PASSPHRASE (non-interactive passphrase for a wrapped identity — automation/CI; otherwise prompted on the TTY).
      CYPHER_BRAIN_PIN_RECIPIENTS (snapshot: allowlist of age1… pubkeys, inline or a file — refuse to encrypt to any other recipient).
      CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 (init: bypass its TTY requirement — automation/CI only, e.g. this repo's own selftest; a human just runs init directly in a terminal).
-Storage: CYPHER_BRAIN_RECEIPT_LEDGER (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl — every arweave/turbo push's actual-cost receipt, #232; see 'ledger' above).
-         CYPHER_BRAIN_AUDIT_LOG (default $CYPHER_BRAIN_HOME/audit-log.jsonl — hash-chained record of every push/restore/verify run, #226; see 'audit' above).
+Storage: CYPHER_BRAIN_RECEIPT_LEDGER (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl — every arweave/turbo push's actual-cost receipt, #232; see 'ledger' above, and 'doctor's receipt-ledger-readability check, #456).
+         CYPHER_BRAIN_AUDIT_LOG (default $CYPHER_BRAIN_HOME/audit-log.jsonl — hash-chained record of every push/restore/verify run, #226; see 'audit' above, and 'doctor's audit-chain-integrity check, #456).
          CYPHER_BRAIN_FILE_DIR (file);
          CYPHER_BRAIN_AR_{HOST,PORT,PROTOCOL,WALLET,GATEWAY,GATEWAYS,HTTP_TIMEOUT,USD_RATE_URL,TURBO_RATES_URL,BALANCE_URL} (arweave; CYPHER_BRAIN_AR_WALLET is a path to a JWK key file — 'cypher-brain wallet create' generates one, 'wallet address' shows what to fund; the 'arweave' npm package is needed only to PUSH or for the rare L1 chunk fallback — a gateway pull needs none; the approximate-USD lines price each backend in its own truthful unit: the raw arweave L1 backend at AR SPOT (CYPHER_BRAIN_AR_USD_RATE_URL — the spend is real AR at market value), the turbo backend and 'wallet balance' at Turbo's own credit rate, fees included (CYPHER_BRAIN_AR_TURBO_RATES_URL — a turbo upload spends credits, and credits sell at Turbo's price, not AR spot; pricing them at spot understated a real push's cost by ~35%), falling back to labeled AR spot only when that price sheet is unavailable or unusable; a dead rate endpoint just omits the USD line, it never blocks a push; CYPHER_BRAIN_AR_BALANCE_URL overrides the payment-service account endpoint 'wallet balance' queries as '<url>?address=<addr>');
          turbo: CYPHER_BRAIN_AR_WALLET (JWK signer) + optional CYPHER_BRAIN_AR_PAID_BY (an address sharing Turbo Credits to that signer); needs '@ardrive/turbo-sdk' to PUSH (a pull reuses the arweave gateway read, no SDK). Funding/credit-share details: docs/arweave-upload-runbook.md.
