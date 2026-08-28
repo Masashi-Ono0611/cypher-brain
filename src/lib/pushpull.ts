@@ -262,6 +262,21 @@ async function pushCore(
 ): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
   if (!o.in) throw new Error('--in <file.age> required');
   if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton> required'); // no silent default
+  // #655: --remote is read ONLY by the rclone backend (backends/rclone.ts's put()) —
+  // every other backend's put() ignores it entirely (file/arweave/turbo/ton/ton-provider
+  // ignore o.remote outright; see FLAG_IRRELEVANT's `push: []` entry in cli.ts, which is
+  // about flags no OTHER command reads at all — a different, backend-conditional case
+  // from this one, same distinction pull's own "--wait has no effect for --backend ..."
+  // warning further down already draws for its own flag). An operator copy-pasting a
+  // push invocation between backends (e.g. switching from rclone to file for a quick
+  // local test) got no signal that --remote did nothing — warn here, before any upload
+  // work, rather than leaving it silently dropped.
+  if (o.remote !== undefined && o.backend !== 'rclone') {
+    warn(
+      `--remote is only used by --backend rclone (this push targets --backend ${o.backend}) — ` +
+        `the value ${JSON.stringify(o.remote)} will be ignored`,
+    );
+  }
   await requireFile(o.in); // #267: one shared check/wording across every command
   // storage must only ever see ciphertext — refuse to push a non-age artifact
   // (e.g. an accidental plaintext path), which would be the last gate before a

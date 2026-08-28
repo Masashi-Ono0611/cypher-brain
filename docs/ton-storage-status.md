@@ -199,6 +199,51 @@ checked in any future assessment.
   it lands back in the operator's own wallet as expected, is now real,
   observed, on-chain evidence, not a projection.
 
+### Known trust-boundary gaps with the live Go provider market (2026-08-29)
+
+Three Codex-audit findings against `src/lib/backends/ton-provider.ts` /
+`scripts/go/storage-v1-client`, third dogfooding round — the fixes for the
+first two landed alongside this doc update (issues #651/#652); the third's
+full remediation is intentionally left as future work:
+
+- **Stale registry terms, now checked BEFORE funds move (issue #651,
+  fixed)**: `put()` used to build and broadcast a deploy purely from
+  mytonprovider.org's registry snapshot (rate/span/capacity) — the selected
+  provider's *live* terms were never asked for until `notify` ran, which is
+  AFTER the contract is funded. `checkProviderLiveTerms()` now queries the
+  provider directly (a new `rates` subcommand on `storage-v1-client`, the
+  ADNL/RLDP `storageProvider.ratesRequest` — ported from
+  `pkg/transport/client.go`'s `GetStorageRates`, the same library `notify`
+  already uses for `storageProvider.storageRequest`) right before
+  `buildDeploy()`, and refuses the push if the provider reports itself
+  unavailable for this bag's size, a live rate higher than what was assumed,
+  or a live span window that no longer covers the chosen span.
+- **Self-reported `downloaded` byte count still not a cryptographic proof of
+  custody (issue #652, partially mitigated)**: `notify`'s `downloaded` field
+  is the provider's own claim — this codebase does not call
+  `VerifyStorageADNLProof`/`checkProofBranch` against a merkle proof (a gap
+  this doc already noted above, e.g. the masabrain confirmation). Full
+  proof-of-custody verification is out of scope for #652 and proposed here
+  as separate future work (a real fix would need either (a) a spot-check
+  retrieval of a specific piece from the provider independent of its notify
+  claim, or (b) wiring up `StorageResponse.Proof`/`VerifyStorageADNLProof`
+  from `pkg/transport` against the contract's own merkle root — neither is
+  implemented). What #652 DID add, as the minimum available corroboration
+  without reimplementing proof verification: `notifyProviderWithRetry()` now
+  flags (a) a FIRST-EVER response that already claims the full size with no
+  gradual progress ever observed, and (b) a LATER response reporting FEWER
+  bytes than a previously reported high-water mark (internally inconsistent
+  — a real download cannot un-download bytes) — both as warnings, not
+  refusals, since a genuinely fast small-bag transfer is legitimate and
+  cannot be told apart from a false claim using self-reported bytes alone.
+  The operator-facing "safe to stop the local seed" line also now says
+  explicitly that this is a self-report, not a verified proof.
+- **Retry-after-timeout can double-fund the same contract (issue #638,
+  tracked separately)**: the StorageV1 contract address is deterministic
+  from bag metadata + owner, but a retry after an ambiguous broadcast or a
+  notify timeout can re-send `amountNano` against the same (already funded)
+  address. Being fixed independently — see that issue.
+
 ## Testnet — third-party providers (C++ lane)
 
 - 2026-08-22 live experiment (bag `a2b26f1c…`, 8 KB, seeded from the droplet's
