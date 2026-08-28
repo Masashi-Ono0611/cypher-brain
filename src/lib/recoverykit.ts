@@ -87,6 +87,8 @@ function recoverySteps(which: 'BACKUP' | 'PRIMARY', blockLocation: 'above' | 'be
     '1) npm install -g cypher-brain          (or: npx cypher-brain@latest <command>)',
     `2) Copy the ${which} IDENTITY block ${blockLocation} (the lines between its BEGIN and END markers,`,
     '   not including the marker lines themselves) into its own file, e.g.: ~/restore-identity.age',
+    '   then: chmod 600 ~/restore-identity.age  (it is a SECRET key — restore warns if it is left readable',
+    '   by anyone else)',
     `3) Copy the SAVE-LOCATOR line ${blockLocation} (between its BEGIN and END markers) into its own`,
     '   file, e.g.: ~/restore-locator.tsv',
     '4) cypher-brain pull --from-locator-file ~/restore-locator.tsv --out ~/restored.age',
