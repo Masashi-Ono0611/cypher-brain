@@ -16,10 +16,10 @@
 // a save-locator), so there is no positional-TSV backward-compatibility surface to
 // preserve, and JSON-per-line is simpler to extend than a growing positional format would
 // be.
-import { readFile, writeFile, rename, rm, mkdir, stat } from 'node:fs/promises';
+import { writeFile, rename, rm, mkdir, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { errMsg } from './util.js';
+import { errMsg, readJsonlLog } from './util.js';
 
 // One stored line. `fingerprint` is an opaque, caller-computed digest of whatever fields
 // define "the same call" for that tool (snapshot_now's is dirs/pg/recipients/out/backend/
@@ -66,46 +66,33 @@ interface ReadResult {
   corrupted: boolean;
 }
 
+function validateStoredLine(parsed: unknown): StoredLine | null {
+  if (
+    parsed &&
+    typeof parsed === 'object' &&
+    typeof (parsed as StoredLine).key === 'string' &&
+    typeof (parsed as StoredLine).tool === 'string' &&
+    typeof (parsed as StoredLine).recordedAt === 'string' &&
+    typeof (parsed as StoredLine).fingerprint === 'string' &&
+    (parsed as StoredLine).result &&
+    typeof (parsed as StoredLine).result === 'object'
+  ) {
+    return parsed as StoredLine;
+  }
+  return null;
+}
+
 // Every line is read + parsed on both lookup and record — this file is not expected to
 // hold more than a handful of live entries at once (recordIdempotencyResult below drops
 // every expired one on each write), so there is no need for an index or a streaming
 // parser.
 async function readAllRecords(path: string): Promise<ReadResult> {
-  let text: string;
   try {
-    text = await readFile(path, 'utf8');
+    const { items, skippedLines } = await readJsonlLog<StoredLine>(path, 'idempotency log', validateStoredLine);
+    return { records: items, corrupted: skippedLines > 0 };
   } catch (e) {
-    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { records: [], corrupted: false }; // no prior calls, never an error
-    // Anything else (EACCES, EISDIR, a transient I/O error, ...) must NOT be treated the
-    // same as "no prior calls" — see IdempotencyStoreError's own doc comment above.
     throw new IdempotencyStoreError(`could not read idempotency log ${path}: ${errMsg(e)}`, { cause: e });
   }
-  const records: StoredLine[] = [];
-  let corrupted = false;
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (
-        parsed &&
-        typeof parsed === 'object' &&
-        typeof parsed.key === 'string' &&
-        typeof parsed.tool === 'string' &&
-        typeof parsed.recordedAt === 'string' &&
-        typeof parsed.fingerprint === 'string' &&
-        parsed.result &&
-        typeof parsed.result === 'object'
-      ) {
-        records.push(parsed as StoredLine);
-      } else {
-        corrupted = true; // parses as JSON but not the shape a StoredLine must have
-      }
-    } catch {
-      corrupted = true; // malformed line (a truncated write, a hand edit)
-    }
-  }
-  return { records, corrupted };
 }
 
 const isFresh = (recordedAt: string, ttlSeconds: number, now: number): boolean => {
