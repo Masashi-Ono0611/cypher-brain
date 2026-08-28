@@ -394,6 +394,18 @@ export const AGE_PUBKEY_RE = /age1pq1[0-9a-z]{1900,2000}|age1[0-9a-z]{50,63}/g;
 // seeder fallback, which verifies nothing, and the caller cannot tell which path
 // answered — so the pin warning must stay on (src/lib/backends/ton.ts header).
 export const NON_CONTENT_ADDRESSED_BACKENDS = new Set(['arweave', 'turbo', 'rclone', 'ton']);
+// #465: `pull --wait <seconds>` only has an effect for backends whose get() can throw
+// util.ts's RetryableError — today that's arweave (a fresh L1 tx/bundle item can take
+// minutes to propagate to a gateway) and turbo (its get() delegates straight to
+// arweaveBackend().get() — src/lib/backends/turbo.ts — so it throws the same
+// RetryableError on the same "not yet indexed" condition). file/rclone/ton/ton-provider's
+// get() throws a plain Error on a not-yet-retrievable object, so pushpull.ts's retry loop
+// (`!(e instanceof RetryableError)` at the top of its catch) exits on attempt 1 regardless
+// of --wait — silently, before this issue, since nothing told the operator their --wait
+// was accepted but ignored. Used by pushpull.ts's pull() to warn() when --wait is set for
+// a backend not in this set. Keep in sync with any backend whose get() starts/stops
+// throwing RetryableError.
+export const WAIT_RETRY_BACKENDS = new Set(['arweave', 'turbo']);
 export const FILE_DIR = readEnv('CYPHER_BRAIN_FILE_DIR') || join(HOME, 'store'); // file backend object store
 // rclone backend (#204): the `rclone` binary name/path, same PATH-or-override
 // pattern as PG_BIN above — most machines just need `rclone` on PATH; override
