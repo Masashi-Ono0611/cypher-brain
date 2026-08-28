@@ -437,11 +437,14 @@ msgcb verify --in "$TMP/msg532.age" --require-signature >/dev/null 2>&1 \
   || { echo "[FAIL] msg532.age did not verify before key rotation"; exit 1; }
 
 msgcb keygen --sign --force >"$TMP/msg532-force.out" 2>&1
-grep -q -- '--force overwrote the previous signing key at its default path' "$TMP/msg532-force.out" \
-  && echo "[PASS] --force message states the default path was overwritten in place" \
+grep -q -- '--force overwrote the previous signing key at' "$TMP/msg532-force.out" \
+  && echo "[PASS] --force message states the previous key's path was overwritten in place" \
   || { echo "[FAIL] --force message missing the overwrite-in-place statement"; cat "$TMP/msg532-force.out"; exit 1; }
+grep -q -- '(the default path)' "$TMP/msg532-force.out" \
+  && echo "[PASS] --force message marks the overwritten path as the default (no --sign-recipient override used)" \
+  || { echo "[FAIL] --force message did not identify the overwritten path as the default"; cat "$TMP/msg532-force.out"; exit 1; }
 grep -q 'will FAIL verification' "$TMP/msg532-force.out" \
-  && echo "[PASS] --force message warns old-key .minisig files will FAIL default verification" \
+  && echo "[PASS] --force message warns old-key .minisig files will FAIL verification there" \
   || { echo "[FAIL] --force message does not warn about FAIL verification"; cat "$TMP/msg532-force.out"; exit 1; }
 grep -q -- '--sign-recipient <path-to-saved-old-pubkey>' "$TMP/msg532-force.out" \
   && echo "[PASS] --force message names the --sign-recipient escape hatch for a saved old pubkey" \
@@ -449,6 +452,25 @@ grep -q -- '--sign-recipient <path-to-saved-old-pubkey>' "$TMP/msg532-force.out"
 grep -q 'stay verifiable.*regardless' "$TMP/msg532-force.out" \
   && { echo "[FAIL] --force message still makes the old unconditional 'stay verifiable ... regardless' claim"; cat "$TMP/msg532-force.out"; exit 1; }
 echo "[PASS] --force message drops the old unconditional 'stay verifiable ... regardless' claim"
+
+# #532 review follow-up: a --force regen at a CUSTOM --sign-recipient path must NOT
+# claim it overwrote "the default path" -- that path only matters to `verify` if
+# `verify` is later pointed at that same custom path via --sign-recipient itself.
+CUSTOM_HOME="$TMP/keys-msg532-custom"
+mkdir -p "$CUSTOM_HOME"
+CUSTOM_SIGN_RECIPIENT="$TMP/custom-sign-recipient.pub"
+CYPHER_BRAIN_HOME="$CUSTOM_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen >/dev/null
+CYPHER_BRAIN_HOME="$CUSTOM_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen --sign --sign-recipient "$CUSTOM_SIGN_RECIPIENT" >/dev/null
+CYPHER_BRAIN_HOME="$CUSTOM_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen --sign --sign-recipient "$CUSTOM_SIGN_RECIPIENT" --force \
+  >"$TMP/msg532-custom.out" 2>&1
+grep -q -- '--force overwrote the previous signing key at' "$TMP/msg532-custom.out" \
+  && echo "[PASS] custom-path --force message states the overwritten path" \
+  || { echo "[FAIL] custom-path --force message missing the overwrite statement"; cat "$TMP/msg532-custom.out"; exit 1; }
+grep -q -- '(the default path)' "$TMP/msg532-custom.out" \
+  && { echo "[FAIL] custom-path --force message wrongly calls a --sign-recipient override 'the default path'"; cat "$TMP/msg532-custom.out"; exit 1; }
+grep -q -- 'pass the same --sign-recipient to verify to use it' "$TMP/msg532-custom.out" \
+  && echo "[PASS] custom-path --force message correctly scopes the warning to that explicit path" \
+  || { echo "[FAIL] custom-path --force message does not scope the warning to the custom path"; cat "$TMP/msg532-custom.out"; exit 1; }
 
 # Prove the message matches reality (the crypto behavior itself is unchanged by #532 —
 # only the text was wrong): the OLD .minisig now FAILS the default-path verify, exactly

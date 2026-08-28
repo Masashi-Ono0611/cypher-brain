@@ -12,6 +12,8 @@ correctly FAIL against it (the cryptographic behavior was always correct;
 only the warning text was misleading). The message now says the default
 verification path was overwritten and, when the old key was saved elsewhere,
 names `verify --sign-recipient <path-to-saved-old-pubkey>` as the way to
-still verify old signatures. A fresh (non-`--force`) `keygen --sign` prints a
-plain backup reminder instead, since no prior signatures exist to reason
-about (#532).
+still verify old signatures. The warning only fires when a signing key
+already existed (a fresh `--force` with nothing there yet, or a plain
+`keygen --sign`, gets the plain backup reminder instead), and correctly
+scopes itself to a custom path when `--sign-recipient` was passed to
+`keygen --sign` rather than always claiming "the default path" (#532).
