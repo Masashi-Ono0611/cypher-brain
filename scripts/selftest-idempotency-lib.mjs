@@ -22,10 +22,43 @@
 //     read-modify-rename has across separate OS processes too: without a lock, both
 //     interleave at the same await points either way. This asserts every key's record
 //     survives once withLogLock serializes the writes.
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+//   - #636 claimIdempotencyKey: a POSITIVE CONTROL for the cross-process claim mcp.ts
+//     now takes for the ENTIRE snapshot_now call (not just the log write above) — proof
+//     the guard actually fires, not just that it exists. A second claim attempt for the
+//     SAME (tool, key) while the first is still held must be rejected outright
+//     (IdempotencyClaimHeldError) — this is the exact mechanism that makes the #636 race
+//     (a second process reading a stale cache-miss while the first is still mid-upload)
+//     impossible: the second process can never even START its own lookup-then-work
+//     sequence while the claim is held, regardless of how long either process's own log
+//     read takes. Also asserts: two DIFFERENT keys never contend; release lets a new
+//     claim through; a claim older than the staleness threshold is stolen (a crashed
+//     holder must not wedge the key forever); and — the one non-obvious failure mode a
+//     naive stale-steal design invites — releasing a claim that was ALREADY stolen by a
+//     later holder must NOT delete that later holder's live claim.
+import { mkdtemp, mkdir, rm, writeFile, readFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { lookupIdempotencyResult, recordIdempotencyResult, IdempotencyStoreError } from '../src/lib/idempotency.ts';
+import { createHash } from 'node:crypto';
+import {
+  lookupIdempotencyResult,
+  recordIdempotencyResult,
+  IdempotencyStoreError,
+  claimIdempotencyKey,
+  IdempotencyClaimHeldError,
+} from '../src/lib/idempotency.ts';
+
+// Must match src/lib/idempotency.ts's own (private) CLAIM_STALE_MS — there is no test
+// hook to read it back, so this is kept in sync by hand; a drift here would only make
+// the staleness test below wait longer or shorter than necessary, never silently pass.
+const CLAIM_STALE_MS = 2 * 60 * 60 * 1000;
+
+// Mirrors idempotency.ts's own (private) claimLockPath — needed here only to backdate a
+// claim's mtime directly on disk to simulate a crashed holder, something the public
+// claimIdempotencyKey/release API has no legitimate reason to expose.
+const claimLockPathFor = (logPath, tool, key) =>
+  `${logPath}.claim.${createHash('sha256')
+    .update(JSON.stringify([tool, key]))
+    .digest('hex')}.lock`;
 
 let failed = 0;
 const check = (name, cond, detail) => {
@@ -153,6 +186,98 @@ try {
       lost.length === 0,
       lost.join(', '),
     );
+  }
+
+  // ---------- #636 claimIdempotencyKey: positive control — the guard actually fires ----------
+  {
+    const logPath = join(tmp, 'claim-log.jsonl');
+
+    // A second claim for the SAME key while the first is still held must be rejected —
+    // this IS the mechanism that closes #636 (a second caller can never start its own
+    // lookup-then-work sequence while the first still holds the claim, no matter how
+    // long either caller's own log read takes).
+    const releaseA = await claimIdempotencyKey(logPath, 'snapshot_now', 'claim-key-1');
+    let secondThrew;
+    try {
+      await claimIdempotencyKey(logPath, 'snapshot_now', 'claim-key-1');
+    } catch (e) {
+      secondThrew = e;
+    }
+    check(
+      'a second claim for the SAME (tool, key) while the first is held is rejected (IdempotencyClaimHeldError)',
+      secondThrew instanceof IdempotencyClaimHeldError,
+      secondThrew ? `${secondThrew.constructor.name}: ${secondThrew.message}` : 'second claim succeeded (BUG)',
+    );
+
+    // A DIFFERENT key must never contend with claim-key-1's still-held claim.
+    const releaseB = await claimIdempotencyKey(logPath, 'snapshot_now', 'claim-key-2');
+    check('a claim for a DIFFERENT key is unaffected by another key’s held claim', true);
+    await releaseB();
+
+    // Release must actually free the key for a new claim.
+    await releaseA();
+    let reclaimThrew;
+    let releaseA2;
+    try {
+      releaseA2 = await claimIdempotencyKey(logPath, 'snapshot_now', 'claim-key-1');
+    } catch (e) {
+      reclaimThrew = e;
+    }
+    check(
+      'releasing a claim lets a subsequent claim for the SAME key succeed',
+      reclaimThrew === undefined,
+      reclaimThrew ? `${reclaimThrew.constructor.name}: ${reclaimThrew.message}` : undefined,
+    );
+    if (releaseA2) await releaseA2();
+  }
+
+  // ---------- #636 claimIdempotencyKey: a stale (presumed-crashed) claim is stolen ----------
+  {
+    const logPath = join(tmp, 'claim-stale-log.jsonl');
+    await claimIdempotencyKey(logPath, 'snapshot_now', 'stale-key'); // deliberately never released — simulates a crashed holder
+    const lockPath = claimLockPathFor(logPath, 'snapshot_now', 'stale-key');
+    const old = new Date(Date.now() - CLAIM_STALE_MS - 1000);
+    await utimes(lockPath, old, old);
+
+    let staleThrew;
+    let releaseStolen;
+    try {
+      releaseStolen = await claimIdempotencyKey(logPath, 'snapshot_now', 'stale-key');
+    } catch (e) {
+      staleThrew = e;
+    }
+    check(
+      'a claim older than the staleness threshold is stolen rather than wedging the key forever',
+      staleThrew === undefined,
+      staleThrew ? `${staleThrew.constructor.name}: ${staleThrew.message}` : undefined,
+    );
+    if (releaseStolen) await releaseStolen();
+  }
+
+  // ---------- #636 claimIdempotencyKey: releasing a STOLEN claim must not delete the new holder's ----------
+  {
+    const logPath = join(tmp, 'claim-stolen-release-log.jsonl');
+    const releaseOriginal = await claimIdempotencyKey(logPath, 'snapshot_now', 'stolen-key');
+    const lockPath = claimLockPathFor(logPath, 'snapshot_now', 'stolen-key');
+    const old = new Date(Date.now() - CLAIM_STALE_MS - 1000);
+    await utimes(lockPath, old, old);
+    // A second caller observes the claim as stale and steals it — this is the NEW
+    // legitimate holder from here on.
+    const releaseNew = await claimIdempotencyKey(logPath, 'snapshot_now', 'stolen-key');
+    const ownerAfterSteal = await readFile(lockPath, 'utf8');
+
+    // The ORIGINAL (unlucky, overran-its-budget) holder finally finishes and calls ITS
+    // OWN release — this must be a silent no-op, not a deletion of the new holder's live
+    // claim (deleting it here would let a THIRD caller in while the second is still
+    // working, exactly the bug this claim exists to prevent).
+    await releaseOriginal();
+    const ownerAfterOriginalRelease = await readFile(lockPath, 'utf8').catch(() => null);
+    check(
+      "releasing a stolen claim does not delete the new holder's live claim",
+      ownerAfterOriginalRelease === ownerAfterSteal,
+      JSON.stringify({ before: ownerAfterSteal, after: ownerAfterOriginalRelease }),
+    );
+    await releaseNew();
   }
 } finally {
   await rm(tmp, { recursive: true, force: true });

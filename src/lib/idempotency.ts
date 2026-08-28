@@ -16,9 +16,9 @@
 // a save-locator), so there is no positional-TSV backward-compatibility surface to
 // preserve, and JSON-per-line is simpler to extend than a growing positional format would
 // be.
-import { writeFile, rename, rm, mkdir, stat } from 'node:fs/promises';
+import { writeFile, readFile, rename, rm, mkdir, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { errMsg, readJsonlLog } from './util.js';
 
 // One stored line. `fingerprint` is an opaque, caller-computed digest of whatever fields
@@ -171,15 +171,9 @@ export async function lookupIdempotencyResult(
 //
 // WHAT THIS DOES NOT CLOSE (documented rather than silently assumed away, per the same
 // review): it serializes WRITES to the log file itself, so no record is lost to a lost
-// update — but it does NOT make the full "look up, then eventually record" sequence
-// atomic across two SEPARATE processes. Two different OS processes racing on the exact
-// SAME idempotency_key can each read a cache MISS (mcp.ts's lookupIdempotencyResult runs
-// outside this lock, before either process starts its own paid work) and both go on to
-// spend — mcp.ts's own idempotencyInFlight Set only guards that window WITHIN one
-// process. Closing the cross-process version of that race would mean holding one lock for
-// the ENTIRE paid call (including the actual network upload), which is a materially larger
-// change than the data-loss bug this closes; if that stronger guarantee is ever needed,
-// it belongs in a follow-up that widens the lock's scope, not a silent assumption here.
+// update — but by itself it does NOT make the full "look up, then eventually record"
+// sequence atomic across two SEPARATE processes; that is what claimIdempotencyKey below
+// is for (#636) — see its own doc comment for the wider-scope lock that closes it.
 const LOCK_STALE_MS = 10_000; // longer than this and the holder is presumed crashed, not slow
 const LOCK_RETRY_DELAY_MS = 50;
 // #617: must stay comfortably LARGER than LOCK_STALE_MS. A waiter that gives up before
@@ -228,6 +222,137 @@ async function withLogLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   } finally {
     await rm(lockPath, { force: true });
   }
+}
+
+// Thrown when (tool, key) is already claimed by another live holder — see
+// claimIdempotencyKey's own doc comment below for what "claimed" means and why the
+// caller should treat this exactly like mcp.ts's own in-process ERR_IDEMPOTENCY_IN_FLIGHT
+// (refuse the concurrent duplicate outright, never queue or retry silently).
+export class IdempotencyClaimHeldError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'IdempotencyClaimHeldError';
+  }
+}
+
+// #636: this claim is held for the caller's ENTIRE call — lookup through record, not
+// merely one log write the way withLogLock's lock above is — so it cannot reuse
+// withLogLock's LOCK_STALE_MS (10s): that value is sized for a single read-modify-rename,
+// and a real paid snapshot_now call (encrypt + upload) can legitimately run far longer.
+// This codebase's own largest existing operation timeout is PIPE_TIMEOUT_MS
+// (src/lib/config.ts, default 60 minutes) — the bound already placed on the tar/encrypt
+// subprocess pipes snapshot() and push() spawn — so a claim held past twice that is a
+// reasonable line between "an honest call that is just slow" and "the process that made
+// it is gone". A holder that legitimately overruns this (a single call slower than every
+// timeout elsewhere in this codebase) can lose its claim to a steal — see the ownership
+// token in the release closure below for why that is a safe, not a silent, failure mode.
+const CLAIM_STALE_MS = 2 * 60 * 60 * 1000; // 2h
+// A steal race between two WOULD-BE claimants stealing the SAME stale claim at once is
+// resolved by retrying the exclusive-create rather than assuming the steal succeeded —
+// bounded so a pathological run of repeated collisions fails closed instead of spinning
+// forever (each attempt only fires after observing a STALE lock, so in practice this
+// almost never exceeds one iteration).
+const CLAIM_STEAL_MAX_ATTEMPTS = 5;
+
+function claimLockPath(path: string, tool: string, key: string): string {
+  // Hashed rather than a literal tool/key-derived filename: an arbitrary caller-chosen
+  // key can contain path separators or other filesystem-unsafe characters, the same
+  // reason mcp.ts's own in-process lockId encodes [tool, key] as JSON rather than
+  // concatenating them with a hand-picked separator.
+  const id = createHash('sha256')
+    .update(JSON.stringify([tool, key]))
+    .digest('hex');
+  return `${path}.claim.${id}.lock`;
+}
+
+/**
+ * Claim (tool, key) across ALL processes sharing this idempotency log's directory, for
+ * the caller's entire call (#636) — the cross-process counterpart of mcp.ts's in-process
+ * `idempotencyInFlight` Set. That Set is process-local: two cypher-brain-mcp server
+ * processes sharing one CYPHER_BRAIN_HOME each have their OWN Set, so one process adding
+ * a key to ITS Set does nothing to stop the other from racing the identical
+ * lookup-miss-then-spend sequence for the same key. This claim closes that: the caller
+ * must acquire it BEFORE calling lookupIdempotencyResult and hold it (via the returned
+ * release function, called in a `finally`) until AFTER its own recordIdempotencyResult
+ * call — so a second process's own claim attempt fails immediately while the first still
+ * holds it, and by the time a claim can succeed again, the previous holder's
+ * recordIdempotencyResult has already completed (release happens no earlier than that),
+ * so the new holder's own lookup is guaranteed to observe it rather than read a stale miss.
+ *
+ * Same exclusive-create + staleness-steal primitive as withLogLock above, but never
+ * WAITS for a held claim to free up (unlike withLogLock, which polls until
+ * LOCK_MAX_WAIT_MS) — mirroring mcp.ts's own idempotencyInFlight behavior, a concurrent
+ * duplicate is refused outright (IdempotencyClaimHeldError) rather than queued, so a
+ * caller retrying blind never silently piles up work waiting in line.
+ *
+ * Returns a release function the caller MUST call exactly once (typically in a
+ * `finally`) once it is done with the key, whether that ended in a cache hit, a
+ * successful spend, or an error. The release only removes the lock file if it still
+ * carries THIS call's own ownership token — if the claim was stolen out from under an
+ * unlucky caller that ran past CLAIM_STALE_MS, releasing must not delete the NEW
+ * holder's live claim (that would let a third concurrent caller in while the second is
+ * still working, exactly the bug this claim exists to prevent); it is silently a no-op
+ * in that case instead.
+ */
+export async function claimIdempotencyKey(path: string, tool: string, key: string): Promise<() => Promise<void>> {
+  const lockPath = claimLockPath(path, tool, key);
+  await mkdir(dirname(resolve(path)), { recursive: true });
+  // Pid alone is not a safe ownership token: a stolen-then-reclaimed lock could in
+  // principle be re-created by a DIFFERENT later call from the same pid (this same
+  // process, a later retry) after this one already lost the race — the random suffix
+  // disambiguates this specific claim instance from any other, same pid or not.
+  const token = `${process.pid}.${randomBytes(4).toString('hex')}`;
+  let attempts = 0;
+  for (;;) {
+    try {
+      await writeFile(lockPath, token, { flag: 'wx' });
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') throw e;
+      let stale: boolean;
+      try {
+        const st = await stat(lockPath);
+        stale = Date.now() - st.mtimeMs > CLAIM_STALE_MS;
+      } catch {
+        continue; // the claim disappeared between our failed create and this stat — retry now, uncounted
+      }
+      if (!stale) {
+        throw new IdempotencyClaimHeldError(
+          `idempotency_key ${JSON.stringify(key)} for tool ${JSON.stringify(tool)} is already claimed at ` +
+            `${lockPath} by another process (or this same process, if it did not check its own in-process ` +
+            'in-flight set first) — refusing to run the same call concurrently rather than risk paying twice.',
+        );
+      }
+      if (++attempts > CLAIM_STEAL_MAX_ATTEMPTS) {
+        throw new IdempotencyClaimHeldError(
+          `could not claim idempotency_key ${JSON.stringify(key)} for tool ${JSON.stringify(tool)} after ` +
+            `${CLAIM_STEAL_MAX_ATTEMPTS} attempts to steal a presumed-crashed holder's claim at ${lockPath} — ` +
+            'refusing rather than risk two processes both believing they now own it.',
+        );
+      }
+      // Presumed-crashed holder (older than CLAIM_STALE_MS) — steal it. If another
+      // process is stealing the SAME stale claim at this exact moment, at most one of
+      // the two `writeFile(..., 'wx')` retries below succeeds; the loser sees EEXIST
+      // again, and since the winner just wrote it, `stale` reads false next time —
+      // correctly reporting held-by-another rather than re-stealing out from under them.
+      await rm(lockPath, { force: true }).catch(() => {});
+    }
+  }
+  let released = false;
+  return async () => {
+    if (released) return; // idempotent — a caller's own cleanup path may call this more than once
+    released = true;
+    try {
+      const owner = await readFile(lockPath, 'utf8');
+      if (owner === token) await rm(lockPath, { force: true });
+      // else: this claim was stolen by a later holder (this call outran CLAIM_STALE_MS)
+      // — leave THEIR live claim alone, see this function's own doc comment above.
+    } catch {
+      // ENOENT (already gone — stolen-then-released by someone else, or a prior release
+      // already ran) or any other read failure: best-effort cleanup only, never throw
+      // out of a release path.
+    }
+  };
 }
 
 /**
