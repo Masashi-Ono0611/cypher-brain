@@ -1,10 +1,10 @@
 ---
-"cypher-brain": patch
 ---
 
 Internal duplication cleanup found by a code-quality audit — no user-facing behavior
 change, confirmed by the full `selftest-ton`/`selftest-ton-provider`/`cli-smoke`/
 `selftest-init`/`selftest-plan`/`selftest-ton-dns` suites passing with identical output.
+An empty changeset per `CONTRIBUTING.md`.
 
 - `TON_HTTP_TIMEOUT_MS` (`src/lib/config.ts`) now reuses `parsePositiveMsOverride`
   instead of hand-rolling the same "positive integer ms, warn+default on invalid"

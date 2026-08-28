@@ -436,9 +436,17 @@ export const TON_BIN = readEnv('CYPHER_BRAIN_TON_BIN') || 'tonutils-storage'; //
 // declaration so this earlier call site can see it) — this is exactly the "validate
 // positive integer ms, warn+default on invalid" logic the TON_PROVIDER_* overrides
 // further down already use; hand-rolling it here a second time only risked the two
-// drifting apart (#499).
+// drifting apart (#499). `|| undefined` preserves this variable's own pre-existing
+// quirk (multi-model review, #499 fix): the old hand-rolled version computed
+// `Number(raw || 30_000)`, so an explicitly-set-but-EMPTY-string value fell back to the
+// default the same silent way an unset one does, with no warning — only a non-empty
+// invalid value (e.g. "abc"/"0"/"-5") warned. Passing raw straight through here would
+// change that one edge case (parsePositiveMsOverride treats "" as a defined-but-invalid
+// "0" and would newly warn on it); the TON_PROVIDER_* overrides below intentionally keep
+// that stricter behavior for their OWN empty-string case, since they never had this `||`
+// shortcut to begin with.
 export const TON_HTTP_TIMEOUT_MS = parsePositiveMsOverride(
-  readEnv('CYPHER_BRAIN_TON_HTTP_TIMEOUT'),
+  readEnv('CYPHER_BRAIN_TON_HTTP_TIMEOUT') || undefined,
   30_000,
   'CYPHER_BRAIN_TON_HTTP_TIMEOUT',
 );
