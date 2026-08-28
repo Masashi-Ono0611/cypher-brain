@@ -395,4 +395,20 @@ printf '%s' "$NOID_OUT" | grep -q 'no private identity on this machine' \
   && echo "[PASS] control: --identity omitted with no default identity present is still an unchanged, expected PARTIAL" \
   || { echo "[FAIL] control: omitted-identity PARTIAL message missing/changed"; echo "$NOID_OUT"; exit 1; }
 
+echo "== #531 (multi-model review fix): an EXPLICIT bad --identity still surfaces as CB-E015 even when the signature ALSO independently fails =="
+# Before this fix, the explicit-identity check lived inside the 'else' of `if (sigOk ===
+# false)` — so a genuinely invalid/tampered signature would route straight into "[SKIP]
+# positive control — skipped (the authenticity signature above failed)" and the identity
+# typo underneath it was never reported at all, silently subsumed by the signature FAIL.
+cp "$TMP/sig528.age.minisig" "$TMP/sig528.age.minisig.bak"
+printf 'not a real signature\n' > "$TMP/sig528.age.minisig"
+set +e
+BADSIG_ERR=$(CYPHER_BRAIN_HOME="$SIGHOME528" cb verify --in "$TMP/sig528.age" --level quick --identity "$TMP/no-such-identity-2.age" 2>&1); BADSIG_RC=$?
+set -e
+mv "$TMP/sig528.age.minisig.bak" "$TMP/sig528.age.minisig"
+[ "$BADSIG_RC" = "1" ] || { echo "[FAIL] explicit bad --identity + invalid signature exited $BADSIG_RC, expected 1"; echo "$BADSIG_ERR"; exit 1; }
+printf '%s' "$BADSIG_ERR" | grep -q 'CB-E015' \
+  && echo "[PASS] explicit bad --identity is still refused (CB-E015) even when the signature above is ALSO invalid" \
+  || { echo "[FAIL] explicit bad --identity was not refused when the signature also failed: $BADSIG_ERR"; exit 1; }
+
 echo "[PASS] verify --level quick/remote/drill (issue #209) all behave as documented"

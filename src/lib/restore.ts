@@ -1066,20 +1066,24 @@ async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<
   // nothing and (per #214) restore's own equivalent check refuses outright rather
   // than decrypt, so verify's report should not imply this one just "went ahead".
   const identity = o.identity || IDENTITY;
+  // #531: an EXPLICITLY-given --identity that doesn't exist is a configuration typo, not
+  // "no private identity is set up on this box" — the same distinction --sign-recipient
+  // already draws above (and restoreImpl's own identical guard draws for `restore
+  // --identity`). Only the DEFAULT path being absent means "not set up yet, legitimately
+  // a public-key-only box" (the SKIP/PARTIAL branch below); a nonexistent path the caller
+  // named on purpose is a hard error instead, so a typo is never read as an expected
+  // verdict. Checked UNCONDITIONALLY, before the `sigOk === false` branch below (multi-
+  // model review, #531) — otherwise a signature that ALSO happens to be invalid would
+  // route straight into "skipped (signature failed)" and this typo would never surface
+  // at all, silently reported as nothing more than a signature failure.
+  if (o.identity && !(await exists(o.identity))) {
+    throw new Error(`no identity at ${o.identity} — cannot decrypt without the private key`);
+  }
   let positiveOk = true;
   let positiveSkipped = false;
   if (sigOk === false) {
     positiveSkipped = true;
     if (!o.json) console.log('[SKIP] positive control — skipped (the authenticity signature above failed)');
-  } else if (o.identity && !(await exists(o.identity))) {
-    // #531: an EXPLICITLY-given --identity that doesn't exist is a configuration typo,
-    // not "no private identity is set up on this box" — the same distinction
-    // --sign-recipient already draws above (and restoreImpl's own identical guard draws
-    // for `restore --identity`). Only the DEFAULT path being absent means "not set up
-    // yet, legitimately a public-key-only box" (the SKIP/PARTIAL branch below); a
-    // nonexistent path the caller named on purpose is a hard error instead, so a typo
-    // is never read as an expected verdict.
-    throw new Error(`no identity at ${o.identity} — cannot decrypt without the private key`);
   } else if (await exists(identity)) {
     try {
       const decrypter = newDecrypter(await loadIdentities(identity)); // prompts if passphrase-wrapped
