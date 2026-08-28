@@ -1011,8 +1011,8 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
     // #636: release BOTH claims acquired above, on every path out of the `try` above —
     // the cache-hit replay's `return`, every `throw`, and the real-work success path.
     // The in-process delete is synchronous and cheap; the cross-process release is
-    // best-effort I/O (see claimIdempotencyKey's own doc comment for why a stolen claim
-    // is deliberately left alone rather than removed here).
+    // best-effort I/O (see claimIdempotencyKey's own doc comment for what it does and does
+    // not remove — it never touches a claim it did not itself create).
     if (lockId) idempotencyInFlight.delete(lockId);
     if (releaseClaim) await releaseClaim();
   }

@@ -298,6 +298,19 @@ function claimLockPath(path: string, tool: string, key: string): string {
  * own retry after a transient failure, say) re-runs the same read-then-maybe-remove check
  * rather than being suppressed by an "already released" flag, so a transient I/O error on
  * one attempt does not wedge the claim indefinitely.
+ *
+ * WHAT THIS STILL DOES NOT CLOSE (documented rather than silently assumed away, multi-
+ * model review, #636): the read-then-maybe-remove above is itself two separate calls, not
+ * one atomic one — an operator's manual removal, a new claimant's `writeFile('wx')`, and
+ * this release's own `rm` could in principle interleave inside that gap and delete the
+ * new holder's fresh claim. Reaching that requires a human to have ALREADY (incorrectly)
+ * decided the original holder was dead and deleted its lock, AND a new claim to land, AND
+ * the original holder's own release to fire — all within the same few-microsecond window.
+ * That is categorically narrower than the bug this file exists to fix (which fired under
+ * ordinary conditions, no operator error required), and closing it fully needs the same
+ * OS-level advisory lock this function's own doc comment above already explains is out of
+ * scope here. If a stronger guarantee is ever needed, it belongs in a follow-up that
+ * replaces this path-based lockfile with one, not a silent assumption here.
  */
 export async function claimIdempotencyKey(path: string, tool: string, key: string): Promise<() => Promise<void>> {
   const lockPath = claimLockPath(path, tool, key);
