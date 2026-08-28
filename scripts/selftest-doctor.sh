@@ -490,6 +490,7 @@ const rl = j.checks.find((c) => c.id === 'receipt-ledger-readability');
 if (!rl || rl.status !== 'warn') throw new Error('expected --json receipt-ledger-readability warn, got ' + JSON.stringify(rl));
 if (!/1 unreadable line/.test(rl.message)) throw new Error('--json message missing the unreadable-line count: ' + rl.message);
 if (j.checks.some((c) => c.status === 'fail')) throw new Error('--json reported a fail-status check — an unreadable receipt ledger line must never escalate to FAIL');
+if (typeof j.health_score !== 'number' || !Number.isFinite(j.health_score)) throw new Error('expected --json health_score to be a finite number, got ' + JSON.stringify(j.health_score));
 if (j.health_score >= 100) throw new Error('verdict PARTIAL but --json health_score is ' + j.health_score + ' — score/verdict must not disagree');
 " "$TMP/r.json"
 echo "[PASS] the same fixture via --json: verdict PARTIAL, exit 2, receipt-ledger-readability warn (not fail), score/verdict agree"
