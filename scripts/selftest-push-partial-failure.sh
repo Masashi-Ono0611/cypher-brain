@@ -24,12 +24,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin/cypher-brain.mjs"
 source "$ROOT/scripts/dev-node-flags.sh"
+source "$ROOT/scripts/selftest-lib.sh" # cb(), see scripts/selftest-lib.sh (#572)
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export CYPHER_BRAIN_FILE_DIR="$TMP/store"
-cb() { CYPHER_BRAIN_HOME="$HOME_DIR" node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
-
-HOME_DIR="$TMP/keys"
+export CYPHER_BRAIN_HOME="$TMP/keys"
 cb keygen >/dev/null
 cb keygen --sign >/dev/null
 

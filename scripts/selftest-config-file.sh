@@ -20,24 +20,16 @@ CLI="$ROOT/dist/cli.mjs"
 MCP="$ROOT/dist/mcp.mjs"
 [ -f "$CLI" ] || { echo "[FAIL] $CLI missing — run npm run build first"; exit 1; }
 
+# with_timeout: the MCP drive below must FAIL LOUDLY within a bounded time rather than
+# hang the suite if the startup guard ever regresses. GNU `timeout` is NOT available on
+# macOS (this test passed locally and failed on macos-latest CI for exactly that reason),
+# so use the shared helper from scripts/selftest-lib.sh (#569).
+source "$ROOT/scripts/selftest-lib.sh"
+
 TMP="$(mktemp -d)"
 trap 'chmod -R u+rwX "$TMP" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
 SRC="$TMP/src"; mkdir -p "$SRC"; printf 'hello\n' > "$SRC/a.md"
-
-# with_timeout: the MCP drive below must FAIL LOUDLY within a bounded time rather than
-# hang the suite if the startup guard ever regresses. GNU `timeout` is NOT available on
-# macOS (this test passed locally and failed on macos-latest CI for exactly that reason),
-# so use the same helper scripts/selftest-init.sh and scripts/selftest-storage.sh already
-# carry — each selftest here is standalone, so it is copied rather than shared.
-with_timeout() {
-  local s=$1; shift
-  "$@" & local c=$!
-  ( sleep "$s"; kill -9 "$c" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
-  wait "$c" 2>/dev/null; local rc=$?
-  kill -9 "$w" 2>/dev/null; wait "$w" 2>/dev/null
-  return $rc
-}
 
 # Each case gets its own CYPHER_BRAIN_HOME so a bad config in one cannot leak into another.
 new_home() { local h="$TMP/$1"; mkdir -p "$h"; printf '%s' "$h"; }

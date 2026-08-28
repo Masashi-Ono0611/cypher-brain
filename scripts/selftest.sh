@@ -12,10 +12,10 @@ BIN="$ROOT/bin/cypher-brain.mjs"
 # build step) under plain node — see scripts/dev-node-flags.sh (never an exported
 # NODE_OPTIONS string — whitespace-split, breaks under a checkout path with a space).
 source "$ROOT/scripts/dev-node-flags.sh"
+source "$ROOT/scripts/selftest-lib.sh" # cb(), see scripts/selftest-lib.sh (#572)
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export CYPHER_BRAIN_HOME="$TMP/keys"
-cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
 # Mirrors src/lib/restore.ts's sourceDigest() EXACTLY (delegates to node rather than
 # re-deriving it in bash) — the FULL, un-truncated 64-hex-char sha256 of the argument
 # STRING encoded as 'utf16le' (NOT shasum's default byte-for-byte/utf8 hashing of

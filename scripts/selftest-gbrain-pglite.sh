@@ -26,20 +26,12 @@ MCP_BIN="$ROOT/bin/cypher-brain-mcp.mjs"
 # BIN_DEV_ARGS: literal argv flags to run the CLI against src/*.ts (no build step)
 # under plain node — see scripts/dev-node-flags.sh.
 source "$ROOT/scripts/dev-node-flags.sh"
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-
-# with_timeout: identical to the helper in scripts/selftest-init.sh — a regression
+# with_timeout: shared helper from scripts/selftest-lib.sh (#569) — a regression
 # that WEDGES the wizard (e.g. a prompt appearing on the branch that must not show
 # it, so the scripted driver waits forever for the next one) has to fail loudly
 # inside a bounded time rather than hang the whole suite.
-with_timeout() {
-  local s=$1; shift
-  "$@" & local c=$!
-  ( sleep "$s"; kill -9 "$c" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
-  wait "$c" 2>/dev/null; local rc=$?
-  kill -9 "$w" 2>/dev/null; wait "$w" 2>/dev/null
-  return $rc
-}
+source "$ROOT/scripts/selftest-lib.sh"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
 # A synthetic PGLite data directory: the two markers a real Postgres data directory
 # always carries, plus a plausible file or two. Keyed on the markers rather than the

@@ -15,10 +15,13 @@ BIN="$ROOT/bin/cypher-brain.mjs"
 # build step) under plain node — see scripts/dev-node-flags.sh (never an exported
 # NODE_OPTIONS string — whitespace-split, breaks under a checkout path with a space).
 source "$ROOT/scripts/dev-node-flags.sh"
+source "$ROOT/scripts/selftest-lib.sh" # sha(), see scripts/selftest-lib.sh (#572)
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export CYPHER_BRAIN_FILE_DIR="$TMP/store"
+# cb here takes the CYPHER_BRAIN_HOME as its OWN first positional arg (this script
+# exercises two concurrent keypairs, $PQ and $X25519) rather than an env-var
+# override, so it keeps its own definition instead of scripts/selftest-lib.sh's.
 cb() { CYPHER_BRAIN_HOME="$1" node "${BIN_DEV_ARGS[@]}" "$BIN" "${@:2}"; }
-sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
 PQ="$TMP/keys-pq"
 X25519="$TMP/keys-x25519"

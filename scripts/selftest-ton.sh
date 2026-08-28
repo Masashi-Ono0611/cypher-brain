@@ -15,6 +15,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin/cypher-brain.mjs"
 source "$ROOT/scripts/dev-node-flags.sh"
+# cb/sha/start_ton_seeder: shared across scripts/selftest-*.sh, see
+# scripts/selftest-lib.sh (#570, #572).
+source "$ROOT/scripts/selftest-lib.sh"
 
 TMP="$(mktemp -d)"
 SEEDER_PID=""
@@ -25,62 +28,11 @@ cleanup() {
 trap cleanup EXIT
 
 export CYPHER_BRAIN_HOME="$TMP/keys"
-SEEDER_HOME="$TMP/seeder-home"
-export MOCK_TON_STORE="$TMP/store"
-mkdir -p "$SEEDER_HOME" "$MOCK_TON_STORE"
 
-cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
-sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
-
-# ---- the "seeder": a mock daemon on loopback + a home directory ----
-MOCK_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$ROOT/scripts/mock-tonutils.mjs" --daemon --api "127.0.0.1:$MOCK_PORT" --db "$TMP/seeder-db" &
-SEEDER_PID=$!
-READY=0
-for _ in $(seq 1 50); do
-  if curl -s "http://127.0.0.1:$MOCK_PORT/api/v1/list" >/dev/null 2>&1; then READY=1; break; fi
-  sleep 0.2
-done
-[ "$READY" = 1 ] || { echo "[FAIL] mock seeder daemon did not come up on port $MOCK_PORT"; exit 1; }
-
-# ---- PATH shims: ssh/scp against the local "seeder", tonutils-storage -> mock ----
-SHIM="$TMP/bin"
-mkdir -p "$SHIM"
-cat > "$SHIM/ssh" <<EOF
-#!/usr/bin/env bash
-# selftest shim: run the remote command line in the fake seeder home.
-while [ \$# -gt 0 ] && [ "\$1" != "--" ]; do
-  case "\$1" in -o|-i) shift 2;; *) shift;; esac
-done
-[ "\${1:-}" = "--" ] && shift
-shift # host
-cd "$SEEDER_HOME"
-exec bash -c "\$*"
-EOF
-cat > "$SHIM/scp" <<EOF
-#!/usr/bin/env bash
-# selftest shim: host:path means a path under the fake seeder home.
-while [ \$# -gt 0 ] && [ "\$1" != "--" ]; do
-  case "\$1" in -o|-i) shift 2;; *) shift;; esac
-done
-[ "\${1:-}" = "--" ] && shift
-resolve() {
-  case "\$1" in
-    *:/*) printf '%s' "\${1#*:}";;
-    *:*)  printf '%s/%s' "$SEEDER_HOME" "\${1#*:}";;
-    *)    printf '%s' "\$1";;
-  esac
-}
-cp "\$(resolve "\$1")" "\$(resolve "\$2")"
-EOF
-cat > "$SHIM/tonutils-storage" <<EOF
-#!/usr/bin/env bash
-exec node "$ROOT/scripts/mock-tonutils.mjs" "\$@"
-EOF
-chmod +x "$SHIM/ssh" "$SHIM/scp" "$SHIM/tonutils-storage"
-export PATH="$SHIM:$PATH"
-export CYPHER_BRAIN_TON_SSH_HOST="mock-seeder"
-export CYPHER_BRAIN_TON_REMOTE_API="127.0.0.1:$MOCK_PORT"
+# ---- the "seeder": a mock daemon on loopback + a home directory, reached
+# through PATH-shimmed ssh/scp (start_ton_seeder sets SEEDER_HOME/SEEDER_PID/
+# MOCK_PORT/SHIM as globals; SEEDER_PID feeds the cleanup trap above) ----
+start_ton_seeder
 
 MARKER="ton-marker-$(od -An -N6 -tx1 /dev/urandom | tr -d ' ')"
 SRC="$TMP/brain-src"

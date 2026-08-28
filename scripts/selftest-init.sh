@@ -26,21 +26,13 @@ BIN="$ROOT/bin/cypher-brain.mjs"
 # build step) under plain node — see scripts/dev-node-flags.sh (never an exported
 # NODE_OPTIONS string — whitespace-split, breaks under a checkout path with a space).
 source "$ROOT/scripts/dev-node-flags.sh"
+# cb/with_timeout/with_stdin_timeout: shared across scripts/selftest-*.sh, see
+# scripts/selftest-lib.sh (#569, #572). with_timeout: a regression here (e.g. the
+# wizard hanging on a dropped prompt) must FAIL LOUDLY within a bounded time, not
+# hang the whole suite (rules/shell-ops.md — every poll/gate/interactive-drive
+# call needs its OWN deadline, not just an outer one).
+source "$ROOT/scripts/selftest-lib.sh"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
-
-# with_timeout: a regression here (e.g. the wizard hanging on a dropped prompt) must
-# FAIL LOUDLY within a bounded time, not hang the whole suite (rules/shell-ops.md —
-# every poll/gate/interactive-drive call needs its OWN deadline, not just an outer
-# one). Identical to the helper already used in scripts/selftest-storage.sh.
-with_timeout() {
-  local s=$1; shift
-  "$@" & local c=$!
-  ( sleep "$s"; kill -9 "$c" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
-  wait "$c" 2>/dev/null; local rc=$?
-  kill -9 "$w" 2>/dev/null; wait "$w" 2>/dev/null
-  return $rc
-}
 
 # file_mode: portable octal permission-bits lookup. GNU coreutils `stat` (Linux,
 # this repo's ubuntu-latest CI matrix cells) and BSD `stat` (macOS) both accept a
@@ -1303,15 +1295,8 @@ echo "== (p) CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 with FILE-redirected (non-
 # because it either already redirects from /dev/null or never needed real stdin
 # content in the first place — this is the first one that does). `<&0` makes the
 # dup an explicit redirection ON the backgrounded command itself, which is enough to
-# opt back out of bash's default.
-with_stdin_timeout() {
-  local s=$1; shift
-  "$@" <&0 & local c=$!
-  ( sleep "$s"; kill -9 "$c" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
-  wait "$c" 2>/dev/null; local rc=$?
-  kill -9 "$w" 2>/dev/null; wait "$w" 2>/dev/null
-  return $rc
-}
+# opt back out of bash's default. scripts/selftest-lib.sh's with_stdin_timeout does
+# exactly this (plus the same #569 hardening as with_timeout).
 
 P_HOME="$TMP/nonpipe-stdin-home"; mkdir -p "$P_HOME"
 P_CB_HOME="$TMP/nonpipe-stdin-cb-home"

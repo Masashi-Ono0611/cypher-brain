@@ -21,6 +21,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin/cypher-brain.mjs"
 source "$ROOT/scripts/dev-node-flags.sh"
+source "$ROOT/scripts/selftest-lib.sh" # cb()/sha(), see scripts/selftest-lib.sh (#572)
 
 TMP="$(mktemp -d)"
 MYTONPROVIDER_PID=""
@@ -39,9 +40,6 @@ mkdir -p "$MOCK_TON_STORE"
 # system launchd/cron — same isolation scripts/selftest-schedule.sh uses.
 export CYPHER_BRAIN_SCHEDULE_DIR="$TMP/sched"
 export CYPHER_BRAIN_LAUNCHD_DIR="$TMP/launchagents"
-
-cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
-sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
 # A fixed, syntactically-valid ProviderKey pubkey — this script's mytonprovider.org mock
 # and its notify-response mock must agree on it (real code cross-checks pubkey shape but

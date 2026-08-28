@@ -52,6 +52,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin/cypher-brain.mjs"
 source "$ROOT/scripts/dev-node-flags.sh"
+source "$ROOT/scripts/selftest-lib.sh" # cb(), see scripts/selftest-lib.sh (#572)
 TMP="$(mktemp -d)"
 trap 'chmod -R u+rwX "$TMP" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
@@ -66,8 +67,6 @@ unset _leaked
 # empty HOME so the bulk of this file never touches whoever-runs-this's REAL ~/.gbrain.
 # Cases that specifically exercise gbrain-engine-detection override HOME per-case below.
 export HOME="$TMP/default-home"; mkdir -p "$HOME"
-
-cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
 
 echo "== (a) a not-yet-set-up home: every check SKIPs, health_score 100, PASS, exit 0 =="
 export CYPHER_BRAIN_HOME="$TMP/fresh-home"
