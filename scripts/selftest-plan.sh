@@ -13,6 +13,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin/cypher-brain.mjs"
 source "$ROOT/scripts/dev-node-flags.sh"
+source "$ROOT/scripts/selftest-lib.sh" # cb()/sha(), see scripts/selftest-lib.sh (#572)
 
 TMP="$(mktemp -d)"
 MOCK_PID=""
@@ -24,9 +25,6 @@ trap cleanup EXIT
 
 export CYPHER_BRAIN_HOME="$TMP/home"
 mkdir -p "$CYPHER_BRAIN_HOME" "$TMP/src" "$TMP/store"
-
-cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
-sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
 echo "hello plan/apply" > "$TMP/src/hello.txt"
 cb keygen >/dev/null

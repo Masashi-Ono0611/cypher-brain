@@ -23,6 +23,7 @@ BIN="$ROOT/bin/cypher-brain.mjs"
 # build step) under plain node — see scripts/dev-node-flags.sh (never an exported
 # NODE_OPTIONS string — whitespace-split, breaks under a checkout path with a space).
 source "$ROOT/scripts/dev-node-flags.sh"
+source "$ROOT/scripts/selftest-lib.sh" # cb(), see scripts/selftest-lib.sh (#572)
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Start from a CLEAN CYPHER_BRAIN_* environment. This script is not merely reading
 # configuration — `schedule install` BAKES whatever it can see into the generated runner
@@ -45,7 +46,6 @@ export CYPHER_BRAIN_HOME="$TMP/home"
 export CYPHER_BRAIN_SCHEDULE_DIR="$TMP/sched"
 export CYPHER_BRAIN_LAUNCHD_DIR="$TMP/launchagents"
 export CYPHER_BRAIN_FILE_DIR="$TMP/store"
-cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
 
 # First 8 hex chars of sha256(CYPHER_BRAIN_HOME) — must match src/lib/schedule.ts's
 # HOME_LABEL_HASH exactly (same input, same algorithm, same truncation) so this script can

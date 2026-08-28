@@ -13,10 +13,10 @@ BIN="$ROOT/bin/cypher-brain.mjs"
 # build step) under plain node — see scripts/dev-node-flags.sh (never an exported
 # NODE_OPTIONS string — whitespace-split, breaks under a checkout path with a space).
 source "$ROOT/scripts/dev-node-flags.sh"
+source "$ROOT/scripts/selftest-lib.sh" # cb(), see scripts/selftest-lib.sh (#572)
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export CYPHER_BRAIN_HOME="$TMP/keys"
-cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
 
 echo "== keygen =="
 cb keygen >/dev/null

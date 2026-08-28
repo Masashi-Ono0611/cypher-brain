@@ -11,11 +11,12 @@ BIN="$ROOT/bin/cypher-brain.mjs"
 # build step) under plain node — see scripts/dev-node-flags.sh (never an exported
 # NODE_OPTIONS string — whitespace-split, breaks under a checkout path with a space).
 source "$ROOT/scripts/dev-node-flags.sh"
+# cb/sha/with_timeout: shared across scripts/selftest-*.sh, see scripts/selftest-lib.sh
+# (#569, #572).
+source "$ROOT/scripts/selftest-lib.sh"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export CYPHER_BRAIN_HOME="$TMP/keys"
 export CYPHER_BRAIN_FILE_DIR="$TMP/store"
-cb() { node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
-sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
 MARKER="secret-thought-$(od -An -N6 -tx1 /dev/urandom | tr -d ' ')"
 SRC="$TMP/brain-src"; mkdir -p "$SRC"
@@ -362,17 +363,9 @@ echo "== #70 review round 4: a top-level FIFO (--dir arg itself a special file) 
 # sha256()-ing it would block forever. The fix (src/lib/snapshot.ts contentDigestOfPath)
 # must detect this at the TOP level the same way the nested-file-walk already does for a
 # special file found inside a --dir, and hash a bare kind marker instead of reading it.
-# with_timeout bounds the snapshot call itself: a regression here must FAIL LOUDLY, not
-# hang the whole suite (rules/shell-ops.md -- poll/gate loops need their own deadline,
-# not just an outer one).
-with_timeout() {
-  local s=$1; shift
-  "$@" & local c=$!
-  ( sleep "$s"; kill -9 "$c" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
-  wait "$c" 2>/dev/null; local rc=$?
-  kill -9 "$w" 2>/dev/null; wait "$w" 2>/dev/null
-  return $rc
-}
+# with_timeout (from scripts/selftest-lib.sh) bounds the snapshot call itself: a
+# regression here must FAIL LOUDLY, not hang the whole suite (rules/shell-ops.md --
+# poll/gate loops need their own deadline, not just an outer one).
 FIFO="$TMP/special.fifo"
 mkfifo "$FIFO"
 with_timeout 15 cb snapshot --dir "$FIFO" --out "$TMP/fifo1.age" || { echo "[FAIL] snapshot on a top-level FIFO timed out or errored (may be blocked reading FIFO content)"; exit 1; }
