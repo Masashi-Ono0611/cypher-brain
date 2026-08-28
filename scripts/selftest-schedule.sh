@@ -252,6 +252,54 @@ set -e
 printf '%s' "$ERR2" | grep -q "obsidian" || { echo "[FAIL] install's wrong-profile --export refusal does not name the mismatched profile"; echo "$ERR2"; exit 1; }
 echo "[PASS] schedule install refuses --export without --profile o2b (absent or mismatched) before writing anything"
 
+echo "== (a3f) schedule install: an unknown --profile name is refused BEFORE writing any files (issue #461), with the same message + did-you-mean suggestion 'snapshot --profile <typo>' already gives; a VALID --profile still installs cleanly (no regression) =="
+# Before this check, install() never validated --profile at all: it just baked `snapshot
+# --profile '<typo>' ...` verbatim into the generated runner, which exits 0 today and only
+# fails every night forever once the nightly actually runs snapshot() (which DOES refuse
+# an unknown profile — the exact "flag accepted, never honored" bug class #461 names).
+# A dedicated, throwaway CYPHER_BRAIN_HOME/SCHEDULE_DIR/LAUNCHD_DIR/FILE_DIR (like (a3d)'s
+# PINHOME) so "wrote NO files" can be asserted precisely — nothing must exist here at all,
+# not just "no NEW file relative to what (a)/(a2)/(a3)/.../(a3e) already wrote" above.
+BADHOME="$TMP/badprofile-home"; BADSCHED="$TMP/badprofile-sched"; BADSTORE="$TMP/badprofile-store"
+BADLAUNCHD="$TMP/badprofile-launchagents"
+BADSRC="$TMP/badprofile-src"; mkdir -p "$BADSRC"; echo "a-thought" > "$BADSRC/note.txt"
+BADRUNNER="$BADSCHED/nightly.sh"; BADCONFIG="$BADSCHED/schedule.json"; BADCRON="$BADSCHED/cron.entry"
+BADPLIST="$BADLAUNCHD/dev.cypher-brain.nightly.$(home_hash "$BADHOME").plist"
+CYPHER_BRAIN_HOME="$BADHOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] keygen for the bad-profile home exited non-zero"; exit 1; }
+
+# Positive control: prove the reference behavior this test compares against actually
+# fires before trusting a comparison to it. Confirm `snapshot --profile claude-cod` (no
+# schedule involved) really does refuse today, with the message this test expects
+# install() to now match — so the assertions below check schedule install against a
+# working reference, not a silently-broken one.
+set +e
+SNAPERR=$(CYPHER_BRAIN_HOME="$BADHOME" cb snapshot --profile claude-cod --dir "$BADSRC" --dry-run 2>&1); SNAPRC=$?
+set -e
+[ "$SNAPRC" != "0" ] || { echo "[FAIL] positive control: snapshot --profile claude-cod (typo) did not fail — this test's reference behavior is itself broken"; echo "$SNAPERR"; exit 1; }
+printf '%s' "$SNAPERR" | grep -q 'unknown profile "claude-cod"' || { echo "[FAIL] positive control: snapshot's own unknown-profile message changed shape"; echo "$SNAPERR"; exit 1; }
+
+set +e
+ERR3=$(CYPHER_BRAIN_HOME="$BADHOME" CYPHER_BRAIN_SCHEDULE_DIR="$BADSCHED" CYPHER_BRAIN_FILE_DIR="$BADSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$BADLAUNCHD" \
+  cb schedule install --backend file --dir "$BADSRC" --profile claude-cod --no-load 2>&1); RC3=$?
+set -e
+[ "$RC3" != "0" ] || { echo "[FAIL] schedule install accepted an unknown --profile name (claude-cod) — should have refused before writing anything (#461)"; exit 1; }
+printf '%s' "$ERR3" | grep -q 'unknown profile "claude-cod"' || { echo "[FAIL] install's bad-profile refusal does not name the rejected profile"; echo "$ERR3"; exit 1; }
+printf '%s' "$ERR3" | grep -q 'did you mean claude-code?' || { echo "[FAIL] install's bad-profile refusal did not offer the did-you-mean suggestion"; echo "$ERR3"; exit 1; }
+[ ! -e "$BADRUNNER" ] || { echo "[FAIL] runner was written despite the invalid --profile (#461)"; exit 1; }
+[ ! -e "$BADCONFIG" ] || { echo "[FAIL] schedule.json was written despite the invalid --profile (#461)"; exit 1; }
+[ ! -e "$BADCRON" ] || { echo "[FAIL] cron entry was written despite the invalid --profile (#461)"; exit 1; }
+[ ! -e "$BADPLIST" ] || { echo "[FAIL] launchd plist was written despite the invalid --profile (#461)"; exit 1; }
+echo "[PASS] schedule install refuses an unknown --profile before writing any runner/plist/cron/config artifact, matching snapshot's own refusal + did-you-mean suggestion"
+
+# Regression: a VALID --profile must still install cleanly — the new guard must not be
+# over-broad. Reuses the same throwaway home/sched/launchd dirs (still empty at this point).
+CYPHER_BRAIN_HOME="$BADHOME" CYPHER_BRAIN_SCHEDULE_DIR="$BADSCHED" CYPHER_BRAIN_FILE_DIR="$BADSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$BADLAUNCHD" \
+  cb schedule install --backend file --profile o2b --export "$TMP/subdir/bank-export.json" --no-load > "$TMP/install-a3f-valid.log" 2>&1 \
+  || { echo "[FAIL] schedule install with a VALID --profile (o2b) regressed"; cat "$TMP/install-a3f-valid.log"; exit 1; }
+[ -f "$BADRUNNER" ] || { echo "[FAIL] a valid --profile no longer installs a runner"; exit 1; }
+grep -q -- "--profile 'o2b'" "$BADRUNNER" || { echo "[FAIL] valid-profile runner does not bake --profile o2b"; cat "$BADRUNNER"; exit 1; }
+echo "[PASS] a VALID --profile (o2b) still installs correctly (no regression)"
+
 echo "== (a4) --pg without CYPHER_BRAIN_PG_BIN resolves pg_dump on PATH at install time and bakes its DIRECTORY as CYPHER_BRAIN_PG_BIN (config.mjs's PG_BIN is a dir joined with the tool name via pgTool(), not the pg_dump binary path itself — baking the binary path verbatim would break both pg_dump AND pg_restore); install fails clearly when pg_dump cannot be resolved =="
 FAKE_PGBIN="$TMP/fake-pgbin"; mkdir -p "$FAKE_PGBIN"
 cat > "$FAKE_PGBIN/pg_dump" <<'SHIM'

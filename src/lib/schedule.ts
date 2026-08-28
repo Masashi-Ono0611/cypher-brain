@@ -53,7 +53,7 @@ import {
 } from './secrets-scan.js';
 import { exists } from './util.js';
 import { printJson } from './ui.js';
-import { assertExportRequiresO2bProfile } from './profiles.js';
+import { assertExportRequiresO2bProfile, assertKnownProfile } from './profiles.js';
 import { tonWalletConfigured } from './wallet.js';
 import { didYouMean, nearestName } from './suggest.js';
 import type { CliOptions } from './types.js';
@@ -653,6 +653,15 @@ async function install(o: CliOptions): Promise<void> {
     }
     throw new Error(`unknown backend: ${o.backend} (expected one of ${[...backends].join('|')})`);
   }
+  // #461: install() never calls resolveProfilePaths() itself (it only reaches profiles.ts
+  // through the --export/o2b check just below) — so a misspelled --profile used to sail
+  // straight through to the runner/plist/cron writes below, baking `snapshot --profile
+  // '<typo>'` into a nightly that would fail from the very first unattended run, silently,
+  // since nobody watches those logs. Same "flag accepted, never honored" bug class
+  // assertExportRequiresO2bProfile() (right below) already refuses for --export — refuse
+  // here too, before anything is written, and using the exact same check `snapshot
+  // --profile <typo>` fails fast with (see profiles.ts's assertKnownProfile()).
+  assertKnownProfile(o.profile);
   // #206/multi-model review: install() bakes cfg.export into the runner's snapshot line
   // unconditionally (below) — it never calls resolveProfilePaths() itself, so an --export
   // given without --profile o2b would install cleanly and only turn out to be a no-op
