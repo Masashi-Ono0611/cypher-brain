@@ -54,7 +54,13 @@ import {
 import { exists } from './util.js';
 import { printJson } from './ui.js';
 import { warn } from './warn.js';
-import { assertExportRequiresO2bProfile, assertKnownProfile } from './profiles.js';
+import {
+  assertExportRequiresO2bProfile,
+  assertKnownProfile,
+  assertPgFiltersRequirePg,
+  assertVaultRequiresObsidianProfile,
+  assertZipRequiresChatgptExportProfile,
+} from './profiles.js';
 import { tonWalletConfigured } from './wallet.js';
 import { didYouMean, nearestName } from './suggest.js';
 import type { CliOptions } from './types.js';
@@ -695,6 +701,19 @@ function validateInstallInputs(o: CliOptions, backends: Set<string>): string {
   // every night, unattended, once the runner actually calls snapshot() (see
   // profiles.ts's assertExportRequiresO2bProfile doc comment for the full bug class).
   assertExportRequiresO2bProfile(o);
+  // #526: install() never calls resolveProfilePaths() itself either (see the --export
+  // comment just above) — so --vault/--zip given without the matching --profile, and
+  // --pg-table/--pg-filter/--pg-exclude-table-data given without --pg, used to install
+  // cleanly and bake a nightly that silently skips them on every unattended run, forever
+  // (see profiles.ts's assertVaultRequiresObsidianProfile/assertZipRequiresChatgptExport
+  // Profile/assertPgFiltersRequirePg doc comments for the full #525 bug class). Refused
+  // here too, before anything is written, same as --export/--profile above. Unlike
+  // snapshot.ts, there is no resolveProfilePaths() call in this function for the
+  // --vault/--zip guards to wait on — install() only ever bakes the raw flags into the
+  // runner script, so these can run right alongside the other two.
+  assertVaultRequiresObsidianProfile(o);
+  assertZipRequiresChatgptExportProfile(o);
+  assertPgFiltersRequirePg(o);
   if (!o.pg && o.dirs.length === 0 && !o.profile) {
     throw new Error('nothing to snapshot: pass --profile <name>, --pg <conn> and/or --dir <path>');
   }

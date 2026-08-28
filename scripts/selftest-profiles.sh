@@ -188,6 +188,126 @@ printf '%s' "$ERR2" | grep -q "obsidian" || { echo "[FAIL] wrong-profile --expor
 test ! -f "$TMP/export-wrongprofile.age" || { echo "[FAIL] refused snapshot (wrong profile) still wrote output"; exit 1; }
 echo "[PASS] --export without --profile o2b (absent or mismatched) is refused before anything is staged"
 
+echo "== --vault without --profile obsidian is refused, not silently dropped (issue #525) =="
+# Same bug class as --export/--profile o2b above: --vault is read ONLY by obsidianPaths(),
+# reached ONLY through resolveProfilePaths() `if (o.profile)` — so a --vault given with no
+# --profile at all, or the WRONG --profile, used to parse fine and then be silently
+# DROPPED: the snapshot below would have exited 0 having archived $EXTRA alone, never
+# mentioning $VAULT anywhere in the output or manifest.
+set +e
+ERR=$(cb snapshot --dir "$EXTRA" --vault "$VAULT" --out "$TMP/vault-noprofile.age" 2>&1); RC=$?
+set -e
+[ "$RC" != "0" ] || { echo "[FAIL] --vault with no --profile at all was accepted"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--vault" || { echo "[FAIL] no-profile --vault refusal does not mention --vault"; echo "$ERR"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--profile obsidian" || { echo "[FAIL] no-profile --vault refusal does not mention --profile obsidian"; echo "$ERR"; exit 1; }
+test ! -f "$TMP/vault-noprofile.age" || { echo "[FAIL] refused snapshot still wrote output"; exit 1; }
+# Same silent-drop shape with a DIFFERENT (but valid) profile selected.
+set +e
+ERR2=$(cb snapshot --profile chatgpt-export --zip "$ZIP" --vault "$VAULT" --out "$TMP/vault-wrongprofile.age" 2>&1); RC2=$?
+set -e
+[ "$RC2" != "0" ] || { echo "[FAIL] --vault with --profile chatgpt-export was accepted"; exit 1; }
+printf '%s' "$ERR2" | grep -q "chatgpt-export" || { echo "[FAIL] wrong-profile --vault refusal does not name the mismatched profile"; echo "$ERR2"; exit 1; }
+test ! -f "$TMP/vault-wrongprofile.age" || { echo "[FAIL] refused snapshot (wrong profile) still wrote output"; exit 1; }
+echo "[PASS] --vault without --profile obsidian (absent or mismatched) is refused before anything is staged"
+
+echo "== --zip without --profile chatgpt-export is refused, not silently dropped (issue #525) =="
+set +e
+ERR=$(cb snapshot --dir "$EXTRA" --zip "$ZIP" --out "$TMP/zip-noprofile.age" 2>&1); RC=$?
+set -e
+[ "$RC" != "0" ] || { echo "[FAIL] --zip with no --profile at all was accepted"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--zip" || { echo "[FAIL] no-profile --zip refusal does not mention --zip"; echo "$ERR"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--profile chatgpt-export" || { echo "[FAIL] no-profile --zip refusal does not mention --profile chatgpt-export"; echo "$ERR"; exit 1; }
+test ! -f "$TMP/zip-noprofile.age" || { echo "[FAIL] refused snapshot still wrote output"; exit 1; }
+echo "[PASS] --zip without --profile chatgpt-export is refused before anything is staged"
+
+echo "== #535: --profile obsidian + --zip (no --vault) names the irrelevant --zip in the error =="
+# obsidianPaths() itself refuses FIRST here (it has its own, more specific "requires
+# --vault" check, reached before the generic assertZipRequiresChatgptExportProfile guard
+# ever runs — see snapshot.ts's ordering comment) — the note about --zip is appended to
+# THAT error, so a confused user learns both facts (missing --vault AND the irrelevant
+# --zip) from one message instead of two round trips.
+set +e
+ERR=$(cb snapshot --profile obsidian --zip "$ZIP" --out "$TMP/ob-535.age" 2>&1); RC=$?
+set -e
+[ "$RC" != "0" ] || { echo "[FAIL] --profile obsidian --zip (no --vault) was accepted"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "requires --vault" || { echo "[FAIL] #535: expected the primary requires-vault error"; echo "$ERR"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--zip was also given" || { echo "[FAIL] #535: error does not note the irrelevant --zip"; echo "$ERR"; exit 1; }
+echo "[PASS] #535: obsidian's missing-vault error notes the irrelevant --zip"
+
+echo "== #535 (symmetric): --profile chatgpt-export + --vault (no --zip) names the irrelevant --vault =="
+set +e
+ERR=$(cb snapshot --profile chatgpt-export --vault "$VAULT" --out "$TMP/gpt-535.age" 2>&1); RC=$?
+set -e
+[ "$RC" != "0" ] || { echo "[FAIL] --profile chatgpt-export --vault (no --zip) was accepted"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "requires --zip" || { echo "[FAIL] #535 symmetric: expected the primary requires-zip error"; echo "$ERR"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--vault was also given" || { echo "[FAIL] #535 symmetric: error does not note the irrelevant --vault"; echo "$ERR"; exit 1; }
+echo "[PASS] #535 (symmetric): chatgpt-export's missing-zip error notes the irrelevant --vault"
+
+echo "== a VALID --profile obsidian --vault (no --zip) still works — no regression from the new #525 guard =="
+cb snapshot --profile obsidian --vault "$VAULT" --out "$TMP/ob-regression.age" >/dev/null 2>&1 \
+  || { echo "[FAIL] valid --profile obsidian --vault was rejected by the new guard"; exit 1; }
+test -f "$TMP/ob-regression.age" || { echo "[FAIL] valid obsidian snapshot produced no output"; exit 1; }
+echo "[PASS] valid --profile obsidian --vault still works (no regression)"
+
+echo "== --pg-table/--pg-filter/--pg-exclude-table-data without --pg are refused, not silently dropped (issue #525) =="
+# These flags are read ONLY inside snapshot.ts's \`if (o.pg)\` pg_dump block — given
+# without --pg they used to parse fine and then be silently DROPPED, same bug class as
+# --vault/--zip/--export above.
+set +e
+ERR=$(cb snapshot --dir "$EXTRA" --pg-table users --out "$TMP/pgtable-nopg.age" 2>&1); RC=$?
+set -e
+[ "$RC" != "0" ] || { echo "[FAIL] --pg-table with no --pg was accepted"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--pg-table" || { echo "[FAIL] no-pg --pg-table refusal does not mention --pg-table"; echo "$ERR"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--pg <conn>" || { echo "[FAIL] no-pg --pg-table refusal does not mention --pg <conn>"; echo "$ERR"; exit 1; }
+test ! -f "$TMP/pgtable-nopg.age" || { echo "[FAIL] refused snapshot still wrote output"; exit 1; }
+FILTER_FILE="$TMP/pg-filter.txt"; printf 'exclude table x\n' > "$FILTER_FILE"
+set +e
+ERR2=$(cb snapshot --dir "$EXTRA" --pg-filter "$FILTER_FILE" --pg-exclude-table-data cache --out "$TMP/pgfilter-nopg.age" 2>&1); RC2=$?
+set -e
+[ "$RC2" != "0" ] || { echo "[FAIL] --pg-filter/--pg-exclude-table-data with no --pg was accepted"; exit 1; }
+printf '%s' "$ERR2" | grep -q -- "--pg-filter" || { echo "[FAIL] no-pg --pg-filter refusal does not mention --pg-filter"; echo "$ERR2"; exit 1; }
+printf '%s' "$ERR2" | grep -q -- "--pg-exclude-table-data" || { echo "[FAIL] no-pg --pg-filter refusal does not mention --pg-exclude-table-data"; echo "$ERR2"; exit 1; }
+test ! -f "$TMP/pgfilter-nopg.age" || { echo "[FAIL] refused snapshot (pg-filter/exclude) still wrote output"; exit 1; }
+echo "[PASS] --pg-table/--pg-filter/--pg-exclude-table-data without --pg are refused before anything is staged"
+
+echo "== --profile obsidian/chatgpt-export with an EMPTY --vault/--zip '' still refuses with the normal requires-<flag> message (multi-model review round 2 catch) =="
+# The CLI parser accepts an empty string as a value, so \`--vault ''\`/\`--zip ''\` are real
+# inputs where the profile MATCHES but the value is unusable. snapshot.ts already catches
+# this (obsidianPaths()/chatgptExportPaths() both use a falsy \`if (!o.vault)\` check, and
+# resolveProfilePaths() runs BEFORE the new guards) — this exercises that existing path
+# stays correct, and is the reference the schedule.ts version of this same case (which has
+# no resolveProfilePaths() call to lean on) is compared against below.
+set +e
+ERR=$(cb snapshot --profile obsidian --vault "" --out "$TMP/emptyvault.age" 2>&1); RC=$?
+set -e
+[ "$RC" != "0" ] || { echo "[FAIL] --profile obsidian --vault '' was accepted"; exit 1; }
+printf '%s' "$ERR" | grep -q "requires --vault" || { echo "[FAIL] empty --vault refusal does not say requires --vault"; echo "$ERR"; exit 1; }
+test ! -f "$TMP/emptyvault.age" || { echo "[FAIL] refused snapshot (empty --vault) still wrote output"; exit 1; }
+set +e
+ERR2=$(cb snapshot --profile chatgpt-export --zip "" --out "$TMP/emptyzip.age" 2>&1); RC2=$?
+set -e
+[ "$RC2" != "0" ] || { echo "[FAIL] --profile chatgpt-export --zip '' was accepted"; exit 1; }
+printf '%s' "$ERR2" | grep -q "requires --zip" || { echo "[FAIL] empty --zip refusal does not say requires --zip"; echo "$ERR2"; exit 1; }
+test ! -f "$TMP/emptyzip.age" || { echo "[FAIL] refused snapshot (empty --zip) still wrote output"; exit 1; }
+echo "[PASS] an empty --vault/--zip with its OWN matching profile still refuses with the requires-<flag> message"
+
+echo "== an EMPTY --pg '' (not just an ABSENT --pg) also refuses --pg-table (multi-model review catch) =="
+# The CLI parser (src/cli.ts's valueAt()) accepts an empty string as a value — only a
+# missing value or one that looks like another flag is refused — so \`--pg ''\` is a real,
+# reachable input distinct from omitting --pg entirely: o.pg is then '' (!== undefined).
+# assertPgFiltersRequirePg() must match the SAME truthy check the pg_dump block itself
+# uses (\`if (o.pg)\`), not an \`undefined\`-only check — otherwise \`--pg '' --pg-table x\`
+# would sail past the guard and hit the exact silent-drop bug this guard exists to close
+# (caught by bounded codex exec review before merge, confirmed with a positive control
+# against the buggy \`o.pg !== undefined\` version before fixing it here).
+set +e
+ERR=$(cb snapshot --dir "$EXTRA" --pg "" --pg-table users --out "$TMP/pgtable-emptypg.age" 2>&1); RC=$?
+set -e
+[ "$RC" != "0" ] || { echo "[FAIL] --pg-table with an EMPTY --pg '' was accepted"; exit 1; }
+printf '%s' "$ERR" | grep -q -- "--pg-table" || { echo "[FAIL] empty-pg --pg-table refusal does not mention --pg-table"; echo "$ERR"; exit 1; }
+test ! -f "$TMP/pgtable-emptypg.age" || { echo "[FAIL] refused snapshot (empty --pg) still wrote output"; exit 1; }
+echo "[PASS] --pg-table with an empty --pg '' is refused exactly like an absent --pg"
+
 echo "== symlinked --vault / --zip / --export are dereferenced (archive the data, not the link) =="
 ln -s "$VAULT" "$TMP/linked-vault"
 cb snapshot --profile obsidian --vault "$TMP/linked-vault" --out "$TMP/ob-ln.age" >/dev/null 2>&1 \

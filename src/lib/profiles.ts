@@ -62,6 +62,103 @@ export function assertExportRequiresO2bProfile(o: CliOptions): void {
   );
 }
 
+// --vault (profile obsidian) and --zip (profile chatgpt-export) have the exact same
+// "flag accepted, never honored" failure mode as --export/--profile o2b just above: each
+// is read ONLY by its own xxxPaths() helper below, reached ONLY through
+// resolveProfilePaths() when o.profile already matches — so `--vault <path>` given
+// without `--profile obsidian` (a typo'd/forgotten --profile, or --vault left over from a
+// different profile) used to parse fine and then be silently DROPPED, exactly like
+// --export was before #206/PR #334 (issue #525). Refused here, called by both snapshot()
+// and schedule's install() before either does anything else with o.vault/o.zip (#526) —
+// same "the two surfaces must not disagree" reasoning as assertExportRequiresO2bProfile.
+//
+// snapshot() calls these AFTER resolveProfilePaths() (not before, unlike the export/pg
+// guards) so that when --profile DOES match (obsidian given --vault, say) but that
+// profile's OWN required companion flag is what's actually missing, the profile's own
+// more specific refusal (obsidianPaths()'s "requires --vault", see #535) is what the user
+// sees — not a generic mismatch message about some unrelated flag they also happened to
+// pass. Both guards still fire before any staging/archiving work happens either way:
+// resolveProfilePaths() only stats/resolves paths, it never stages or writes anything.
+export function assertVaultRequiresObsidianProfile(o: CliOptions): void {
+  if (o.vault === undefined) return;
+  if (o.profile === 'obsidian') {
+    // #525 (empty-string edge case, multi-model review round 2): the CLI parser accepts
+    // an empty string as a value (same as --pg above), so `--vault ''` is a real,
+    // reachable input distinct from omitting --vault entirely. snapshot() never reaches
+    // this far with it — resolveProfilePaths()'s obsidianPaths() already throws its own
+    // "requires --vault" for a falsy o.vault before this function ever runs (see the
+    // ordering comment above) — but schedule.ts's install() never calls
+    // resolveProfilePaths()/obsidianPaths() at all, so without this check `--profile
+    // obsidian --vault ''` would sail through here (the matching-profile branch) and
+    // then hit buildScheduleConfig()'s `o.vault ? ... : {}` (a truthy check), baking NO
+    // --vault into the runner at all — installing a nightly that fails "requires --vault"
+    // forever, unattended, never refused at install time. Same message obsidianPaths()
+    // itself throws, so the two surfaces still agree.
+    if (o.vault) return;
+    throw new Error('profile obsidian requires --vault <path> (the vault directory)');
+  }
+  throw new Error(
+    `--vault <path> only applies to --profile obsidian (it is the vault directory that profile snapshots) — ` +
+      (o.profile
+        ? `this run's --profile is "${o.profile}", which does not read --vault`
+        : 'no --profile was given, so --vault would otherwise be silently ignored') +
+      `. Add --profile obsidian to actually use --vault, or drop --vault if you meant --profile ${o.profile ?? '<name>'} on its own.`,
+  );
+}
+
+export function assertZipRequiresChatgptExportProfile(o: CliOptions): void {
+  if (o.zip === undefined) return;
+  if (o.profile === 'chatgpt-export') {
+    // #525 (empty-string edge case, multi-model review round 2): symmetric to
+    // assertVaultRequiresObsidianProfile's own comment above — schedule.ts's install()
+    // never calls resolveProfilePaths()/chatgptExportPaths(), so `--profile
+    // chatgpt-export --zip ''` needs the same explicit catch here.
+    if (o.zip) return;
+    throw new Error('profile chatgpt-export requires --zip <path> (the official ChatGPT export zip)');
+  }
+  throw new Error(
+    `--zip <path> only applies to --profile chatgpt-export (it is the official ChatGPT export zip that profile ` +
+      `snapshots) — ` +
+      (o.profile
+        ? `this run's --profile is "${o.profile}", which does not read --zip`
+        : 'no --profile was given, so --zip would otherwise be silently ignored') +
+      `. Add --profile chatgpt-export to actually use --zip, or drop --zip if you meant --profile ${o.profile ?? '<name>'} on its own.`,
+  );
+}
+
+// --pg-table/--pg-filter/--pg-exclude-table-data are read ONLY by the `if (o.pg)` pg_dump
+// block in snapshot.ts — so any of them given without --pg <conn> used to parse fine and
+// then be silently DROPPED, same bug class as --export/--vault/--zip above (issue #525).
+// Refused here, called by both snapshot() and schedule's install() before either does
+// anything else with these flags (#526).
+//
+// Deliberately `if (o.pg)` — the SAME truthy check the pg_dump block itself uses below —
+// not `o.pg !== undefined`. The CLI parser (src/cli.ts's valueAt()) accepts an empty
+// string as a value (only a missing value or one that looks like another flag is
+// refused), so `--pg ''` is a real, reachable input: `o.pg` is then `''`, which IS
+// `!== undefined` but is exactly as un-usable to pg_dump as no --pg at all. Matching
+// `undefined` alone would let `snapshot --pg '' --pg-table x ...` sail past this guard
+// and then hit the SAME silent-drop bug this function exists to close (multi-model
+// review, bounded codex exec: caught before merge).
+export function assertPgFiltersRequirePg(o: CliOptions): void {
+  if (o.pg) return;
+  const given: string[] = [];
+  if (o.tables.length > 0) given.push('--pg-table');
+  if (o.pg_filter !== undefined) given.push('--pg-filter');
+  if (o.pg_exclude_table_data?.length) given.push('--pg-exclude-table-data');
+  if (given.length === 0) return;
+  const flags = given.join('/');
+  // #525 (multi-model review round 3): word the reason to cover BOTH ways this guard
+  // fires — --pg genuinely absent (o.pg === undefined) and --pg given but empty
+  // (o.pg === '', see the doc comment above) — rather than a flat "no --pg was given"
+  // that reads wrong for the second case (something WAS typed, just unusable).
+  const pgReason = o.pg === undefined ? 'no --pg was given' : "--pg was given but empty ('')";
+  throw new Error(
+    `${flags} only appl${given.length > 1 ? 'y' : 'ies'} with --pg <conn> (${given.length > 1 ? 'they filter' : 'it filters'} what pg_dump dumps) — ` +
+      `${pgReason}, so ${flags} would otherwise be silently ignored. Add --pg <conn>, or drop ${flags} if you did not mean to dump Postgres.`,
+  );
+}
+
 // Resolve --profile to the concrete source paths it snapshots.
 export async function resolveProfilePaths(o: CliOptions): Promise<string[]> {
   assertKnownProfile(o.profile);
@@ -119,7 +216,19 @@ async function claudeCodePaths(): Promise<string[]> {
 // path without it is probably a typo (snapshotting the wrong tree feels like
 // success until restore day), so refuse unless --force-vault says "I know".
 async function obsidianPaths(o: CliOptions): Promise<string[]> {
-  if (!o.vault) throw new Error('profile obsidian requires --vault <path> (the vault directory)');
+  // #535: --vault is the flag THIS profile needs; --zip only feeds profile chatgpt-export
+  // (assertZipRequiresChatgptExportProfile already refuses --zip with any OTHER profile,
+  // but never even runs here since resolveProfilePaths() calls this function first — see
+  // that guard's own doc comment) — so a --zip given alongside a forgotten --vault is
+  // worth calling out by name rather than leaving the user to guess why it didn't help.
+  // `o.zip !== undefined` (not truthy) — matches how assertZipRequiresChatgptExportProfile
+  // itself defines "was --zip given" (an empty `--zip ''` is still a flag the user typed,
+  // even though it is as unusable as omitting --zip; multi-model review round 3).
+  if (!o.vault)
+    throw new Error(
+      `profile obsidian requires --vault <path> (the vault directory)` +
+        (o.zip !== undefined ? ' (note: --zip was also given, but that only applies to --profile chatgpt-export)' : ''),
+    );
   const vault = resolve(o.vault);
   const st = await stat(vault).catch(() => null);
   if (!st) throw new Error(`no vault at ${vault} — profile obsidian snapshots the vault directory`);
@@ -136,7 +245,14 @@ async function obsidianPaths(o: CliOptions): Promise<string[]> {
 // archived as one component file and never extracted, so the restored zip is
 // byte-identical to what ChatGPT handed out.
 async function chatgptExportPaths(o: CliOptions): Promise<string[]> {
-  if (!o.zip) throw new Error('profile chatgpt-export requires --zip <path> (the official ChatGPT export zip)');
+  // #535 (symmetric case): same reasoning as obsidianPaths()'s note above, for the
+  // reverse mix-up (--vault given, --zip forgotten). `o.vault !== undefined`, not truthy
+  // — same reasoning as obsidianPaths()'s own note (multi-model review round 3).
+  if (!o.zip)
+    throw new Error(
+      `profile chatgpt-export requires --zip <path> (the official ChatGPT export zip)` +
+        (o.vault !== undefined ? ' (note: --vault was also given, but that only applies to --profile obsidian)' : ''),
+    );
   const zip = resolve(o.zip);
   const st = await stat(zip).catch(() => null);
   if (!st?.isFile())
