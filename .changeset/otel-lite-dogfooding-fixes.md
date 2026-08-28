@@ -7,7 +7,7 @@ dogfooding pass on 2026-08-28:
 
 - **#473**: `getTracer()`'s error handler always attributed an import-resolution
   failure to a hardcoded `@opentelemetry/sdk-trace-node`, regardless of which of the
-  four dynamic imports actually threw. In the simplest case — none of the OTel
+  five dynamic imports actually threw. In the simplest case — none of the OTel
   packages installed at all — the FIRST import to fail is `@opentelemetry/api`, so the
   advisory falsely claimed `sdk-trace-node` was already installed and sent an operator
   down the wrong (isolated-directory) remediation path instead of the simple

@@ -375,7 +375,7 @@ function resourceAttr(payload, key) {
     // clear advisory, never crash or hang.
     //
     // #473 regression check: this isolated dir has NO node_modules at all, so
-    // '@opentelemetry/api' — the FIRST of the four imports getTracer() attempts — is
+    // '@opentelemetry/api' — the FIRST of the five imports getTracer() attempts — is
     // the one that actually fails to resolve. Before the fix, otel.ts always passed a
     // hardcoded '@opentelemetry/sdk-trace-node' to sdkImportAdvice() regardless of
     // which import threw, so this exact scenario produced the WRONG advisory (falsely
