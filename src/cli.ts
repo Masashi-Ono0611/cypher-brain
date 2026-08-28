@@ -248,11 +248,15 @@ function parseArgs(argv: string[], cmd: string | undefined): CliOptions {
   if (positionals.length > 0) {
     const knownCommand = cmd !== undefined && Object.hasOwn(FLAG_IRRELEVANT, cmd);
     if (knownCommand && !POSITIONAL_COMMANDS.has(cmd as string)) {
+      // Codex review: a "write it as './name'" remediation (the valueAt() hint above
+      // uses this for a VALUE that merely looks like a flag) would NOT fix a bare
+      // positional — it is still a plain, non-"--" token either way and would be
+      // rejected identically on retry. Only naming the flag it should be attached to
+      // is an actual fix here.
       throw new Error(
         `${cmd} does not take a bare argument: ${positionals.map((p) => JSON.stringify(p)).join(', ')}. ` +
-          `Every value must be attached to a flag (e.g. "--dir ${positionals[0]}"), or written "./${positionals[0]}" ` +
-          `if it is genuinely a path by that name. Refused rather than ignored: an argument that is silently ` +
-          `dropped looks exactly like one that was honored.`,
+          `Every value must be attached to a flag (e.g. "--dir ${positionals[0]}"). Refused rather than ignored: ` +
+          `an argument that is silently dropped looks exactly like one that was honored.`,
       );
     }
     if (knownCommand && positionals.length > 1) {
