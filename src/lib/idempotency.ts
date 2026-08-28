@@ -16,7 +16,7 @@
 // a save-locator), so there is no positional-TSV backward-compatibility surface to
 // preserve, and JSON-per-line is simpler to extend than a growing positional format would
 // be.
-import { writeFile, readFile, rename, rm, mkdir, stat } from 'node:fs/promises';
+import { writeFile, readFile, rename, rm, mkdir, stat, utimes } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { errMsg, readJsonlLog } from './util.js';
@@ -243,10 +243,19 @@ export class IdempotencyClaimHeldError extends Error {
 // (src/lib/config.ts, default 60 minutes) — the bound already placed on the tar/encrypt
 // subprocess pipes snapshot() and push() spawn — so a claim held past twice that is a
 // reasonable line between "an honest call that is just slow" and "the process that made
-// it is gone". A holder that legitimately overruns this (a single call slower than every
-// timeout elsewhere in this codebase) can lose its claim to a steal — see the ownership
-// token in the release closure below for why that is a safe, not a silent, failure mode.
+// it is gone".
 const CLAIM_STALE_MS = 2 * 60 * 60 * 1000; // 2h
+// Multi-model review (#636, Critical): a fixed staleness deadline with NO renewal means a
+// single legitimately slow call — one call, slower than every other timeout in this
+// codebase, but still honest — can be stolen mid-flight, which is exactly the double-claim
+// this whole mechanism exists to prevent. claimIdempotencyKey below periodically re-touches
+// its own lock file's mtime for as long as it is held (see the renewal timer in that
+// function), so a live holder's claim keeps looking fresh regardless of how long the real
+// call takes; a steal can then only ever happen to a claim NOBODY is renewing anymore —
+// i.e. a genuinely crashed holder. The interval is a fraction of CLAIM_STALE_MS so a few
+// missed/delayed ticks (a busy event loop during CPU-bound encrypt work, say) still leave
+// several more chances to renew before the claim would ever be judged stale.
+const CLAIM_RENEW_INTERVAL_MS = CLAIM_STALE_MS / 6; // 20m
 // A steal race between two WOULD-BE claimants stealing the SAME stale claim at once is
 // resolved by retrying the exclusive-create rather than assuming the steal succeeded —
 // bounded so a pathological run of repeated collisions fails closed instead of spinning
@@ -283,16 +292,34 @@ function claimLockPath(path: string, tool: string, key: string): string {
  * WAITS for a held claim to free up (unlike withLogLock, which polls until
  * LOCK_MAX_WAIT_MS) — mirroring mcp.ts's own idempotencyInFlight behavior, a concurrent
  * duplicate is refused outright (IdempotencyClaimHeldError) rather than queued, so a
- * caller retrying blind never silently piles up work waiting in line.
+ * caller retrying blind never silently piles up work waiting in line. Unlike
+ * withLogLock, this claim also self-renews (see CLAIM_RENEW_INTERVAL_MS's own comment)
+ * for as long as it is held, so staleness only ever fires on a claim nobody is renewing
+ * — i.e. an actually crashed holder, not merely a slow one.
+ *
+ * Both the steal path (below) and the release function it returns use a
+ * read-immediately-before-mutate check against this call's own ownership `token` rather
+ * than a bare `rm`/overwrite — a blind mutate-by-path has no way to tell "the file I just
+ * inspected" from "a DIFFERENT file a THIRD party already put at this same path a moment
+ * ago", which would otherwise let a delayed steal or a delayed release destroy a brand
+ * new, live claim (multi-model review, #636, Critical). This narrows those windows to a
+ * single microtask between the read and the mutate rather than eliminating them
+ * outright — closing them completely would need an OS-level advisory lock instead of a
+ * path-based lockfile, a materially larger change this codebase's existing lock
+ * primitives (withLogLock above) do not attempt either.
  *
  * Returns a release function the caller MUST call exactly once (typically in a
  * `finally`) once it is done with the key, whether that ended in a cache hit, a
  * successful spend, or an error. The release only removes the lock file if it still
  * carries THIS call's own ownership token — if the claim was stolen out from under an
- * unlucky caller that ran past CLAIM_STALE_MS, releasing must not delete the NEW
- * holder's live claim (that would let a third concurrent caller in while the second is
- * still working, exactly the bug this claim exists to prevent); it is silently a no-op
- * in that case instead.
+ * unlucky caller that ran past CLAIM_STALE_MS despite renewal (e.g. the renewal itself
+ * failed repeatedly), releasing must not delete the NEW holder's live claim (that would
+ * let a third concurrent caller in while the second is still working, exactly the bug
+ * this claim exists to prevent); it is silently a no-op in that case instead. Safe to
+ * call more than once — a repeat call (a caller's own retry after a transient failure,
+ * say) re-runs the same read-then-maybe-remove check rather than being suppressed by a
+ * "already released" flag, so a transient I/O error on one attempt does not wedge the
+ * claim for the rest of CLAIM_STALE_MS the way silently swallowing it once would.
  */
 export async function claimIdempotencyKey(path: string, tool: string, key: string): Promise<() => Promise<void>> {
   const lockPath = claimLockPath(path, tool, key);
@@ -310,11 +337,19 @@ export async function claimIdempotencyKey(path: string, tool: string, key: strin
     } catch (e) {
       if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') throw e;
       let stale: boolean;
+      let staleContent: string | null;
       try {
         const st = await stat(lockPath);
         stale = Date.now() - st.mtimeMs > CLAIM_STALE_MS;
-      } catch {
-        continue; // the claim disappeared between our failed create and this stat — retry now, uncounted
+        staleContent = stale ? await readFile(lockPath, 'utf8').catch(() => null) : null;
+      } catch (statErr) {
+        // Only ENOENT (the claim disappeared between our failed create and this stat —
+        // a concurrent release) is safe to silently retry. Any OTHER error (EACCES,
+        // EIO, a directory sitting where the lockfile should be, ...) means this
+        // process cannot reliably tell held-and-fresh apart from abandoned-and-stale —
+        // fail loud rather than spin on it forever (multi-model review, #636, Warning).
+        if ((statErr as NodeJS.ErrnoException)?.code !== 'ENOENT') throw statErr;
+        continue; // uncounted — this is a benign, expected race, not a steal attempt
       }
       if (!stale) {
         throw new IdempotencyClaimHeldError(
@@ -330,27 +365,53 @@ export async function claimIdempotencyKey(path: string, tool: string, key: strin
             'refusing rather than risk two processes both believing they now own it.',
         );
       }
-      // Presumed-crashed holder (older than CLAIM_STALE_MS) — steal it. If another
-      // process is stealing the SAME stale claim at this exact moment, at most one of
-      // the two `writeFile(..., 'wx')` retries below succeeds; the loser sees EEXIST
-      // again, and since the winner just wrote it, `stale` reads false next time —
-      // correctly reporting held-by-another rather than re-stealing out from under them.
-      await rm(lockPath, { force: true }).catch(() => {});
+      // Presumed-crashed holder (older than CLAIM_STALE_MS, and nobody is renewing it —
+      // see CLAIM_RENEW_INTERVAL_MS's own comment) — steal it. Compare-and-delete against
+      // the content just read as stale, not a bare rm: if some OTHER stealer already won
+      // this exact race and replaced the file in the moment since our own read, `readFile`
+      // here observes THEIR new content, sees it does not match what we judged stale, and
+      // leaves it alone — our own `writeFile('wx')` retry below then correctly fails
+      // EEXIST against their fresh (non-stale) claim instead of deleting it out from under
+      // them (multi-model review, #636, Critical).
+      try {
+        const recheck = await readFile(lockPath, 'utf8');
+        if (recheck === staleContent) await rm(lockPath, { force: true });
+      } catch {
+        // gone already (a concurrent release, or another stealer's own steal-then-recreate
+        // landing between our recheck and here) — fine, the loop below retries the create
+      }
     }
   }
-  let released = false;
+  const renewalTimer = setInterval(() => {
+    // Fire-and-forget, best-effort: only touch mtime while we still own it — this must
+    // never resurrect a claim that was already stolen or released, only keep a LIVE one
+    // from looking abandoned. Any failure (the file is gone, a transient I/O error) is
+    // silently skipped; the next tick tries again, and losing a few ticks is exactly what
+    // CLAIM_RENEW_INTERVAL_MS's margin below CLAIM_STALE_MS is sized to tolerate.
+    void (async () => {
+      try {
+        const owner = await readFile(lockPath, 'utf8');
+        if (owner === token) await utimes(lockPath, new Date(), new Date());
+      } catch {
+        // see comment above — best-effort only
+      }
+    })();
+  }, CLAIM_RENEW_INTERVAL_MS);
+  renewalTimer.unref?.(); // never keep the process alive on its own — the real work does that
   return async () => {
-    if (released) return; // idempotent — a caller's own cleanup path may call this more than once
-    released = true;
+    clearInterval(renewalTimer);
     try {
       const owner = await readFile(lockPath, 'utf8');
       if (owner === token) await rm(lockPath, { force: true });
-      // else: this claim was stolen by a later holder (this call outran CLAIM_STALE_MS)
-      // — leave THEIR live claim alone, see this function's own doc comment above.
+      // else: this claim was stolen by a later holder (this call outran CLAIM_STALE_MS
+      // despite renewal) — leave THEIR live claim alone, see this function's own doc
+      // comment above.
     } catch {
       // ENOENT (already gone — stolen-then-released by someone else, or a prior release
       // already ran) or any other read failure: best-effort cleanup only, never throw
-      // out of a release path.
+      // out of a release path. Deliberately no "already released" short-circuit — see
+      // this function's own doc comment for why a repeat call must re-run this check
+      // rather than being suppressed.
     }
   };
 }
