@@ -43,6 +43,26 @@ grep -q '"backend": "file"' "$TMP/plan.json" || { echo "[FAIL] plan.json backend
 grep -q "plan saved -> $TMP/plan.json" "$TMP/estimate.err" || { echo "[FAIL] estimate --out did not report where it saved the plan"; exit 1; }
 echo "[PASS] estimate --out writes a plan.json with the expected shape"
 
+# positive control (#470): a second "estimate --out" at the SAME path must refuse
+# (same no-clobber posture as "snapshot --out", CB-E009) instead of silently
+# discarding the prior plan. Uses a throwaway path so $TMP/plan.json (relied on by
+# every test below) is never touched by this block.
+CYPHER_BRAIN_FILE_DIR="$TMP/store" cb estimate --in "$TMP/snap.age" --backend file --out "$TMP/clobber-plan.json" >/dev/null 2>&1
+BEFORE_HASH="$(sha "$TMP/clobber-plan.json")"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb estimate --in "$TMP/snap.age" --backend file --out "$TMP/clobber-plan.json" >"$TMP/clobber.out" 2>"$TMP/clobber.err"; then
+  echo "[FAIL] estimate --out silently overwrote an existing plan file (#470 regression)"; exit 1
+fi
+grep -q "already exists — refusing to overwrite" "$TMP/clobber.err" || { echo "[FAIL] wrong no-clobber message"; cat "$TMP/clobber.err"; exit 1; }
+[ "$(sha "$TMP/clobber-plan.json")" = "$BEFORE_HASH" ] || { echo "[FAIL] plan file content changed despite the refusal"; exit 1; }
+echo "[PASS] estimate --out refuses to clobber an existing plan file without --force (#470)"
+
+# --force overwrites anyway (the same escape hatch push/pull/wallet create use for
+# this exact refusal) — the file's content actually changes (a fresh created_at).
+sleep 1.1
+CYPHER_BRAIN_FILE_DIR="$TMP/store" cb estimate --in "$TMP/snap.age" --backend file --out "$TMP/clobber-plan.json" --force >"$TMP/clobber-force.out" 2>"$TMP/clobber-force.err"
+[ "$(sha "$TMP/clobber-plan.json")" != "$BEFORE_HASH" ] || { echo "[FAIL] --force did not actually rewrite the plan file"; exit 1; }
+echo "[PASS] estimate --out --force overwrites an existing plan file"
+
 CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan.json" >"$TMP/push.out" 2>"$TMP/push.err"
 grep -q "validated" "$TMP/push.err" || { echo "[FAIL] push --plan did not report validation"; cat "$TMP/push.err"; exit 1; }
 [ -s "$TMP/push.out" ] || { echo "[FAIL] push --plan produced no locator on stdout"; exit 1; }
@@ -128,6 +148,54 @@ if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend fil
 fi
 grep -q "does not look like a cypher-brain plan file" "$TMP/incomplete.err" || { echo "[FAIL] wrong incomplete-plan message"; cat "$TMP/incomplete.err"; exit 1; }
 echo "[PASS] incomplete-plan-shape guard fired"
+
+# positive control (#471): an otherwise-VALID plan whose cypher_brain_plan_version is a
+# future/different number gets its own specific message, distinct from the generic
+# "does not look like a plan file" one above.
+python3 -c "
+import json
+p = json.load(open('$TMP/plan.json'))
+p['cypher_brain_plan_version'] = 2
+json.dump(p, open('$TMP/plan-future-version.json', 'w'))
+"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan-future-version.json" >"$TMP/futurever.out" 2>"$TMP/futurever.err"; then
+  echo "[FAIL] push --plan accepted a plan with an unsupported version"; exit 1
+fi
+grep -q "unsupported plan version 2 (expected 1)" "$TMP/futurever.err" || { echo "[FAIL] wrong plan-version message"; cat "$TMP/futurever.err"; exit 1; }
+if grep -q "does not look like a cypher-brain plan file" "$TMP/futurever.err"; then
+  echo "[FAIL] version-mismatch case fell through to the generic malformed-plan message"; cat "$TMP/futurever.err"; exit 1
+fi
+echo "[PASS] unsupported-plan-version guard fired with its own specific message (#471)"
+
+# positive control (#469): recipients_fingerprint is recorded in every plan.json but
+# was NEVER read back by validatePlan() — a hand-edited value went completely
+# unchecked. This is the exact repro from the issue: everything else in the plan is
+# untouched/valid, only recipients_fingerprint is tampered.
+python3 -c "
+import json
+p = json.load(open('$TMP/plan.json'))
+p['recipients_fingerprint'] = 'deadbeef' * 8
+json.dump(p, open('$TMP/plan-bad-fingerprint.json', 'w'))
+"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan-bad-fingerprint.json" >"$TMP/badfp.out" 2>"$TMP/badfp.err"; then
+  echo "[FAIL] push --plan accepted a plan with a tampered recipients_fingerprint (#469 regression)"; exit 1
+fi
+grep -q "plan was built for recipients fingerprint" "$TMP/badfp.err" || { echo "[FAIL] wrong recipients-fingerprint-mismatch message"; cat "$TMP/badfp.err"; exit 1; }
+echo "[PASS] tampered-recipients-fingerprint guard fired (#469 — previously silently accepted)"
+
+# positive control (#469): recipients_fingerprint null -> non-null crossing, the same
+# asymmetric-null shape already covered for payer_address above.
+python3 -c "
+import json
+p = json.load(open('$TMP/plan.json'))
+p['recipients_fingerprint'] = None
+json.dump(p, open('$TMP/plan-null-fingerprint.json', 'w'))
+"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan-null-fingerprint.json" >"$TMP/nullfp.out" 2>"$TMP/nullfp.err"; then
+  echo "[FAIL] push --plan accepted a plan with no recipients fingerprint against a current sidecar that has one"; exit 1
+fi
+grep -q "plan was built with no recipients fingerprint recorded" "$TMP/nullfp.err" || { echo "[FAIL] wrong null-fingerprint-crossing message"; cat "$TMP/nullfp.err"; exit 1; }
+echo "[PASS] recipients-fingerprint null->value crossing guard fired (#469)"
 
 # positive control: nonexistent plan file
 if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/no-such-plan.json" >"$TMP/noexist.out" 2>"$TMP/noexist.err"; then

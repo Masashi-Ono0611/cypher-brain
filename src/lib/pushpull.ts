@@ -282,20 +282,30 @@ async function pushCore(
     const plan = await readPlanFile(o.plan);
     const { size: sizeBytes } = await stat(o.in);
     const remote = o.remote ?? null;
-    const [artifactSha256, freshEstimate, payerAddress] = await Promise.all([
+    const [artifactSha256, freshEstimate, payerAddress, recipientsFingerprint] = await Promise.all([
       sha256(o.in),
       estimateCost(o.backend, sizeBytes),
       payerAddressFor(o.backend, o),
+      recipientsFingerprintFor(o),
     ]);
-    const result = validatePlan(plan, { backend: o.backend, artifactSha256, freshEstimate, payerAddress, remote });
+    const result = validatePlan(plan, {
+      backend: o.backend,
+      artifactSha256,
+      freshEstimate,
+      payerAddress,
+      remote,
+      recipientsFingerprint,
+    });
     if (!result.ok) throw new Error(`--plan ${o.plan}: ${result.reason}`);
     // Only claim a signal "matched" when it was actually non-null on the PLAN side too
     // — otherwise "both null, nothing to compare" (a legitimate pass) would print the
     // same success text as a genuine comparison, overstating what was checked (Codex
-    // review, same root cause as the payer-bypass fix above).
+    // review, same root cause as the payer-bypass fix above). recipients follows suit
+    // (#469): validatePlan above now actually checks it, so it earns the same claim.
     const checked = [
       payerAddress && plan.payer_address ? 'payer' : null,
       remote && plan.remote ? 'remote' : null,
+      recipientsFingerprint && plan.recipients_fingerprint ? 'recipients' : null,
     ].filter((s): s is string => s !== null);
     console.error(
       `--plan ${o.plan}: validated (artifact, backend and price within tolerance` +

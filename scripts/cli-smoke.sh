@@ -57,6 +57,25 @@ if ! grep -qF -- "$ADDR1" "$TMP/wallet-create.log"; then
 fi
 echo "[PASS] dist wallet create: wallet.json (mode 600) at default path; wallet address derives the SAME address create printed"
 
+# (c1b) #472: a DEFAULT-path `wallet create` must say CYPHER_BRAIN_AR_WALLET is
+# optional (push/estimate/wallet address/balance already find it there), not imply it
+# must be exported unconditionally.
+grep -Fq "already find it here by default" "$TMP/wallet-create.log" \
+  || { echo "[FAIL] wallet create (default path) does not say CYPHER_BRAIN_AR_WALLET is optional (#472)"; cat "$TMP/wallet-create.log"; exit 1; }
+if grep -Fq "then set CYPHER_BRAIN_AR_WALLET=" "$TMP/wallet-create.log"; then
+  echo "[FAIL] wallet create (default path) still tells the operator to set CYPHER_BRAIN_AR_WALLET unconditionally (#472)"; cat "$TMP/wallet-create.log"; exit 1
+fi
+echo "[PASS] dist wallet create (default path): correctly says CYPHER_BRAIN_AR_WALLET is optional (#472)"
+
+# (c1c) #472, other side: a NON-default --out path genuinely IS required to set
+# CYPHER_BRAIN_AR_WALLET (or --wallet) for push/estimate to find it, so that message
+# must still say so.
+node "$DIST" wallet create --out "$TMP/custom-wallet.json" > "$TMP/wallet-create-custom.log" 2>&1 \
+  || { echo "[FAIL] dist wallet create --out exited non-zero"; cat "$TMP/wallet-create-custom.log"; exit 1; }
+grep -Fq "then set CYPHER_BRAIN_AR_WALLET=$TMP/custom-wallet.json" "$TMP/wallet-create-custom.log" \
+  || { echo "[FAIL] wallet create --out (non-default path) lost the 'set CYPHER_BRAIN_AR_WALLET' guidance (#472)"; cat "$TMP/wallet-create-custom.log"; exit 1; }
+echo "[PASS] dist wallet create --out (non-default path): still tells the operator to set CYPHER_BRAIN_AR_WALLET (#472)"
+
 node "$DIST" wallet create > /dev/null 2>"$TMP/wallet-noclobber.log"
 if [ $? -eq 0 ]; then echo "[FAIL] wallet create without --force overwrote an existing wallet"; exit 1; fi
 if ! grep -q "already exists" "$TMP/wallet-noclobber.log"; then
@@ -103,6 +122,24 @@ grep -q "^cost: 0$" "$TMP/estimate-file.log" \
   || { echo "[FAIL] estimate --backend file did not report cost: 0"; cat "$TMP/estimate-file.log"; exit 1; }
 echo "[PASS] dist estimate --backend file: cost: 0 for a local file"
 
+# (d2) #481: estimate --backend ton's note must not leak an internal source file path
+# (every other backend's note is free of one; ton used to be the sole exception).
+# Free/no-network branch, same as (d) — no seeder box needed.
+node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend ton > "$TMP/estimate-ton.log" 2>&1 \
+  || { echo "[FAIL] dist estimate --backend ton exited non-zero"; cat "$TMP/estimate-ton.log"; exit 1; }
+if grep -Fq "src/lib/backends/ton.ts" "$TMP/estimate-ton.log"; then
+  echo "[FAIL] estimate --backend ton note still leaks its internal source file path (#481)"; cat "$TMP/estimate-ton.log"; exit 1
+fi
+grep -Fq "seeds the bag from your OWN tonutils-storage box" "$TMP/estimate-ton.log" \
+  || { echo "[FAIL] estimate --backend ton note lost its explanation entirely"; cat "$TMP/estimate-ton.log"; exit 1; }
+echo "[PASS] dist estimate --backend ton: note explains itself without leaking a source file path (#481)"
+node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend ton --json > "$TMP/estimate-ton.json" 2>&1 \
+  || { echo "[FAIL] dist estimate --backend ton --json exited non-zero"; cat "$TMP/estimate-ton.json"; exit 1; }
+if grep -Fq "src/lib/backends/ton.ts" "$TMP/estimate-ton.json"; then
+  echo "[FAIL] estimate --backend ton --json note still leaks its internal source file path (#481) — reaches MCP estimate_cost too"; cat "$TMP/estimate-ton.json"; exit 1
+fi
+echo "[PASS] dist estimate --backend ton --json: same fix reaches the JSON path MCP estimate_cost returns (#481)"
+
 # (e) estimate --backend turbo — deterministic/offline either way, but the expected
 # note depends on whether the OPTIONAL @ardrive/turbo-sdk happens to be installed in
 # this environment (it is not a devDependency, only an optional peerDependency — see
@@ -134,6 +171,21 @@ if [ $? -eq 0 ]; then echo "[FAIL] estimate --backend bogus exited 0, expected n
 grep -q "unknown backend" "$TMP/estimate-bad.log" \
   || { echo "[FAIL] estimate --backend bogus did not report 'unknown backend'"; cat "$TMP/estimate-bad.log"; exit 1; }
 echo "[PASS] dist estimate --backend bogus: rejected with 'unknown backend'"
+
+# (g2) #501: estimate's "unknown backend" usage text and push's (backends/index.ts's
+# own, separate copy per estimate.ts's header comment) must both list the SAME
+# canonical set, sourced from the one shared STORAGE_BACKEND_NAMES const (types.ts)
+# instead of each hand-keeping its own copy (the exact drift #435 already caused once).
+grep -Fq "file|arweave|turbo|rclone|ton|ton-provider" "$TMP/estimate-bad.log" \
+  || { echo "[FAIL] estimate --backend bogus does not list the full canonical backend set (#501)"; cat "$TMP/estimate-bad.log"; exit 1; }
+# pull hits backends/index.ts's OWN separate "unknown backend" copy (per estimate.ts's
+# header comment on #159) without needing a real ciphertext --in (unlike push, which
+# checks the age-header magic bytes before reaching backendFor()).
+node "$DIST" pull --backend bogus --locator whatever --out "$TMP/pull-bad-backend.age" > "$TMP/pull-bad-backend.log" 2>&1
+if [ $? -eq 0 ]; then echo "[FAIL] pull --backend bogus exited 0, expected non-zero"; cat "$TMP/pull-bad-backend.log"; exit 1; fi
+grep -Fq "file|arweave|turbo|rclone|ton|ton-provider" "$TMP/pull-bad-backend.log" \
+  || { echo "[FAIL] pull --backend bogus does not list the full canonical backend set (#501)"; cat "$TMP/pull-bad-backend.log"; exit 1; }
+echo "[PASS] dist estimate/pull --backend bogus: both list the same canonical backend set, sourced from one shared const (#501)"
 
 # (h) estimate rejects a directory --in (stat().size on a dir would otherwise produce
 # a nonsensical-but-silent "estimate" instead of a clear error)

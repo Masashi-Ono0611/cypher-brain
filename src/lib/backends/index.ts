@@ -10,7 +10,7 @@ import { rcloneBackend } from './rclone.js';
 import { tonBackend } from './ton.js';
 import { tonProviderBackend } from './ton-provider.js';
 import { didYouMean, nearestName } from '../suggest.js';
-import type { StorageBackend } from '../types.js';
+import { STORAGE_BACKEND_NAMES, type StorageBackend } from '../types.js';
 
 // #435 (Codex review): backendFor()'s dispatch used to be an if-chain naming each
 // backend twice — once in the chain, once again in the "unknown backend" message's
@@ -19,7 +19,17 @@ import type { StorageBackend } from '../types.js';
 // it, and its keys are also the full "declared value set" nearestName() (#425/#435)
 // suggests --backend typos against — a backend added/removed here can no longer
 // silently fall out of sync with either.
-const BACKEND_FACTORIES: Record<string, () => StorageBackend | Promise<StorageBackend>> = {
+// #501 (Codex review): typed against STORAGE_BACKEND_NAMES's own element union
+// (types.ts), not a second freeform `Record<string, ...>` — a name added/removed
+// from EITHER this object or that const now fails typecheck (missing/excess
+// property) instead of the two silently drifting apart, which a same-shaped-but-
+// independent Record could still do even after #501 pointed estimate.ts at the
+// shared list. `backendFor` below casts back to a plain string index at the one
+// spot that actually needs to look up an arbitrary runtime string.
+const BACKEND_FACTORIES: Record<
+  (typeof STORAGE_BACKEND_NAMES)[number],
+  () => StorageBackend | Promise<StorageBackend>
+> = {
   file: fileBackend,
   arweave: arweaveBackend,
   turbo: turboBackend,
@@ -61,10 +71,16 @@ const BACKEND_FACTORIES: Record<string, () => StorageBackend | Promise<StorageBa
 export const BACKEND_NAMES = ['turbo', 'arweave', 'ton-provider', 'file'] as const;
 
 export async function backendFor(name: string | undefined): Promise<StorageBackend> {
-  const factory = name ? BACKEND_FACTORIES[name] : undefined;
+  // `name` is an arbitrary runtime string (CLI/MCP input), not narrowed to
+  // BACKEND_FACTORIES' literal-union key type above — the cast is the one place
+  // that boundary is crossed, deliberately narrow rather than loosening the map's
+  // own type back to `Record<string, ...>` (which would reopen the drift #501 fixed).
+  const factory = name
+    ? (BACKEND_FACTORIES as Record<string, () => StorageBackend | Promise<StorageBackend>>)[name]
+    : undefined;
   if (factory) return factory();
   const suggestion = name ? nearestName(name, Object.keys(BACKEND_FACTORIES)) : undefined;
   throw new Error(
-    `unknown backend: ${name || '(none)'}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use --backend file|arweave|turbo|rclone|ton|ton-provider`,
+    `unknown backend: ${name || '(none)'}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use --backend ${STORAGE_BACKEND_NAMES.join('|')}`,
   );
 }

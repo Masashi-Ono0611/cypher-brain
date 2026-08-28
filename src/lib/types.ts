@@ -3,6 +3,17 @@
 // src/lib/backends/*.ts implements. Kept in one place so cli.ts, mcp.ts and every
 // lib/*.ts consumer import the SAME type instead of each hand-rolling its own.
 
+// The full canonical set of storage backend names, shared by backends/index.ts (its
+// BACKEND_FACTORIES key set, and the "unknown backend" usage text) and estimate.ts
+// (its own "unknown backend"/"did you mean" suggestion and --backend usage text) —
+// one list so the two can never drift apart the way #435 already let them once
+// (backends/index.ts's own header comment documents that history; #501 is the
+// estimate.ts side of the same fix). Lives HERE, not in backends/index.ts, because
+// estimate.ts must NOT import backends/index.ts directly — that would pull every
+// backend's own SDK dependency graph into estimate.ts just to get a name list — and
+// this file has no such imports for either side to worry about.
+export const STORAGE_BACKEND_NAMES = ['file', 'arweave', 'turbo', 'rclone', 'ton', 'ton-provider'] as const;
+
 // The flags every "cypher-brain <cmd>" (and its schedule-runner-generating twin)
 // can see. `parseArgs` (src/cli.ts) turns `--foo-bar val` into `foo_bar: val` for
 // any flag not in BOOL_FLAGS (which get `true`) — genuinely dynamic (any command
