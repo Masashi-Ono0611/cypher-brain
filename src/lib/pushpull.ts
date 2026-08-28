@@ -175,6 +175,88 @@ export async function readSavedLocatorLine(path: string): Promise<SavedLocator |
 // be treated as "an upload succeeded". Also returns the locator (null on a SKIPPED
 // push) so the public push() wrapper below can record it in the audit trail (#226)
 // without re-parsing stdout or depending on --save-locator having been passed.
+//
+// --skip-unchanged (#510, extracted from pushCore): don't re-push (and, on arweave/
+// turbo, re-pay for) content that has not changed since the previous push. THREE
+// independent signals must ALL match the current --save-locator entry for the same
+// backend before a skip fires:
+//   1. the PLAINTEXT content digest (the "<out>.digest" sidecar) — it can never be
+//      the ciphertext hash, because age's ephemeral file key makes identical content
+//      encrypt to different bytes every run;
+//   2. the recipients fingerprint (the "<out>.recipients-fingerprint" sidecar) — the
+//      set of age1… keys THIS ciphertext was actually encrypted to. Without this
+//      second check, re-snapshotting unchanged plaintext under a CHANGED recipient
+//      set (a newly added offline recovery key, or a removed/revoked one) would
+//      still skip and return the OLD locator — whose ciphertext the new key can
+//      never decrypt, and/or a revoked key still can (#70 review round 2, a real
+//      security regression, not just a correctness nit);
+//   3. the SIGNING state (#250) — whether this artifact carries a "<in>.minisig"
+//      and, if so, which signing key id produced it. Without this third check,
+//      running `keygen --sign` (signing newly enabled) or `keygen --sign --force`
+//      (key rotated) over otherwise-unchanged content skipped silently, leaving the
+//      remote copy unsigned, or signed with the OLD key — less protected than the
+//      operator now expects, with nothing said about it. Neither case lets tampered
+//      content ACCEPT (the invalid-signature checks in restore/verify are
+//      untouched); the gap is that the store quietly keeps a stale-authenticity
+//      copy.
+// All three are compared against the current --save-locator file's fields (4th =
+// content_digest, 5th = recipients_fingerprint, 6th = sig_locator, 7th =
+// sign_key_id). Any missing piece on EITHER side (no sidecar/--digest, a legacy
+// 3/4-field file, a different backend) proceeds normally: skip is an optimization
+// that only fires when EVERY signal is known and equal — an unknown signal must
+// never be treated as "unchanged". --force pushes anyway. Checked before the
+// paid-backend consent gate: a skipped push contacts nothing and spends nothing.
+async function resolveSkipUnchanged(
+  o: CliOptions,
+): Promise<{ skip: true; locator: string; sigLocator: string | null } | { skip: false }> {
+  if (!o.skip_unchanged) return { skip: false };
+  if (!o.save_locator)
+    throw new Error(
+      '--skip-unchanged requires --save-locator <file> (the previous content digest, recipients fingerprint and signing key id live in its 4th/5th/7th fields)',
+    );
+  if (o.force) return { skip: false };
+  const cur = await contentDigestFor(o);
+  const curRecipients = await recipientsFingerprintFor(o);
+  const curSigning = await signingStateFor(o);
+  const prev = await readSavedLocatorLine(o.save_locator);
+  const contentUnchanged = !!(
+    cur &&
+    prev?.locator &&
+    prev.backend === o.backend &&
+    prev.contentDigest &&
+    prev.contentDigest.toLowerCase() === cur
+  );
+  const recipientsUnchanged = !!(
+    curRecipients &&
+    prev?.recipientsFingerprint &&
+    prev.recipientsFingerprint.toLowerCase() === curRecipients
+  );
+  // "Was the previous push signed?" is answered by the 6th field (sig_locator),
+  // which push has written since #214 whenever it uploaded a sidecar — so an
+  // artifact pushed before #250 (or before #214) is correctly read as UNSIGNED
+  // rather than as unknown, and an unsigned setup — the pre-#214 default — keeps
+  // skipping exactly as it did. The 7th field only has to answer the narrower
+  // "signed by WHICH key", and its absence on a signed previous push (a 6-field
+  // line written between #214 and #250) is genuinely unknown: don't skip, then
+  // the re-push records it and the next run compares normally. A curSigning of
+  // null is the same kind of unknown on the current side (a sidecar that exists
+  // but does not parse) and likewise never skips.
+  const prevSigned = !!prev?.sigLocator;
+  const signingUnchanged = !curSigning
+    ? false
+    : curSigning.signed
+      ? prevSigned && !!prev?.signKeyId && prev.signKeyId.toLowerCase() === curSigning.keyId
+      : !prevSigned;
+  if (contentUnchanged && recipientsUnchanged && signingUnchanged && prev) {
+    console.error(
+      `SKIPPED: content, recipients and signing unchanged (digest ${cur}) — already pushed to ${o.backend} as ${prev.locator} (--force to push anyway)`,
+    );
+    console.log(prev.locator); // stdout contract unchanged: a script still captures a valid locator
+    return { skip: true, locator: prev.locator, sigLocator: prev.sigLocator ?? null };
+  }
+  return { skip: false };
+}
+
 async function pushCore(
   o: CliOptions,
 ): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
@@ -187,81 +269,9 @@ async function pushCore(
   if (!(await readHead(o.in, 64)).startsWith(AGE_MAGIC)) {
     throw new Error(`${o.in} is not age ciphertext (header mismatch) — refusing to push non-ciphertext to storage`);
   }
-  // --skip-unchanged: don't re-push (and, on arweave/turbo, re-pay for) content that
-  // has not changed since the previous push. THREE independent signals must ALL match
-  // the current --save-locator entry for the same backend before a skip fires:
-  //   1. the PLAINTEXT content digest (the "<out>.digest" sidecar) — it can never be
-  //      the ciphertext hash, because age's ephemeral file key makes identical content
-  //      encrypt to different bytes every run;
-  //   2. the recipients fingerprint (the "<out>.recipients-fingerprint" sidecar) — the
-  //      set of age1… keys THIS ciphertext was actually encrypted to. Without this
-  //      second check, re-snapshotting unchanged plaintext under a CHANGED recipient
-  //      set (a newly added offline recovery key, or a removed/revoked one) would
-  //      still skip and return the OLD locator — whose ciphertext the new key can
-  //      never decrypt, and/or a revoked key still can (#70 review round 2, a real
-  //      security regression, not just a correctness nit);
-  //   3. the SIGNING state (#250) — whether this artifact carries a "<in>.minisig"
-  //      and, if so, which signing key id produced it. Without this third check,
-  //      running `keygen --sign` (signing newly enabled) or `keygen --sign --force`
-  //      (key rotated) over otherwise-unchanged content skipped silently, leaving the
-  //      remote copy unsigned, or signed with the OLD key — less protected than the
-  //      operator now expects, with nothing said about it. Neither case lets tampered
-  //      content ACCEPT (the invalid-signature checks in restore/verify are
-  //      untouched); the gap is that the store quietly keeps a stale-authenticity
-  //      copy.
-  // All three are compared against the current --save-locator file's fields (4th =
-  // content_digest, 5th = recipients_fingerprint, 6th = sig_locator, 7th =
-  // sign_key_id). Any missing piece on EITHER side (no sidecar/--digest, a legacy
-  // 3/4-field file, a different backend) proceeds normally: skip is an optimization
-  // that only fires when EVERY signal is known and equal — an unknown signal must
-  // never be treated as "unchanged". --force pushes anyway. Checked before the
-  // paid-backend consent gate: a skipped push contacts nothing and spends nothing.
-  if (o.skip_unchanged) {
-    if (!o.save_locator)
-      throw new Error(
-        '--skip-unchanged requires --save-locator <file> (the previous content digest, recipients fingerprint and signing key id live in its 4th/5th/7th fields)',
-      );
-    if (!o.force) {
-      const cur = await contentDigestFor(o);
-      const curRecipients = await recipientsFingerprintFor(o);
-      const curSigning = await signingStateFor(o);
-      const prev = await readSavedLocatorLine(o.save_locator);
-      const contentUnchanged = !!(
-        cur &&
-        prev?.locator &&
-        prev.backend === o.backend &&
-        prev.contentDigest &&
-        prev.contentDigest.toLowerCase() === cur
-      );
-      const recipientsUnchanged = !!(
-        curRecipients &&
-        prev?.recipientsFingerprint &&
-        prev.recipientsFingerprint.toLowerCase() === curRecipients
-      );
-      // "Was the previous push signed?" is answered by the 6th field (sig_locator),
-      // which push has written since #214 whenever it uploaded a sidecar — so an
-      // artifact pushed before #250 (or before #214) is correctly read as UNSIGNED
-      // rather than as unknown, and an unsigned setup — the pre-#214 default — keeps
-      // skipping exactly as it did. The 7th field only has to answer the narrower
-      // "signed by WHICH key", and its absence on a signed previous push (a 6-field
-      // line written between #214 and #250) is genuinely unknown: don't skip, then
-      // the re-push records it and the next run compares normally. A curSigning of
-      // null is the same kind of unknown on the current side (a sidecar that exists
-      // but does not parse) and likewise never skips.
-      const prevSigned = !!prev?.sigLocator;
-      const signingUnchanged = !curSigning
-        ? false
-        : curSigning.signed
-          ? prevSigned && !!prev?.signKeyId && prev.signKeyId.toLowerCase() === curSigning.keyId
-          : !prevSigned;
-      if (contentUnchanged && recipientsUnchanged && signingUnchanged && prev) {
-        console.error(
-          `SKIPPED: content, recipients and signing unchanged (digest ${cur}) — already pushed to ${o.backend} as ${prev.locator} (--force to push anyway)`,
-        );
-        console.log(prev.locator); // stdout contract unchanged: a script still captures a valid locator
-        return { success: false, locator: prev.locator, sigLocator: prev.sigLocator ?? null };
-      }
-    }
+  const skipResult = await resolveSkipUnchanged(o);
+  if (skipResult.skip) {
+    return { success: false, locator: skipResult.locator, sigLocator: skipResult.sigLocator };
   }
   // --plan <path.json> (#231): re-validate a plan written by "estimate --out" against
   // the state THIS push is about to act on — refuses BEFORE the estimate display and
@@ -644,34 +654,32 @@ export async function pull(o: CliOptions): Promise<void> {
   // still win if both are also given.
   if (o.from_locator_file) {
     if (!(await exists(o.from_locator_file))) throw new Error(`no such locator file: ${o.from_locator_file}`);
-    const line = (await readFile(o.from_locator_file, 'utf8'))
-      .split('\n')
-      .map((l) => l.trim())
-      .find((l) => l && !l.startsWith('#'));
-    if (!line) throw new Error(`locator file ${o.from_locator_file} has no locator line`);
-    // Accept the legacy 3-field line, the 4-field one (a trailing content_digest,
+    // #502: reuse the same parser push's --skip-unchanged path already relies on
+    // (readSavedLocatorLine, above) instead of hand-rolling an identical read+split —
+    // it accepts the legacy 3-field line, the 4-field one (a trailing content_digest,
     // written since --skip-unchanged), the 5-field one (+recipients_fingerprint), the
     // 6-field one (+sig_locator, #214) AND the 7-field one (+sign_key_id, #250):
     // recovery of every existing save-locator file must keep working, so extra columns
     // are simply ignored here. sign_key_id in particular is push-side bookkeeping for
     // --skip-unchanged and is deliberately NOT used as a pin on pull: the trustworthy
     // authenticity check is restore/verify against the pinned signing PUBLIC key.
-    const [savedLoc, savedBackend, savedSha, , , savedSigLocator] = line.split('\t');
+    const saved = await readSavedLocatorLine(o.from_locator_file);
+    if (!saved) throw new Error(`locator file ${o.from_locator_file} has no locator line`);
     // A truncated / hand-mangled file missing the backend column would otherwise fall
     // through to the generic "--backend required" error, hiding the real cause.
-    if (!savedLoc || !savedBackend) {
+    if (!saved.locator || !saved.backend) {
       throw new Error(
-        `locator file ${o.from_locator_file} must contain "<locator>\\t<backend>[\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]]" — got: ${JSON.stringify(line)}`,
+        `locator file ${o.from_locator_file} must contain "<locator>\\t<backend>[\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]]" — got fields: ${JSON.stringify(saved)}`,
       );
     }
-    if (!o.locator) o.locator = savedLoc;
-    if (!o.backend) o.backend = savedBackend;
+    if (!o.locator) o.locator = saved.locator;
+    if (!o.backend) o.backend = saved.backend;
     // Apply the saved integrity pin so recovery is fail-closed (a substituted ciphertext
     // is rejected); an explicit --sha256 still wins if the operator passed one.
-    if (!o.sha256 && savedSha) o.sha256 = savedSha;
+    if (!o.sha256 && saved.sha) o.sha256 = saved.sha;
     // Same idea for the authenticity sidecar (#214): if push recorded where "<in>.minisig"
     // landed, fetch it alongside the ciphertext below (best-effort — see the fetch site).
-    if (!o.sig_locator && savedSigLocator) o.sig_locator = savedSigLocator;
+    if (!o.sig_locator && saved.sigLocator) o.sig_locator = saved.sigLocator;
   }
   // rclone backend (#204): its locator IS the "<remote>:<path>" string (see
   // backends/rclone.ts) — --remote is accepted here as the same value --locator

@@ -951,6 +951,9 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       consent — its own locator becomes the 6th --save-locator field above, so pull can
       fetch it back automatically, and the signing key id inside it becomes the 7th
       (#250, see --skip-unchanged below). Unchanged behavior when no sidecar exists.
+      push has no --sign flag of its own — to enable signing for what you are about to
+      push, see "snapshot --help" (a signing identity from "keygen --sign" makes
+      snapshot write the "<in>.minisig" this section auto-uploads; --no-sign opts out).
       --skip-unchanged (requires --save-locator): skips ONLY when ALL THREE of (a) the
       snapshot's PLAINTEXT content digest — read from the "<in>.digest" sidecar
       snapshot writes, or given as --digest <hex> — equals the content_digest recorded
@@ -1016,7 +1019,11 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       Fetch ciphertext by locator into --out. --from-locator-file reads the locator, its
       backend AND the saved sha256 from a file written by push --save-locator (the recovery
       path: identity + this file are all a fresh machine needs; the saved sha256 is applied
-      as the integrity pin automatically). --wait retries while the item is not yet
+      as the integrity pin automatically). --from-locator-file can be combined with an
+      explicit --locator/--backend — either one, if also given, OVERRIDES the value
+      recorded in the file (a --backend that conflicts with the file's recorded backend is
+      not refused; the explicit flag wins silently, so double-check the two agree before
+      combining them). --wait retries while the item is not yet
       retrievable (a fresh Turbo/Arweave upload takes ~5-8 min to propagate); default 0.
       Only has an effect for --backend arweave/turbo — file/rclone/ton/ton-provider fail
       a not-yet-retrievable object immediately regardless of --wait (a warning is printed
