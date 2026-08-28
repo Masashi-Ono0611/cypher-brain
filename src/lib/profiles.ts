@@ -13,9 +13,30 @@ import type { Dirent } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { exists } from './util.js';
+import { didYouMean, nearestName } from './suggest.js';
 import type { CliOptions } from './types.js';
 
 export const PROFILE_NAMES = ['claude-code', 'obsidian', 'chatgpt-export', 'o2b'];
+
+// #461: a plain NAME check, deliberately split out of resolveProfilePaths() below so a
+// caller that must refuse a bad --profile before doing anything else (schedule.ts's
+// install(), which writes a runner script + plist/cron entry — see its own call site
+// comment) can do so without also paying for, or requiring at THIS moment, whatever
+// filesystem inputs (--vault, --zip, --export) each individual profile needs to actually
+// run. resolveProfilePaths() below calls this too, so `snapshot --profile <typo>` and
+// `schedule install --profile <typo>` refuse with the exact same message — the two
+// surfaces must not disagree about what a valid profile name is, same reasoning as
+// assertExportRequiresO2bProfile() just below. Shares its matcher with #463 (did-you-mean
+// for --profile): a future caller there needs only PROFILE_NAMES + nearestName(), both
+// already here.
+export function assertKnownProfile(profile: string | undefined): void {
+  if (profile === undefined) return;
+  if ((PROFILE_NAMES as readonly string[]).includes(profile)) return;
+  const suggestion = nearestName(profile, PROFILE_NAMES);
+  throw new Error(
+    `unknown profile "${profile}"${suggestion ? ` (${didYouMean(suggestion)})` : ''} — valid profiles: ${PROFILE_NAMES.join(', ')}`,
+  );
+}
 
 // --export (issue #206) is read ONLY by o2bPaths() below, and ONLY reached via
 // resolveProfilePaths() — which snapshot.ts calls `if (o.profile)` and schedule.ts's
@@ -43,6 +64,7 @@ export function assertExportRequiresO2bProfile(o: CliOptions): void {
 
 // Resolve --profile to the concrete source paths it snapshots.
 export async function resolveProfilePaths(o: CliOptions): Promise<string[]> {
+  assertKnownProfile(o.profile);
   switch (o.profile) {
     case 'claude-code':
       return claudeCodePaths();
@@ -53,6 +75,10 @@ export async function resolveProfilePaths(o: CliOptions): Promise<string[]> {
     case 'o2b':
       return o2bPaths(o);
     default:
+      // Unreachable: assertKnownProfile() above already refused anything not in
+      // PROFILE_NAMES. This default only exists to satisfy TS's return-type check on
+      // the switch (o.profile is typed `string | undefined`, not a literal union of
+      // PROFILE_NAMES, so the compiler can't see the cases are exhaustive on its own).
       throw new Error(`unknown profile "${o.profile}" — valid profiles: ${PROFILE_NAMES.join(', ')}`);
   }
 }
