@@ -601,14 +601,21 @@ async function autoSignAndBroadcastDeploy(
 // on the Tonkeeper-deeplink path a human is on the other end of this, so timing out is a
 // real, expected outcome (the operator can re-run push once they have signed), not a bug.
 //
-// `isAutoSign` distinguishes the two ways put() can reach this call (#480): with
-// CYPHER_BRAIN_TON_WALLET configured, put() already signed and broadcast the deploy
-// itself and printed NO deeplink ("no Tonkeeper deeplink needed") — so a timeout here
-// must NOT tell the operator to "sign the deeplink printed above" (issue #480: that
-// instruction is inapplicable, and was actively misleading, on this exact path). The
-// most likely real cause on the auto-sign path is the wallet not having enough TON to
-// cover gas — tonapi's broadcast endpoint accepts (HTTP 200) a doomed transaction just as
-// readily as a good one, so "broadcast succeeded" proves nothing about "will confirm".
+// `fundingPath` distinguishes the THREE ways put() can reach this call:
+//   - 'auto-sign': CYPHER_BRAIN_TON_WALLET configured, put() already signed and
+//     broadcast the deploy itself and printed NO deeplink ("no Tonkeeper deeplink
+//     needed") — so a timeout here must NOT tell the operator to "sign the deeplink
+//     printed above" (issue #480: that instruction is inapplicable, and was actively
+//     misleading, on this exact path). The most likely real cause on this path is the
+//     wallet not having enough TON to cover gas — tonapi's broadcast endpoint accepts
+//     (HTTP 200) a doomed transaction just as readily as a good one, so "broadcast
+//     succeeded" proves nothing about "will confirm".
+//   - 'deeplink': no wallet configured, put() printed a Tonkeeper deeplink for a human
+//     to sign — the original #480 guidance applies unchanged.
+//   - 'skipped' (issue #638): the already-non-fresh check above found the contract
+//     already had on-chain history and skipped funding entirely THIS run — no deeplink
+//     was printed and nothing was broadcast, so BOTH of the above instructions would be
+//     wrong (there is nothing to sign, and no broadcast to check the balance for).
 //
 // 'active' alone does not prove the deploy message's modify_providers body specifically
 // added THIS provider to the on-chain dict (Codex review) — it only proves some message
@@ -620,7 +627,10 @@ async function autoSignAndBroadcastDeploy(
 // that surfaced the original ProviderV1.Address field-mapping incident this session
 // (docs/ton-storage-status.md). A silently-empty provider dict would fail loudly at that
 // step, not pass silently through this one.
-async function waitForContractActive(addr: TonAddress, isAutoSign: boolean): Promise<void> {
+async function waitForContractActive(
+  addr: TonAddress,
+  fundingPath: 'auto-sign' | 'deeplink' | 'skipped',
+): Promise<void> {
   const start = Date.now();
   const deadline = start + TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS;
   // #480: a real 20-minute wait with zero output in between reads as a hang, not a wait
@@ -633,12 +643,18 @@ async function waitForContractActive(addr: TonAddress, isAutoSign: boolean): Pro
     if (acc?.status === 'active') return;
     const now = Date.now();
     if (now > deadline) {
-      const remediation = isAutoSign
-        ? "the auto-signed broadcast may not have landed — check the wallet's TON balance and this " +
-          "address's transaction history on a TON explorer (a common cause is the wallet not holding enough " +
-          "TON to cover gas; tonapi's broadcast endpoint accepts a doomed transaction the same as a good one), " +
-          'then re-run push'
-        : 'sign the deeplink printed above, then re-run push';
+      const remediation =
+        fundingPath === 'auto-sign'
+          ? "the auto-signed broadcast may not have landed — check the wallet's TON balance and this " +
+            "address's transaction history on a TON explorer (a common cause is the wallet not holding enough " +
+            "TON to cover gas; tonapi's broadcast endpoint accepts a doomed transaction the same as a good one), " +
+            'then re-run push'
+          : fundingPath === 'deeplink'
+            ? 'sign the deeplink printed above, then re-run push'
+            : 'this run skipped funding because the contract already looked non-fresh on-chain before ' +
+              'broadcasting anything (issue #638 — see the warning above) — no deeplink was printed and no new ' +
+              "transfer was sent this time, so there is nothing to sign here; check the address's transaction " +
+              'history on a TON explorer directly to see what state it is actually in';
       throw new Error(
         `ton-provider backend: contract ${addr.toRawString()} did not become active on-chain within ` +
           `${TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS}ms — ${remediation} (the same ciphertext will resolve to the ` +
@@ -1238,7 +1254,7 @@ export function tonProviderBackend(): StorageBackend {
               'still succeed and be paid for. A bigger bag, a longer span, or a higher rate would raise this estimate.',
           );
         }
-        // ---------- money-safety: skip re-funding an already-active contract (issue #638) ----------
+        // ---------- money-safety: skip re-funding a non-fresh contract (issue #638) ----------
         // The StorageV1 contract ADDRESS is fully determined by bagId + owner +
         // dataSizeBytes + pieceSize + merkleHash (buildDeploy()'s `data` cell above) —
         // NONE of which depend on which provider was picked or its rate. A retry of the
@@ -1249,45 +1265,62 @@ export function tonProviderBackend(): StorageBackend {
         // the deploy itself landed and only the LATER notify() step timed out. Before
         // this fix, autoSignAndBroadcastDeploy() (or a human re-approving the same
         // Tonkeeper deeplink) unconditionally sent `amountNano` again with a fresh
-        // seqno/query id — funding an already-active contract a second time, and a
+        // seqno/query id — funding an already-funded contract a second time, and a
         // newly-selected provider on the retry could also silently replace the
         // first one in the on-chain dict (modify_providers REPLACES, not merges — see
         // scripts/go/storage-v1-client/updateproviders.go's own field notes), stranding
         // the first payment. Checking here, BEFORE any funds move, closes that gap.
         //
-        // Checked for literal 'active' only (not "anything but nonexist"): tonapi's
-        // brief 'uninit' window right after a broadcast (funded, code not yet run) is a
-        // real residual gap this does not close — a retry landing in that few-second
-        // window can still double-send (bounded by the SAME seqno-replay protection
-        // already documented above: at most one of the two transfers is accepted).
-        // Closing that narrower race would need a persisted "broadcast in flight"
-        // record surviving process restarts — real complexity for an edge window this
+        // Checked as "anything other than 'nonexist'" (Codex review, xhigh pass), not
+        // literal 'active' only: tonapi's `status` vocabulary also has 'uninit' (funded,
+        // contract code not yet run — the exact few-second window right after a
+        // broadcast lands) and 'frozen' (was deployed, now suspended) — neither is a
+        // fresh address either, and checking 'active' alone would still let a retry
+        // landing in that 'uninit' window double-send. `nonexist` (no funds present at
+        // all) is the only status this backend's own first-ever deploy for a bag/owner
+        // pair should ever observe here.
+        //
+        // A narrower race remains: tonapi's own indexing can lag a JUST-broadcast
+        // transaction by a moment, during which this SAME address can still read back
+        // as 'nonexist' even though a transfer is already in flight. A retry landing in
+        // that indexing-lag window is bounded by the SAME seqno-replay protection
+        // already documented above (at most one of the two transfers is accepted), not
+        // by this check — closing it fully would need a persisted "broadcast in flight"
+        // record surviving process restarts, real complexity for an edge window this
         // fix does not claim to eliminate, left as a known limitation (see this PR's
         // description) rather than implemented speculatively.
         //
         // A network failure while checking is NOT treated as proof the contract is
-        // inactive: falling back to the PRE-#638 behavior (attempt to fund) on a check
+        // fresh: falling back to the PRE-#638 behavior (attempt to fund) on a check
         // failure means this fix can only make double-funding LESS likely, never
         // introduce a new way to silently skip a real, first-time deploy.
         let alreadyActive = false;
+        let observedStatus = '';
         try {
           const contractState = await fetchAccountState(deploy.contractAddress);
-          alreadyActive = contractState.status === 'active';
+          observedStatus = contractState.status;
+          alreadyActive = observedStatus !== 'nonexist';
         } catch (e) {
           warn(
-            `ton-provider: could not check whether contract ${deploy.contractAddress.toRawString()} is already ` +
-              `active on-chain (${errMsg(e)}) — proceeding as if it is not (the pre-#638 behavior for this ` +
+            `ton-provider: could not check whether contract ${deploy.contractAddress.toRawString()} already has ` +
+              `on-chain history (${errMsg(e)}) — proceeding as if it does not (the pre-#638 behavior for this ` +
               'specific check failure; the broadcast/signature step below still gives its own unambiguous result)',
           );
         }
         if (alreadyActive) {
-          console.error(
-            `ton-provider: contract ${deploy.contractAddress.toRawString()} is ALREADY ACTIVE on-chain — this ` +
-              'looks like a retry of an already-broadcast (or already-completed) deploy for the same bag/owner. ' +
-              `Skipping re-funding (no new ${deploy.amountNano} nanoTON transfer) and going straight to notifying ` +
-              "the provider. If the provider selected THIS run differs from whichever one the contract's on-chain " +
-              'dict was actually deployed with, notify below may fail for it — re-run `update-providers` ' +
-              '(scripts/go/storage-v1-client) to register the correct one instead of relying on a second deploy.',
+          // warn() (#347), not a raw console.error: this is a safety-relevant skip
+          // decision, not routine progress output — an MCP-driven caller (an agent
+          // retrying a failed push, exactly issue #638's own motivating scenario) must
+          // see this in the structured result's warnings[] array, not only in a
+          // background log nobody is watching.
+          warn(
+            `ton-provider: contract ${deploy.contractAddress.toRawString()} already shows on-chain activity ` +
+              `(status=${observedStatus}) — this looks like a retry of an already-broadcast (or already-completed) ` +
+              `deploy for the same bag/owner. Skipping re-funding (no new ${deploy.amountNano} nanoTON transfer) ` +
+              'and going straight to notifying the provider. If the provider selected THIS run differs from ' +
+              "whichever one the contract's on-chain dict was actually deployed with, notify below may fail for " +
+              'it — re-run `update-providers` (scripts/go/storage-v1-client) to register the correct one instead ' +
+              'of relying on a second deploy.',
           );
         }
         // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
@@ -1337,7 +1370,10 @@ export function tonProviderBackend(): StorageBackend {
           console.error(`  ${deploy.deeplink}`);
         }
 
-        await waitForContractActive(deploy.contractAddress, Boolean(autoSignWallet));
+        await waitForContractActive(
+          deploy.contractAddress,
+          alreadyActive ? 'skipped' : autoSignWallet ? 'auto-sign' : 'deeplink',
+        );
         console.error(`ton-provider: contract ${deploy.contractAddress.toRawString()} is active on-chain`);
 
         await notifyProviderWithRetry(provider.pubkey, deploy.contractAddress.toRawString(), bag.dataSizeBytes);

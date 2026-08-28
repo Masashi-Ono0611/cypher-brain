@@ -330,13 +330,28 @@ func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 		)
 	}
 	fmt.Fprintf(stdout, "  status: %s — %s\n", acc.Status, stateVerdict(acc.Status))
-	if acc.Status == "active" {
+	// Codex review (xhigh pass): checking for literal "active" only left "uninit" (funded,
+	// contract code not yet run — the exact few-second window right after a broadcast
+	// lands) able to slip through and get funded a SECOND time; "frozen" (was deployed,
+	// now suspended) is not a fresh address either. `nonexist` (no funds present at all)
+	// is the ONLY status a genuinely first-time deploy should ever see here, so refuse on
+	// anything else rather than allow-listing just "active".
+	if acc.Status != "nonexist" {
+		followUp := "use `update-providers` instead (gas-only, does NOT re-send the storage cost)"
+		if acc.Status != "active" {
+			followUp = fmt.Sprintf(
+				"wait and re-run `status --contract %s%s` until it settles (tonapi may simply be lagging a recent "+
+					"broadcast) before deciding what to do next",
+				res.contractAddr.StringRaw(), statusFlag,
+			)
+		}
 		return guardf(
-			"contract %s is ALREADY ACTIVE on %s — deploying again would send another %.9f TON (%s nanoTON) to an "+
-				"already-deployed contract. If you need to change or add a provider on it, use `update-providers` "+
-				"instead (gas-only, does NOT re-send the storage cost); to inspect what's there first, use "+
+			"contract %s is NOT a fresh address on %s (tonapi reports status=%q — %s) — deploying again would risk "+
+				"sending another %.9f TON (%s nanoTON) to an address that may already hold funds. If it's already "+
+				"active and you need to change or add a provider, %s; to inspect it directly, use "+
 				"`status --contract %s%s`",
-			res.contractAddr.StringRaw(), network, nanoToFloat(res.amountNano), res.amountNano,
+			res.contractAddr.StringRaw(), network, acc.Status, stateVerdict(acc.Status),
+			nanoToFloat(res.amountNano), res.amountNano, followUp,
 			res.contractAddr.StringRaw(), statusFlag,
 		)
 	}

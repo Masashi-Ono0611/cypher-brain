@@ -17,10 +17,16 @@ import (
 // withMockTonapi points tonapiBase() (status.go) at a local httptest.Server for the
 // duration of the calling test, so runDeploy's issue #638 already-active check (below)
 // gets a real HTTP round trip without ever reaching the actual tonapi.io — restores the
-// override on cleanup so it cannot leak into any other test in this package.
-func withMockTonapi(t *testing.T, status string) {
+// override on cleanup so it cannot leak into any other test in this package. Returns
+// the path of the MOST RECENT request the mock received, so a test can assert it was
+// actually the derived CONTRACT address being queried (Codex review: a mock that
+// answers identically for every path would not catch a regression that accidentally
+// queried the owner, or some other address, instead).
+func withMockTonapi(t *testing.T, status string) *string {
 	t.Helper()
+	var lastPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastPath = r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": status, "balance": 0})
 	}))
@@ -28,6 +34,7 @@ func withMockTonapi(t *testing.T, status string) {
 	prev := tonapiBaseOverride
 	tonapiBaseOverride = srv.URL
 	t.Cleanup(func() { tonapiBaseOverride = prev })
+	return &lastPath
 }
 
 func fixedDeployParams(t *testing.T) deployParams {
@@ -247,7 +254,7 @@ func TestResolveDeployParamsReportsAllMissingRequiredFlags(t *testing.T) {
 // than tonapi.io, reporting 'nonexist' — a genuinely fresh, never-deployed address —
 // so the deploy link is still offered, exactly like before issue #638's fix.
 func TestRunDeployOffline(t *testing.T) {
-	withMockTonapi(t, "nonexist")
+	lastPath := withMockTonapi(t, "nonexist")
 	args := []string{
 		"--bag-id", strings.Repeat("a", 64),
 		"--provider-pubkey", strings.Repeat("b", 64),
@@ -281,6 +288,24 @@ func TestRunDeployOffline(t *testing.T) {
 			t.Errorf("runDeploy output missing %q; full output:\n%s", want, out)
 		}
 	}
+	// Codex review: prove the already-active check queried the derived CONTRACT
+	// address specifically — a mock that answered the same for any path would not
+	// catch a regression that accidentally checked the owner (or some other address)
+	// instead. "contract addr:" line above gives us the address runDeploy itself
+	// printed; the mock request path must contain that same raw address.
+	addrLine := ""
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "contract addr:") {
+			addrLine = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "contract addr:"))
+			break
+		}
+	}
+	if addrLine == "" {
+		t.Fatalf("could not find the printed contract address in output:\n%s", out)
+	}
+	if !strings.Contains(*lastPath, addrLine) {
+		t.Fatalf("already-active check queried %q, which does not contain the derived contract address %q", *lastPath, addrLine)
+	}
 }
 
 // deployArgsFixture returns the SAME deploy args as TestRunDeployOffline's, factored
@@ -304,60 +329,68 @@ func deployArgsFixture(providerPubkey, rate string) []string {
 	}
 }
 
-// TestRunDeployRefusesAlreadyActiveContract is issue #638's core positive control for
-// the Go `deploy` subcommand: once tonapi reports the derived contract address as
-// 'active', deploy must REFUSE to offer another deploy link rather than let the
-// operator sign and pay the storage cost a second time — even though this run picked
-// a DIFFERENT --provider-pubkey/--rate-nano-per-mb-day than whatever the original
-// deploy used (the address does not depend on either, per buildDeploy's own field
-// mapping — see TestBuildDeployAddressDependsOnStateFieldsOnly).
-func TestRunDeployRefusesAlreadyActiveContract(t *testing.T) {
-	withMockTonapi(t, "active")
-	args := deployArgsFixture(strings.Repeat("e", 64), "9999") // different provider/rate than the offline test above — SAME contract address
-
-	var stdout bytes.Buffer
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	err := runDeploy(ctx, args, &stdout)
-	if err == nil {
-		t.Fatal("expected runDeploy to refuse an already-active contract, got nil error")
-	}
-	if _, ok := err.(*guardError); !ok {
-		t.Fatalf("expected *guardError, got %T: %v", err, err)
-	}
-	if !strings.Contains(err.Error(), "ALREADY ACTIVE") {
-		t.Fatalf("refusal message missing 'ALREADY ACTIVE': %v", err)
-	}
-	if !strings.Contains(err.Error(), "update-providers") {
-		t.Fatalf("refusal message should point the operator at update-providers instead: %v", err)
-	}
-	if strings.Contains(stdout.String(), "== deploy ==") {
-		t.Fatalf("a deploy link was printed despite the contract already being active:\n%s", stdout.String())
-	}
-}
-
-// TestRunDeployProceedsForNotYetActiveStates proves the guard above is scoped to
-// 'active' specifically, not "anything but nonexist" — a contract that is funded but
-// not yet running ('uninit', the brief window right after a broadcast lands) or that
-// was never deployed at all ('nonexist') must still get a normal deploy link.
-func TestRunDeployProceedsForNotYetActiveStates(t *testing.T) {
-	for _, status := range []string{"nonexist", "uninit"} {
+// TestRunDeployRefusesForNonFreshStates is issue #638's core positive control for the
+// Go `deploy` subcommand: once tonapi reports the derived contract address as
+// anything OTHER than 'nonexist', deploy must REFUSE to offer another deploy link
+// rather than let the operator sign and pay the storage cost a second time — even
+// though this run picked a DIFFERENT --provider-pubkey/--rate-nano-per-mb-day than
+// whatever the original deploy used (the address does not depend on either, per
+// buildDeploy's own field mapping — see TestBuildDeployAddressDependsOnStateFieldsOnly).
+//
+// Codex review (xhigh pass): checking for literal 'active' only left 'uninit' (funded,
+// contract code not yet run — the exact few-second window right after a broadcast
+// lands) and 'frozen' (was deployed, now suspended) able to slip through and get
+// funded again — neither is a fresh address. Only 'nonexist' should ever proceed
+// (covered separately by TestRunDeployOffline and TestRunDeployProceedsForFreshContract).
+func TestRunDeployRefusesForNonFreshStates(t *testing.T) {
+	for _, status := range []string{"active", "uninit", "frozen"} {
 		t.Run(status, func(t *testing.T) {
 			withMockTonapi(t, status)
-			args := deployArgsFixture(strings.Repeat("f", 64), "1234")
+			args := deployArgsFixture(strings.Repeat("e", 64), "9999") // different provider/rate than the offline test — SAME contract address
 
 			var stdout bytes.Buffer
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 
-			if err := runDeploy(ctx, args, &stdout); err != nil {
-				t.Fatalf("runDeploy: %v", err)
+			err := runDeploy(ctx, args, &stdout)
+			if err == nil {
+				t.Fatalf("expected runDeploy to refuse a %q contract, got nil error", status)
 			}
-			if !strings.Contains(stdout.String(), "== deploy ==") {
-				t.Fatalf("expected a normal deploy link for status %q, got:\n%s", status, stdout.String())
+			if _, ok := err.(*guardError); !ok {
+				t.Fatalf("expected *guardError, got %T: %v", err, err)
+			}
+			if !strings.Contains(err.Error(), "NOT a fresh address") {
+				t.Fatalf("refusal message missing 'NOT a fresh address': %v", err)
+			}
+			if status == "active" && !strings.Contains(err.Error(), "update-providers") {
+				t.Fatalf("refusal message for an active contract should point the operator at update-providers: %v", err)
+			}
+			if strings.Contains(stdout.String(), "== deploy ==") {
+				t.Fatalf("a deploy link was printed despite the contract being %q:\n%s", status, stdout.String())
 			}
 		})
+	}
+}
+
+// TestRunDeployProceedsForFreshContract proves the guard above is scoped to
+// 'nonexist' specifically (see TestRunDeployRefusesForNonFreshStates for what does
+// NOT proceed) — a genuinely never-deployed address must still get a normal deploy
+// link. TestRunDeployOffline already covers this with the offline test's own fixed
+// args; this covers it again with deployArgsFixture's args for symmetry with the
+// refusal test above.
+func TestRunDeployProceedsForFreshContract(t *testing.T) {
+	withMockTonapi(t, "nonexist")
+	args := deployArgsFixture(strings.Repeat("f", 64), "1234")
+
+	var stdout bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := runDeploy(ctx, args, &stdout); err != nil {
+		t.Fatalf("runDeploy: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "== deploy ==") {
+		t.Fatalf("expected a normal deploy link for a fresh (nonexist) contract, got:\n%s", stdout.String())
 	}
 }
 

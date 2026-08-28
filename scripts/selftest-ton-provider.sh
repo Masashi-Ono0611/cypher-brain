@@ -194,17 +194,24 @@ createServer((req, res) => {
   const lowBalance = lowBalanceFlagPath && existsSync(lowBalanceFlagPath) && url.pathname.includes(ownerAddr);
   const neverActive = neverActiveFlagPath && existsSync(neverActiveFlagPath) && !url.pathname.includes(ownerAddr);
   let status;
-  if (neverActive) {
-    status = 'uninitialized';
-  } else if (isFrozenTarget) {
+  if (isFrozenTarget) {
     status = 'frozen';
   } else {
     // issue #638: see the "seen" tracking header comment above this mock's source.
+    // `firstQuery` is computed even when neverActive applies (below), so a GENUINELY
+    // fresh address still reads as 'nonexist' on its first-ever query even under the
+    // #480 "never confirms" positive control -- otherwise that flag would make ton-
+    // provider.ts's own #638 already-non-fresh check see 'uninitialized' (not
+    // 'nonexist') on the very FIRST query for a brand-new address too, incorrectly
+    // skipping funding before a broadcast ever had a chance to happen.
     const addrMatch = url.pathname.match(/^\/v2\/(?:blockchain\/)?accounts\/([^/]+)$/);
     const addr = addrMatch ? addrMatch[1] : null;
-    if (addr && !seenAddrs.has(addr)) {
-      seenAddrs.add(addr);
+    const firstQuery = addr !== null && !seenAddrs.has(addr);
+    if (addr) seenAddrs.add(addr);
+    if (firstQuery) {
       status = 'nonexist';
+    } else if (neverActive) {
+      status = 'uninitialized';
     } else {
       status = 'active';
     }
@@ -857,7 +864,7 @@ printf '%s' "$SECOND_LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' || { echo 
 [ "$FIRST_LOC" = "$SECOND_LOC" ] || { echo "[FAIL] the retry derived a DIFFERENT locator than the first push ($FIRST_LOC vs $SECOND_LOC) — test setup is not actually retrying the same bag"; exit 1; }
 SECOND_BROADCASTS=$(grep -c '"boc"' "$BROADCAST_LOG" || true)
 [ "$SECOND_BROADCASTS" = "1" ] || { echo "[FAIL] issue #638 REGRESSION: the retry sent a SECOND broadcast against an already-active contract (double-funding) — broadcast count is now $SECOND_BROADCASTS, expected still 1"; cat "$BROADCAST_LOG"; exit 1; }
-grep -q 'ALREADY ACTIVE on-chain' "$TMP/issue638-retry.err" || { echo "[FAIL] the retry did not report that the contract was already active/skipped"; cat "$TMP/issue638-retry.err"; exit 1; }
+grep -q 'already shows on-chain activity' "$TMP/issue638-retry.err" || { echo "[FAIL] the retry did not report that the contract was already active/skipped"; cat "$TMP/issue638-retry.err"; exit 1; }
 echo "[PASS] issue #638: retrying an already-active StorageV1 contract skips re-funding (broadcast count stayed at 1, not 2)"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
@@ -877,10 +884,24 @@ export CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS=1500
 export CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS=200
 export CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS=400
 
+# issue #638: both pushes below need a GENUINELY FRESH contract address (never queried
+# before in this script run) — the mock's "seen" tracking (see header comment above the
+# mock's source) makes a non-fresh address's FIRST query report 'uninitialized' (not
+# 'nonexist') once NEVER_ACTIVE_FLAG is set below, which would trip ton-provider.ts's
+# own #638 already-non-fresh check and skip funding BEFORE ever reaching the code path
+# each of these tests actually wants to exercise (the real auto-sign broadcast / the
+# real deeplink print). got.age (reused throughout this script) is NOT fresh by this
+# point — two brand-new, never-before-pushed files avoid the collision.
+mkdir -p "$TMP/autosign-timeout-src" "$TMP/manual-timeout-src"
+printf 'ton-provider #480 auto-sign timeout test payload\n' > "$TMP/autosign-timeout-src/note.txt"
+printf 'ton-provider #480 manual (deeplink) timeout test payload\n' > "$TMP/manual-timeout-src/note.txt"
+cb snapshot --dir "$TMP/autosign-timeout-src" --out "$TMP/autosign-timeout.age"
+cb snapshot --dir "$TMP/manual-timeout-src" --out "$TMP/manual-timeout.age"
+
 echo "== auto-sign: a deploy that never confirms on-chain times out with auto-sign-appropriate guidance, NOT the Tonkeeper-deeplink instruction (#480) =="
 touch "$NEVER_ACTIVE_FLAG"
 if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/autosign-timeout.err"; then
+  cb push --in "$TMP/autosign-timeout.age" --backend ton-provider 2>"$TMP/autosign-timeout.err"; then
   echo "[FAIL] push succeeded despite the mock tonapi reporting the contract as never-active"; exit 1
 fi
 grep -q 'did not become active on-chain within' "$TMP/autosign-timeout.err" || { echo "[FAIL] the deploy-confirm timeout did not fire"; cat "$TMP/autosign-timeout.err"; exit 1; }
@@ -897,7 +918,7 @@ grep -Eq 'still waiting for contract .+ to become active on-chain \([0-9]+s elap
 echo "[PASS] the deploy-confirm wait prints periodic progress ($PROGRESS_LINES line(s) in a ${CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS}ms window)"
 
 echo "== Tonkeeper-deeplink path: the SAME timeout keeps the original 'sign the deeplink' guidance (positive control — #480 must not have broken the manual path) =="
-if cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/manual-timeout.err"; then
+if cb push --in "$TMP/manual-timeout.age" --backend ton-provider 2>"$TMP/manual-timeout.err"; then
   echo "[FAIL] push succeeded despite the mock tonapi reporting the contract as never-active"; exit 1
 fi
 grep -q 'sign the deeplink printed above' "$TMP/manual-timeout.err" || { echo "[FAIL] the Tonkeeper-deeplink path lost its original timeout guidance"; cat "$TMP/manual-timeout.err"; exit 1; }
