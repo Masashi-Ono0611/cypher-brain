@@ -229,7 +229,10 @@ server.listen(Number(process.env.MOCK_PORT), '127.0.0.1', () => {
 });
 MOCKEOF
 
-MOCK_PORT=18765
+# Ephemeral port (same idiom as selftest-ton.sh/selftest-ton-dns.sh/selftest-ton-provider.sh's
+# mock daemons, #575) — a hardcoded port collides with another process/stale daemon/
+# parallel CI shard and turns into flakiness instead of a real failure.
+MOCK_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
 PRICE_FILE="$PRICE_FILE" MOCK_PORT="$MOCK_PORT" node "$TMP/mock-arweave.mjs" >"$TMP/mock.log" 2>&1 &
 MOCK_PID=$!
 READY=0

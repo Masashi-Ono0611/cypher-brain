@@ -758,7 +758,20 @@ echo "== race: an --out that appears mid-snapshot is NOT clobbered (link promote
 RACE="$TMP/race-out.age"
 PATH="$STUBBIN:$PATH" TAR_STUB_MODE=slow TAR_STUB_SLEEP=3 node "${BIN_DEV_ARGS[@]}" "$BIN" snapshot --dir "$SRC" --out "$RACE" >/dev/null 2>&1 &
 RACE_PID=$!
-for _ in $(seq 1 50); do find "$TMPDIR" -maxdepth 1 -name 'cypher-brain-*' -type d 2>/dev/null | grep -q . && break; sleep 0.1; done
+# APPEARED flag (same pattern as selftest-ton.sh's READY / selftest-verify-levels.sh's
+# APPEARED / selftest-gbrain-pglite.sh's post-loop grep, #573): without this, a silently
+# exhausted loop (slow CI, or a staging-dir naming regression) would let the script
+# proceed anyway, and the RC/content checks below could still report PASS via the CLI's
+# earlier upfront exists() refusal rather than the late link()+EEXIST exclusive-promote
+# path this test is actually meant to exercise.
+APPEARED=0
+for _ in $(seq 1 50); do find "$TMPDIR" -maxdepth 1 -name 'cypher-brain-*' -type d 2>/dev/null | grep -q . && { APPEARED=1; break; }; sleep 0.1; done
+if [ "$APPEARED" != "1" ]; then
+  echo "FAIL: staging dir never appeared — the race window was never set up, so the link()+EEXIST path was not exercised"
+  kill "$RACE_PID" 2>/dev/null || true
+  wait "$RACE_PID" 2>/dev/null || true
+  exit 1
+fi
 printf 'PRE-EXISTING-WINNER\n' > "$RACE"   # a "concurrent run" finished first
 set +e
 wait "$RACE_PID"; RC=$?

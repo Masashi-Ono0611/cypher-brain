@@ -252,13 +252,13 @@ SIZE=$(stat -f%z "$TMP/snap.age" 2>/dev/null || stat -c%s "$TMP/snap.age")
 
 echo "== estimate --backend ton-provider (real priced query against the mock registry) =="
 EST=$(cb estimate --in "$TMP/snap.age" --backend ton-provider --json)
-echo "$EST" | grep -q '"unit":"nanoTON"' || { echo "[FAIL] estimate did not price in nanoTON: $EST"; exit 1; }
+printf '%s' "$EST" | grep -q '"unit":"nanoTON"' || { echo "[FAIL] estimate did not price in nanoTON: $EST"; exit 1; }
 echo "[PASS] estimate returns a real nanoTON cost"
 # #396 Phase B: usd_estimate is now populated too (tonUsdRate(), estimate.ts), sourced
 # from the mock tonapi's /v2/rates handler above (fixed at $3.5/TON) — a real number,
 # not the null every OTHER field-completeness gap in this backend used to leave.
-echo "$EST" | grep -q '"usd_estimate":null' && { echo "[FAIL] estimate's usd_estimate is null despite the mock tonapi rates endpoint answering"; echo "$EST"; exit 1; }
-echo "$EST" | grep -Eq '"usd_estimate":[0-9]' || { echo "[FAIL] estimate did not include a numeric usd_estimate: $EST"; exit 1; }
+printf '%s' "$EST" | grep -q '"usd_estimate":null' && { echo "[FAIL] estimate's usd_estimate is null despite the mock tonapi rates endpoint answering"; echo "$EST"; exit 1; }
+printf '%s' "$EST" | grep -Eq '"usd_estimate":[0-9]' || { echo "[FAIL] estimate did not include a numeric usd_estimate: $EST"; exit 1; }
 echo "[PASS] estimate --json also carries a real usd_estimate (tonapi rates, #396 Phase B)"
 
 echo "== push --backend ton-provider (deploy -> wait active -> notify-until-full) =="
@@ -294,15 +294,15 @@ TP_RECEIPT=$(node -e '
   if (!r) { console.error("no ton-provider receipt found among " + lines.length + " line(s)"); process.exit(1); }
   console.log(JSON.stringify(r));
 ' "$RECEIPT_LEDGER_PATH_TP") || { echo "[FAIL] could not find a ton-provider receipt in $RECEIPT_LEDGER_PATH_TP"; cat "$RECEIPT_LEDGER_PATH_TP"; exit 1; }
-echo "$TP_RECEIPT" | grep -q '"unit":"nanoton"' || { echo "[FAIL] ton-provider receipt unit is not nanoton: $TP_RECEIPT"; exit 1; }
-echo "$TP_RECEIPT" | grep -Eq '"cost":"[0-9]+"' || { echo "[FAIL] ton-provider receipt cost is not a plain digit string: $TP_RECEIPT"; exit 1; }
+printf '%s' "$TP_RECEIPT" | grep -q '"unit":"nanoton"' || { echo "[FAIL] ton-provider receipt unit is not nanoton: $TP_RECEIPT"; exit 1; }
+printf '%s' "$TP_RECEIPT" | grep -Eq '"cost":"[0-9]+"' || { echo "[FAIL] ton-provider receipt cost is not a plain digit string: $TP_RECEIPT"; exit 1; }
 printf '%s' "$TP_RECEIPT" | grep -F "\"locator\":\"$LOC\"" >/dev/null \
   || { echo "[FAIL] ton-provider receipt locator does not match what push printed ($LOC): $TP_RECEIPT"; exit 1; }
 echo "[PASS] a successful ton-provider push writes a receipt (backend/locator/nanoton cost all correct)"
 
 LEDGER_HUMAN_TP=$(cb ledger)
-echo "$LEDGER_HUMAN_TP" | grep -q 'ton-provider' || { echo "[FAIL] ledger (human) does not mention ton-provider: $LEDGER_HUMAN_TP"; exit 1; }
-echo "$LEDGER_HUMAN_TP" | grep -q 'nanoton' || { echo "[FAIL] ledger (human) does not show a nanoton cost: $LEDGER_HUMAN_TP"; exit 1; }
+printf '%s' "$LEDGER_HUMAN_TP" | grep -q 'ton-provider' || { echo "[FAIL] ledger (human) does not mention ton-provider: $LEDGER_HUMAN_TP"; exit 1; }
+printf '%s' "$LEDGER_HUMAN_TP" | grep -q 'nanoton' || { echo "[FAIL] ledger (human) does not show a nanoton cost: $LEDGER_HUMAN_TP"; exit 1; }
 echo "[PASS] ledger (human report) includes the ton-provider push"
 
 LEDGER_JSON_TP=$(cb ledger --json)
@@ -349,7 +349,7 @@ echo "[PASS] the bounty-floor warning stays silent once the computed bounty clea
 echo "== estimate --backend ton-provider also carries the bounty-floor warning when under-floor (#403) =="
 rm -f "$TMP/high-price-flag" # back to the default (low) rate so this estimate is under-floor
 EST2=$(cb estimate --in "$TMP/high-price.age" --backend ton-provider --json)
-echo "$EST2" | grep -q 'looks below the ~0.05 TON floor' || { echo "[FAIL] estimate's note did not carry the bounty-floor warning: $EST2"; exit 1; }
+printf '%s' "$EST2" | grep -q 'looks below the ~0.05 TON floor' || { echo "[FAIL] estimate's note did not carry the bounty-floor warning: $EST2"; exit 1; }
 echo "[PASS] estimate warns about an under-floor bounty before any funds move"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore for the pull test below
 
@@ -546,7 +546,7 @@ grep -q 'already exists' "$TMP/ton-wallet-clobber.err" || { echo "[FAIL] wrong T
 echo "[PASS] wallet create --chain ton no-clobber guard fired, original mnemonic byte-identical after the refusal"
 
 BAL=$(cb wallet balance --chain ton --wallet "$TMP/ton-wallet.json" --json)
-echo "$BAL" | grep -q '"balance_nanoton":5000000000' || { echo "[FAIL] wallet balance --chain ton did not read the mock tonapi balance: $BAL"; exit 1; }
+printf '%s' "$BAL" | grep -q '"balance_nanoton":5000000000' || { echo "[FAIL] wallet balance --chain ton did not read the mock tonapi balance: $BAL"; exit 1; }
 echo "[PASS] wallet balance --chain ton reads the (mocked) on-chain balance"
 
 # Issue #479: a freshly generated, never-funded wallet must read as a clean zero
@@ -558,11 +558,11 @@ cb wallet create --chain ton --out "$TMP/ton-wallet-fresh.json" > /dev/null
 FRESH_ADDR=$(cb wallet address --chain ton --wallet "$TMP/ton-wallet-fresh.json")
 printf '%s' "$FRESH_ADDR" > "$UNFUNDED_ADDR_FLAG"
 FRESH_BAL=$(cb wallet balance --chain ton --wallet "$TMP/ton-wallet-fresh.json" --json)
-echo "$FRESH_BAL" | grep -q '"balance_nanoton":0' || { echo "[FAIL] a never-active wallet's balance did not read as 0: $FRESH_BAL"; exit 1; }
-echo "$FRESH_BAL" | grep -q '"status":"nonexist"' || { echo "[FAIL] a never-active wallet's status was not 'nonexist': $FRESH_BAL"; exit 1; }
+printf '%s' "$FRESH_BAL" | grep -q '"balance_nanoton":0' || { echo "[FAIL] a never-active wallet's balance did not read as 0: $FRESH_BAL"; exit 1; }
+printf '%s' "$FRESH_BAL" | grep -q '"status":"nonexist"' || { echo "[FAIL] a never-active wallet's status was not 'nonexist': $FRESH_BAL"; exit 1; }
 echo "[PASS] wallet balance --chain ton --json reads a never-active wallet as a clean 0, not an error (#479)"
 FRESH_BAL_PLAIN=$(cb wallet balance --chain ton --wallet "$TMP/ton-wallet-fresh.json")
-echo "$FRESH_BAL_PLAIN" | grep -q '^balance : 0 nanoTON' || { echo "[FAIL] a never-active wallet's plain balance output was not a clean 0: $FRESH_BAL_PLAIN"; exit 1; }
+printf '%s' "$FRESH_BAL_PLAIN" | grep -q '^balance : 0 nanoTON' || { echo "[FAIL] a never-active wallet's plain balance output was not a clean 0: $FRESH_BAL_PLAIN"; exit 1; }
 echo "[PASS] wallet balance --chain ton (plain output) reads a never-active wallet as a clean 0, not an error (#479)"
 rm -f "$UNFUNDED_ADDR_FLAG"
 
