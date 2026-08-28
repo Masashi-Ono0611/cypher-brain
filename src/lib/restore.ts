@@ -777,25 +777,37 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   // backup or an existing setup that hasn't run `keygen --sign` — UNLESS --require-
   // signature opts into strict mode, in which case an attacker who simply deletes the
   // .minisig sidecar (rather than forging one) no longer silently succeeds either.
-  const signRecipient = o.sign_recipient || SIGN_RECIPIENT;
-  // An EXPLICITLY-named --sign-recipient that doesn't exist is a configuration typo,
-  // not "authenticity isn't set up yet" — silently falling back to no_pubkey/SKIP here
-  // would make a mistyped path look identical to a deliberately unconfigured one. Only
-  // the DEFAULT path missing means "not opted in yet" (see snapshot.ts's --sign-identity
-  // for the same distinction on the signing side).
-  if (o.sign_recipient && !(await exists(o.sign_recipient))) {
-    throw new Error(`--sign-recipient ${o.sign_recipient} does not exist`);
-  }
-  const sigCheck = await checkArtifactSignature(o.in, signRecipient);
-  if (sigCheck.status === 'invalid') {
-    throw new Error(`refusing to restore ${o.in}: ${sigCheck.reason}`);
-  }
-  if (sigCheck.status === 'verified') {
-    console.log(`[PASS] minisign authenticity signature verified (${o.in}.minisig)`);
-  } else if (o.require_signature) {
-    throw new Error(`refusing to restore ${o.in}: --require-signature was given but ${sigCheck.reason}`);
-  } else {
-    console.error(`warning: ${sigCheck.reason}`);
+  // #530: verify --level drill sets skip_signature_check on the internal restoreImpl()
+  // call it makes below — its own runFileChecks() already ran this EXACT check against
+  // this EXACT fetched artifact, and already printed the PASS/FAIL/SKIP line for it.
+  // Without this, drill's output showed the same signature-check result twice (once at
+  // verify's own top level, once again — independently — from here), reading as if two
+  // checks ran rather than one. verifyImpl() only ever reaches this call once its own
+  // check already came back non-FAIL (a FAIL verdict short-circuits before restoreImpl()
+  // is ever called, per the comment above drill's restoreOpts below), so there is nothing
+  // left here to decide OR report — every other caller of restoreImpl() (the CLI's
+  // `restore` command) never sets this, and runs the check exactly as before.
+  if (!o.skip_signature_check) {
+    const signRecipient = o.sign_recipient || SIGN_RECIPIENT;
+    // An EXPLICITLY-named --sign-recipient that doesn't exist is a configuration typo,
+    // not "authenticity isn't set up yet" — silently falling back to no_pubkey/SKIP here
+    // would make a mistyped path look identical to a deliberately unconfigured one. Only
+    // the DEFAULT path missing means "not opted in yet" (see snapshot.ts's --sign-identity
+    // for the same distinction on the signing side).
+    if (o.sign_recipient && !(await exists(o.sign_recipient))) {
+      throw new Error(`--sign-recipient ${o.sign_recipient} does not exist`);
+    }
+    const sigCheck = await checkArtifactSignature(o.in, signRecipient);
+    if (sigCheck.status === 'invalid') {
+      throw new Error(`refusing to restore ${o.in}: ${sigCheck.reason}`);
+    }
+    if (sigCheck.status === 'verified') {
+      console.log(`[PASS] minisign authenticity signature verified (${o.in}.minisig)`);
+    } else if (o.require_signature) {
+      throw new Error(`refusing to restore ${o.in}: --require-signature was given but ${sigCheck.reason}`);
+    } else {
+      console.error(`warning: ${sigCheck.reason}`);
+    }
   }
   const identity = o.identity || IDENTITY;
   if (!(await exists(identity))) throw new Error(`no identity at ${identity} — cannot decrypt without the private key`);
@@ -1059,6 +1071,15 @@ async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<
   if (sigOk === false) {
     positiveSkipped = true;
     if (!o.json) console.log('[SKIP] positive control — skipped (the authenticity signature above failed)');
+  } else if (o.identity && !(await exists(o.identity))) {
+    // #531: an EXPLICITLY-given --identity that doesn't exist is a configuration typo,
+    // not "no private identity is set up on this box" — the same distinction
+    // --sign-recipient already draws above (and restoreImpl's own identical guard draws
+    // for `restore --identity`). Only the DEFAULT path being absent means "not set up
+    // yet, legitimately a public-key-only box" (the SKIP/PARTIAL branch below); a
+    // nonexistent path the caller named on purpose is a hard error instead, so a typo
+    // is never read as an expected verdict.
+    throw new Error(`no identity at ${o.identity} — cannot decrypt without the private key`);
   } else if (await exists(identity)) {
     try {
       const decrypter = newDecrypter(await loadIdentities(identity)); // prompts if passphrase-wrapped
@@ -1221,15 +1242,25 @@ async function verifyImpl(o: CliOptions): Promise<number> {
   }
 
   if (level === 'quick') {
-    if (o.locator || o.backend || o.from_locator_file) {
+    // #528: --sig-locator names something to FETCH (the *.minisig sidecar), exactly like
+    // --locator/--backend/--from-locator-file name something to fetch — quick never
+    // fetches anything, so it belongs in this same refusal rather than being silently
+    // accepted and dropped (which is exactly what used to happen: no error, no warning,
+    // just a flag that did nothing).
+    if (o.locator || o.backend || o.from_locator_file || o.sig_locator) {
       throw new Error(
         '--level quick checks the LOCAL --in file only — it never fetches from storage, so --locator/' +
-          '--backend/--from-locator-file have nothing to do here (--level remote or --level drill fetch by ' +
-          'those instead of taking --in)',
+          '--backend/--from-locator-file/--sig-locator have nothing to do here (--level remote or --level ' +
+          'drill fetch by those instead of taking --in)',
       );
     }
+    // #536: remote/drill both print a "level: …" first line and carry a "level" field in
+    // --json (below); quick used to have neither, so a caller inspecting only the JSON
+    // (or grepping a captured log for "level:") could not tell "quick ran" apart from
+    // "nothing ran" — same field, same meaning, for parity across all three depths.
+    if (!o.json) console.log(`level: ${level}`);
     const r = await runFileChecks(o, true);
-    return finishVerify(o, r);
+    return finishVerify(o, r, { level });
   }
 
   // remote and drill both start the same way: actually fetch the artifact. That fetch IS
@@ -1279,6 +1310,13 @@ async function verifyImpl(o: CliOptions): Promise<number> {
       backend: o.backend,
       from_locator_file: o.from_locator_file,
       sha256: o.sha256,
+      // #528: was missing entirely — pull() only ever fetches the *.minisig sidecar when
+      // sig_locator is set (either explicitly here, or filled in below from
+      // --from-locator-file's 6th field), so a bare --locator/--backend + --sig-locator
+      // call (the exact pattern `pull --sig-locator` documents, and the one a user would
+      // reach for by analogy) silently never fetched the sidecar at all — a false-negative
+      // FAIL under --require-signature on a genuinely valid signature.
+      sig_locator: o.sig_locator,
       out: target,
       dirs: [],
       tables: [],
@@ -1409,6 +1447,12 @@ async function verifyImpl(o: CliOptions): Promise<number> {
       sign_recipient: o.sign_recipient,
       require_signature: o.require_signature,
       verbose: o.verbose, // #436: let --level drill --verbose show the raw manifest.json restoreImpl() reads, same as a plain "restore --verbose" would
+      // #530: the checks above (runFileChecks, called via `r` earlier in this function)
+      // already ran and printed this EXACT signature check against this EXACT fetched
+      // artifact — only reached at all when that came back PASS or SKIP (see the early
+      // return above for FAIL/PARTIAL). Re-running it here would print the same result a
+      // second time.
+      skip_signature_check: true,
       dirs: [],
       tables: [],
       recipients: [],

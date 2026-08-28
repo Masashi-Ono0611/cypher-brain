@@ -45,6 +45,7 @@ export interface CliOptions {
   sign?: boolean; // keygen --sign: generate a minisign-compatible Ed25519 signing keypair instead of an age identity (#214)
   no_sign?: boolean; // snapshot --no-sign: skip writing a <out>.minisig sidecar even when a signing identity is present (#214)
   require_signature?: boolean; // restore/verify: an absent/unverifiable signature is a hard failure, not just a warning (#214)
+  skip_signature_check?: boolean; // INTERNAL ONLY, never a CLI/MCP flag (not in cli.ts's BOOL_FLAGS/VALUE_FLAGS): verify --level drill sets this on the restoreImpl() call it makes from src/lib/restore.ts, after its own runFileChecks() already ran (and printed) this exact signature check against this exact fetched artifact — restoreImpl skips re-running (and re-printing) it rather than reporting the same check twice (#530)
 
   // value flags — always a string when passed (argv is untyped text)
   out?: string;

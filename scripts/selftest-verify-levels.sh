@@ -305,4 +305,94 @@ LEFTOVERS=$(find "$TMPDIR" -maxdepth 1 -name 'cypher-brain-verify-*' 2>/dev/null
   || { echo "[FAIL] SIGTERM mid-component-expand leaked $LEFTOVERS scratch dir(s)"; exit 1; }
 unset TMPDIR
 
+echo "== #536: --level quick --json includes \"level\":\"quick\" (parity with remote/drill) =="
+QJ=$(cb verify --in "$TMP/snap2.age" --json); QJRC=$?
+[ "$QJRC" = "0" ] || { echo "[FAIL] quick --json exited $QJRC"; echo "$QJ"; exit 1; }
+printf '%s' "$QJ" | grep -q '"level":"quick"' \
+  && echo "[PASS] --level quick --json includes \"level\":\"quick\"" \
+  || { echo "[FAIL] --level quick --json missing the level field"; echo "$QJ"; exit 1; }
+
+echo "== #536: --level quick's plain-text first line is 'level: quick' (parity with remote/drill's own first line) =="
+QPLAIN=$(cb verify --in "$TMP/snap2.age")
+QFIRST=$(printf '%s\n' "$QPLAIN" | head -1)
+[ "$QFIRST" = "level: quick" ] \
+  && echo "[PASS] --level quick's plain-text output starts with 'level: quick'" \
+  || { echo "[FAIL] --level quick's first output line was '$QFIRST', expected 'level: quick'"; exit 1; }
+
+echo "== #528 setup: a genuinely signed artifact, pushed with --save-locator (records the sig_locator as the 6th field) =="
+SIGHOME528="$TMP/sig-keys-528"; mkdir -p "$SIGHOME528"
+CYPHER_BRAIN_HOME="$SIGHOME528" cb keygen >/dev/null
+CYPHER_BRAIN_HOME="$SIGHOME528" cb keygen --sign >/dev/null
+SIGSRC528="$TMP/sig-src-528"; mkdir -p "$SIGSRC528"
+printf 'sig528-test-%s\n' "$MARKER" > "$SIGSRC528/note.txt"
+CYPHER_BRAIN_HOME="$SIGHOME528" cb snapshot --dir "$SIGSRC528" --out "$TMP/sig528.age" >/dev/null
+CYPHER_BRAIN_HOME="$SIGHOME528" cb push --in "$TMP/sig528.age" --backend file --save-locator "$TMP/sig528-loc.tsv" >/dev/null
+SIG528_LOC=$(cut -f1 "$TMP/sig528-loc.tsv")
+SIG528_LOCATOR=$(cut -f6 "$TMP/sig528-loc.tsv")
+[ -n "$SIG528_LOCATOR" ] || { echo "[FAIL] #528 setup: save-locator file has no 6th (sig_locator) field"; cat "$TMP/sig528-loc.tsv"; exit 1; }
+
+echo "== #528 POSITIVE CONTROL: bare --locator/--backend/--sig-locator/--require-signature now PASSes on a genuinely valid signature =="
+# Before the fix, verifyImpl()'s internal pull() call (src/lib/restore.ts ~line 1277)
+# built its CliOptions object literal WITHOUT sig_locator, so the .minisig sidecar was
+# never fetched — --require-signature then hard-failed on a signature that was actually
+# valid and fetchable. Confirmed as an actual regression during development (not just
+# theorized): temporarily removing the `sig_locator: o.sig_locator,` line from that
+# object literal and re-running this EXACT command reproduced `"signature":"fail"` /
+# `"verdict":"FAIL"` / exit 1 — restoring the line fixed it back to PASS, which is what
+# this assertion locks in.
+set +e
+S528=$(CYPHER_BRAIN_HOME="$SIGHOME528" cb verify --level remote --locator "$SIG528_LOC" --backend file --sig-locator "$SIG528_LOCATOR" --require-signature --json); S528RC=$?
+set -e
+[ "$S528RC" = "0" ] || { echo "[FAIL] #528: bare --locator/--backend/--sig-locator/--require-signature exited $S528RC, expected 0"; echo "$S528"; exit 1; }
+printf '%s' "$S528" | grep -q '"signature":"pass"' \
+  && echo "[PASS] #528: bare --locator/--backend/--sig-locator/--require-signature fetches and verifies a genuinely valid signature" \
+  || { echo "[FAIL] #528: signature check did not report pass"; echo "$S528"; exit 1; }
+printf '%s' "$S528" | grep -q '"verdict":"PASS"' \
+  && echo "[PASS] #528: overall verdict is PASS (not a false-negative FAIL)" \
+  || { echo "[FAIL] #528: overall verdict was not PASS"; echo "$S528"; exit 1; }
+
+echo "== #528: --level quick refuses --sig-locator (it never fetches, same as --locator/--backend/--from-locator-file) =="
+set +e
+SQ_ERR=$(cb verify --level quick --in "$TMP/snap2.age" --sig-locator "$SIG528_LOCATOR" 2>&1); SQ_RC=$?
+set -e
+[ "$SQ_RC" != "0" ] || { echo "[FAIL] --level quick accepted --sig-locator"; exit 1; }
+printf '%s' "$SQ_ERR" | grep -q -- '--sig-locator' \
+  && echo "[PASS] --level quick refuses --sig-locator" \
+  || { echo "[FAIL] --level quick --sig-locator refusal message unclear: $SQ_ERR"; exit 1; }
+
+echo "== #530: --level drill prints the signature-check result exactly once (not duplicated by the internal restore step) =="
+D530=$(CYPHER_BRAIN_HOME="$SIGHOME528" cb verify --level drill --locator "$SIG528_LOC" --backend file --sig-locator "$SIG528_LOCATOR" --require-signature 2>&1)
+printf '%s\n' "$D530" | grep -q 'VERDICT: PASS' \
+  || { echo "[FAIL] #530 setup: --level drill on a signed artifact did not PASS"; echo "$D530"; exit 1; }
+SIGLINES=$(printf '%s\n' "$D530" | grep -c 'minisign authenticity signature verified' || true)
+[ "$SIGLINES" = "1" ] \
+  && echo "[PASS] #530: --level drill prints the signature-check PASS line exactly once (not twice)" \
+  || { echo "[FAIL] #530: --level drill printed the signature-check line $SIGLINES time(s), expected exactly 1"; echo "$D530"; exit 1; }
+
+echo "== #531: an EXPLICITLY-given --identity path that does not exist is a hard error (typo), not a silent PARTIAL =="
+set +e
+ID_ERR=$(cb verify --in "$TMP/snap2.age" --level quick --identity "$TMP/no-such-identity.age" 2>&1); ID_RC=$?
+set -e
+[ "$ID_RC" = "1" ] || { echo "[FAIL] explicit nonexistent --identity exited $ID_RC, expected 1 (hard error, not exit 2/PARTIAL)"; echo "$ID_ERR"; exit 1; }
+printf '%s' "$ID_ERR" | grep -q 'cannot decrypt without the private key' \
+  && echo "[PASS] explicit nonexistent --identity is refused with the same hard-error wording restore uses" \
+  || { echo "[FAIL] explicit nonexistent --identity refusal message unclear: $ID_ERR"; exit 1; }
+printf '%s' "$ID_ERR" | grep -q 'CB-E015' \
+  && echo "[PASS] explicit nonexistent --identity carries the CB-E015 error code" \
+  || { echo "[FAIL] explicit nonexistent --identity is missing the CB-E015 error code: $ID_ERR"; exit 1; }
+if printf '%s' "$ID_ERR" | grep -q 'PARTIAL'; then
+  echo "[FAIL] explicit nonexistent --identity error text mentions PARTIAL — it must read as a hard error, not a verdict"
+  exit 1
+fi
+echo "[PASS] explicit nonexistent --identity does not read as a PARTIAL verdict"
+
+echo "== #531 control: --identity OMITTED entirely (no default identity present either) is still the legitimate PARTIAL — must not regress =="
+set +e
+NOID_OUT=$(CYPHER_BRAIN_HOME="$PUBONLY" node "${BIN_DEV_ARGS[@]}" "$BIN" verify --in "$TMP/snap2.age" --level quick 2>&1); NOID_RC=$?
+set -e
+[ "$NOID_RC" = "2" ] || { echo "[FAIL] control: --identity omitted on a public-key-only box exited $NOID_RC, expected 2 (PARTIAL)"; echo "$NOID_OUT"; exit 1; }
+printf '%s' "$NOID_OUT" | grep -q 'no private identity on this machine' \
+  && echo "[PASS] control: --identity omitted with no default identity present is still an unchanged, expected PARTIAL" \
+  || { echo "[FAIL] control: omitted-identity PARTIAL message missing/changed"; echo "$NOID_OUT"; exit 1; }
+
 echo "[PASS] verify --level quick/remote/drill (issue #209) all behave as documented"

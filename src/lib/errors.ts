@@ -206,7 +206,9 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     title: 'identity file not found (cannot decrypt)',
     pattern: /cannot decrypt without the private key/,
     origin: 'ours',
-    source: 'src/lib/restore.ts (restoreImpl, "no identity at … — cannot decrypt without the private key")',
+    source:
+      'src/lib/restore.ts (restoreImpl, and runFileChecks for an EXPLICIT --identity path on verify, #531), ' +
+      '"no identity at … — cannot decrypt without the private key"',
   },
   {
     code: 'CB-E016',
