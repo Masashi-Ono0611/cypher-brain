@@ -1030,6 +1030,21 @@ export function tonProviderBackend(): StorageBackend {
         // tx.reward (receipt.ts's own header comment). `raw` is a small normalized
         // summary (ton-provider has no single SDK response object to defer to, same
         // reasoning as arweave's own raw L1 backend).
+        //
+        // Known gap (Codex review): if notifyProviderWithRetry() above throws (the
+        // provider never confirms a full download within CYPHER_BRAIN_TON_PROVIDER_
+        // NOTIFY_RETRY_MS), this line is never reached — the deploy transfer is already
+        // confirmed on-chain (real funds committed) but no receipt gets recorded, since
+        // this push did not COMPLETE (receipt.ts's own contract: a receipt is "the best
+        // available ACTUAL-cost record for a completed paid push", matching arweave's/
+        // turbo's own receipts, each recorded at the last step of an upload that fully
+        // succeeds). pushpull.ts's push() only ever persists a receipt for a put() call
+        // that RESOLVES, so recording one for this specific failure path would need a
+        // partial-success signal analogous to PushSignatureUploadError's, threaded back
+        // through pushpull.ts — a deliberately separate follow-up, not folded in here.
+        // The thrown error's own message already tells the operator the contract IS
+        // deployed and may still complete on its own; audit.ts's own log still records
+        // this run (backend=ton-provider, non-zero exit_code) either way.
         opts.onReceipt?.(
           {
             contract_address: deploy.contractAddress.toRawString(),
