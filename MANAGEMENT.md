@@ -527,6 +527,7 @@ failure); the plain message is still the full story either way. Over MCP,
 | CB-E014 | `schedule status`/`uninstall` ran before `schedule install`, or writing the crontab entry failed. | Run `cypher-brain schedule install` first; a crontab-write failure usually means missing cron permissions/availability in this environment. |
 | CB-E015 | `restore`/`verify` can't find the private identity file it needs to decrypt (default or `--identity` path). | Run `cypher-brain keygen` if you haven't yet, or point `--identity` at the correct file. |
 | CB-E016 | `restore`/`verify` found a `*.minisig` signature next to the ciphertext, and a configured signing public key, but the signature did NOT verify — the artifact may be tampered or forged. | Do not trust the artifact. Confirm you're checking against the correct `sign-recipient.pub` (or `--sign-recipient`); if it matches and the failure persists, treat the ciphertext as compromised and re-fetch from a trusted copy. |
+| CB-E017 | `schedule status` read `schedule.json` and it either isn't valid JSON (truncated write, disk full mid-write, hand edit) or is missing a field `status` needs (a partially-written or older-schema file). | Re-run `cypher-brain schedule install` to regenerate a valid `schedule.json`. |
 
 ## What's proven vs recommended
 

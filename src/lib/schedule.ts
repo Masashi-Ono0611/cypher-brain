@@ -636,10 +636,36 @@ async function readOwnCronEntry(): Promise<string | null> {
 
 // ---------- subcommands ----------
 
-async function install(o: CliOptions): Promise<void> {
-  if (!o.backend) throw new Error('--backend <file|arweave|turbo|ton-provider> required');
-  const backends = await scheduleableBackends();
-  if (!backends.has(o.backend)) {
+// ---------- install() helpers ----------
+//
+// #508: install() used to be a single ~365-line function reading top to bottom as (1)
+// input validation, (2) environment probing/resolution (pg_dump, gitleaks paths), (3)
+// building the resolved ScheduleConfig, (4) writing the runner/plist/cron/config
+// artifacts + registering the launchd/cron trigger + migrating off a legacy
+// label/marker scheme, (5) printing the operational summary. Unlike wizard.ts's
+// interactive flow, none of that needs to be interleaved with user I/O — it is pure
+// sequential data transformation + file writes, so it is split into one function per
+// concern below. Every helper is called from install() in EXACTLY the original order,
+// with EXACTLY the original side effects (throws, console.error lines, process.env /
+// `o` mutations) — this is a pure refactor, not a behavior change. Two params
+// (`backend`, `effectiveScan`) are threaded through explicitly rather than re-read off
+// `o` in every helper: TypeScript's narrowing of `o.backend`/`o.scan_secrets` (established
+// by the `if (!o.backend) throw` guard and the `isScanSecretsMode` check below) does not
+// survive a function-call boundary, so passing the already-validated values is what keeps
+// this compiling with the exact same runtime guarantees the single function had.
+
+// ---------- (1) input validation ----------
+// The `--backend` presence check itself stays in install(), BEFORE scheduleableBackends()
+// is even called (see install() below) — scheduleableBackends() does a filesystem check
+// (does a TON wallet exist), and the original single function never paid for that when
+// `--backend` was missing outright (Codex review: reordering it after would have made a
+// plain usage error do extra I/O it never did before). `backend` is therefore guaranteed
+// non-empty by the time this runs; only its MEMBERSHIP in `backends` still needs checking
+// here. Returns the validated backend name (narrowed from CliOptions' `backend?: string`)
+// so every helper below can take a plain `string` instead of re-deriving it from `o`.
+function validateInstallInputs(o: CliOptions, backends: Set<string>): string {
+  const backend = o.backend as string;
+  if (!backends.has(backend)) {
     // #434: ton-provider IS a recognized, documented backend name — it's just
     // excluded from `backends` above until a TON wallet is configured. Routing
     // that case through the generic "unknown backend" message below reads as if
@@ -648,10 +674,10 @@ async function install(o: CliOptions): Promise<void> {
     // here. Name it specifically instead; every OTHER rejected name (rclone/ton,
     // which are real but intentionally never scheduleable, or a genuine typo)
     // still falls through to the generic message unchanged.
-    if (o.backend === 'ton-provider') {
+    if (backend === 'ton-provider') {
       throw new Error("ton-provider requires CYPHER_BRAIN_TON_WALLET=<path> — see 'wallet create --chain ton'");
     }
-    throw new Error(`unknown backend: ${o.backend} (expected one of ${[...backends].join('|')})`);
+    throw new Error(`unknown backend: ${backend} (expected one of ${[...backends].join('|')})`);
   }
   // #461: install() never calls resolveProfilePaths() itself (it only reaches profiles.ts
   // through the --export/o2b check just below) — so a misspelled --profile used to sail
@@ -699,6 +725,16 @@ async function install(o: CliOptions): Promise<void> {
       );
     }
   }
+  return backend;
+}
+
+// ---------- (2) environment probing/resolution (pg_dump, gitleaks paths) ----------
+// Also finishes resolving --scan-secrets to its EFFECTIVE mode (#301) — inseparable from
+// the gitleaks resolution just below (the default depends on whether gitleaks is
+// resolvable at all). Mutates `o.scan_secrets` exactly as the original single function
+// did: the MCP schedule_install result reads the RESOLVED mode back off the SAME options
+// object after install() returns, not the caller's original input (see mcp.ts).
+function resolveScheduleEnv(o: CliOptions): { gitleaksBin: string | null; effectiveScan: ScanSecretsMode | undefined } {
   // launchd/cron start with a BARE env — they do NOT inherit the interactive shell's PATH,
   // so a --pg snapshot that resolves pg_dump via PATH interactively (the common Homebrew /
   // Postgres.app setup) would find pg_dump right now but fail every scheduled run. Resolve
@@ -742,7 +778,11 @@ async function install(o: CliOptions): Promise<void> {
   // failure #307 closed. So the effective mode is computed once, now, and baked in
   // explicitly; `off` is baked too, so "this schedule does not scan" is a recorded decision
   // rather than the absence of one.
-  let effectiveScan: ScanSecretsMode | undefined = o.scan_secrets;
+  // validateInstallInputs() already confirmed this is undefined or a valid
+  // ScanSecretsMode before install() ever calls this function — TS narrowing does not
+  // cross that function-call boundary, so this cast just restates what was already
+  // checked (a no-op at runtime, same value either way).
+  let effectiveScan: ScanSecretsMode | undefined = o.scan_secrets as ScanSecretsMode | undefined;
   if (effectiveScan === undefined) {
     const hasScannableSource = o.dirs.length > 0 || !!o.profile;
     effectiveScan =
@@ -776,15 +816,22 @@ async function install(o: CliOptions): Promise<void> {
   // schedule_install result) must not echo an omitted input as "no scan" when install just
   // resolved and baked one.
   o.scan_secrets = effectiveScan;
-  const at = o.at || '03:30';
-  const { hour, minute } = parseAt(at);
+  return { gitleaksBin, effectiveScan };
+}
+
+// ---------- (1b) spend-cap + --ping-url-fail validation ----------
+// Runs AFTER resolveScheduleEnv() in install() (same order the original single function
+// checked these in) and takes the already-validated `backend` rather than `o.backend`
+// for the same narrowing reason validateInstallInputs() returns it (see the file-level
+// comment above).
+function validateSpendCaps(o: CliOptions, backend: string): void {
   // The one thing this feature must never create: unattended spending without a cap.
   // A paid backend gets CYPHER_BRAIN_YES=1 baked into the runner, so a spend cap is
   // MANDATORY here — refuse to install rather than schedule an uncapped nightly upload.
-  if (PAID.has(o.backend)) {
+  if (PAID.has(backend)) {
     if (!o.max_spend) {
       throw new Error(
-        `--backend ${o.backend} is a paid store: --max-spend <n> is required for an unattended schedule (native units: winc for turbo, winston for arweave L1) — the runner gets CYPHER_BRAIN_YES=1, so it must also get a spend cap`,
+        `--backend ${backend} is a paid store: --max-spend <n> is required for an unattended schedule (native units: winc for turbo, winston for arweave L1) — the runner gets CYPHER_BRAIN_YES=1, so it must also get a spend cap`,
       );
     }
     if (!/^\d+$/.test(String(o.max_spend)) || BigInt(o.max_spend) <= 0n) {
@@ -792,7 +839,7 @@ async function install(o: CliOptions): Promise<void> {
     }
   } else if (o.max_spend) {
     throw new Error(
-      `--max-spend only applies to arweave/turbo (native units: winc/winston); --backend ${o.backend} either is free ` +
+      `--max-spend only applies to arweave/turbo (native units: winc/winston); --backend ${backend} either is free ` +
         'or (ton-provider) uses its own CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) instead — see below',
     );
   }
@@ -808,7 +855,7 @@ async function install(o: CliOptions): Promise<void> {
   // guidance instead of every night at push time (Codex review, xhigh pass: the original cut
   // of this PR made ton-provider "schedule install"-eligible without ALSO requiring or
   // carrying forward what a nightly run actually needs to succeed).
-  if (o.backend === 'ton-provider') {
+  if (backend === 'ton-provider') {
     if (TON_PROVIDER_MAX_SPEND <= 0n) {
       throw new Error(
         'ton-provider is a paid store: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) must be set in the ' +
@@ -830,16 +877,21 @@ async function install(o: CliOptions): Promise<void> {
   if (o.ping_url_fail && !o.ping_url) {
     throw new Error('--ping-url-fail requires --ping-url (the success URL) to also be set');
   }
+}
 
-  // Read any PRE-EXISTING artifacts now, before anything below overwrites them — used only
-  // to detect (and, unless --no-load, migrate off) a legacy pre-#114 registration for THIS
-  // SAME home, so re-running install after upgrading cypher-brain doesn't leave BOTH the
-  // old unscoped job and the new scoped one running nightly (#114). Read AFTER the input
-  // validation above so a plain usage error (bad --backend, missing --max-spend, ...) never
-  // pays for this extra I/O.
-  const priorCfg = await tryReadConfig();
-  const priorCronEntry = await readOwnCronEntry();
-
+// ---------- (3) building the resolved ScheduleConfig ----------
+async function buildScheduleConfig(
+  o: CliOptions,
+  args: {
+    backend: string;
+    at: string;
+    hour: number;
+    minute: number;
+    gitleaksBin: string | null;
+    effectiveScan: ScanSecretsMode | undefined;
+  },
+): Promise<ScheduleConfig> {
+  const { backend, at, hour, minute, gitleaksBin, effectiveScan } = args;
   // The resolved scanner is layered ON TOP of the captured environment rather than being
   // written back into process.env the way the --pg branch does with CYPHER_BRAIN_PG_BIN.
   // In the CLI the two are equivalent (one process, one install), but the MCP server is
@@ -849,12 +901,12 @@ async function install(o: CliOptions): Promise<void> {
   const capturedEnv = await captureEnv();
   if (gitleaksBin) capturedEnv.CYPHER_BRAIN_GITLEAKS_BIN = gitleaksBin;
 
-  const cfg: ScheduleConfig = {
+  return {
     schema: 1,
     at,
     hour,
     minute,
-    backend: o.backend,
+    backend,
     ...(o.profile ? { profile: o.profile } : {}),
     // --vault/--zip are always filesystem paths (a directory / a zip file) — resolve
     // NOW, against the cwd `schedule install` is run from, exactly like --dir below.
@@ -913,7 +965,10 @@ async function install(o: CliOptions): Promise<void> {
     // the naive append isn't what you want.
     ...(o.ping_url ? { ping_url: o.ping_url, ping_url_fail: o.ping_url_fail || `${o.ping_url}/fail` } : {}),
   };
+}
 
+// ---------- (4) writing the runner/plist/cron/config artifacts ----------
+async function writeScheduleArtifacts(cfg: ScheduleConfig): Promise<void> {
   await mkdir(LOGS_DIR, { recursive: true });
   await mkdir(SNAPS_DIR, { recursive: true });
   await writeFile(RUNNER, runnerBody(cfg));
@@ -929,8 +984,16 @@ async function install(o: CliOptions): Promise<void> {
     console.error(`cron entry written -> ${CRON_ENTRY_FILE}`);
   }
   await writeFile(CONFIG, `${JSON.stringify(cfg, null, 2)}\n`);
+}
 
-  if (o.no_load) {
+// ---------- (4b) launchd/cron trigger registration + legacy-scheme migration ----------
+async function registerTrigger(
+  cfg: ScheduleConfig,
+  priorCfg: ScheduleConfig | null,
+  priorCronEntry: string | null,
+  noLoad: boolean | undefined,
+): Promise<void> {
+  if (noLoad) {
     if (cfg.trigger.type === 'launchd') {
       console.error(
         `--no-load: trigger NOT registered (launchctl untouched) — but ${PLIST} is a REAL, PERSISTENT file that was just written. Its default location (~/Library/LaunchAgents) is a real system dir, NOT scoped to CYPHER_BRAIN_HOME (override with CYPHER_BRAIN_LAUNCHD_DIR to sandbox a --no-load preview). Remove it by hand, or with \`cypher-brain schedule uninstall\`, if you do not intend to \`launchctl load\` it or re-run install without --no-load.`,
@@ -979,12 +1042,15 @@ async function install(o: CliOptions): Promise<void> {
       }
     }
   }
+}
 
+// ---------- (5) operational summary ----------
+function printInstallSummary(cfg: ScheduleConfig): void {
   // The write-window rationale (MANAGEMENT.md "Avoid the write window"): a run pg_dumps
   // the DB and tars the files at different instants, so it must not straddle the nightly
   // re-synthesis of the source.
   console.error(
-    `scheduled daily at ${at} — run well after the source re-synthesizes overnight, so the DB and files are captured from the same settled state`,
+    `scheduled daily at ${cfg.at} — run well after the source re-synthesizes overnight, so the DB and files are captured from the same settled state`,
   );
   if (PAID.has(cfg.backend)) {
     console.error(
@@ -1001,6 +1067,34 @@ async function install(o: CliOptions): Promise<void> {
   }
 }
 
+// ---------- install() — orchestrates the above in the ORIGINAL sequential order ----------
+async function install(o: CliOptions): Promise<void> {
+  // Checked here, BEFORE scheduleableBackends() (which does a filesystem check for a TON
+  // wallet) — same order the original single function had: a plain "--backend missing"
+  // usage error must never pay for that extra I/O (Codex review).
+  if (!o.backend) throw new Error('--backend <file|arweave|turbo|ton-provider> required');
+  const backends = await scheduleableBackends();
+  const backend = validateInstallInputs(o, backends);
+  const { gitleaksBin, effectiveScan } = resolveScheduleEnv(o);
+  const at = o.at || '03:30';
+  const { hour, minute } = parseAt(at);
+  validateSpendCaps(o, backend);
+
+  // Read any PRE-EXISTING artifacts now, before anything below overwrites them — used only
+  // to detect (and, unless --no-load, migrate off) a legacy pre-#114 registration for THIS
+  // SAME home, so re-running install after upgrading cypher-brain doesn't leave BOTH the
+  // old unscoped job and the new scoped one running nightly (#114). Read AFTER the input
+  // validation above so a plain usage error (bad --backend, missing --max-spend, ...) never
+  // pays for this extra I/O.
+  const priorCfg = await tryReadConfig();
+  const priorCronEntry = await readOwnCronEntry();
+
+  const cfg = await buildScheduleConfig(o, { backend, at, hour, minute, gitleaksBin, effectiveScan });
+  await writeScheduleArtifacts(cfg);
+  await registerTrigger(cfg, priorCfg, priorCronEntry, o.no_load);
+  printInstallSummary(cfg);
+}
+
 // A real, checkable (`instanceof`) marker for "nothing installed" — same pattern as
 // util.ts's MissingPathError — so doctor.ts (#333 review) can tell this ONE expected
 // condition apart from any other failure reading the schedule (a corrupt schedule.json,
@@ -1010,11 +1104,63 @@ async function install(o: CliOptions): Promise<void> {
 // class) still recognizes it.
 export class ScheduleNotInstalledError extends Error {}
 
+// #494: the exact fields scheduleStatusReport() (readConfig's only caller) dereferences
+// off the returned config, checked up front so a partially-written/older-schema
+// schedule.json that parses fine but is missing one of them surfaces as THIS clear
+// message instead of a generic "Cannot read properties of undefined" deep inside that
+// function. Deliberately narrower than every key ScheduleConfig declares (e.g. `tables`/
+// `dirs`/`recipients`/`env` are never read by readConfig's caller) — validating fields
+// nothing here uses would reject a config that `status` can perfectly well report on.
+function assertScheduleConfigShape(v: unknown): asserts v is ScheduleConfig {
+  const missing = (field: string) =>
+    new Error(
+      `schedule config is corrupt (${CONFIG} is missing required field "${field}") — reinstall with: cypher-brain schedule install`,
+    );
+  if (typeof v !== 'object' || v === null) {
+    throw new Error(
+      `schedule config is corrupt (${CONFIG} is not a JSON object) — reinstall with: cypher-brain schedule install`,
+    );
+  }
+  const cfg = v as Record<string, unknown>;
+  if (typeof cfg.at !== 'string') throw missing('at');
+  if (typeof cfg.hour !== 'number') throw missing('hour');
+  if (typeof cfg.minute !== 'number') throw missing('minute');
+  if (typeof cfg.backend !== 'string') throw missing('backend');
+  if (typeof cfg.home !== 'string') throw missing('home');
+  if (typeof cfg.runner !== 'string') throw missing('runner');
+  const trigger = cfg.trigger as Record<string, unknown> | undefined;
+  if (typeof trigger !== 'object' || trigger === null) throw missing('trigger');
+  if (trigger.type === 'launchd') {
+    if (typeof trigger.path !== 'string') throw missing('trigger.path');
+  } else if (trigger.type === 'cron') {
+    if (typeof trigger.entry_file !== 'string') throw missing('trigger.entry_file');
+  } else {
+    throw missing('trigger.type');
+  }
+}
+
 async function readConfig(): Promise<ScheduleConfig> {
   if (!(await exists(CONFIG))) {
     throw new ScheduleNotInstalledError(`schedule not installed (no ${CONFIG}) — run: cypher-brain schedule install`);
   }
-  return JSON.parse(await readFile(CONFIG, 'utf8'));
+  // Only JSON.parse() is wrapped — NOT the readFile() above it (Codex review): a
+  // filesystem failure reading an EXISTING file (permission denied, a delete race between
+  // the exists() check and this read) is a different problem than a malformed file, and
+  // labeling it "not valid JSON" would be actively misleading. That class of failure is
+  // left to propagate exactly as it did before this fix (unwrapped, whatever Node's own
+  // fs error says) — only a genuine parse failure gets the structured message below.
+  const raw = await readFile(CONFIG, 'utf8');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `schedule config is corrupt (${CONFIG} is not valid JSON: ${detail}) — reinstall with: cypher-brain schedule install`,
+    );
+  }
+  assertScheduleConfigShape(parsed);
+  return parsed;
 }
 
 async function lastLog(): Promise<{ name: string; rcLine: string; warningCount: number | null } | null> {

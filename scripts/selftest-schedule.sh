@@ -699,6 +699,28 @@ if (j.installed !== true) throw new Error('expected installed:true for an instal
 " "$SJOUT"
 echo "[PASS] status --json: one JSON line; configured/runner/last_run/next_run/trigger/installed all correct"
 
+echo "== (d1) issue #494: corrupted schedule.json produces a structured CB-E017 error, not a raw SyntaxError =="
+cp "$CONFIG" "$TMP/schedule.json.bak"
+printf '{not valid json' > "$CONFIG"
+if cb schedule status > "$TMP/status-corrupt.log" 2>&1; then
+  echo "[FAIL] status on a corrupted schedule.json unexpectedly exited 0"; cat "$TMP/status-corrupt.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1
+fi
+grep -q 'schedule config is corrupt' "$TMP/status-corrupt.log" || { echo "[FAIL] corrupted-JSON status error lacks 'schedule config is corrupt'"; cat "$TMP/status-corrupt.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1; }
+grep -q 'CB-E017' "$TMP/status-corrupt.log" || { echo "[FAIL] corrupted-JSON status error lacks the CB-E017 code"; cat "$TMP/status-corrupt.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1; }
+if grep -qi 'SyntaxError' "$TMP/status-corrupt.log"; then echo "[FAIL] corrupted-JSON status leaked a raw SyntaxError instead of the structured message"; cat "$TMP/status-corrupt.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1; fi
+cp "$TMP/schedule.json.bak" "$CONFIG"
+
+echo "== (d2) issue #494: schedule.json missing a required field also produces CB-E017, not a generic property-access crash =="
+printf '{"schema":1}' > "$CONFIG"
+if cb schedule status > "$TMP/status-missing-field.log" 2>&1; then
+  echo "[FAIL] status on a schedule.json missing required fields unexpectedly exited 0"; cat "$TMP/status-missing-field.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1
+fi
+grep -q 'schedule config is corrupt' "$TMP/status-missing-field.log" || { echo "[FAIL] missing-field status error lacks 'schedule config is corrupt'"; cat "$TMP/status-missing-field.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1; }
+grep -q 'missing required field' "$TMP/status-missing-field.log" || { echo "[FAIL] missing-field status error lacks 'missing required field'"; cat "$TMP/status-missing-field.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1; }
+if grep -qi 'Cannot read propert' "$TMP/status-missing-field.log"; then echo "[FAIL] missing-field status leaked a generic property-access crash"; cat "$TMP/status-missing-field.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1; fi
+cp "$TMP/schedule.json.bak" "$CONFIG"
+echo "[PASS] corrupted / field-missing schedule.json surfaces a structured CB-E017 error (#494), not a raw SyntaxError or property-access crash"
+
 echo "== (c2) a failing run leaves a trailing FAILED rc=N line (heartbeat contract) =="
 CYPHER_BRAIN_SCHEDULE_DIR="$TMP/sched-fail" cb schedule install --backend file --dir "$TMP/does-not-exist" --no-load > /dev/null 2>&1 \
   || { echo "[FAIL] install (failure fixture) exited non-zero"; exit 1; }

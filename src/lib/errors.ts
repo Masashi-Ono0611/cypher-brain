@@ -216,6 +216,14 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     source:
       'src/lib/restore.ts (restoreImpl) + src/lib/minisign.ts (verifyDetached), "… signature does not verify …" / "… signature verification failed …"',
   },
+  {
+    code: 'CB-E017',
+    title: 'schedule config is corrupt — invalid JSON, or missing a required field (#494)',
+    pattern: /schedule config is corrupt \(/,
+    origin: 'ours',
+    source:
+      'src/lib/schedule.ts (readConfig, "schedule config is corrupt (… is not valid JSON: …" / "… is missing required field …")',
+  },
 ];
 
 /** The first registry entry whose pattern matches `message`, if any. */
