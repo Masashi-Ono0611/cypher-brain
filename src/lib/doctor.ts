@@ -39,6 +39,7 @@
 import { stat, readFile, writeFile, rename, rm } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { identityToRecipient } from 'age-encryption';
 import {
@@ -62,6 +63,7 @@ import { scheduleStatusReport, ScheduleNotInstalledError } from './schedule.js';
 import { buildInfo, buildAgeDays, BUILD_STALE_DAYS } from './buildinfo.js';
 import { readAuditLog, verifyAuditChain } from './audit.js';
 import { readReceipts } from './receipt.js';
+import { detectGbrainEngine } from './gbrain.js';
 import { printJson, printMascot, moodForVerdict } from './ui.js';
 import type { CliOptions } from './types.js';
 
@@ -575,6 +577,60 @@ async function checkReceiptLedger(): Promise<DoctorCheck> {
   };
 }
 
+// #542: detectGbrainEngine() (gbrain.ts, #367) was, until now, wired ONLY into the init
+// wizard's one-time snapshot-source prompt — and `init` itself refuses to rerun once an
+// identity already exists, so a gbrain install that later CHANGES engine (e.g. migrates
+// PGLite -> Postgres, or the reverse) left the operator with no way to notice their
+// init-time --pg answer had gone stale, short of re-reading the wizard's own source. This
+// surfaces the SAME detection standalone, re-checkable on every doctor run.
+//
+// Deliberately informational: PASS-with-note for a genuine detection, WARN (never FAIL)
+// for an unreadable config — there is nothing insecure about ANY detected engine, this is
+// a heads-up, not a health problem the other checks above are. Standalone, not
+// cross-referenced against an installed schedule's own --pg flag (the issue's own
+// suggested fallback when wiring that in is too invasive): schedule.ts's ScheduleConfig
+// keeps `pg` (a connection string, which can embed a credential) out of its public
+// ScheduleStatusReport entirely — see that type's own "names only, never values" posture
+// on `config_file.variables` — so reaching in for it here would be new, privileged
+// plumbing this check does not need to do its job.
+async function checkGbrainEngine(): Promise<DoctorCheck> {
+  const id = 'gbrain-engine-detection';
+  const gbrainConfigPath = join(homedir(), '.gbrain', 'config.json');
+  if (!(await exists(gbrainConfigPath))) {
+    return {
+      id,
+      status: 'skip',
+      message: `no gbrain config found at ${gbrainConfigPath} — gbrain is not set up on this machine (or uses a non-default GBRAIN_HOME)`,
+    };
+  }
+  const gbrain = await detectGbrainEngine(gbrainConfigPath);
+  if (gbrain.readError) {
+    return {
+      id,
+      status: 'warn',
+      message: `gbrain config at ${gbrainConfigPath} could not be read — its engine could not be determined (defaulted to postgres for any --pg decision); if this machine actually runs PGLite, that default is wrong until the config is fixed`,
+      remediation: `inspect ${gbrainConfigPath} by hand — it should be valid JSON with an "engine" field ("pglite" or "postgres")`,
+    };
+  }
+  if (gbrain.engine === 'pglite') {
+    const where = gbrain.dataPath
+      ? `store recorded at ${gbrain.dataPath}`
+      : gbrain.relativeDataPath
+        ? `store recorded as a relative path (${gbrain.relativeDataPath}) — its real location cannot be resolved from here`
+        : 'no database_path recorded — its location cannot be told from here';
+    return {
+      id,
+      status: 'pass',
+      message: `gbrain engine: PGLite (${where}) — no Postgres dump is needed; back up the directory itself`,
+    };
+  }
+  return {
+    id,
+    status: 'pass',
+    message: `gbrain engine: Postgres — a "cypher-brain snapshot --pg <connection string>" is needed to include gbrain's actual data in a backup`,
+  };
+}
+
 // How old is the code that is actually running (#348)? The real incident: a
 // hand-copied dist ran the snapshot host for 5+ weeks, silently missing documented
 // features — nothing surfaced its age, and the version string (0.0.1 on every build to
@@ -841,6 +897,7 @@ export async function computeDoctorReport(): Promise<DoctorReport> {
     ...(await checkSchedule()),
     await checkAuditChain(),
     await checkReceiptLedger(),
+    await checkGbrainEngine(),
   ];
 
   const statePath = doctorStatePath();
