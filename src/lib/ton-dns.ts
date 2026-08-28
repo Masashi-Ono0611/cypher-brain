@@ -19,7 +19,7 @@ import { mkdir, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TON_BIN, TON_NETWORK_CONFIG, TON_TONAPI_URL, CIPHER_YES } from './config.js';
-import { errMsg, rmrf, sdkImportAdvice, sleep } from './util.js';
+import { errMsg, exists, rmrf, sdkImportAdvice, sleep } from './util.js';
 import { warn } from './warn.js';
 import { readSavedLocatorLine } from './pushpull.js';
 import { bagIdFrom, tonLocator } from './backends/ton.js';
@@ -271,8 +271,17 @@ export async function publishLatest(o: CliOptions): Promise<void> {
   validateDomain(o.domain);
   const waitS = parseWaitSeconds(o.wait);
   if (!o.from_locator_file) throw new Error('--from-locator-file <path> required (written by push --save-locator)');
+  // #482: distinguish "file missing" from "file has no valid locator" — same two
+  // failure modes pull's --from-locator-file already separates (pushpull.ts, pull()),
+  // instead of collapsing both into readSavedLocatorLine's generic null.
+  if (!(await exists(o.from_locator_file))) throw new Error(`no such locator file: ${o.from_locator_file}`);
   const saved = await readSavedLocatorLine(o.from_locator_file);
-  if (!saved) throw new Error(`no locator line found in ${o.from_locator_file}`);
+  if (!saved) {
+    throw new Error(
+      `${o.from_locator_file} has no locator line — run a push with --save-locator first, and point ` +
+        '--from-locator-file at the file it wrote',
+    );
+  }
   if (saved.backend !== 'ton') {
     throw new Error(
       `publish-latest only works with the ton backend — ${o.from_locator_file} records backend "${saved.backend}" (locator: ${saved.locator})`,
