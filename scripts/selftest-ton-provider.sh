@@ -207,14 +207,46 @@ chmod +x "$SHIM/tonutils-storage"
 export PATH="$SHIM:$PATH"
 
 # ---- fake notify binary: mimics scripts/go/storage-v1-client's plain-text output ----
+# issue #651: also dispatches on a `rates` subcommand (rates.go) — put()'s
+# checkProviderLiveTerms() shells out to it right before every deploy is built, so
+# EVERY push test below (not just the dedicated #651 positive controls further down)
+# depends on this branch answering with terms permissive enough not to trip that check.
+# Defaults (available=true, a rate well under BOTH mock registry prices this script
+# ever configures — 800 and 2e8 nanoTON/MB/day, see mock-mytonprovider.mjs above — and
+# a span range wide enough to cover every span this script ever computes) are
+# deliberately generous so ONLY the dedicated rates-mismatch positive controls below
+# (which set one of the three override flags) ever see a refusal.
 cat > "$SHIM/fake-notify" <<EOF
 #!/usr/bin/env bash
 # Args: notify --provider-pubkey <hex> --contract <addr> --mainnet
+#    or rates  --provider-pubkey <hex> --size-bytes <n> --mainnet
+STATE="$TMP/notify-downloaded"
+REASON_FILE="$TMP/notify-reason-override"
+RATES_UNAVAILABLE_FLAG="$TMP/rates-unavailable-flag"
+RATES_HIGH_RATE_FLAG="$TMP/rates-high-rate-flag"
+RATES_NARROW_SPAN_FLAG="$TMP/rates-narrow-span-flag"
+SUB="\$1"
+if [ "\$SUB" = "rates" ]; then
+  printf '%s\n' "\$@" > "$TMP/rates-args.log"
+  AVAILABLE=true
+  [ -f "\$RATES_UNAVAILABLE_FLAG" ] && AVAILABLE=false
+  RATE=750
+  [ -f "\$RATES_HIGH_RATE_FLAG" ] && RATE=999999999
+  MIN_SPAN=1
+  MAX_SPAN=4294967295
+  [ -f "\$RATES_NARROW_SPAN_FLAG" ] && MAX_SPAN=100000
+  echo "== rates response =="
+  echo "  available:            \$AVAILABLE"
+  echo "  rate_nano_per_mb_day: \$RATE"
+  echo "  min_bounty_nano:      50000000"
+  echo "  space_available:      999999999999"
+  echo "  min_span:             \$MIN_SPAN"
+  echo "  max_span:             \$MAX_SPAN"
+  exit 0
+fi
 # Downloaded byte count is read from a control file this script writes on push, so the
 # "wait until fully downloaded" retry loop can be exercised deterministically (see the
 # partial-then-full positive control below) instead of only ever answering "done" once.
-STATE="$TMP/notify-downloaded"
-REASON_FILE="$TMP/notify-reason-override"
 # issue #404: records the args THIS call received, overwriting each time — the
 # network-selection positive controls below check the MOST RECENT call only.
 printf '%s\n' "\$@" > "$TMP/notify-args.log"
@@ -228,7 +260,23 @@ echo "  status: preflight-should-be-ignored — some verdict"
 echo "== notify response =="
 echo "  status:     active"
 echo "  reason:     \$(cat "\$REASON_FILE" 2>/dev/null || echo ok)"
-echo "  downloaded: \$(cat "\$STATE" 2>/dev/null || echo 0) bytes"
+# issue #652: an OPTIONAL per-call sequence file (newline-separated byte counts) lets a
+# test drive a SPECIFIC, deterministic sequence of downloaded values across successive
+# retry-loop calls (e.g. "partial, then a DECREASE, then full") without racing real
+# wall-clock timing against a backgrounded push — each call increments a counter and
+# reads that line number, falling past the end to the last line. Absent (the common
+# case, every OTHER test here), behavior is unchanged: the single static \$STATE value.
+SEQ_FILE="$TMP/notify-downloaded-sequence"
+if [ -f "\$SEQ_FILE" ]; then
+  COUNTER_FILE="$TMP/notify-call-counter"
+  N=\$(( \$(cat "\$COUNTER_FILE" 2>/dev/null || echo 0) + 1 ))
+  echo "\$N" > "\$COUNTER_FILE"
+  DL=\$(sed -n "\${N}p" "\$SEQ_FILE")
+  [ -n "\$DL" ] || DL=\$(tail -n1 "\$SEQ_FILE")
+else
+  DL=\$(cat "\$STATE" 2>/dev/null || echo 0)
+fi
+echo "  downloaded: \$DL bytes"
 EOF
 chmod +x "$SHIM/fake-notify"
 export CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN="$SHIM/fake-notify"
@@ -595,6 +643,92 @@ grep -Eq '"boc":"[A-Za-z0-9+/=]{200,}"' "$BROADCAST_LOG" || {
   echo "[FAIL] auto-sign's broadcast body doesn't look like a real signed BOC"; cat "$BROADCAST_LOG"; exit 1
 }
 echo "[PASS] auto-sign path: owner derived from the wallet, deploy broadcast (no deeplink, no human)"
+
+# ========================================================================
+# issue #651: checkProviderLiveTerms() must refuse BEFORE any funds move (i.e. before
+# the auto-sign broadcast below ever fires) when the provider's LIVE ADNL rates
+# disagree with the mytonprovider.org registry snapshot the deploy was built from. Run
+# on the auto-sign path (not the manual Tonkeeper-deeplink path) so BROADCAST_LOG
+# actually proves "never reached broadcast", not just "push exited non-zero".
+# ========================================================================
+
+echo "== live-rates check: provider reports itself NOT available -> refuses before broadcast (#651) =="
+touch "$TMP/rates-unavailable-flag"
+: > "$BROADCAST_LOG"
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/rates-unavailable.err"; then
+  echo "[FAIL] push succeeded despite the provider's live rates reporting itself unavailable"; exit 1
+fi
+grep -q 'reports itself as NOT available' "$TMP/rates-unavailable.err" || { echo "[FAIL] wrong rates-unavailable message"; cat "$TMP/rates-unavailable.err"; exit 1; }
+[ -s "$BROADCAST_LOG" ] && { echo "[FAIL] push reached broadcast despite the live-rates check refusing first"; exit 1; }
+rm -f "$TMP/rates-unavailable-flag"
+echo "[PASS] a provider reporting itself unavailable via live ADNL rates refuses the push before any funds move"
+
+echo "== live-rates check: provider's LIVE rate exceeds what the registry snapshot assumed -> refuses (#651) =="
+touch "$TMP/rates-high-rate-flag"
+: > "$BROADCAST_LOG"
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/rates-high-rate.err"; then
+  echo "[FAIL] push succeeded despite the provider's live rate exceeding the registry-derived rate"; exit 1
+fi
+grep -q 'LIVE rate' "$TMP/rates-high-rate.err" || { echo "[FAIL] wrong high-rate message"; cat "$TMP/rates-high-rate.err"; exit 1; }
+[ -s "$BROADCAST_LOG" ] && { echo "[FAIL] push reached broadcast despite the live rate being higher than assumed"; exit 1; }
+rm -f "$TMP/rates-high-rate-flag"
+echo "[PASS] a live rate higher than the registry snapshot refuses the push before any funds move"
+
+echo "== live-rates check: provider's LIVE span range no longer covers the chosen span -> refuses (#651) =="
+touch "$TMP/rates-narrow-span-flag"
+: > "$BROADCAST_LOG"
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/rates-narrow-span.err"; then
+  echo "[FAIL] push succeeded despite the provider's live span range excluding the chosen span"; exit 1
+fi
+grep -q 'LIVE span range' "$TMP/rates-narrow-span.err" || { echo "[FAIL] wrong narrow-span message"; cat "$TMP/rates-narrow-span.err"; exit 1; }
+[ -s "$BROADCAST_LOG" ] && { echo "[FAIL] push reached broadcast despite the live span range excluding the chosen span"; exit 1; }
+rm -f "$TMP/rates-narrow-span-flag"
+echo "[PASS] a live span range that excludes the chosen span refuses the push before any funds move"
+
+echo "== live-rates check: a permissive live-rates response (the default mock) still lets push proceed (#651 control) =="
+: > "$BROADCAST_LOG"
+CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/rates-ok.err" >/dev/null \
+  || { echo "[FAIL] push failed under a permissive live-rates response"; cat "$TMP/rates-ok.err"; exit 1; }
+[ -s "$BROADCAST_LOG" ] || { echo "[FAIL] push never reached broadcast despite a permissive live-rates response"; exit 1; }
+echo "[PASS] a permissive live-rates response does not block the push (the three refusals above are specific to their own override flags)"
+
+# ========================================================================
+# issue #652: a provider's notify `downloaded` figure is self-reported, never
+# cryptographically verified — notifyProviderWithRetry() now flags two signals: an
+# immediate full-size claim on the FIRST response (every push above already exercises
+# this, since the default mock reports the full size on the very first call), and a
+# LATER response that reports FEWER bytes than a previously reported value (internally
+# inconsistent — a real download cannot un-download bytes).
+# ========================================================================
+
+echo "== notify self-report: an immediate full-size FIRST response is flagged, not silently trusted (#652) =="
+grep -q 'reported the FULL bag' "$TMP/rates-ok.err" || { echo "[FAIL] the immediate-full-report warning did not fire on the very first notify response"; cat "$TMP/rates-ok.err"; exit 1; }
+grep -q "provider's own self-report, not independently verified" "$TMP/rates-ok.err" || { echo "[FAIL] the self-report caveat wording is missing"; cat "$TMP/rates-ok.err"; exit 1; }
+grep -q 'reports the full bag downloaded — stopping the local seed' "$TMP/rates-ok.err" || { echo "[FAIL] the stop-seeding line lost its self-report caveat wording"; cat "$TMP/rates-ok.err"; exit 1; }
+echo "[PASS] a first-response full-size claim is flagged as unverified self-report, and the stop-seeding line carries the same caveat"
+
+echo "== notify self-report: a downloaded count that DECREASES between retries is flagged as inconsistent (#652) =="
+# Deterministic per-call sequence (see fake-notify's own comment above): call 1 a
+# partial value well short of $SIZE, call 2 a DECREASE from that high-water mark, call
+# 3+ full — driven by fake-notify's own call counter, not real-time timing, so this
+# cannot be flaky. Fractions of $SIZE, not hardcoded bytes, since a tiny test snapshot's
+# actual size is unknown ahead of time (it only needs HALF < SIZE and HALF > 1).
+HALF_SIZE=$((SIZE / 2))
+printf '%s\n1\n%s\n' "$HALF_SIZE" "$SIZE" > "$TMP/notify-downloaded-sequence"
+rm -f "$TMP/notify-call-counter"
+CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS=5000 CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS=100 \
+  CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/downloaded-decrease.err" >/dev/null \
+  || { echo "[FAIL] push did not complete once the sequence reached full"; cat "$TMP/downloaded-decrease.err"; exit 1; }
+grep -q 'DECREASED between' "$TMP/downloaded-decrease.err" || { echo "[FAIL] the decreasing-downloaded warning did not fire"; cat "$TMP/downloaded-decrease.err"; exit 1; }
+grep -q 'internally inconsistent' "$TMP/downloaded-decrease.err" || { echo "[FAIL] the decreasing-downloaded warning is missing its inconsistency wording"; cat "$TMP/downloaded-decrease.err"; exit 1; }
+echo "[PASS] a downloaded count that decreases between notify retries is flagged as internally inconsistent"
+rm -f "$TMP/notify-downloaded-sequence" "$TMP/notify-call-counter"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore the static value for any later runs
 
 echo "== auto-sign: a mismatched CYPHER_BRAIN_TON_PROVIDER_OWNER is a HARD ERROR, not a silent override (Codex review, xhigh pass: unattended reachability means nobody may be watching a warning) =="
 MISMATCHED_OWNER="0:0000000000000000000000000000000000000000000000000000000000000002"

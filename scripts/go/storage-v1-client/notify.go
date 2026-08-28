@@ -2,14 +2,11 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/xssnick/tonutils-go/address"
-	"github.com/xssnick/tonutils-go/adnl"
-	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-storage-provider/pkg/transport"
 )
 
@@ -37,33 +34,24 @@ func globalConfigURL(testnet bool) string {
 //
 // UNVERIFIED IN THIS SESSION: not exercised against a live provider — see
 // the completion report.
+//
+// Connection setup (ephemeral ADNL key + gateway + DHT client) is shared
+// with rates.go's checkProviderRates via newProviderTransportClient
+// (providerclient.go) — factored out 2026-08-29 (issue #651) when a second
+// subcommand needed the identical setup; behavior here is unchanged.
 func notifyProvider(ctx context.Context, providerKey []byte, contractAddr *address.Address, byteToProof uint64, configURL string, timeout time.Duration) (*transport.StorageResponse, error) {
 	if len(providerKey) != 32 {
 		return nil, fmt.Errorf("provider key must be 32 bytes, got %d", len(providerKey))
 	}
 
-	_, prv, err := ed25519.GenerateKey(nil)
+	tc, closeClient, err := newProviderTransportClient(ctx, configURL, timeout)
 	if err != nil {
-		return nil, fmt.Errorf("generate ephemeral ADNL key: %w", err)
+		return nil, err
 	}
+	defer closeClient()
 
-	gw := adnl.NewGateway(prv)
-	if err := gw.StartClient(); err != nil {
-		return nil, fmt.Errorf("start ADNL client gateway: %w", err)
-	}
-	defer gw.Close()
-
-	dctx, cancel := context.WithTimeout(ctx, timeout)
+	qctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	dhtClient, err := dht.NewClientFromConfigUrl(dctx, gw, configURL)
-	if err != nil {
-		return nil, fmt.Errorf("create DHT client from %s: %w", configURL, err)
-	}
-
-	tc := transport.NewClient(gw, dhtClient)
-
-	qctx, cancel2 := context.WithTimeout(ctx, timeout)
-	defer cancel2()
 	resp, err := tc.RequestStorageInfo(qctx, providerKey, contractAddr, byteToProof)
 	if err != nil {
 		return nil, fmt.Errorf("storageProvider.storageRequest to provider %x: %w", providerKey, err)

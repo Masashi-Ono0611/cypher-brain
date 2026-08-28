@@ -166,6 +166,8 @@ Usage:
       [--mainnet] [--max-spend-ton 0.5]
   storage-v1-client notify --provider-pubkey <64hex> --contract <raw-addr> \
       [--mainnet] [--byte-to-proof <uint64>] [--timeout <seconds>]
+  storage-v1-client rates --provider-pubkey <64hex> --size-bytes <n> \
+      [--mainnet] [--timeout <seconds>]
   storage-v1-client status --contract <raw-addr> [--mainnet]
   storage-v1-client update-providers --contract <raw-addr> \
       --provider-pubkey <64hex> --rate-nano-per-mb-day <int> --span-days <int> \
@@ -282,6 +284,37 @@ program cannot distinguish "not yet confirmed" from "never happened".
   is arguably fine anyway.
 `
 
+const ratesHelp = `rates: sends the ADNL/RLDP "storageProvider.ratesRequest" query to ask a
+provider for its CURRENT LIVE terms (available/rate/min_bounty/space/span) —
+as opposed to mytonprovider.org's registry snapshot, which can go stale
+between when a client last searched it and when a deploy is actually
+broadcast (issue #651: a provider raising its minimum rate, or running out
+of capacity, was previously only ever discovered by 'notify' AFTER a
+contract had already been funded and paid for). Run this BEFORE
+building/broadcasting a deploy to catch that mismatch while nothing has
+been spent yet.
+
+  --provider-pubkey <64hex> required. The provider's ProviderKey (Ed25519)
+                             public key — mytonprovider.org's registry
+                             'pubkey' field; same value 'deploy'/'notify'
+                             take (see main.go field notes).
+  --size-bytes <n>          required. Bag size in bytes — the provider's own
+                             GetStorageInfo() call is keyed by this so its
+                             'available' verdict reflects capacity for THIS
+                             bag, not just whether it is up at all.
+  --timeout <seconds>       ADNL/DHT operation timeout. Default 20.
+  --mainnet                 opt in to mainnet. Default: testnet.
+
+  This does not push anything new to the provider (unlike 'notify', it does
+  not tell the provider about any contract) — it only asks what terms the
+  provider is CURRENTLY posting. Still a real ADNL/RLDP round trip against a
+  live provider daemon over its own throwaway session key, same as 'notify'.
+
+  UNVERIFIED IN THIS SESSION: DHT resolution and the RLDP query have not
+  been exercised against a live provider daemon — see notify's own help for
+  the same caveat (this shares its connection-setup code).
+`
+
 const statusHelp = `status: queries tonapi for --contract's on-chain account state. Read-only,
 informational — mirrors scripts/ton-provider-experiment.mjs's 'status'
 subcommand, EXCEPT it exits 1 (not 0) if the tonapi query itself fails
@@ -367,12 +400,13 @@ paid for it the moment this lands.
 // helpText is the full global help — helpIntro plus every subcommand's own
 // section, in usage order — shown by the bare `storage-v1-client --help`/
 // `-h` and the no-args/unknown-subcommand error paths (see run() below).
-const helpText = helpIntro + "\n" + deployHelp + "\n" + notifyHelp + "\n" + statusHelp + "\n" + updateProvidersHelp + "\n" + withdrawHelp
+const helpText = helpIntro + "\n" + deployHelp + "\n" + notifyHelp + "\n" + ratesHelp + "\n" + statusHelp + "\n" + updateProvidersHelp + "\n" + withdrawHelp
 
 // subcommandHelp maps each subcommand name to its own focused help section.
 var subcommandHelp = map[string]string{
 	"deploy":           deployHelp,
 	"notify":           notifyHelp,
+	"rates":            ratesHelp,
 	"status":           statusHelp,
 	"update-providers": updateProvidersHelp,
 	"withdraw":         withdrawHelp,
@@ -419,6 +453,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = runDeploy(ctx, rest, stdout)
 	case "notify":
 		err = runNotify(ctx, rest, stdout)
+	case "rates":
+		err = runRates(ctx, rest, stdout)
 	case "status":
 		err = runStatus(ctx, rest, stdout)
 	case "update-providers":

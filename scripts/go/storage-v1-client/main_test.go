@@ -11,6 +11,7 @@ import (
 var allSubHeaders = map[string]string{
 	"deploy":           "deploy: derives the StorageV1 contract address",
 	"notify":           `notify: sends the ADNL/RLDP "storageProvider.storageRequest" query`,
+	"rates":            `rates: sends the ADNL/RLDP "storageProvider.ratesRequest" query`,
 	"status":           "status: queries tonapi for --contract's on-chain account state.",
 	"update-providers": "update-providers: REPAIR path for an ALREADY-DEPLOYED contract",
 	"withdraw":         "withdraw: sends withdraw_owner (op 0x61fff683",

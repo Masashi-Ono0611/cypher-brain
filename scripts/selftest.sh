@@ -946,6 +946,26 @@ if (typeof j.note !== 'string' || j.note.length === 0) throw new Error('expected
 " "$EJOUT" "$EXPECT_SIZE"
 echo "[PASS] estimate --json (file backend): one JSON line, field-for-field matching the human report's underlying CostEstimate"
 
+echo "== issue #655: --remote is warned as ignored when passed with --backend file (rclone-only flag) =="
+# --remote is read ONLY by the rclone backend (backends/rclone.ts) — every other
+# backend's put() ignores it entirely. Previously push --backend file --remote <val>
+# succeeded silently with no signal the value did anything (repro: an operator
+# copy-pasting a push invocation between backends, e.g. switching from rclone to file
+# for a quick local test).
+FILE_REMOTE_ERR=$(cb push --in "$TMP/snap.age" --backend file --remote "someremote:/some/path" 2>&1 >/dev/null)
+printf '%s' "$FILE_REMOTE_ERR" | grep -q -- '--remote is only used by --backend rclone' \
+  || { echo "[FAIL] push --backend file --remote did not warn that --remote is ignored"; echo "$FILE_REMOTE_ERR"; exit 1; }
+printf '%s' "$FILE_REMOTE_ERR" | grep -qF 'someremote:/some/path' \
+  || { echo "[FAIL] the --remote warning did not name the ignored value"; echo "$FILE_REMOTE_ERR"; exit 1; }
+echo "[PASS] push --backend file --remote <val> warns that --remote will be ignored"
+
+echo "== issue #655 control: push --backend file WITHOUT --remote prints no such warning =="
+FILE_NO_REMOTE_ERR=$(cb push --in "$TMP/snap.age" --backend file 2>&1 >/dev/null)
+if printf '%s' "$FILE_NO_REMOTE_ERR" | grep -q -- '--remote is only used by'; then
+  echo "[FAIL] the --remote warning fired despite --remote not being given"; echo "$FILE_NO_REMOTE_ERR"; exit 1
+fi
+echo "[PASS] push --backend file without --remote stays silent about --remote"
+
 echo "== pipeline timeout: a wedged, SIGTERM-IGNORING tar can't hang the CLI (#38) =="
 # TAR_STUB_MODE=wedge swaps the pipeline tar for a node stub that IGNORES SIGTERM and
 # stays alive 30s (exec'd — no grandchild, so SIGKILL on it leaks nothing). This

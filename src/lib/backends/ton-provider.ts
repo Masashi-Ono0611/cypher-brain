@@ -718,6 +718,143 @@ async function notifyProvider(providerPubkeyHex: string, contractAddrRaw: string
   }
 }
 
+// ---------- live provider terms check (issue #651) ----------
+// mytonprovider.org's registry snapshot (searchProviders() above) is what selectProvider()
+// picked a provider FROM and what rateNanoPerMB/spanDays below were computed FROM — but
+// that snapshot can go stale between when a client searched it and when a deploy is
+// actually broadcast. Before this check existed, a stale-registry mismatch (the provider
+// has since raised its minimum rate, narrowed its span window, or run out of capacity for
+// this bag) was only ever discovered by notifyProviderWithRetry() further down, AFTER the
+// contract had already been funded and paid for — real money locked in a contract the
+// provider will not service, with no in-product way to have noticed BEFORE spending
+// (issue #651's own repro). scripts/go/storage-v1-client grew a `rates` subcommand
+// (rates.go) for exactly this purpose: an ADNL/RLDP "storageProvider.ratesRequest" that
+// asks the provider for its CURRENT terms, the same live signal notify's own "storageProvider.
+// storageRequest" already gets, just BEFORE funds move instead of after.
+export interface LiveRatesResult {
+  available: boolean;
+  rateNanoPerMB: bigint;
+  minBountyNano: bigint;
+  minSpanSeconds: number;
+  maxSpanSeconds: number;
+}
+
+// Parses the Go tool's plain-text "== rates response ==" block (rates.go's own
+// fmt.Fprintf lines) — same marker-based shape as parseNotifyOutput above, but a
+// DIFFERENT fail-closed direction: parseNotifyOutput's caller (the notify-retry loop)
+// treats an under-parsed value as "keep waiting", which is harmless there. This
+// function's caller runs BEFORE any funds move, so a field this cannot confidently
+// parse must ABORT the deploy rather than silently proceed as if it were permissive
+// (e.g. a missing rate line must never be read as "rate 0, always affordable") —
+// hence throwing here instead of defaulting fields the way parseNotifyOutput does.
+function parseRatesOutput(out: string): LiveRatesResult {
+  const marker = '== rates response ==';
+  const markerIdx = out.indexOf(marker);
+  if (markerIdx === -1) {
+    throw new Error(`ton-provider backend: could not find the "${marker}" marker in the rates output: ${out}`);
+  }
+  const response = out.slice(markerIdx + marker.length);
+  const availableRaw = /^\s*available:\s*(\S+)/m.exec(response)?.[1];
+  const rateRaw = /^\s*rate_nano_per_mb_day:\s*(\d+)/m.exec(response)?.[1];
+  const minBountyRaw = /^\s*min_bounty_nano:\s*(\d+)/m.exec(response)?.[1];
+  const minSpanRaw = /^\s*min_span:\s*(\d+)/m.exec(response)?.[1];
+  const maxSpanRaw = /^\s*max_span:\s*(\d+)/m.exec(response)?.[1];
+  if (
+    availableRaw === undefined ||
+    rateRaw === undefined ||
+    minBountyRaw === undefined ||
+    minSpanRaw === undefined ||
+    maxSpanRaw === undefined
+  ) {
+    throw new Error(`ton-provider backend: could not parse the rates response fields: ${response.trim()}`);
+  }
+  return {
+    available: availableRaw === 'true',
+    rateNanoPerMB: BigInt(rateRaw),
+    minBountyNano: BigInt(minBountyRaw),
+    minSpanSeconds: Number(minSpanRaw),
+    maxSpanSeconds: Number(maxSpanRaw),
+  };
+}
+
+// Shells out to the SAME notify binary (TON_PROVIDER_NOTIFY_BIN — already checked for
+// presence/executability earlier in put(), before this is ever reached), its `rates`
+// subcommand. Called from put() right after rateNanoPerMB/spanDays are computed from the
+// registry snapshot and right BEFORE buildDeploy()/signing — i.e. before any funds move —
+// deliberately kept as its own standalone function/call site (not inlined into the
+// broadcast step itself) so it stays independent of the separate already-active-contract
+// check issue #638 adds around the actual broadcast call further down in put().
+async function checkProviderLiveTerms(
+  providerPubkeyHex: string,
+  dataSizeBytes: bigint,
+  rateNanoPerMB: bigint,
+  spanDays: bigint,
+): Promise<LiveRatesResult> {
+  let out: string;
+  try {
+    ({ out } = await run(
+      TON_PROVIDER_NOTIFY_BIN,
+      [
+        'rates',
+        '--provider-pubkey',
+        providerPubkeyHex,
+        '--size-bytes',
+        dataSizeBytes.toString(),
+        ...(TON_NETWORK_CONFIG ? [] : ['--mainnet']),
+      ],
+      // 60s, matching notifyProvider()'s own budget above for the SAME Go binary's
+      // connection setup (Codex review): rates.go's two ADNL/DHT phases (DHT client
+      // construction, then the RLDP query itself) each default to a 20s --timeout, so a
+      // legitimately slow-but-succeeding call can take up to ~40s — a shorter Node-side
+      // timeout here would kill a call the Go binary's own bound would have let succeed.
+      { timeoutMs: 60_000 },
+    ));
+  } catch (e) {
+    throw new Error(
+      `ton-provider backend: could not confirm provider ${providerPubkeyHex}'s live ADNL terms before deploying ` +
+        `(${errMsg(e)}) — refusing to broadcast against a possibly-stale mytonprovider.org registry snapshot`,
+    );
+  }
+  console.error(out.trim());
+  const live = parseRatesOutput(out);
+  if (!live.available) {
+    throw new Error(
+      `ton-provider backend: provider ${providerPubkeyHex} reports itself as NOT available for a bag this size ` +
+        'right now (live ADNL ratesRequest) — the mytonprovider.org registry snapshot that selected it is ' +
+        'stale; refusing to broadcast a deploy this provider would refuse to service. Re-run push to search again.',
+    );
+  }
+  if (live.rateNanoPerMB > rateNanoPerMB) {
+    throw new Error(
+      `ton-provider backend: provider ${providerPubkeyHex}'s LIVE rate (${live.rateNanoPerMB} nanoTON/MB/day, ` +
+        `via ADNL ratesRequest) is higher than the ${rateNanoPerMB} nanoTON/MB/day this deploy was built with ` +
+        "(from mytonprovider.org's registry snapshot) — the registry is stale and this deploy would underpay. " +
+        'Refusing to broadcast before funds move; re-run push to re-search at the current rate.',
+    );
+  }
+  const spanSeconds = spanDays * 86400n;
+  if (spanSeconds < BigInt(live.minSpanSeconds) || spanSeconds > BigInt(live.maxSpanSeconds)) {
+    throw new Error(
+      `ton-provider backend: provider ${providerPubkeyHex}'s LIVE span range (${live.minSpanSeconds}s..` +
+        `${live.maxSpanSeconds}s, via ADNL ratesRequest) no longer includes the ${spanSeconds}s span this deploy ` +
+        "was built with (from mytonprovider.org's registry snapshot) — refusing to broadcast before funds move; " +
+        're-run push to re-search at the current terms.',
+    );
+  }
+  // live.minBountyNano is returned (not compared here) — see the call site in put():
+  // Codex review (Critical) found it was parsed but never used at all. It is used to
+  // REPLACE the static assumption the existing advisory bounty check (issue #403) used
+  // (PROVIDER_BOUNTY_FLOOR_NANO, tonutils-storage-provider's library default) with this
+  // SAME provider's own LIVE-reported floor (which could be higher OR lower than that
+  // guess) — kept as a WARN there, not a refusal here,
+  // matching that check's own established posture (an under-bounty deploy still succeeds
+  // and gets paid; it is the provider's own subsequent notify that may then refuse to
+  // fetch it, not this broadcast itself), unlike availability/rate/span above, which are
+  // hard refusals because those conditions are exactly what would make the CONTRACT
+  // ITSELF get built with terms this provider does not agree to yet.
+  return live;
+}
+
 // ---------- local ephemeral bag creation (put()'s first phase) ----------
 // Unlike ton.ts (which creates the bag on a REMOTE, persistent seeder over SSH), this
 // backend has no seeder of its own — the file must be hashed into a bag SOMEWHERE
@@ -804,9 +941,46 @@ async function notifyProviderWithRetry(
   // least 0.05 TON to cover fees") until a generic timeout 10 minutes later is exactly
   // what made this issue hard to diagnose in the first place.
   let lastReason = '';
+  // #652: the provider's `downloaded` figure is its own self-report — no merkle proof
+  // or independent spot-check retrieval verifies it (see this function's own header
+  // comment above, and docs/ton-storage-status.md for the documented gap; a full
+  // cryptographic proof-of-custody check is out of scope here and proposed there as a
+  // follow-up issue instead). These two running checks are the minimum available
+  // corroboration without reimplementing proof verification:
+  //   - a FIRST-EVER response that already claims the full size, with no gradual
+  //     progress ever observed, cannot be told apart from a genuinely fast small
+  //     transfer using self-reported bytes alone — flagged (not refused: a small bag
+  //     really can transfer in one round trip), so the operator at least sees this was
+  //     never corroborated by an observed partial read.
+  //   - a LATER response reporting FEWER bytes than a previously reported high-water
+  //     mark is not merely uncorroborated, it is internally INCONSISTENT (a real
+  //     download cannot un-download bytes) — a stronger signal something is wrong (a
+  //     buggy provider, or one whose self-report cannot be trusted).
+  let sawFirstResponse = false;
+  let maxDownloadedSoFar = 0n;
   for (;;) {
     try {
       const res = await notifyProvider(providerPubkeyHex, contractAddrRaw);
+      if (!sawFirstResponse) {
+        sawFirstResponse = true;
+        if (res.downloaded >= dataSizeBytes) {
+          warn(
+            `ton-provider: provider ${providerPubkeyHex} reported the FULL bag (${res.downloaded} bytes) ` +
+              'downloaded on its very FIRST notify response, with no gradual progress observed — this is the ' +
+              "provider's own self-report, not independently verified (no cryptographic proof-of-custody or " +
+              'spot-check retrieval is performed here; see docs/ton-storage-status.md and issue #652). Treat ' +
+              'this as unconfirmed until a later independent check (e.g. re-`notify` or mytonstorage.org).',
+          );
+        }
+      } else if (res.downloaded < maxDownloadedSoFar) {
+        warn(
+          `ton-provider: provider ${providerPubkeyHex}'s self-reported downloaded byte count DECREASED between ` +
+            `notify calls (${maxDownloadedSoFar} -> ${res.downloaded}) — a real download cannot lose bytes, so ` +
+            'this self-report is internally inconsistent (no cryptographic proof-of-custody is checked here; ' +
+            'see issue #652). Treat a later "full" report from this provider with extra suspicion.',
+        );
+      }
+      if (res.downloaded > maxDownloadedSoFar) maxDownloadedSoFar = res.downloaded;
       if (res.downloaded >= dataSizeBytes) {
         progress.report(total, total);
         return;
@@ -947,6 +1121,14 @@ export function tonProviderBackend(): StorageBackend {
         const rateNanoPerMB = providerRateNanoPerMB(provider.price);
         const spanDays = spanDaysFor(provider);
 
+        // #651: confirm the provider's CURRENT ADNL-reported terms (rate/span/capacity)
+        // still match the registry snapshot above, BEFORE building/broadcasting a deploy
+        // against them — see checkProviderLiveTerms()'s own doc comment for why this is
+        // a separate call site from the broadcast step further down. The returned
+        // liveRates also carries the provider's own live bounty floor, used below in
+        // place of the existing advisory bounty check's static assumption (issue #403).
+        const liveRates = await checkProviderLiveTerms(provider.pubkey, bag.dataSizeBytes, rateNanoPerMB, spanDays);
+
         const deploy = await buildDeploy({
           bagId: Buffer.from(bag.bagId, 'hex'),
           merkleHash: bag.merkleHash,
@@ -969,15 +1151,19 @@ export function tonProviderBackend(): StorageBackend {
         // own comment for what this is and why it warns rather than refuses. Placed
         // BEFORE the deploy is signed (both paths below) so the warning is visible to
         // whoever/whatever is about to commit real funds, not discovered only after a
-        // 10-minute notify timeout.
+        // 10-minute notify timeout. Compared against liveRates.minBountyNano — this
+        // SAME provider's own LIVE-reported floor (checkProviderLiveTerms() above,
+        // issue #651) — rather than the static PROVIDER_BOUNTY_FLOOR_NANO assumption,
+        // since an actual measured value is strictly more accurate than a guess about
+        // which tonutils-storage-provider library default this specific provider runs.
         const bounty = estimatedBountyNano(rateNanoPerMB, bag.dataSizeBytes, spanDays);
-        if (bounty < PROVIDER_BOUNTY_FLOOR_NANO) {
+        if (bounty < liveRates.minBountyNano) {
           warn(
             `ton-provider: the computed bounty for this deploy (${bounty} nanoTON, from rate ${rateNanoPerMB} ` +
-              `nanoTON/MB/day × ${bag.dataSizeBytes} bytes × ${spanDays} day(s)) looks BELOW the ~${PROVIDER_BOUNTY_FLOOR_NANO} ` +
-              "nanoTON floor providers built on tonutils-storage-provider enforce — this specific provider's notify " +
-              'may refuse to ever fetch the bag even though the deploy itself will still succeed and be paid for. ' +
-              'A bigger bag, a longer span, or a higher rate would raise this estimate.',
+              `nanoTON/MB/day × ${bag.dataSizeBytes} bytes × ${spanDays} day(s)) looks BELOW the provider's own ` +
+              `LIVE-reported minimum bounty (${liveRates.minBountyNano} nanoTON, via ADNL ratesRequest) — this ` +
+              "specific provider's notify may refuse to ever fetch the bag even though the deploy itself will " +
+              'still succeed and be paid for. A bigger bag, a longer span, or a higher rate would raise this estimate.',
           );
         }
         // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
@@ -1027,7 +1213,14 @@ export function tonProviderBackend(): StorageBackend {
         console.error(`ton-provider: contract ${deploy.contractAddress.toRawString()} is active on-chain`);
 
         await notifyProviderWithRetry(provider.pubkey, deploy.contractAddress.toRawString(), bag.dataSizeBytes);
-        console.error(`ton-provider: provider ${provider.pubkey} has the full bag — safe to stop the local seed`);
+        // #652: made explicit here (not just in this file's own doc comments) since this
+        // is the line an operator actually sees before their local seed stops — "safe"
+        // is the provider's OWN claim, not a cryptographic proof this push verified.
+        console.error(
+          `ton-provider: provider ${provider.pubkey} reports the full bag downloaded — stopping the local seed ` +
+            "(this is the provider's own self-report, not independently verified against a merkle proof or a " +
+            'spot-check retrieval — see docs/ton-storage-status.md and issue #652 for the known gap)',
+        );
 
         // #484: ledger's cumulative-cost tracking was arweave/turbo-only despite
         // ton-provider being a real paid backend with its own MAX_SPEND cap (doctor/
