@@ -93,7 +93,7 @@ import {
   SKIP_FUNDS_CHECK,
 } from '../config.js';
 import { run } from '../proc.js';
-import { sleep, rmrf, errMsg, throwForSdkImport } from '../util.js';
+import { sleep, rmrf, errMsg, throwForSdkImport, makeBagLocator } from '../util.js';
 import { warn } from '../warn.js';
 import { tonApi, startLocalTonDaemon, type TonBagDetails, type LocalTonDaemon } from './ton-client.js';
 import { p2pFetch, entryNameFor } from './ton.js';
@@ -117,16 +117,10 @@ async function getTon(): Promise<TonModule> {
 }
 
 // ---------- locator ----------
-const LOCATOR_RE = /^ton-provider:v1:([0-9a-f]{64})$/;
-export const tonProviderLocator = (bagId: string): string => `ton-provider:v1:${bagId.toLowerCase()}`;
-export function bagIdFrom(locator: string): string {
-  const m = LOCATOR_RE.exec(locator);
-  if (!m)
-    throw new Error(
-      `ton-provider backend: locator does not match the expected ton-provider:v1:<64-hex-bag-id> shape: ${locator}`,
-    );
-  return m[1];
-}
+// Built via the shared makeBagLocator() factory (util.ts) — ton.ts uses the same
+// factory with the 'ton' schema, so the two locator shapes cannot drift apart (#505).
+const { locator: tonProviderLocator, bagIdFrom } = makeBagLocator('ton-provider');
+export { tonProviderLocator, bagIdFrom };
 
 // ---------- StorageV1 contract code (xssnick/tonutils-storage-provider@v0.4.3) ----------
 // The exact V1Code BOC pkg/contract/v1.go embeds — identical bytes, so any BOC this

@@ -170,6 +170,37 @@ export function fmtBytes(n: number): string {
   return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
 }
 
+// Shared shape for backends/ton.ts's "ton:v1:<64-hex-bag-id>" and backends/ton-provider.ts's
+// "ton-provider:v1:<64-hex-bag-id>" recovery locators: schema-versioned, nothing mutable
+// embedded (no URLs, no host names, no contract address — those live in config / on-chain,
+// not in the recovery artifact). A locator may arrive over an UNTRUSTED channel (a
+// tampered --save-locator file feeding pull), so the regex stays anchored + exact-length —
+// same "narrow validated shape" defense file.ts/arweave.ts apply. The two backends used to
+// each hand-roll an identical-shaped LOCATOR_RE/builder/parser trio that differed only in
+// the schema prefix (#505) — factored out here so the two schemas cannot drift in shape.
+// `schema` is always a fixed literal from a call site in this codebase, never
+// caller-controlled input, so it is interpolated into the RegExp source unescaped.
+export function makeBagLocator(schema: string): {
+  locator: (bagId: string) => string;
+  bagIdFrom: (locator: string) => string;
+  test: (locator: string) => boolean;
+} {
+  const re = new RegExp(`^${schema}:v1:([0-9a-f]{64})$`);
+  return {
+    locator: (bagId: string) => `${schema}:v1:${bagId.toLowerCase()}`,
+    bagIdFrom: (locator: string) => {
+      const m = re.exec(locator);
+      if (!m) {
+        throw new Error(
+          `${schema} backend: locator does not match the expected ${schema}:v1:<64-hex-bag-id> shape: ${locator}`,
+        );
+      }
+      return m[1];
+    },
+    test: (locator: string) => re.test(locator),
+  };
+}
+
 // Shape check for a bare wallet address of any chain Turbo accepts (Arweave base64url,
 // Ethereum 0x-hex, Solana base58). Deliberately a SHAPE check, not a per-chain validator:
 // the point is to reject input that would break out of the context it is interpolated

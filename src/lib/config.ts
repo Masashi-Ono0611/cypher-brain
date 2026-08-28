@@ -432,17 +432,24 @@ export const TON_BIN = readEnv('CYPHER_BRAIN_TON_BIN') || 'tonutils-storage'; //
 // every pull into the less-verifiable seeder fallback — a config typo must not be able
 // to change what a successful pull proves. Invalid -> warn + default, never throw
 // (this runs at import time; the CONFIG_FILE_ERROR pattern above explains why).
-const TON_HTTP_TIMEOUT_RAW = readEnv('CYPHER_BRAIN_TON_HTTP_TIMEOUT');
-const tonHttpTimeoutParsed = Number(TON_HTTP_TIMEOUT_RAW || 30_000);
-export const TON_HTTP_TIMEOUT_MS =
-  Number.isFinite(tonHttpTimeoutParsed) && Number.isInteger(tonHttpTimeoutParsed) && tonHttpTimeoutParsed > 0
-    ? tonHttpTimeoutParsed
-    : 30_000;
-if (TON_HTTP_TIMEOUT_RAW !== undefined && TON_HTTP_TIMEOUT_MS !== tonHttpTimeoutParsed) {
-  warn(
-    `CYPHER_BRAIN_TON_HTTP_TIMEOUT must be a positive integer (ms) — got ${JSON.stringify(TON_HTTP_TIMEOUT_RAW)}; using the 30000ms default`,
-  );
-}
+// Reuses parsePositiveMsOverride (declared below in this file, hoisted as a function
+// declaration so this earlier call site can see it) — this is exactly the "validate
+// positive integer ms, warn+default on invalid" logic the TON_PROVIDER_* overrides
+// further down already use; hand-rolling it here a second time only risked the two
+// drifting apart (#499). `|| undefined` preserves this variable's own pre-existing
+// quirk (multi-model review, #499 fix): the old hand-rolled version computed
+// `Number(raw || 30_000)`, so an explicitly-set-but-EMPTY-string value fell back to the
+// default the same silent way an unset one does, with no warning — only a non-empty
+// invalid value (e.g. "abc"/"0"/"-5") warned. Passing raw straight through here would
+// change that one edge case (parsePositiveMsOverride treats "" as a defined-but-invalid
+// "0" and would newly warn on it); the TON_PROVIDER_* overrides below intentionally keep
+// that stricter behavior for their OWN empty-string case, since they never had this `||`
+// shortcut to begin with.
+export const TON_HTTP_TIMEOUT_MS = parsePositiveMsOverride(
+  readEnv('CYPHER_BRAIN_TON_HTTP_TIMEOUT') || undefined,
+  30_000,
+  'CYPHER_BRAIN_TON_HTTP_TIMEOUT',
+);
 // STRICTLY '1', same reasoning as SKIP_FUNDS_CHECK below: this switch changes what a
 // successful pull PROVES (P2P availability vs. merely "the seeder still had a copy"),
 // so a stray `=0` must keep the default behaviour.
@@ -480,11 +487,11 @@ export const TON_PROVIDER_MYTONPROVIDER_URL =
 // so its "push waits, does not succeed early" positive control finishes in seconds
 // instead of the real 10-minute default a genuine push needs (a fresh provider fetch of
 // a large brain over P2P is real network work, not instantaneous).
-// Validated the same way TON_HTTP_TIMEOUT_MS above is (Codex review): an unvalidated
-// NaN/Infinity/negative override would make notifyProviderWithRetry()'s `Date.now() >
-// deadline` comparison never trip, silently leaving the paid deploy's local ephemeral
-// daemon (and the temp directory it seeds from) retrying forever instead of the bounded
-// failure this budget exists to guarantee.
+// Validated by the same parsePositiveMsOverride helper TON_HTTP_TIMEOUT_MS above calls
+// (Codex review): an unvalidated NaN/Infinity/negative override would make
+// notifyProviderWithRetry()'s `Date.now() > deadline` comparison never trip, silently
+// leaving the paid deploy's local ephemeral daemon (and the temp directory it seeds
+// from) retrying forever instead of the bounded failure this budget exists to guarantee.
 function parsePositiveMsOverride(raw: string | undefined, defaultMs: number, name: string): number {
   if (raw === undefined) return defaultMs;
   const n = Number(raw);
