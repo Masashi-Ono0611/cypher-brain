@@ -418,6 +418,14 @@ export async function arweaveBackend(): Promise<StorageBackend> {
     try {
       return JSON.parse(await readFile(AR_WALLET, 'utf8'));
     } catch (e) {
+      // ENOENT specifically means "not created yet" — give the same friendly nudge
+      // wallet.ts's addressFromWallet() already gives `wallet address`/`wallet balance`
+      // (#164), instead of a raw ENOENT with no next action (#600). Any OTHER failure
+      // (EACCES, corrupt/non-JSON file, …) is a genuine problem the operator needs the
+      // real error to debug, so that keeps the raw errMsg(e) detail untouched.
+      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        throw new Error(`arweave: no wallet at ${AR_WALLET} — run 'cypher-brain wallet create' first`);
+      }
       throw new Error(`arweave: cannot read JWK wallet at ${AR_WALLET}: ${errMsg(e)}`);
     }
   };

@@ -2,10 +2,14 @@
 // The check src/lib/errors.ts says does not exist (#295).
 //
 // CB-E### codes are attached by matching a REGEX against an already-formatted error
-// message, deliberately, so ~100 throw sites stay untouched (#212). The cost is stated
-// in that file's own header: rewording a message can silently stop a pattern matching,
-// "with no compiler or test to catch it". Only two of the sixteen codes are exercised
-// end-to-end anywhere (CB-E013 in cli-smoke.sh, CB-E016 in selftest-minisign.sh).
+// message, deliberately, so the existing throw sites (296, as of writing) stay untouched
+// (#212). The cost is stated in that file's own header: rewording a message can silently
+// stop a pattern matching, "with no compiler or test to catch it". At least a dozen of
+// the registry's 23 codes (as of writing — see src/lib/errors.ts's ERROR_CODES for the
+// current, authoritative count) are exercised end-to-end somewhere: CB-E001, CB-E002,
+// CB-E005, CB-E007, CB-E008, CB-E009, CB-E010, CB-E013, CB-E014, CB-E015, CB-E016, and
+// CB-E017, across selftest.sh, selftest-storage.sh, selftest-verify-levels.sh,
+// selftest-schedule.sh, cli-smoke.sh, selftest-minisign.sh, and mcp-smoke.mjs.
 //
 // What this asserts, stated narrowly because it is easy to overclaim: for every entry
 // whose text WE write, the literal the pattern looks for still appears somewhere in the
@@ -17,8 +21,8 @@
 //     can rot while the other keeps this green.
 //   - It does NOT distinguish a real throw site from a comment or an unrelated string —
 //     `includes()` over file text is all it does.
-//   - It does NOT prove the code still ATTACHES at runtime; only two codes are
-//     exercised end-to-end anywhere (CB-E013, CB-E016).
+//   - It does NOT prove the code still ATTACHES at runtime for the codes that are NOT
+//     among the dozen-plus exercised end-to-end (listed above).
 //
 // It is a cheap tripwire for the specific accident the header of errors.ts warns about,
 // not a proof of correctness. Its value is that today there is nothing at all.
@@ -26,9 +30,9 @@
 // Entries marked origin:'upstream' are skipped BY DESIGN and reported as skipped, not
 // silently passed: their wording belongs to a dependency (arweave, @ardrive/turbo-sdk),
 // so it is correctly absent from src/ and cannot be asserted here. 'mixed' entries span
-// both and declare their own half in `assertLiterals`. Full end-to-end coverage of all
-// sixteen is deliberately NOT attempted — several need a funded wallet or a specific
-// gateway failure, and #212 scoped this feature to representative patterns.
+// both and declare their own half in `assertLiterals`. Full end-to-end coverage of the
+// whole registry is deliberately NOT attempted — several need a funded wallet or a
+// specific gateway failure, and #212 scoped this feature to representative patterns.
 //
 // Exits 0 on success, 1 on the first failure with context on stderr.
 

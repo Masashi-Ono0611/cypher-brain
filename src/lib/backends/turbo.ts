@@ -47,6 +47,12 @@ export function turboBackend(): StorageBackend {
       try {
         jwk = JSON.parse(await readFile(AR_WALLET, 'utf8'));
       } catch (e) {
+        // Same ENOENT special-case as arweave.ts's loadWallet() (#600): "not created
+        // yet" gets the friendly 'wallet create' nudge instead of a raw ENOENT, since
+        // a missing wallet during push is the most common first-time-user failure mode.
+        if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') {
+          throw new Error(`turbo: no wallet at ${AR_WALLET} — run 'cypher-brain wallet create' first`);
+        }
         throw new Error(`turbo: cannot read JWK wallet at ${AR_WALLET}: ${errMsg(e)}`);
       }
       const turbo = TurboFactory.authenticated({ signer: new ArweaveSigner(jwk) });
