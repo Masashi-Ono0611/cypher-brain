@@ -1238,6 +1238,58 @@ export function tonProviderBackend(): StorageBackend {
               'still succeed and be paid for. A bigger bag, a longer span, or a higher rate would raise this estimate.',
           );
         }
+        // ---------- money-safety: skip re-funding an already-active contract (issue #638) ----------
+        // The StorageV1 contract ADDRESS is fully determined by bagId + owner +
+        // dataSizeBytes + pieceSize + merkleHash (buildDeploy()'s `data` cell above) —
+        // NONE of which depend on which provider was picked or its rate. A retry of the
+        // SAME file (same content -> same bag hash -> identical StateInit) after ANY
+        // broadcast-adjacent failure therefore derives the IDENTICAL contract address,
+        // whether the previous attempt's HTTP response was lost after tonapi already
+        // accepted the BOC (the broadcast POST throws but the transfer still lands), or
+        // the deploy itself landed and only the LATER notify() step timed out. Before
+        // this fix, autoSignAndBroadcastDeploy() (or a human re-approving the same
+        // Tonkeeper deeplink) unconditionally sent `amountNano` again with a fresh
+        // seqno/query id — funding an already-active contract a second time, and a
+        // newly-selected provider on the retry could also silently replace the
+        // first one in the on-chain dict (modify_providers REPLACES, not merges — see
+        // scripts/go/storage-v1-client/updateproviders.go's own field notes), stranding
+        // the first payment. Checking here, BEFORE any funds move, closes that gap.
+        //
+        // Checked for literal 'active' only (not "anything but nonexist"): tonapi's
+        // brief 'uninit' window right after a broadcast (funded, code not yet run) is a
+        // real residual gap this does not close — a retry landing in that few-second
+        // window can still double-send (bounded by the SAME seqno-replay protection
+        // already documented above: at most one of the two transfers is accepted).
+        // Closing that narrower race would need a persisted "broadcast in flight"
+        // record surviving process restarts — real complexity for an edge window this
+        // fix does not claim to eliminate, left as a known limitation (see this PR's
+        // description) rather than implemented speculatively.
+        //
+        // A network failure while checking is NOT treated as proof the contract is
+        // inactive: falling back to the PRE-#638 behavior (attempt to fund) on a check
+        // failure means this fix can only make double-funding LESS likely, never
+        // introduce a new way to silently skip a real, first-time deploy.
+        let alreadyActive = false;
+        try {
+          const contractState = await fetchAccountState(deploy.contractAddress);
+          alreadyActive = contractState.status === 'active';
+        } catch (e) {
+          warn(
+            `ton-provider: could not check whether contract ${deploy.contractAddress.toRawString()} is already ` +
+              `active on-chain (${errMsg(e)}) — proceeding as if it is not (the pre-#638 behavior for this ` +
+              'specific check failure; the broadcast/signature step below still gives its own unambiguous result)',
+          );
+        }
+        if (alreadyActive) {
+          console.error(
+            `ton-provider: contract ${deploy.contractAddress.toRawString()} is ALREADY ACTIVE on-chain — this ` +
+              'looks like a retry of an already-broadcast (or already-completed) deploy for the same bag/owner. ' +
+              `Skipping re-funding (no new ${deploy.amountNano} nanoTON transfer) and going straight to notifying ` +
+              "the provider. If the provider selected THIS run differs from whichever one the contract's on-chain " +
+              'dict was actually deployed with, notify below may fail for it — re-run `update-providers` ' +
+              '(scripts/go/storage-v1-client) to register the correct one instead of relying on a second deploy.',
+          );
+        }
         // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
         // signer balance, #342) — WARN only, never abort, for BOTH signing paths: a
         // balance read has no freshness guarantee, so it must never be what blocks a
@@ -1246,7 +1298,9 @@ export function tonProviderBackend(): StorageBackend {
         // path actually sends the transaction gives its own unambiguous refusal on a
         // real shortfall — a human's Tonkeeper app, or the auto-sign broadcast/on-chain
         // processing itself — so this exists only to save the wait through
-        // waitForContractActive() on a spend that was always going to fail.
+        // waitForContractActive() on a spend that was always going to fail. Left
+        // unconditional even when alreadyActive (the check above never blocks on it
+        // either) — a harmless, still-informative balance read either way.
         // CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences it for one run (shared with turbo's
         // check, not a ton-provider-specific flag). Both lines go through warn() (#347),
         // not a raw console.error, so an agent-driven push (MCP) carries this in the
@@ -1270,7 +1324,9 @@ export function tonProviderBackend(): StorageBackend {
             warn(`ton-provider: could not pre-check the owner's balance (${errMsg(e)}); proceeding`);
           }
         }
-        if (autoSignWallet) {
+        if (alreadyActive) {
+          // Nothing to sign or broadcast — see the money-safety comment above.
+        } else if (autoSignWallet) {
           console.error(
             `ton-provider: auto-signing with local wallet ${owner.toString({ bounceable: true })} ` +
               '(CYPHER_BRAIN_TON_WALLET) — no Tonkeeper deeplink needed',
@@ -1321,17 +1377,28 @@ export function tonProviderBackend(): StorageBackend {
         // The thrown error's own message already tells the operator the contract IS
         // deployed and may still complete on its own; audit.ts's own log still records
         // this run (backend=ton-provider, non-zero exit_code) either way.
-        opts.onReceipt?.(
-          {
-            contract_address: deploy.contractAddress.toRawString(),
-            bag_id: bag.bagId,
-            provider_pubkey: provider.pubkey,
-            cost_nano: deploy.costNano.toString(),
-            deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
-            amount_nano: deploy.amountNano.toString(),
-          },
-          { amount: deploy.amountNano.toString(), unit: 'nanoton' },
-        );
+        //
+        // issue #638: skipped when alreadyActive — this run did not actually move any
+        // funds (see the money-safety comment above), so `deploy.amountNano` here is a
+        // hypothetical recomputation (possibly against a DIFFERENT provider/rate than
+        // whichever run actually paid), not an "ACTUAL-cost record" receipt.ts's own
+        // contract requires. Recording one would double-count the ledger's cumulative
+        // cost for a single real on-chain spend. This is the SAME pre-existing "no
+        // receipt for a deploy that only completes on a later, notify-only retry" gap
+        // documented just above (Known gap) — not a new one this fix introduces.
+        if (!alreadyActive) {
+          opts.onReceipt?.(
+            {
+              contract_address: deploy.contractAddress.toRawString(),
+              bag_id: bag.bagId,
+              provider_pubkey: provider.pubkey,
+              cost_nano: deploy.costNano.toString(),
+              deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
+              amount_nano: deploy.amountNano.toString(),
+            },
+            { amount: deploy.amountNano.toString(), unit: 'nanoton' },
+          );
+        }
 
         return tonProviderLocator(bag.bagId);
       } finally {
