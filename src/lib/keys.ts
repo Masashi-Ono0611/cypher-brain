@@ -182,6 +182,17 @@ async function wrapInPlace(identityPath: string): Promise<void> {
 async function keygenSign(o: CliOptions): Promise<void> {
   const identityPath = o.sign_identity || SIGN_IDENTITY;
   const recipientPath = o.sign_recipient || SIGN_RECIPIENT;
+  // Captured BEFORE generation: --force alone doesn't mean a prior key was replaced
+  // (e.g. a fresh `keygen --sign --force` with nothing there yet), so the "this
+  // overwrote a previous key" warning below must key off actual pre-existence, not
+  // the flag (#532 review feedback). Specifically recipientPath's OWN pre-existence,
+  // not identityPath's or "either" — the warning is entirely about the PUBLIC
+  // verification key at recipientPath being overwritten (that's what makes old
+  // *.minisig files start failing), so it would be wrong to fire it off identityPath
+  // alone existing while recipientPath itself was actually untouched-before (e.g. an
+  // identity re-used at its default path alongside a brand-new --sign-recipient path
+  // that never existed) — a second review round on #532 caught this.
+  const recipientExistedBefore = await exists(recipientPath);
   const { wrapped, pubkeyText } = await keygenSignAt({
     home: HOME,
     identityPath,
@@ -194,9 +205,28 @@ async function keygenSign(o: CliOptions): Promise<void> {
   console.log(`signing identity (PRIVATE, keep offline):  ${identityPath}${wrapped ? ' (passphrase-wrapped)' : ''}`);
   console.log(`signing public key (PUBLIC, safe to copy): ${recipientPath}`);
   console.log(pubkeyText.trimEnd());
+  // #532: --force regenerates IN PLACE at recipientPath, so any `verify` resolving TO
+  // THAT SAME PATH now sees this NEW key — existing *.minisig files, signed with the
+  // OLD key, will FAIL that verification. They only stay verifiable if the OLD
+  // sign-recipient.pub was copied elsewhere BEFORE this run, via an explicit
+  // `verify --sign-recipient <saved-old-pubkey>`. The prior wording claimed old
+  // signatures "stay verifiable... regardless", which was true only under that
+  // unstated precondition — this message now states it. Whether recipientPath IS
+  // verify's default lookup depends on whether --sign-recipient was passed to THIS
+  // keygen call (a custom path here doesn't collide with verify's default unless
+  // verify is later pointed at that same custom path), so the wording is phrased in
+  // terms of "this path" rather than unconditionally asserting "the default path"
+  // (review feedback on an earlier draft that assumed default paths only).
+  const isDefaultRecipientPath = recipientPath === SIGN_RECIPIENT;
   console.log(
-    '\n⚠  Back up the signing identity now. Losing it means future snapshots can no longer be signed ' +
-      '(existing *.minisig files stay verifiable against the public key above regardless).',
+    recipientExistedBefore
+      ? `\n⚠  Back up the signing identity now. --force overwrote the previous signing public key at ${recipientPath}` +
+          (isDefaultRecipientPath ? ' (the default path)' : ' (pass the same --sign-recipient to verify to use it)') +
+          ' — a `verify` resolving to this path now sees the NEW key, so existing *.minisig files signed with ' +
+          'the OLD key will FAIL verification there unless you retained a copy of the OLD sign-recipient.pub ' +
+          '(saved elsewhere before regenerating, or recovered from a backup). If you have one, verify those ' +
+          'files with `verify --sign-recipient <path-to-saved-old-pubkey>`.'
+      : '\n⚠  Back up the signing identity now. Losing it means future snapshots can no longer be signed.',
   );
 }
 

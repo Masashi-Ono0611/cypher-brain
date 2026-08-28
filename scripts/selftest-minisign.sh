@@ -385,5 +385,128 @@ else
     || { echo "[FAIL] cypher-brain's verify rejected a genuine minisign-generated signature"; cat "$TMP/verify-real.out"; exit 1; }
 fi
 
+# #532: `keygen --sign --force`'s completion message used to unconditionally claim
+# existing *.minisig files "stay verifiable against the public key above regardless" —
+# false, since --force overwrites sign-recipient.pub IN PLACE at its default path, so
+# verify's default lookup now sees the NEW key and OLD-key signatures correctly FAIL
+# against it. This isolated block (own HOME/SRC, independent of $HOME_DIR/$SK_HOME
+# above) proves the corrected message text matches what actually happens: a fresh
+# keygen --sign gives a plain backup reminder, a --force regen warns that the default
+# path now serves the NEW key and names the --sign-recipient escape hatch, and the
+# underlying crypto behavior (old sig fails by default, passes with the saved old
+# pubkey named explicitly) is exactly what the message describes.
+echo "== keygen --sign --force completion message accurately describes the default-path key swap (#532) =="
+MSG_HOME="$TMP/keys-msg532"
+MSG_SRC="$TMP/src-msg532"
+mkdir -p "$MSG_HOME" "$MSG_SRC"
+printf 'msg532 fixture\n' >"$MSG_SRC/note.txt"
+msgcb() { CYPHER_BRAIN_HOME="$MSG_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"; }
+msgcb keygen >/dev/null
+
+msgcb keygen --sign >"$TMP/msg532-fresh.out" 2>&1
+grep -q 'Losing it means future snapshots can no longer be signed\.$' "$TMP/msg532-fresh.out" \
+  && echo "[PASS] fresh keygen --sign prints the plain backup reminder" \
+  || { echo "[FAIL] fresh keygen --sign message changed unexpectedly"; cat "$TMP/msg532-fresh.out"; exit 1; }
+grep -q 'stay verifiable' "$TMP/msg532-fresh.out" \
+  && { echo "[FAIL] fresh keygen --sign still makes the old unconditional 'stay verifiable' claim"; cat "$TMP/msg532-fresh.out"; exit 1; }
+echo "[PASS] fresh keygen --sign message has no unconditional old-key claim"
+
+# #532 review follow-up: --force with NOTHING there yet (no prior signing key) must NOT
+# claim it "overwrote the previous signing public key" — the warning has to key off actual
+# pre-existence, not the --force flag itself (a fresh --force is a no-op-flag-wise
+# first run, same as a plain keygen --sign).
+FRESH_FORCE_HOME="$TMP/keys-msg532-freshforce"
+mkdir -p "$FRESH_FORCE_HOME"
+CYPHER_BRAIN_HOME="$FRESH_FORCE_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen >/dev/null
+CYPHER_BRAIN_HOME="$FRESH_FORCE_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen --sign --force >"$TMP/msg532-freshforce.out" 2>&1
+grep -q 'Losing it means future snapshots can no longer be signed\.$' "$TMP/msg532-freshforce.out" \
+  && echo "[PASS] keygen --sign --force with no prior key prints the plain backup reminder" \
+  || { echo "[FAIL] a --force run with no prior key did not print the plain message"; cat "$TMP/msg532-freshforce.out"; exit 1; }
+grep -q 'overwrote the previous signing public key' "$TMP/msg532-freshforce.out" \
+  && { echo "[FAIL] a --force run with no prior key falsely claims it overwrote a previous key"; cat "$TMP/msg532-freshforce.out"; exit 1; }
+echo "[PASS] keygen --sign --force with no prior key does not falsely claim an overwrite"
+
+# Save the OLD public key before regenerating — mirrors the issue's repro and the
+# message's own advice: retaining a copy of the OLD sign-recipient.pub is what lets an
+# old .minisig still be verified (via --sign-recipient) after --force overwrites the
+# default path with the NEW key.
+cp "$MSG_HOME/sign-recipient.pub" "$TMP/msg532-old-sign-recipient.pub"
+msgcb snapshot --dir "$MSG_SRC" --out "$TMP/msg532.age" >/dev/null
+msgcb verify --in "$TMP/msg532.age" --require-signature >/dev/null 2>&1 \
+  && echo "[PASS] msg532.age verifies against the key it was signed with" \
+  || { echo "[FAIL] msg532.age did not verify before key rotation"; exit 1; }
+
+msgcb keygen --sign --force >"$TMP/msg532-force.out" 2>&1
+grep -q -- '--force overwrote the previous signing public key at' "$TMP/msg532-force.out" \
+  && echo "[PASS] --force message states the previous key's path was overwritten in place" \
+  || { echo "[FAIL] --force message missing the overwrite-in-place statement"; cat "$TMP/msg532-force.out"; exit 1; }
+grep -q -- '(the default path)' "$TMP/msg532-force.out" \
+  && echo "[PASS] --force message marks the overwritten path as the default (no --sign-recipient override used)" \
+  || { echo "[FAIL] --force message did not identify the overwritten path as the default"; cat "$TMP/msg532-force.out"; exit 1; }
+grep -q 'will FAIL verification' "$TMP/msg532-force.out" \
+  && echo "[PASS] --force message warns old-key .minisig files will FAIL verification there" \
+  || { echo "[FAIL] --force message does not warn about FAIL verification"; cat "$TMP/msg532-force.out"; exit 1; }
+grep -q -- '--sign-recipient <path-to-saved-old-pubkey>' "$TMP/msg532-force.out" \
+  && echo "[PASS] --force message names the --sign-recipient escape hatch for a saved old pubkey" \
+  || { echo "[FAIL] --force message does not name the --sign-recipient escape hatch"; cat "$TMP/msg532-force.out"; exit 1; }
+grep -q 'stay verifiable.*regardless' "$TMP/msg532-force.out" \
+  && { echo "[FAIL] --force message still makes the old unconditional 'stay verifiable ... regardless' claim"; cat "$TMP/msg532-force.out"; exit 1; }
+echo "[PASS] --force message drops the old unconditional 'stay verifiable ... regardless' claim"
+
+# #532 review follow-up: a --force regen at a CUSTOM --sign-recipient path must NOT
+# claim it overwrote "the default path" -- that path only matters to `verify` if
+# `verify` is later pointed at that same custom path via --sign-recipient itself.
+CUSTOM_HOME="$TMP/keys-msg532-custom"
+mkdir -p "$CUSTOM_HOME"
+CUSTOM_SIGN_RECIPIENT="$TMP/custom-sign-recipient.pub"
+CYPHER_BRAIN_HOME="$CUSTOM_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen >/dev/null
+CYPHER_BRAIN_HOME="$CUSTOM_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen --sign --sign-recipient "$CUSTOM_SIGN_RECIPIENT" >/dev/null
+CYPHER_BRAIN_HOME="$CUSTOM_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen --sign --sign-recipient "$CUSTOM_SIGN_RECIPIENT" --force \
+  >"$TMP/msg532-custom.out" 2>&1
+grep -q -- '--force overwrote the previous signing public key at' "$TMP/msg532-custom.out" \
+  && echo "[PASS] custom-path --force message states the overwritten path" \
+  || { echo "[FAIL] custom-path --force message missing the overwrite statement"; cat "$TMP/msg532-custom.out"; exit 1; }
+grep -q -- '(the default path)' "$TMP/msg532-custom.out" \
+  && { echo "[FAIL] custom-path --force message wrongly calls a --sign-recipient override 'the default path'"; cat "$TMP/msg532-custom.out"; exit 1; }
+grep -q -- 'pass the same --sign-recipient to verify to use it' "$TMP/msg532-custom.out" \
+  && echo "[PASS] custom-path --force message correctly scopes the warning to that explicit path" \
+  || { echo "[FAIL] custom-path --force message does not scope the warning to the custom path"; cat "$TMP/msg532-custom.out"; exit 1; }
+
+# #532 review round 3: an identity that pre-exists at its DEFAULT path, combined with a
+# --sign-recipient path that has never existed before, must NOT trigger the "overwrote
+# the previous signing public key" warning -- recipientPath itself is being CREATED, not
+# replaced, even though --force is set and identityPath does pre-exist. The warning is
+# specifically about the PUBLIC verification key at recipientPath, so it must key off
+# recipientPath's own pre-existence, not identityPath's (or "either").
+MIXED_HOME="$TMP/keys-msg532-mixed"
+mkdir -p "$MIXED_HOME"
+NEVER_EXISTED_RECIPIENT="$TMP/never-existed-sign-recipient.pub"
+CYPHER_BRAIN_HOME="$MIXED_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen >/dev/null
+CYPHER_BRAIN_HOME="$MIXED_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen --sign >/dev/null
+test -f "$MIXED_HOME/sign-identity.key" || { echo "[FAIL] mixed-case fixture setup: sign-identity.key missing"; exit 1; }
+test ! -e "$NEVER_EXISTED_RECIPIENT" || { echo "[FAIL] mixed-case fixture setup: recipient path already exists"; exit 1; }
+# --sign-identity re-points at the ALREADY-EXISTING default identity (so identityPath
+# pre-exists) while --sign-recipient names the never-existed path above -- --force lets
+# this through (keygenSignAt only individually guards each path without --force).
+CYPHER_BRAIN_HOME="$MIXED_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen --sign \
+  --sign-identity "$MIXED_HOME/sign-identity.key" --sign-recipient "$NEVER_EXISTED_RECIPIENT" --force \
+  >"$TMP/msg532-mixed.out" 2>&1
+grep -q 'overwrote the previous signing public key' "$TMP/msg532-mixed.out" \
+  && { echo "[FAIL] message falsely claims an overwrite when only identityPath (not recipientPath) pre-existed"; cat "$TMP/msg532-mixed.out"; exit 1; }
+grep -q 'Losing it means future snapshots can no longer be signed\.$' "$TMP/msg532-mixed.out" \
+  && echo "[PASS] identity-pre-exists + brand-new --sign-recipient path prints the plain backup reminder, not the overwrite warning" \
+  || { echo "[FAIL] mixed-case message did not print the expected plain reminder"; cat "$TMP/msg532-mixed.out"; exit 1; }
+
+# Prove the message matches reality (the crypto behavior itself is unchanged by #532 —
+# only the text was wrong): the OLD .minisig now FAILS the default-path verify, exactly
+# as the new message says, and PASSES again once told where the saved old pubkey is.
+if msgcb verify --in "$TMP/msg532.age" --require-signature >/dev/null 2>&1; then
+  echo "[FAIL] msg532.age still verifies against the default path after --force rotated the key"; exit 1
+fi
+echo "[PASS] old .minisig FAILs default-path verify after --force, matching the corrected message"
+msgcb verify --in "$TMP/msg532.age" --require-signature --sign-recipient "$TMP/msg532-old-sign-recipient.pub" >/dev/null 2>&1 \
+  && echo "[PASS] old .minisig verifies again via --sign-recipient pointed at the saved old pubkey" \
+  || { echo "[FAIL] old .minisig did not verify even with the saved old pubkey named explicitly"; exit 1; }
+
 echo
 echo "MINISIGN AUTHENTICITY SELFTEST PASS"
