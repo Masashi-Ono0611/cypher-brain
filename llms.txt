@@ -88,10 +88,14 @@ cypher-brain <command> --help                                   # just that comm
 cypher-brain keygen                                             # one-time identity + recipient
 cypher-brain snapshot --dir <path> --recipient <file> --out <f.age>
 cypher-brain verify --in <f.age>                                # real ciphertext? wrong key rejected?
+cypher-brain wallet create                                      # one-time: signing wallet, required by paid backends (turbo/arweave)
 cypher-brain push --in <f.age> --backend turbo --yes             # pays a one-time bundler fee
 cypher-brain pull --locator <id> --backend turbo --out <f.age>   # plain gateway fetch, no wallet
 cypher-brain restore --in <f.age> --out-dir <dir>
 cypher-brain schedule install --backend turbo --dir <path> --max-spend <n>   # unattended nightly
+cypher-brain doctor                                              # read-only setup health check (PASS/WARN/FAIL/SKIP)
+cypher-brain ledger                                              # read-only cumulative spend report (paid backends only)
+cypher-brain audit                                               # read-only hash-chain integrity check of the audit log
 ```
 
 ## Docs
