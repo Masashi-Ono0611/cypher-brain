@@ -407,13 +407,24 @@ function assertWithinHome(p: string): void {
 //
 // `out`'s FINAL path component (and possibly more of its ancestry, e.g. a not-yet-
 // created subdirectory) does not need to exist yet — wallet_create may be creating it
-// — so this cannot simply call realpath() on the whole path (which throws ENOENT when
-// the target itself is missing). Instead it walks UP from `p` to the nearest ancestor
-// that already exists on disk, resolves THAT (following any symlinks), and re-attaches
-// the still-nonexistent tail lexically — the tail cannot itself be a symlink escape
-// because nothing is there yet for a write to follow.
+// — so this cannot simply call realpath() on the whole path unconditionally (it throws
+// ENOENT when the target itself is missing). It tries the full path FIRST (multi-model
+// review, #648: an earlier version always skipped straight to the ancestor walk below,
+// which never resolves `p`'s OWN final component even when `p` already exists — a
+// symlinked CYPHER_BRAIN_HOME itself, not just a symlinked ancestor under it, produced
+// a false-positive rejection of a legitimately-scoped `out`, since HOME's own realpath
+// and `out`'s realpath then disagreed on whether HOME's symlink had been followed).
+// Only on ENOENT does it fall back to walking UP to the nearest ancestor that already
+// exists, resolving THAT (following any symlinks), and re-attaching the still-
+// nonexistent tail lexically — the tail cannot itself be a symlink escape because
+// nothing is there yet for a write to follow.
 async function realpathOfNearestAncestor(p: string): Promise<string> {
   const abs = resolve(p);
+  try {
+    return await realpath(abs);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') throw e;
+  }
   let dir = dirname(abs);
   const tail: string[] = [basename(abs)];
   for (;;) {
@@ -434,8 +445,19 @@ async function realpathOfNearestAncestor(p: string): Promise<string> {
 // kept, unchanged, as the cheap lexical pre-check every caller still gets first) —
 // resolves symlinks on BOTH sides before comparing, so a symlinked ancestor anywhere
 // under CYPHER_BRAIN_HOME (or CYPHER_BRAIN_HOME itself being a symlink) cannot smuggle
-// the write outside the scoped directory.
-async function assertRealpathWithinHome(p: string): Promise<void> {
+// the write outside the scoped directory. Returns the RESOLVED path rather than just
+// validating it (multi-model review, #648: a Critical finding on an earlier version
+// that only checked and let the caller re-resolve the ORIGINAL, possibly-symlinked
+// path a second time at write time) — an ancestor symlink swapped in the gap between
+// this check and the actual write would otherwise still be followed a SECOND time by
+// that later resolution (a classic check-then-use TOCTOU). Callers must use the
+// returned path for the actual write, not the original `p`, so the write only ever
+// touches the path this check already vetted, closing that gap for the ancestor
+// portion of the path (the same residual risk any other fixed-path write in this
+// codebase already carries — e.g. a symlink planted at the resolved path itself
+// after this check returns — is unavoidable without an O_NOFOLLOW-based openat
+// rewrite of every write primitive, which is out of scope for this check).
+async function resolveRealpathWithinHome(p: string): Promise<string> {
   const resolved = await realpathOfNearestAncestor(p);
   const homeResolved = await realpathOfNearestAncestor(HOME);
   if (resolved !== homeResolved && !resolved.startsWith(homeResolved + sep)) {
@@ -444,6 +466,7 @@ async function assertRealpathWithinHome(p: string): Promise<void> {
       `out must be inside CYPHER_BRAIN_HOME (${HOME}), got: ${p} (resolves to ${resolved} after following symlinks)`,
     );
   }
+  return resolved;
 }
 
 // #559: restore_now writes DECRYPTED PLAINTEXT into out_dir — a materially higher-risk
@@ -1549,10 +1572,21 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
     try {
       await discardFetchDir(tdir);
     } catch (cleanupErr) {
-      console.error(
-        `warning: failed to clean up restore fetch/scratch dir ${tdir} after a failed restore_now call: ` +
-          `${errMsg(cleanupErr)} (it may remain on disk until server restart) — the error below is the one to act on.`,
-      );
+      const warnMsg =
+        `failed to clean up restore fetch/scratch dir ${tdir} after a failed restore_now call: ` +
+        `${errMsg(cleanupErr)} (it may remain on disk until server restart) — the error below is the one to act on.`;
+      console.error(`warning: ${warnMsg}`);
+      // multi-model review, #650: ride this onto `e.cbWarnings` (the SAME convention
+      // captureCall()'s own catch / reclassify() already use to carry a warning onto a
+      // thrown error) so it reaches the structured error's `warnings` field via
+      // buildErrorPayload() too, not just the server's raw stderr — an agent branching
+      // on the structured result otherwise never sees it at all.
+      if (e instanceof Error) {
+        (e as Error & { cbWarnings?: string[] }).cbWarnings = [
+          ...((e as Error & { cbWarnings?: string[] }).cbWarnings ?? []),
+          warnMsg,
+        ];
+      }
     }
     throw e;
   }
@@ -1767,16 +1801,21 @@ async function handleWalletCreate(args: ToolArgs): Promise<CallToolResult> {
   const { out, force } = args;
   if (out !== undefined && !isStr(out)) throw new ToolError('ERR_INVALID_INPUT', 'out must be a string path');
   if (force !== undefined && !isBool(force)) throw new ToolError('ERR_INVALID_INPUT', 'force must be a boolean');
+  // #648: the actual WRITE below uses `resolvedOut` (this check's own resolved output),
+  // never the caller's original `out` — see resolveRealpathWithinHome()'s own comment
+  // for why (closes the check-then-use TOCTOU a separate check-and-reuse-the-original-
+  // path approach would leave open).
+  let resolvedOut: string | undefined;
   if (isStr(out)) {
-    assertWithinHome(out);
-    await assertRealpathWithinHome(out); // #648: catches a symlinked ancestor the lexical check above cannot see
+    assertWithinHome(out); // cheap lexical pre-check every caller still gets first
+    resolvedOut = await resolveRealpathWithinHome(out);
   }
   const walletOpts: CliOptions = {
     _: 'create',
     dirs: [],
     tables: [],
     recipients: [],
-    out: isStr(out) ? out : undefined,
+    out: resolvedOut,
     force,
   };
   const res = await captureCall(() => wallet(walletOpts));
