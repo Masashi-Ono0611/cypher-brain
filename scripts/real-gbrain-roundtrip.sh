@@ -23,7 +23,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLI="$ROOT/bin/cypher-brain.mjs"
 WORK="$(mktemp -d)"
 export CYPHER_BRAIN_HOME="$WORK/keys"
-SCRATCH_URL="${CB_PG_URL%/*}/$SCRATCH_DB"
+# Replace only the path component (the db name after the last '/' before any
+# '?query' or '#fragment') so a CB_PG_URL carrying standard Postgres URL params
+# (sslmode, channel_binding, etc. -- common on managed Postgres/Supabase/RDS)
+# keeps them on the derived scratch URL. A naive "${CB_PG_URL%/*}" strip drops
+# everything after the last '/', including the query string (#618).
+SCRATCH_URL="$(python3 -c "
+import sys
+from urllib.parse import urlsplit, urlunsplit
+u = urlsplit(sys.argv[1])
+print(urlunsplit((u.scheme, u.netloc, '/' + sys.argv[2], u.query, u.fragment)))
+" "$CB_PG_URL" "$SCRATCH_DB")"
 # always tidy up: remove the work dir AND drop the scratch db even if a step fails mid-run
 trap 'rm -rf "$WORK"; psql "$CB_PG_URL" -c "drop database if exists $SCRATCH_DB;" >/dev/null 2>&1 || true' EXIT
 

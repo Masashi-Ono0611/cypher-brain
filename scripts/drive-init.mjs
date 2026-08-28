@@ -73,7 +73,7 @@ child.stderr.on('data', (d) => {
 });
 
 const exitCode = await new Promise((resolve) => {
-  child.on('close', (code, signal) => resolve(code ?? (signal ? 1 : 1)));
+  child.on('close', (code) => resolve(code ?? 1));
   child.on('error', () => resolve(1));
 });
 

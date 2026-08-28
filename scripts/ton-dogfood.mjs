@@ -30,6 +30,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEV_ARGS } from './dev-node-flags.mjs';
+import { API_RE, HEX64_RE, assertSafe, sshRun } from './ton-ssh-lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -126,40 +127,12 @@ function findMarker(dir, marker) {
   return null;
 }
 
-// ---------- remote-command safety (mirrors the allowlist idea in src/lib/backends/ton.ts:
-// every value interpolated into a REMOTE shell command line must pass a narrow character
-// allowlist first, since the remote side is a real shell) ----------
+// ---------- remote-command safety ----------
+// HOST_RE/API_RE/HEX64_RE, assertSafe(), sshBaseArgs(), sshRun() live in
+// scripts/ton-ssh-lib.mjs (shared with scripts/ton-provider-experiment.mjs — see
+// that file's comment for why, #604). REMOTE_PATH_RE is only used here.
 
-const HOST_RE = /^[A-Za-z0-9._-]+(?:@[A-Za-z0-9._-]+)?$/;
 const REMOTE_PATH_RE = /^[A-Za-z0-9._/-]+$/;
-const HEX64_RE = /^[0-9a-f]{64}$/;
-const API_RE = /^[A-Za-z0-9.:-]+$/;
-
-function assertSafe(value, what, re) {
-  if (typeof value !== 'string' || !re.test(value) || value.startsWith('-')) {
-    throw new Error(
-      `${what} contains characters this script refuses to place in a remote command: ${JSON.stringify(value)}`,
-    );
-  }
-  return value;
-}
-
-function sshBaseArgs() {
-  const args = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
-  if (process.env.CYPHER_BRAIN_TON_SSH_KEY) args.push('-i', process.env.CYPHER_BRAIN_TON_SSH_KEY);
-  return args;
-}
-
-function sshRun(cmd, timeoutMs = 60_000) {
-  const host = assertSafe(process.env.CYPHER_BRAIN_TON_SSH_HOST, 'CYPHER_BRAIN_TON_SSH_HOST', HOST_RE);
-  const r = spawnSync('ssh', [...sshBaseArgs(), '--', host, cmd], { encoding: 'utf8', timeout: timeoutMs });
-  if (r.error) throw new Error(`ssh failed: ${r.error.message}`);
-  if (r.status !== 0)
-    throw new Error(
-      `ssh exited ${r.status}${r.signal ? ` (signal ${r.signal})` : ''}: ${(r.stderr || '').trim().slice(-2000)}`,
-    );
-  return r.stdout;
-}
 
 // Removes the ONE test bag this run created: the seeder daemon record (via its own
 // /api/v1/remove, with_files:true) plus cypher-brain's own inventory bookkeeping (which
