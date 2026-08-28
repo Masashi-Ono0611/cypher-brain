@@ -41,7 +41,12 @@
 #       overall VERDICT is FAIL (exit 1) — the exact false-100/100 gap #456 was filed for.
 #   (r) POSITIVE CONTROL — an unreadable line appended to the receipt ledger is a WARN
 #       (not a FAIL — a data-quality issue, not a broken security boundary), and
-#       doctor's overall VERDICT is PARTIAL (exit 2), never a silent PASS.
+#       doctor's overall VERDICT is PARTIAL (exit 2), never a silent PASS. Checked in
+#       BOTH plain and --json output (#493: the --json half of this exact PARTIAL
+#       fixture was previously unchecked — (h) below only exercises --json's general
+#       shape against whatever verdict is ambient at that point in the script, never
+#       specifically forcing PARTIAL — so a regression only visible in --json's
+#       verdict/exit-code pairing could have shipped unnoticed).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -468,6 +473,27 @@ if grep -qE '^\[FAIL\]' "$TMP/r.log"; then
 fi
 grep -q '^VERDICT: PARTIAL$' "$TMP/r.log" || { echo "[FAIL] expected doctor's overall VERDICT to be PARTIAL, not a silent PASS"; cat "$TMP/r.log"; exit 1; }
 echo "[PASS] unreadable receipt ledger line: receipt-ledger-readability WARN (not FAIL), doctor VERDICT PARTIAL (exit 2)"
+
+# #493: the SAME fixture, but through --json — doctor's exit code is set once from
+# report.verdict regardless of -o.json (doctor.ts's doctor()), so --json must agree with
+# the plain-text assertions just made: exit 2, verdict "PARTIAL", the same check WARN
+# (never fail), and score/verdict must not read as a healthy 100 next to a non-PASS
+# verdict (the same discipline (h) already asserts generically, forced here onto this
+# exact PARTIAL fixture instead of whatever verdict happens to be ambient).
+RC=0
+cb doctor --json > "$TMP/r.json" 2>&1 || RC=$?
+[ "$RC" = "2" ] || { echo "[FAIL] doctor --json with an unreadable receipt ledger line exited $RC, expected 2 (PARTIAL — WARN only)"; cat "$TMP/r.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+if (j.verdict !== 'PARTIAL') throw new Error('expected --json verdict PARTIAL, got ' + j.verdict);
+const rl = j.checks.find((c) => c.id === 'receipt-ledger-readability');
+if (!rl || rl.status !== 'warn') throw new Error('expected --json receipt-ledger-readability warn, got ' + JSON.stringify(rl));
+if (!/1 unreadable line/.test(rl.message)) throw new Error('--json message missing the unreadable-line count: ' + rl.message);
+if (j.checks.some((c) => c.status === 'fail')) throw new Error('--json reported a fail-status check — an unreadable receipt ledger line must never escalate to FAIL');
+if (typeof j.health_score !== 'number' || !Number.isFinite(j.health_score)) throw new Error('expected --json health_score to be a finite number, got ' + JSON.stringify(j.health_score));
+if (j.health_score >= 100) throw new Error('verdict PARTIAL but --json health_score is ' + j.health_score + ' — score/verdict must not disagree');
+" "$TMP/r.json"
+echo "[PASS] the same fixture via --json: verdict PARTIAL, exit 2, receipt-ledger-readability warn (not fail), score/verdict agree"
 
 echo
 echo "all cypher-brain doctor selftests passed"
