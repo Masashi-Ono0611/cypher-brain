@@ -20,6 +20,7 @@ import {
   AR_HTTP_TIMEOUT_MS,
   AR_MAX_SPEND,
   AR_L1_MAX_BYTES,
+  PIPE_TIMEOUT_MS,
   readEnv,
 } from '../config.js';
 import {
@@ -196,6 +197,20 @@ const SHAPE_CHECK: Record<FetchShape, (part: string) => Promise<boolean>> = {
 // a stalled gateway WITHOUT capping a large but progressing transfer (#17). Accept ONLY
 // HTTP 200 (a 202 "pending" / soft-404 means "not here, try the next gateway"). Redirects
 // are followed MANUALLY (#39) so each hop's target is SSRF-screened before we fetch it.
+//
+// The per-chunk stall timeout alone does NOT bound a malicious/compromised gateway that
+// keeps SOME bytes flowing without ever actually stalling: `arm()` below resets on every
+// received chunk, so a drip-fed 200 response could otherwise stream forever and grow
+// `part` until local disk is exhausted (#641) — neither Content-Length, received byte
+// count, nor total elapsed time was bounded. `totalTimer` below closes that gap with an
+// ABSOLUTE, wall-clock timer on this one gateway attempt (redirects included), armed once
+// and never reset — deliberately NOT implemented as a per-chunk deadline check, since that
+// would only ever be re-evaluated when another chunk arrives: a gateway that sends bytes
+// right up to (but not past) the cap and then goes silent would keep the stall timer
+// (reset by that same last chunk) as the only thing standing between it and
+// AR_HTTP_TIMEOUT_MS, which can be configured LARGER than this cap (Codex review). A real
+// timer fires regardless of chunk activity, including while still waiting on
+// headers/redirects before any body byte has arrived at all.
 async function streamArweaveGateway(
   url: string,
   part: string,
@@ -208,6 +223,24 @@ async function streamArweaveGateway(
     clearTimeout(stall);
     stall = setTimeout(() => ctl.abort(), timeoutMs);
   };
+  // PIPE_TIMEOUT_MS is the same "overall wall-clock cap for one long-running operation"
+  // budget ton.ts's p2pFetchInto() already applies to its P2P download loop (see its
+  // `now - started > PIPE_TIMEOUT_MS` check) — reused here rather than adding a new env
+  // var. Generous default (1h): a real transfer completes in seconds to minutes and never
+  // trips this; only a transfer that never actually finishes does. Armed exactly once,
+  // for the whole function — NOT reset by arm() — and always cleared in the `finally`
+  // below regardless of which path this function returns through.
+  const totalTimer = setTimeout(() => {
+    console.error(
+      `arweave: gateway attempt exceeded ${PIPE_TIMEOUT_MS}ms total — a stalled/malicious gateway can keep resetting the per-chunk timeout by trickling bytes, so this bounds total attempt time independently; skipping gateway`,
+    );
+    ctl.abort();
+  }, PIPE_TIMEOUT_MS);
+  // Kept as a fast-path, defense-in-depth check alongside the real timer above: if a
+  // chunk happens to arrive right around the deadline, this notices it synchronously
+  // (with a more specific, byte-count-bearing message) rather than waiting for the timer
+  // callback's own tick — but `totalTimer` above is what actually GUARANTEES the bound.
+  const deadline = Date.now() + PIPE_TIMEOUT_MS;
   try {
     let current = url;
     let pin: ScreenedTarget | null = null; // screened for the NEXT request — pins out DNS-rebinding
@@ -250,12 +283,25 @@ async function streamArweaveGateway(
       let received = 0;
       const tap = new Transform({
         transform(c, _e, cb) {
+          // Checked BEFORE arm()/resetting the stall timer: a gateway that keeps
+          // resetting the stall deadline by trickling bytes must still hit this total
+          // cap eventually (#641) — the two timers are deliberately independent.
+          if (Date.now() > deadline) {
+            clearTimeout(stall);
+            ctl.abort();
+            cb(
+              new Error(
+                `arweave: gateway transfer exceeded ${PIPE_TIMEOUT_MS}ms total (received ${received} bytes) — a stalled/malicious gateway can keep resetting the per-chunk timeout, so this bounds total transfer time independently; skipping gateway`,
+              ),
+            );
+            return;
+          }
           arm();
           received += c.length;
           progress.report(received, total);
           cb(null, c);
         },
-      }); // each chunk resets the stall deadline
+      }); // each chunk resets the stall deadline (but not the total-duration deadline above)
       await pipeline(resp, tap, createWriteStream(part));
       clearTimeout(stall);
       // Accept the body only if it is actually age ciphertext (every stored object
@@ -272,6 +318,7 @@ async function streamArweaveGateway(
     /* stall / network / mid-stream error — try the next gateway */
   } finally {
     clearTimeout(stall);
+    clearTimeout(totalTimer);
   }
   await rm(part, { force: true });
   return false;

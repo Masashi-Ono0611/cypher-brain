@@ -257,26 +257,35 @@ async function resolveSkipUnchanged(
   return { skip: false };
 }
 
+// --remote <name>:<path> is read ONLY by the rclone backend's put() (src/lib/backends/
+// rclone.ts's own required-remote check, and estimate.ts's #468 check just above pin the
+// OPPOSITE direction: rclone REQUIRES --remote). Every OTHER backend's put() ignores it
+// entirely (src/lib/types.ts's PutOpts.remote doc comment says exactly this) — so `push
+// --backend file --remote foo:/bar` used to parse fine and silently drop --remote,
+// writing to the file backend's normal default store path with no warning that --remote
+// had no effect (#655). Same "flag accepted, never honored" bug class #253/#277/#307/
+// #525/#526 already refuse elsewhere in this codebase (see profiles.ts's
+// assertVaultRequiresObsidianProfile/assertPgFiltersRequirePg for the same shape: a
+// companion flag refused unless the OTHER flag it depends on has the one matching
+// value). Refused here, before backendFor()/put() ever runs, so the mistake is caught
+// at the point it was made — e.g. an operator copy-pasting a push invocation between
+// backends (rclone -> file for a quick local test) and forgetting to drop --remote.
+function assertRemoteRequiresRcloneBackend(o: CliOptions): void {
+  if (o.remote === undefined) return;
+  if (o.backend === 'rclone') return;
+  throw new Error(
+    `--remote <name>:<path> only applies to --backend rclone (it is the rclone destination "<remote>:<path>" that backend's put() writes to) — ` +
+      `this run's --backend is "${o.backend}", which does not read --remote. ` +
+      `Use --backend rclone to actually use --remote, or drop --remote if you meant --backend ${o.backend} on its own.`,
+  );
+}
+
 async function pushCore(
   o: CliOptions,
 ): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
   if (!o.in) throw new Error('--in <file.age> required');
   if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton> required'); // no silent default
-  // #655: --remote is read ONLY by the rclone backend (backends/rclone.ts's put()) —
-  // every other backend's put() ignores it entirely (file/arweave/turbo/ton/ton-provider
-  // ignore o.remote outright; see FLAG_IRRELEVANT's `push: []` entry in cli.ts, which is
-  // about flags no OTHER command reads at all — a different, backend-conditional case
-  // from this one, same distinction pull's own "--wait has no effect for --backend ..."
-  // warning further down already draws for its own flag). An operator copy-pasting a
-  // push invocation between backends (e.g. switching from rclone to file for a quick
-  // local test) got no signal that --remote did nothing — warn here, before any upload
-  // work, rather than leaving it silently dropped.
-  if (o.remote !== undefined && o.backend !== 'rclone') {
-    warn(
-      `--remote is only used by --backend rclone (this push targets --backend ${o.backend}) — ` +
-        `the value ${JSON.stringify(o.remote)} will be ignored`,
-    );
-  }
+  assertRemoteRequiresRcloneBackend(o); // #655 — see the function's own doc comment (supersedes #658's warn-only version, since a hard refusal here makes that warn path unreachable)
   await requireFile(o.in); // #267: one shared check/wording across every command
   // storage must only ever see ciphertext — refuse to push a non-age artifact
   // (e.g. an accidental plaintext path), which would be the last gate before a

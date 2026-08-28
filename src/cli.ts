@@ -769,6 +769,9 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       brain implements none of them itself. Free (like file); needs rclone on
       PATH and a remote already set up via 'rclone config' (or a config-less
       on-the-fly remote, e.g. --remote ":local:/path"). --remote is required.
+      --remote only applies to --backend rclone — every other backend ignores it, so
+      passing --remote with a different --backend is refused up front rather than
+      silently doing nothing (#655).
       No-clobber for rclone (#533): refuses to upload when an object already
       exists at that exact --remote path — unlike file's <sha256>.age locator
       (content-addressed, so a same-path "overwrite" is always byte-identical)

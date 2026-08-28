@@ -598,5 +598,10 @@ export const AR_L1_MAX_BYTES = Number(readEnv('CYPHER_BRAIN_AR_L1_MAX') || 10 * 
 // a FIFO/special file under --dir, or a stalled remote transfer) can't hang the CLI
 // forever. Generous default (1h) — a real ~850 MB brain streams in seconds, so this
 // only ever trips on a genuine hang. Override with CYPHER_BRAIN_PIPE_TIMEOUT (ms) for
-// very large brains / restores / slow remotes.
+// very large brains / restores / slow remotes. Also reused as the same "one long-
+// running operation's total budget" by ton.ts's P2P download loop and, since #641, by
+// arweave.ts's per-gateway pull attempt — a malicious/compromised gateway that keeps
+// resetting ITS OWN per-chunk stall timeout by trickling bytes forever must still hit
+// this total cap, independent of that stall timer, or it could grow the pulled part
+// file until local disk is exhausted.
 export const PIPE_TIMEOUT_MS = Number(readEnv('CYPHER_BRAIN_PIPE_TIMEOUT') || 60 * 60 * 1000);

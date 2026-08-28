@@ -1,6 +1,9 @@
 // file backend: a local content-addressed store. Needs no daemon and no network,
 // so CI can exercise push/pull end-to-end. locator = <FILE_DIR>/<sha256><ext>
-import { mkdir, copyFile } from 'node:fs/promises';
+import { mkdir, copyFile, rename, rm } from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { pipeline } from 'node:stream/promises';
 import { join, dirname, resolve, basename, extname } from 'node:path';
 import { FILE_DIR } from '../config.js';
 import { exists, sha256 } from '../util.js';
@@ -56,18 +59,62 @@ export function fileBackend(): StorageBackend {
       // without verifying the object against its own filename here, a caller who passed
       // no --sha256 (trusting this backend's locator to already BE the hash) would have
       // the substituted bytes served back as if nothing had changed, and verify --level
-      // remote/drill would report VERDICT: PASS over it (#209 review). Checked BEFORE
-      // copying anywhere `out` might already be trusted.
+      // remote/drill would report VERDICT: PASS over it (#209 review).
+      //
+      // The hash is computed WHILE copying (one read pass, piped through a hashing
+      // transform to a same-directory temp file), not by a separate sha256(resolved)
+      // read followed by a later copyFile(resolved, out) — two independent filesystem
+      // reads of the SAME path would leave a check/use (TOCTOU) window: a process with
+      // write access to FILE_DIR could swap the object AFTER it's hashed but BEFORE it's
+      // copied, and this backend would then serve the replacement bytes as if they'd
+      // passed the hash check that actually ran against the OLD bytes (#642). Streaming
+      // means the digest compared below is guaranteed to be the digest of the exact
+      // bytes that landed in `tmp` — there is no second read of `resolved` for anything
+      // to race. `tmp` lives in `out`'s own directory (not /tmp) so the final rename is
+      // same-filesystem (atomic, no partial-write window at `out`), and a failed/
+      // mismatched attempt is cleaned up rather than left behind.
       const claimedHash = basename(resolved, extname(resolved));
-      const gotHash = await sha256(resolved);
+      const resolvedOut = resolve(out);
+      await mkdir(dirname(resolvedOut), { recursive: true });
+      // Same naming convention pushpull.ts's own pull() already uses for ITS scratch
+      // sibling of --out (`${o.out}.${pid}.${randHex}.part`) — a same-directory temp
+      // so the rename below is same-filesystem (atomic), and PID + random suffix so two
+      // concurrent get() calls into the same `out` (e.g. two pulls racing) never collide.
+      const tmp = `${resolvedOut}.${process.pid}.${randomBytes(4).toString('hex')}.part`;
+      const hash = createHash('sha256');
+      try {
+        await pipeline(
+          createReadStream(resolved),
+          async function* hashTap(source: AsyncIterable<Buffer>) {
+            for await (const chunk of source) {
+              hash.update(chunk);
+              yield chunk;
+            }
+          },
+          createWriteStream(tmp),
+        );
+      } catch (e) {
+        await rm(tmp, { force: true });
+        throw e;
+      }
+      const gotHash = hash.digest('hex');
       if (gotHash !== claimedHash) {
+        await rm(tmp, { force: true });
         throw new Error(
           `file backend: object at ${resolved} does not match its own locator hash (expected ${claimedHash}, got ` +
             `${gotHash}) — this store's content-addressing invariant is violated; refusing to serve it`,
         );
       }
-      await mkdir(dirname(resolve(out)), { recursive: true });
-      await copyFile(resolved, out);
+      try {
+        await rename(tmp, resolvedOut);
+      } catch (e) {
+        // The digest already matched — this is a PROMOTION failure (a permissions
+        // problem, --out's directory disappearing, a platform refusing to replace an
+        // existing --out, ...), not a verification failure — but `tmp` must not be left
+        // behind either way (Codex review, #642 follow-up).
+        await rm(tmp, { force: true });
+        throw e;
+      }
     },
   };
 }
