@@ -411,8 +411,25 @@ grep -q 'stay verifiable' "$TMP/msg532-fresh.out" \
   && { echo "[FAIL] fresh keygen --sign still makes the old unconditional 'stay verifiable' claim"; cat "$TMP/msg532-fresh.out"; exit 1; }
 echo "[PASS] fresh keygen --sign message has no unconditional old-key claim"
 
+# #532 review follow-up: --force with NOTHING there yet (no prior signing key) must NOT
+# claim it "overwrote the previous signing key" — the warning has to key off actual
+# pre-existence, not the --force flag itself (a fresh --force is a no-op-flag-wise
+# first run, same as a plain keygen --sign).
+FRESH_FORCE_HOME="$TMP/keys-msg532-freshforce"
+mkdir -p "$FRESH_FORCE_HOME"
+CYPHER_BRAIN_HOME="$FRESH_FORCE_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen >/dev/null
+CYPHER_BRAIN_HOME="$FRESH_FORCE_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen --sign --force >"$TMP/msg532-freshforce.out" 2>&1
+grep -q 'Losing it means future snapshots can no longer be signed\.$' "$TMP/msg532-freshforce.out" \
+  && echo "[PASS] keygen --sign --force with no prior key prints the plain backup reminder" \
+  || { echo "[FAIL] a --force run with no prior key did not print the plain message"; cat "$TMP/msg532-freshforce.out"; exit 1; }
+grep -q 'overwrote the previous signing key' "$TMP/msg532-freshforce.out" \
+  && { echo "[FAIL] a --force run with no prior key falsely claims it overwrote a previous key"; cat "$TMP/msg532-freshforce.out"; exit 1; }
+echo "[PASS] keygen --sign --force with no prior key does not falsely claim an overwrite"
+
 # Save the OLD public key before regenerating — mirrors the issue's repro and the
-# message's own advice: this is the ONLY way an old .minisig stays verifiable.
+# message's own advice: retaining a copy of the OLD sign-recipient.pub is what lets an
+# old .minisig still be verified (via --sign-recipient) after --force overwrites the
+# default path with the NEW key.
 cp "$MSG_HOME/sign-recipient.pub" "$TMP/msg532-old-sign-recipient.pub"
 msgcb snapshot --dir "$MSG_SRC" --out "$TMP/msg532.age" >/dev/null
 msgcb verify --in "$TMP/msg532.age" --require-signature >/dev/null 2>&1 \

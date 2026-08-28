@@ -182,6 +182,11 @@ async function wrapInPlace(identityPath: string): Promise<void> {
 async function keygenSign(o: CliOptions): Promise<void> {
   const identityPath = o.sign_identity || SIGN_IDENTITY;
   const recipientPath = o.sign_recipient || SIGN_RECIPIENT;
+  // Captured BEFORE generation: --force alone doesn't mean a prior key was replaced
+  // (e.g. a fresh `keygen --sign --force` with nothing there yet), so the "this
+  // overwrote a previous key" warning below must key off actual pre-existence, not
+  // the flag (#532 review feedback).
+  const hadExistingKey = (await exists(identityPath)) || (await exists(recipientPath));
   const { wrapped, pubkeyText } = await keygenSignAt({
     home: HOME,
     identityPath,
@@ -202,7 +207,7 @@ async function keygenSign(o: CliOptions): Promise<void> {
   // wording claimed old signatures "stay verifiable... regardless", which was true
   // only under that unstated precondition — this message now states it.
   console.log(
-    o.force
+    hadExistingKey
       ? '\n⚠  Back up the signing identity now. --force overwrote the previous signing key at its default path ' +
           `(${recipientPath}) — the default verify lookup now resolves to this NEW key, so existing *.minisig ` +
           'files signed with the OLD key will FAIL verification unless you copied the OLD sign-recipient.pub ' +
