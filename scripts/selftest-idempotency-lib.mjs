@@ -31,11 +31,12 @@
 //     impossible: the second process can never even START its own lookup-then-work
 //     sequence while the claim is held, regardless of how long either process's own log
 //     read takes. Also asserts: two DIFFERENT keys never contend; release lets a new
-//     claim through; a claim older than the staleness threshold is stolen (a crashed
-//     holder must not wedge the key forever); and — the one non-obvious failure mode a
-//     naive stale-steal design invites — releasing a claim that was ALREADY stolen by a
-//     later holder must NOT delete that later holder's live claim.
-import { mkdtemp, mkdir, rm, writeFile, readFile, utimes } from 'node:fs/promises';
+//     claim through; a manually-removed claim (the supported recovery path for a
+//     confirmed-crashed holder — see claimIdempotencyKey's own doc comment for why there
+//     is deliberately no AUTOMATIC steal) can be re-claimed; and releasing a claim after
+//     it was manually removed and re-claimed by someone else must NOT delete that new
+//     holder's live claim.
+import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -47,14 +48,9 @@ import {
   IdempotencyClaimHeldError,
 } from '../src/lib/idempotency.ts';
 
-// Must match src/lib/idempotency.ts's own (private) CLAIM_STALE_MS — there is no test
-// hook to read it back, so this is kept in sync by hand; a drift here would only make
-// the staleness test below wait longer or shorter than necessary, never silently pass.
-const CLAIM_STALE_MS = 2 * 60 * 60 * 1000;
-
-// Mirrors idempotency.ts's own (private) claimLockPath — needed here only to backdate a
-// claim's mtime directly on disk to simulate a crashed holder, something the public
-// claimIdempotencyKey/release API has no legitimate reason to expose.
+// Mirrors idempotency.ts's own (private) claimLockPath — needed here only to simulate an
+// operator manually removing a confirmed-crashed holder's lock file directly, something
+// the public claimIdempotencyKey/release API has no legitimate reason to expose.
 const claimLockPathFor = (logPath, tool, key) =>
   `${logPath}.claim.${createHash('sha256')
     .update(JSON.stringify([tool, key]))
@@ -231,51 +227,75 @@ try {
     if (releaseA2) await releaseA2();
   }
 
-  // ---------- #636 claimIdempotencyKey: a stale (presumed-crashed) claim is stolen ----------
+  // ---------- #636 claimIdempotencyKey: held claim's error names the lock file + gives an age hint ----------
   {
-    const logPath = join(tmp, 'claim-stale-log.jsonl');
-    await claimIdempotencyKey(logPath, 'snapshot_now', 'stale-key'); // deliberately never released — simulates a crashed holder
-    const lockPath = claimLockPathFor(logPath, 'snapshot_now', 'stale-key');
-    const old = new Date(Date.now() - CLAIM_STALE_MS - 1000);
-    await utimes(lockPath, old, old);
-
-    let staleThrew;
-    let releaseStolen;
+    const logPath = join(tmp, 'claim-message-log.jsonl');
+    const release = await claimIdempotencyKey(logPath, 'snapshot_now', 'message-key');
+    const lockPath = claimLockPathFor(logPath, 'snapshot_now', 'message-key');
+    let threw;
     try {
-      releaseStolen = await claimIdempotencyKey(logPath, 'snapshot_now', 'stale-key');
+      await claimIdempotencyKey(logPath, 'snapshot_now', 'message-key');
     } catch (e) {
-      staleThrew = e;
+      threw = e;
     }
     check(
-      'a claim older than the staleness threshold is stolen rather than wedging the key forever',
-      staleThrew === undefined,
-      staleThrew ? `${staleThrew.constructor.name}: ${staleThrew.message}` : undefined,
+      "a held claim's error names the lock file path (an operator's recovery entry point) and gives an age hint",
+      threw instanceof IdempotencyClaimHeldError &&
+        threw.message.includes(lockPath) &&
+        /\d+ minute/.test(threw.message),
+      threw ? threw.message : 'did not throw (BUG)',
     );
-    if (releaseStolen) await releaseStolen();
+    await release();
   }
 
-  // ---------- #636 claimIdempotencyKey: releasing a STOLEN claim must not delete the new holder's ----------
+  // ---------- #636 claimIdempotencyKey: manual removal (the supported recovery path) unblocks a new claim ----------
   {
-    const logPath = join(tmp, 'claim-stolen-release-log.jsonl');
-    const releaseOriginal = await claimIdempotencyKey(logPath, 'snapshot_now', 'stolen-key');
-    const lockPath = claimLockPathFor(logPath, 'snapshot_now', 'stolen-key');
-    const old = new Date(Date.now() - CLAIM_STALE_MS - 1000);
-    await utimes(lockPath, old, old);
-    // A second caller observes the claim as stale and steals it — this is the NEW
-    // legitimate holder from here on.
-    const releaseNew = await claimIdempotencyKey(logPath, 'snapshot_now', 'stolen-key');
-    const ownerAfterSteal = await readFile(lockPath, 'utf8');
+    // There is deliberately NO automatic staleness-based steal (see claimIdempotencyKey's
+    // own doc comment) — recovering from a confirmed-crashed holder is an operator action:
+    // remove the named lock file by hand. Simulated here the same way an operator would,
+    // by deleting the file directly rather than calling the crashed holder's own release
+    // (which, by definition, a crashed process never gets to call).
+    const logPath = join(tmp, 'claim-manual-recovery-log.jsonl');
+    await claimIdempotencyKey(logPath, 'snapshot_now', 'crashed-key'); // deliberately never released — simulates a crashed holder
+    const lockPath = claimLockPathFor(logPath, 'snapshot_now', 'crashed-key');
+    await rm(lockPath, { force: true }); // the operator's manual intervention
 
-    // The ORIGINAL (unlucky, overran-its-budget) holder finally finishes and calls ITS
-    // OWN release — this must be a silent no-op, not a deletion of the new holder's live
-    // claim (deleting it here would let a THIRD caller in while the second is still
-    // working, exactly the bug this claim exists to prevent).
+    let reclaimThrew;
+    let releaseRecovered;
+    try {
+      releaseRecovered = await claimIdempotencyKey(logPath, 'snapshot_now', 'crashed-key');
+    } catch (e) {
+      reclaimThrew = e;
+    }
+    check(
+      'a manually-removed claim can be re-claimed (the supported recovery path for a confirmed-crashed holder)',
+      reclaimThrew === undefined,
+      reclaimThrew ? `${reclaimThrew.constructor.name}: ${reclaimThrew.message}` : undefined,
+    );
+    if (releaseRecovered) await releaseRecovered();
+  }
+
+  // ---------- #636 claimIdempotencyKey: releasing after manual removal + re-claim must not delete the new holder's ----------
+  {
+    const logPath = join(tmp, 'claim-recovered-release-log.jsonl');
+    const releaseOriginal = await claimIdempotencyKey(logPath, 'snapshot_now', 'recovered-key');
+    const lockPath = claimLockPathFor(logPath, 'snapshot_now', 'recovered-key');
+    await rm(lockPath, { force: true }); // an operator, believing the original holder crashed, removes it
+    // A second caller claims the now-vacant key — this is the NEW legitimate holder.
+    const releaseNew = await claimIdempotencyKey(logPath, 'snapshot_now', 'recovered-key');
+    const ownerAfterRecover = await readFile(lockPath, 'utf8');
+
+    // The ORIGINAL caller was not actually gone (the operator's belief was wrong, or it
+    // simply finishes late) and finally calls ITS OWN release — this must be a silent
+    // no-op, not a deletion of the new holder's live claim (deleting it here would let a
+    // THIRD caller in while the second is still working, exactly the bug this claim
+    // exists to prevent).
     await releaseOriginal();
     const ownerAfterOriginalRelease = await readFile(lockPath, 'utf8').catch(() => null);
     check(
-      "releasing a stolen claim does not delete the new holder's live claim",
-      ownerAfterOriginalRelease === ownerAfterSteal,
-      JSON.stringify({ before: ownerAfterSteal, after: ownerAfterOriginalRelease }),
+      "releasing a claim after manual removal + re-claim does not delete the new holder's live claim",
+      ownerAfterOriginalRelease === ownerAfterRecover,
+      JSON.stringify({ before: ownerAfterRecover, after: ownerAfterOriginalRelease }),
     );
     await releaseNew();
   }
