@@ -34,7 +34,13 @@ func parseHex32(name, v string) ([]byte, error) {
 func parseRawAddr(name, v string, allowedWorkchains ...int32) (*address.Address, error) {
 	addr, err := address.ParseRawAddr(v)
 	if err != nil {
-		return nil, fmt.Errorf(`%s is not a raw TON address (want "wc:hex64"): %w`, name, err)
+		return nil, fmt.Errorf(
+			`%s is not a raw TON address (want "wc:hex64"): %w — if you copied an EQ.../UQ... `+
+				`address from a wallet app (e.g. Tonkeeper), convert it to raw form first: paste it `+
+				`into tonviewer.com's address lookup (it shows the raw form too), or run `+
+				`Address.parse("EQ...").toRawString() with @ton/core`,
+			name, err,
+		)
 	}
 	for _, wc := range allowedWorkchains {
 		if addr.Workchain() == wc {

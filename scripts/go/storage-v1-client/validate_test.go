@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseHex32(t *testing.T) {
 	valid := repeatHex("a", 64)
@@ -71,6 +74,19 @@ func TestParseRawAddr(t *testing.T) {
 		if _, err := parseRawAddr("--x", bad, 0, -1); err == nil {
 			t.Errorf("parseRawAddr(%q) expected error, got nil", bad)
 		}
+	}
+}
+
+// TestParseRawAddrFriendlyFormHint locks in issue #562: rejecting an EQ.../UQ...
+// (friendly-form, what every wallet app displays) address must point the
+// operator at a conversion path, not just restate the required raw shape.
+func TestParseRawAddrFriendlyFormHint(t *testing.T) {
+	_, err := parseRawAddr("--owner", "EQD_not_a_raw_addr", 0, -1)
+	if err == nil {
+		t.Fatal("expected an error for a friendly-form address, got nil")
+	}
+	if !strings.Contains(err.Error(), "tonviewer.com") || !strings.Contains(err.Error(), "toRawString") {
+		t.Errorf("expected a conversion hint (tonviewer.com / toRawString) in error, got: %v", err)
 	}
 }
 

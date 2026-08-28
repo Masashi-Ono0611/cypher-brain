@@ -220,6 +220,13 @@ REASON_FILE="$TMP/notify-reason-override"
 # issue #404: records the args THIS call received, overwriting each time — the
 # network-selection positive controls below check the MOST RECENT call only.
 printf '%s\n' "\$@" > "$TMP/notify-args.log"
+# issue #561 regression guard: notify.go ALWAYS prints a pre-flight "status:" line
+# (its own on-chain account-state check) BEFORE the "== notify response ==" marker,
+# with a value that can differ from the real response's status. Mimic that shape here
+# — with a deliberately distinct, obviously-wrong value — so ton-provider.ts's
+# parseNotifyOutput() greedily matching the FIRST "status:" line in the output (instead
+# of the one inside the marked response block) would be caught by this selftest.
+echo "  status: preflight-should-be-ignored — some verdict"
 echo "== notify response =="
 echo "  status:     active"
 echo "  reason:     \$(cat "\$REASON_FILE" 2>/dev/null || echo ok)"
@@ -477,6 +484,14 @@ grep -q 'notify response so far.*bounty should be at least 0.05 TON to cover fee
 # reason warning flows through the same #347 summary mechanism as every other warning.
 REASON_COUNT=$(grep -c 'notify response so far.*bounty should be at least 0.05 TON to cover fees' "$TMP/reason-surfaced.err")
 [ "$REASON_COUNT" = "2" ] || { echo "[FAIL] the reason line appeared $REASON_COUNT time(s), expected exactly 2 (1 live + 1 run-summary) — dedup or the #347 summary broke"; cat "$TMP/reason-surfaced.err"; exit 1; }
+# issue #561 regression guard: the warn() line's status=... must come from the notify
+# response block (fake-notify's "active"), never from the pre-flight status line
+# fake-notify now also emits ("preflight-should-be-ignored") ahead of the marker.
+grep -q 'status=active' "$TMP/reason-surfaced.err" || { echo "[FAIL] parseNotifyOutput did not surface the notify-response status"; cat "$TMP/reason-surfaced.err"; exit 1; }
+if grep -q 'status=preflight-should-be-ignored' "$TMP/reason-surfaced.err"; then
+  echo "[FAIL] parseNotifyOutput matched the pre-flight status line instead of the notify response (issue #561 regression)"; cat "$TMP/reason-surfaced.err"; exit 1
+fi
+echo "[PASS] parseNotifyOutput picks the notify-response status, not the pre-flight status line (issue #561)"
 rm -f "$TMP/notify-reason-override"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore for any later runs
 echo "[PASS] the provider's stated reason is surfaced once, immediately, and not repeated while unchanged"

@@ -651,9 +651,20 @@ export interface NotifyResult {
 // UP past Number.MAX_SAFE_INTEGER, which would make the "under-count, never over-count"
 // guarantee above false for a large enough bag.
 function parseNotifyOutput(out: string): NotifyResult {
-  const status = /^\s*status:\s*(\S+)/m.exec(out)?.[1] ?? 'unknown';
-  const downloadedRaw = /^\s*downloaded:\s*(\d+)\s*bytes/m.exec(out)?.[1];
-  const reason = /^\s*reason:\s*(.*)$/m.exec(out)?.[1]?.trim() ?? '';
+  // notify.go prints a pre-flight "  status: %s — %s\n" line (its own on-chain account
+  // state check, notify.go:164) BEFORE ever calling the provider, then prints the
+  // "== notify response ==" marker followed by the REAL response's own status/reason/
+  // downloaded lines (notify.go:182-185). The regexes below are intentionally
+  // non-anchored to tolerate leading whitespace, so without first slicing to the marker
+  // they matched the earlier pre-flight status line instead of the actual notify
+  // response (issue #561). Falling back to the full output when the marker is absent
+  // preserves the previous best-effort behavior for unexpected/truncated output.
+  const marker = '== notify response ==';
+  const markerIdx = out.indexOf(marker);
+  const response = markerIdx === -1 ? out : out.slice(markerIdx + marker.length);
+  const status = /^\s*status:\s*(\S+)/m.exec(response)?.[1] ?? 'unknown';
+  const downloadedRaw = /^\s*downloaded:\s*(\d+)\s*bytes/m.exec(response)?.[1];
+  const reason = /^\s*reason:\s*(.*)$/m.exec(response)?.[1]?.trim() ?? '';
   return { status, downloaded: downloadedRaw ? BigInt(downloadedRaw) : 0n, reason };
 }
 

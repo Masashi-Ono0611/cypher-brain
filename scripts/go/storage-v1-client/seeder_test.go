@@ -31,6 +31,30 @@ func TestAssertSafe(t *testing.T) {
 	}
 }
 
+// TestAssertSafeDistinguishesEmptyFromInvalid locks in issue #563: an unset
+// (empty) value must produce a different, non-misleading message from a
+// value that actually fails the character allowlist.
+func TestAssertSafeDistinguishesEmptyFromInvalid(t *testing.T) {
+	_, errEmpty := assertSafe("", "CYPHER_BRAIN_TON_SSH_HOST", hostRe)
+	if errEmpty == nil {
+		t.Fatal("expected an error for an empty value, got nil")
+	}
+	if strings.Contains(errEmpty.Error(), "contains characters") {
+		t.Errorf("empty-value error should not claim invalid characters, got: %v", errEmpty)
+	}
+	if !strings.Contains(errEmpty.Error(), "not set") {
+		t.Errorf("empty-value error should say the value is not set, got: %v", errEmpty)
+	}
+
+	_, errInvalid := assertSafe("host; rm -rf /", "CYPHER_BRAIN_TON_SSH_HOST", hostRe)
+	if errInvalid == nil {
+		t.Fatal("expected an error for an invalid value, got nil")
+	}
+	if !strings.Contains(errInvalid.Error(), "contains characters") {
+		t.Errorf("invalid-value error should mention disallowed characters, got: %v", errInvalid)
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	if got := truncate("  hello  ", 100); got != "hello" {
 		t.Fatalf("truncate did not trim: %q", got)
