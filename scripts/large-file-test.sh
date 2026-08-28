@@ -26,6 +26,9 @@ cb keygen >/dev/null
 
 echo "== snapshot (measure time + node peak RSS to prove it streams, not buffers) =="
 T0=$(now)
+# macOS/BSD-only: `-l` and the "maximum resident set size" wording below are
+# specific to /usr/bin/time on macOS. On Linux, use GNU `time -v` instead,
+# which reports the same figure as "Maximum resident set size (kbytes)" (#620).
 /usr/bin/time -l node "${BIN_DEV_ARGS[@]}" "$BIN" snapshot --dir "$SRC" --out "$TMP/big.age" 2>"$TMP/rss.txt" 1>/dev/null
 T1=$(now)
 RSS_BYTES=$(grep -i 'maximum resident set size' "$TMP/rss.txt" | grep -oE '[0-9]+' | head -1)

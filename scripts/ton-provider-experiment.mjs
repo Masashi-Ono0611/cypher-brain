@@ -48,10 +48,10 @@
 // THE SCRIPT NEVER TOUCHES A PRIVATE KEY. Every on-chain action it produces is a
 // Tonkeeper transfer deeplink (+ raw base64 BOC for other wallets) — signing
 // always happens in the operator's own wallet app.
-import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { Address, beginCell, Cell, toNano } from '@ton/ton';
+import { API_RE, HEX64_RE, assertSafe, sshRun } from './ton-ssh-lib.mjs';
 
 // -----------------------------------------------------------------------
 // Constants (ported)
@@ -185,41 +185,12 @@ Env (offer, only when --size-bytes is not given — mirrors ton-dogfood.mjs):
 `;
 
 // -----------------------------------------------------------------------
-// Remote-command safety (mirrors scripts/ton-dogfood.mjs, itself mirroring the
-// allowlist in src/lib/backends/ton.ts): every value interpolated into a REMOTE
-// shell command line must pass a narrow allowlist first.
+// Remote-command safety: HOST_RE/API_RE/HEX64_RE, assertSafe(), sshBaseArgs(),
+// sshRun() live in scripts/ton-ssh-lib.mjs, shared with scripts/ton-dogfood.mjs
+// (see that file's comment for why, #604) — itself mirroring the allowlist in
+// src/lib/backends/ton.ts: every value interpolated into a REMOTE shell
+// command line must pass a narrow allowlist first.
 // -----------------------------------------------------------------------
-
-const HOST_RE = /^[A-Za-z0-9._-]+(?:@[A-Za-z0-9._-]+)?$/;
-const API_RE = /^[A-Za-z0-9.:-]+$/;
-const HEX64_RE = /^[0-9a-f]{64}$/;
-
-function assertSafe(value, what, re) {
-  if (typeof value !== 'string' || !re.test(value) || value.startsWith('-')) {
-    throw new Error(
-      `${what} contains characters this script refuses to place in a remote command: ${JSON.stringify(value)}`,
-    );
-  }
-  return value;
-}
-
-function sshBaseArgs() {
-  const args = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
-  if (process.env.CYPHER_BRAIN_TON_SSH_KEY) args.push('-i', process.env.CYPHER_BRAIN_TON_SSH_KEY);
-  return args;
-}
-
-function sshRun(cmd, timeoutMs = 60_000) {
-  const host = assertSafe(process.env.CYPHER_BRAIN_TON_SSH_HOST, 'CYPHER_BRAIN_TON_SSH_HOST', HOST_RE);
-  const r = spawnSync('ssh', [...sshBaseArgs(), '--', host, cmd], { encoding: 'utf8', timeout: timeoutMs });
-  if (r.error) throw new Error(`ssh failed: ${r.error.message}`);
-  if (r.status !== 0) {
-    throw new Error(
-      `ssh exited ${r.status}${r.signal ? ` (signal ${r.signal})` : ''}: ${(r.stderr || '').trim().slice(-2000)}`,
-    );
-  }
-  return r.stdout;
-}
 
 // Bag size, read from the seeder's OWN tonutils-storage — the same daemon our
 // `ton` backend already talks to for push/pull (src/lib/backends/ton-client.ts:
