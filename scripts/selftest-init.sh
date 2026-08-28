@@ -138,6 +138,58 @@ grep -qi "At least one directory is required" "$TMP/nodir.log" || { echo "[FAIL]
 [ -f "$NODIR_CB_HOME/sign-identity.key" ] || { echo "[FAIL] signing identity is missing — the #492 repro's own rollback target must survive an empty directory answer"; exit 1; }
 echo "[PASS] an empty directory answer re-prompts instead of throwing — primary, backup AND signing identities all survive (issue #492 fixed)"
 
+echo "== (c3) profile=none with a NONEXISTENT (typo'd) directory path RE-PROMPTS instead of throwing-and-rolling-back (issue #605) =="
+# #492 (test (c) above) only fixed the EMPTY-answer case: the loop kept askLine()ing
+# until at least one non-empty candidate was given, but never checked that candidate
+# actually existed on disk. A non-empty but NONEXISTENT (typo'd) directory path still
+# sailed straight through `.filter(Boolean)` to the final "Choose a backend" step and
+# only failed deep inside snapshot()'s requirePath() check ("no such snapshot source:
+# ..."), by which point the catch block a few hundred lines down had already rolled
+# back the primary identity, the offline backup keypair, and the signing keypair — the
+# exact same rollback-cost bug class #492 fixed for the empty case, just one input
+# shape wider (confirmed live via drive-init.mjs against the PRE-fix code before this
+# was closed: the wizard proceeded straight to "Choose a backend" and then failed with
+# "error: no such snapshot source: ...", deleting all three artifacts). The fix checks
+# each candidate against disk (util.ts's exists()) and drops — with a "does not exist"
+# message — whichever ones are not real, re-looping (same "At least one directory is
+# required" re-prompt test (c) already asserts) until at least one EXISTING directory
+# survives.
+NODIR2_HOME="$TMP/nodir2-home"; mkdir -p "$NODIR2_HOME"
+NODIR2_CB_HOME="$TMP/nodir2-cb-home"
+NODIR2_STORE="$TMP/nodir2-store"
+NODIR2_SRC="$TMP/nodir2-src"; mkdir -p "$NODIR2_SRC"
+printf 'nodir2-marker\n' > "$NODIR2_SRC/note.txt"
+NODIR2_KIT_PATH="$NODIR2_HOME/recovery-kit.txt"
+NODIR2_BACKUP_HOME="${NODIR2_CB_HOME}-backup"
+NODIR2_BADPATH="$TMP/nodir2-this-path-does-not-exist"
+
+cat > "$TMP/qa-nodir2.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "y"],
+  ["Path for the backup keypair", ""],
+  ["Generate a signing keypair now?", "y"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$NODIR2_BADPATH"],
+  ["At least one directory is required", "$NODIR2_SRC"],
+  ["Choose a backend", ""],
+  ["Path to write the recovery kit", "$NODIR2_KIT_PATH"]
+]
+JSON
+CYPHER_BRAIN_HOME="$NODIR2_CB_HOME" CYPHER_BRAIN_FILE_DIR="$NODIR2_STORE" HOME="$NODIR2_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 NO_COLOR=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-nodir2.json" --out "$TMP/nodir2.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] the nonexistent-then-valid directory answer made init fail (it should re-prompt, then complete normally)"; cat "$TMP/nodir2.log"; exit 1; }
+grep -q 'cypher-brain init: complete' "$TMP/nodir2.log" || { echo "[FAIL] nonexistent-directory-answer wizard log lacks its own completion marker"; cat "$TMP/nodir2.log"; exit 1; }
+grep -qi "no such snapshot source" "$TMP/nodir2.log" && { echo "[FAIL] the nonexistent directory answer still threw the old rollback-triggering error"; cat "$TMP/nodir2.log"; exit 1; }
+grep -qF "$NODIR2_BADPATH does not exist" "$TMP/nodir2.log" || { echo "[FAIL] the nonexistent directory answer did not print a does-not-exist message naming it"; cat "$TMP/nodir2.log"; exit 1; }
+grep -qi "At least one directory is required" "$TMP/nodir2.log" || { echo "[FAIL] the nonexistent directory answer did not re-prompt"; cat "$TMP/nodir2.log"; exit 1; }
+[ -f "$NODIR2_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity is missing — a nonexistent directory answer should never roll anything back"; exit 1; }
+[ -f "$NODIR2_BACKUP_HOME/identity.age" ] || { echo "[FAIL] backup identity is missing — the #605 repro's own rollback target must survive a nonexistent directory answer"; exit 1; }
+[ -f "$NODIR2_CB_HOME/sign-identity.key" ] || { echo "[FAIL] signing identity is missing — the #605 repro's own rollback target must survive a nonexistent directory answer"; exit 1; }
+echo "[PASS] a nonexistent directory answer re-prompts instead of throwing — primary, backup AND signing identities all survive (issue #605 fixed)"
+
 echo "== (c2) select() offers ton-provider by name, and picking it with no CYPHER_BRAIN_TON_PROVIDER_OWNER/MAX_SPEND set refuses BEFORE spending (issue #396 Phase B) =="
 TONPROV_USER_HOME="$TMP/tonprov-user-home"; mkdir -p "$TONPROV_USER_HOME" # HOME override, same as test (d)'s WIZ_HOME below: without this, step 6 detects the REAL machine's ~/.gbrain/config.json (if any) and asks an extra --pg prompt this qa.json does not script for
 TONPROV_HOME="$TMP/tonprov-home"
@@ -332,6 +384,73 @@ O2B_RESTORED_SHA=$(shasum -a 256 "$TMP/o2b-wiz-restore/o2b-bank-export.json" | c
 [ "$O2B_SHA" = "$O2B_RESTORED_SHA" ] || { echo "[FAIL] wizard's o2b snapshot did not archive the bundle byte-identical"; exit 1; }
 echo "[PASS] init wizard's profile o2b path prompts for the bundle and actually snapshots it byte-identical (manifest records profile o2b)"
 
+echo "== (e3b) profile obsidian's --vault prompt loops past an empty AND a nonexistent answer before rolling anything back (issue #605) =="
+# #462 fixed the Profile SELECTOR itself (a typo there is now structurally inert — see
+# (e4) below) and #492 fixed the "none" profile's free-text directory prompt, but the
+# three profile-SPECIFIC free-text path prompts (--vault/--zip/--export, right after a
+# real profile is chosen) were never covered by either fix: a plain one-shot askLine()
+# with no re-prompt loop and no existence check. Confirmed live via drive-init.mjs
+# against the PRE-fix code before this was closed: an empty OR a nonexistent vault
+# answer sailed straight through steps 6-7 to "Choose a backend", then failed deep
+# inside snapshot() ("no vault at ... — profile obsidian snapshots the vault
+# directory"), and the catch block a few hundred lines down rolled back the primary
+# identity, the offline backup keypair, AND the signing keypair from steps 1-3 — same
+# rollback-cost bug class as #462/#492, just never extended here. The fix
+# (askExistingPath() in wizard.ts) loops until the answer is both non-empty and
+# actually exists, exactly like the "none" profile's own directory prompt. This one
+# test exercises obsidian specifically, but chatgpt-export's --zip and o2b's --export
+# prompts call the exact same helper function (askExistingPath()) — not a
+# copy/reimplementation per profile — so this is a shared-code-path regression check
+# for all three, not just obsidian (each profile's OWN wizard flow — o2b's above,
+# obsidian's own byte-identical-archive path, chatgpt-export's — is unchanged and
+# already covered elsewhere; this test is specifically about the bad-answer loop).
+#
+# "Profile (what to back up)" navigates the select() menu down two entries from its
+# default "none" (options order: none, claude-code, obsidian, chatgpt-export, o2b) —
+# same down-arrow escape-sequence mechanism (e3)'s up-arrow answer above already uses.
+OBS_HOME="$TMP/obsidian-home"; mkdir -p "$OBS_HOME"
+OBS_CB_HOME="$TMP/obsidian-cb-home"
+OBS_STORE="$TMP/obsidian-store"
+OBS_VAULT="$TMP/obsidian-real-vault"; mkdir -p "$OBS_VAULT/.obsidian"
+printf 'obsidian-marker\n' > "$OBS_VAULT/note.md"
+OBS_KIT_PATH="$OBS_HOME/recovery-kit.txt"
+OBS_BACKUP_HOME="${OBS_CB_HOME}-backup"
+OBS_BADPATH="$TMP/obsidian-this-vault-does-not-exist"
+
+cat > "$TMP/qa-obsidian.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "y"],
+  ["Path for the backup keypair", ""],
+  ["Generate a signing keypair now?", "y"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", "\u001b[B\u001b[B"],
+  ["Path to your Obsidian vault", ""],
+  ["A path is required", "$OBS_BADPATH"],
+  ["does not exist", "$OBS_VAULT"],
+  ["Choose a backend", ""],
+  ["Path to write the recovery kit", "$OBS_KIT_PATH"]
+]
+JSON
+CYPHER_BRAIN_HOME="$OBS_CB_HOME" CYPHER_BRAIN_FILE_DIR="$OBS_STORE" HOME="$OBS_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 NO_COLOR=1 \
+  with_timeout 90 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-obsidian.json" --out "$TMP/wizard-obsidian.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] the empty-then-nonexistent-then-valid obsidian vault answer made init fail (it should re-prompt, then complete normally)"; cat "$TMP/wizard-obsidian.log"; exit 1; }
+grep -q 'cypher-brain init: complete' "$TMP/wizard-obsidian.log" || { echo "[FAIL] obsidian bad-vault wizard log lacks its own completion marker"; cat "$TMP/wizard-obsidian.log"; exit 1; }
+grep -qi "no vault at" "$TMP/wizard-obsidian.log" && { echo "[FAIL] the bad vault answer still threw the old rollback-triggering snapshot() error"; cat "$TMP/wizard-obsidian.log"; exit 1; }
+grep -qi "A path is required" "$TMP/wizard-obsidian.log" || { echo "[FAIL] the empty vault answer did not re-prompt"; cat "$TMP/wizard-obsidian.log"; exit 1; }
+grep -qF "$OBS_BADPATH does not exist" "$TMP/wizard-obsidian.log" || { echo "[FAIL] the nonexistent vault answer did not print a does-not-exist message naming it"; cat "$TMP/wizard-obsidian.log"; exit 1; }
+[ -f "$OBS_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity is missing — a bad obsidian vault answer should never roll anything back"; exit 1; }
+[ -f "$OBS_BACKUP_HOME/identity.age" ] || { echo "[FAIL] backup identity is missing — the #605 repro's own rollback target must survive a bad obsidian vault answer"; exit 1; }
+[ -f "$OBS_CB_HOME/sign-identity.key" ] || { echo "[FAIL] signing identity is missing — the #605 repro's own rollback target must survive a bad obsidian vault answer"; exit 1; }
+OBS_SNAP="$(find "$OBS_CB_HOME" -maxdepth 1 -name 'brain-*.age' | head -n1)"
+[ -n "$OBS_SNAP" ] || { echo "[FAIL] no brain-*.age snapshot found under the obsidian wizard's CYPHER_BRAIN_HOME"; exit 1; }
+CYPHER_BRAIN_HOME="$OBS_CB_HOME" cb restore --in "$OBS_SNAP" --out-dir "$TMP/obsidian-wiz-restore" >/dev/null 2>&1 \
+  || { echo "[FAIL] restore of the wizard's obsidian snapshot failed"; exit 1; }
+grep -q '"profile": "obsidian"' "$TMP/obsidian-wiz-restore/manifest.json" \
+  || { echo "[FAIL] wizard's obsidian snapshot manifest lacks profile obsidian"; cat "$TMP/obsidian-wiz-restore/manifest.json"; exit 1; }
+echo "[PASS] obsidian's --vault prompt re-prompts past an empty AND a nonexistent answer, then completes with the real vault snapshotted — primary, backup AND signing identities all survive (issue #605 fixed; chatgpt-export/o2b share the same askExistingPath() helper)"
+
 echo "== (e4) a former profile TYPO no longer errors or rolls back anything — select() closed the path (#462) =="
 # Before the fix, this exact keystroke sequence — "obsidan" (a typo of "obsidian")
 # submitted at the free-text Profile prompt, with the SAME backup=yes/signing=yes
@@ -488,6 +607,17 @@ grep -qF -- '--- CYPHER_BRAIN_PIN_RECIPIENTS (add to $CYPHER_BRAIN_HOME/config.e
 if grep -qF 'add to your shell rc, e.g. ~/.zshrc' "$F_KIT_PATH"; then echo "[FAIL] the printed recovery kit still carries the pre-#286 shell-rc instruction"; exit 1; fi
 grep -qF "CYPHER_BRAIN_PIN_RECIPIENTS=\"$F_PIN_PUB\"" "$F_KIT_PATH" || { echo "[FAIL] the kit does not inline the exact pin line the wizard suggested"; exit 1; }
 echo "[PASS] pin=yes suggests a config.env KEY=value line (no export prefix), names the file to add it to, and the kit heading carries that same instruction onto the printed sheet"
+
+# issue #622: the shell-rc alternative (still offered right below the config.env
+# instruction, for the interactive-shells-only use case the prose above already
+# explains) used to carry no caveat that it EXECUTES the suggested line as shell code,
+# unlike config.env (which is parsed as KEY=value, never executed, per #299 above). A
+# user who edits the suggested line to include shell metacharacters and follows the
+# shell-rc alternative would source it as literal shell code on every new shell with no
+# warning the two destinations differ. Test (f)'s run is the only one here that accepts
+# the pin suggestion, so its transcript is what carries this instruction.
+grep -qF 'SOURCES this line as literal shell code on every new shell' "$TMP/wizard-pass.log" || { echo "[FAIL] the shell-rc alternative does not caveat that it executes the line as shell code (issue #622)"; cat "$TMP/wizard-pass.log"; exit 1; }
+echo "[PASS] the shell-rc alternative now caveats that it sources the suggested line as literal shell code, unlike config.env (issue #622 fixed)"
 
 echo "== (h) rollback + clean retry: a failure AFTER identity creation must not brick a retry (P2 fix) =="
 # The primary identity is created in step 1/6, well before later prompts that can
@@ -898,6 +1028,42 @@ cmp -s "$M_BACKUP_HOME/identity.age" "$TMP/backup-preexist-identity.age.orig" ||
 cmp -s "$M_BACKUP_HOME/recipient.txt" "$TMP/backup-preexist-recipient.txt.orig" || { echo "[FAIL] the pre-existing backup recipient.txt survived but its CONTENT changed — not byte-identical"; exit 1; }
 [ ! -f "$M_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity survived (the pre-existing generic rollback should still have cleared it)"; exit 1; }
 echo "[PASS] pointing the backup-path prompt at a pre-existing real backup identity refuses (keygenAt's own guard, unchanged) and leaves it completely untouched, byte-identical — the round-8 regression is fixed"
+
+echo "== (l4) pointing the backup-path prompt at the PRIMARY CYPHER_BRAIN_HOME itself refuses with an explicit self-collision message (issue #621) =="
+# Before this fix, answering the backup-path prompt with the exact same path as
+# CYPHER_BRAIN_HOME (a plausible copy-paste mistake, e.g. re-typing $CYPHER_BRAIN_HOME
+# out of habit) sailed straight into keygenAt(), which correctly refuses to overwrite
+# identityPath/recipientPath (#121's own no-clobber guard, same one test (l3) above
+# exercises against a DIFFERENT pre-existing backup) — but here those targets ARE the
+# primary identity/recipient this same run just wrote in step 1, so the error read as
+# "error: identity already exists at .../identity.age (refusing to overwrite — losing
+# it = losing the brain)", as if some unrelated stale file were blocking the backup
+# keypair, with no hint that it was actually about to roll back the primary identity
+# this run just created (confirmed live via drive-init.mjs against the PRE-fix code
+# before this was closed). The fix detects resolve(backupHome) === resolve(HOME)
+# BEFORE calling keygenAt and refuses immediately with a message naming the actual
+# collision. The primary identity STILL gets rolled back by the outer catch (that part
+# is correct, standard behavior, unchanged by this fix — see MEM_CB_HOME's own check
+# below) — only the confusing error message is what this closes.
+MEM_HOME="$TMP/backup-self-collision-home"; mkdir -p "$MEM_HOME"
+MEM_CB_HOME="$TMP/backup-self-collision-cb-home"
+MEM_STORE="$TMP/backup-self-collision-store"
+
+cat > "$TMP/qa-backup-self-collision.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "y"],
+  ["Path for the backup keypair", "$MEM_CB_HOME"]
+]
+JSON
+if CYPHER_BRAIN_HOME="$MEM_CB_HOME" CYPHER_BRAIN_FILE_DIR="$MEM_STORE" HOME="$MEM_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 30 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-backup-self-collision.json" --out "$TMP/backup-self-collision.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] init did not refuse when the backup-path prompt points at the primary CYPHER_BRAIN_HOME itself"; cat "$TMP/backup-self-collision.log"; exit 1
+fi
+grep -qF "the backup keypair path cannot be the same as your primary CYPHER_BRAIN_HOME" "$TMP/backup-self-collision.log" || { echo "[FAIL] failure does not carry the new, explicit self-collision message"; cat "$TMP/backup-self-collision.log"; exit 1; }
+if grep -qi "refusing to overwrite" "$TMP/backup-self-collision.log"; then echo "[FAIL] the old confusing keygenAt no-clobber message still leaked through instead of the new explicit refusal"; cat "$TMP/backup-self-collision.log"; exit 1; fi
+[ ! -f "$MEM_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity survived (the standard rollback should still clear it — only the message changed, not this behavior)"; exit 1; }
+echo "[PASS] a backup-path answer that collides with the primary CYPHER_BRAIN_HOME refuses immediately with an explicit message naming the collision, before ever reaching keygenAt's own no-clobber guard (issue #621 fixed)"
 
 echo "== THE DRILL (issue #68 acceptance criterion 2): kit-ONLY restore on a simulated fresh, fully isolated machine =="
 # Isolation: a BRAND NEW temp dir with NO shared CYPHER_BRAIN_HOME, no leftover

@@ -56,7 +56,7 @@
 import { text, confirm, select, isCancel } from '@clack/prompts';
 import { readFile, writeFile, rm, stat, access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import {
   HOME,
@@ -163,6 +163,36 @@ function expandHome(path: string): string {
   if (path === '~') return homedir();
   if (path.startsWith('~/')) return join(homedir(), path.slice(2));
   return path;
+}
+
+// #605: the obsidian/chatgpt-export/o2b free-text path prompts (--vault/--zip/--export)
+// used to be a plain one-shot askLine() with no re-prompt loop and no existence check —
+// same bug class #462 (profile selector) and #492 ("none" profile's directory prompt)
+// already fixed elsewhere in this wizard, just never extended to these three. An empty
+// answer, or a non-empty but nonexistent/typo'd path, sailed all the way through to the
+// final "Choose a backend" step and only failed deep inside snapshot() ("profile obsidian
+// requires --vault <path>", etc.) — by which point the catch block a few hundred lines
+// down had already rolled back the primary identity, the offline backup keypair, AND the
+// signing keypair from steps 1-3, forcing a full redo over what is often a single typo.
+// Loop until the answer is both non-empty and actually exists on disk, the same
+// loop-until-valid shape #492 already established for the "none" profile's directory
+// prompt just below. This deliberately does NOT replicate snapshot.ts's own deeper,
+// profile-specific checks (obsidian's ".obsidian/ inside" heuristic, chatgpt-export's
+// ".zip" extension check, ...) — those stay snapshot()'s job; this only closes the
+// "nothing here at all" gap that used to reach all the way to the rollback catch.
+async function askExistingPath(question: string): Promise<string> {
+  for (;;) {
+    const answer = expandHome(await askLine(question));
+    if (!answer) {
+      console.log('A path is required — please try again.');
+      continue;
+    }
+    if (!(await exists(answer))) {
+      console.log(`${answer} does not exist — please try again.`);
+      continue;
+    }
+    return answer;
+  }
 }
 
 // An unrecognized answer (a typo, "yeah"/"sure", anything other than a y/n form) must
@@ -333,6 +363,25 @@ export async function init(_o: CliOptions): Promise<void> {
             defaultBackupHome,
           ),
         );
+        // #621: a backup path that resolves to the SAME directory as the primary
+        // CYPHER_BRAIN_HOME (a plausible copy-paste mistake, e.g. re-typing
+        // $CYPHER_BRAIN_HOME out of habit) would otherwise sail into keygenAt() below,
+        // which correctly refuses to overwrite identityPath/recipientPath (#121's
+        // no-clobber guard) — but here those targets ARE the primary identity/recipient
+        // this same run just wrote in step 1, so the error reads as if some unrelated
+        // stale file is blocking the backup keypair, with no hint that it is actually
+        // about to roll back the primary identity this run just created. Refuse
+        // immediately, before keygenAt() ever runs, with a message that names the actual
+        // collision. The primary identity still gets rolled back by the outer catch below
+        // (this throw is inside the same try) — that part of the behaviour is correct and
+        // unchanged; only the confusing error message is the bug this closes.
+        if (resolve(backupHome) === resolve(HOME)) {
+          throw new Error(
+            `the backup keypair path cannot be the same as your primary CYPHER_BRAIN_HOME (${HOME}) — pick a ` +
+              'different location for the offline backup keypair (that path already holds the primary identity ' +
+              'this run just created).',
+          );
+        }
         const identityPath = join(backupHome, 'identity.age');
         const recipientPath = join(backupHome, 'recipient.txt');
         // Same partial-write hazard as the primary keygen above (identity.age written,
@@ -496,9 +545,12 @@ export async function init(_o: CliOptions): Promise<void> {
           `\nAdd this line to ${CONFIG_FILE_PATH} (create the file if it does not exist yet, then chmod 600 it):\n` +
             `${pinRecipientsLine}\n` +
             'For a shell rc instead, prefix it with "export " and open a new shell — but see the note above about\n' +
-            'the unattended nightly run. Either way it applies from the NEXT cypher-brain run onward: this\n' +
-            'wizard read its configuration at startup, so the first snapshot it is about to take (step 7/7,\n' +
-            'encrypting to the key(s) it just generated) is not itself checked against this list.',
+            'the unattended nightly run. Unlike the config file (parsed as KEY=value, never executed), a shell rc\n' +
+            'SOURCES this line as literal shell code on every new shell — if you edit it to include shell\n' +
+            'metacharacters ($, `, ;, |, ", ...), avoid the shell-rc destination or strip them first. Either way it\n' +
+            'applies from the NEXT cypher-brain run onward: this wizard read its configuration at startup, so the\n' +
+            'first snapshot it is about to take (step 7/7, encrypting to the key(s) it just generated) is not\n' +
+            'itself checked against this list.',
         );
       } else {
         console.log('Skipping the recipient pin suggestion.');
@@ -544,13 +596,26 @@ export async function init(_o: CliOptions): Promise<void> {
         // loop askLine until at least one directory is given — the same fix the
         // maintainer already chose for the sibling bug, applied here since a menu isn't
         // available.
+        //
+        // #605: non-emptiness alone was not enough — a non-empty but NONEXISTENT
+        // (typo'd) directory path used to sail straight through this check (only
+        // `.filter(Boolean)`, no existence check) and fail the same way deep inside
+        // snapshot(), well past this loop's ability to catch it. Check each
+        // comma-separated candidate against disk and drop (with a message) whichever
+        // ones do not exist, then keep looping — same as an all-empty answer — until at
+        // least one EXISTING directory survives.
         let dirs: string[] = [];
         while (dirs.length === 0) {
           const dirsInput = await askLine('Directory path(s) to back up, comma-separated (at least one, required)');
-          dirs = dirsInput
+          const candidates = dirsInput
             .split(',')
             .map((d) => expandHome(d.trim()))
             .filter(Boolean);
+          dirs = [];
+          for (const candidate of candidates) {
+            if (await exists(candidate)) dirs.push(candidate);
+            else console.log(`  ${candidate} does not exist — skipping it.`);
+          }
           if (dirs.length === 0) console.log('At least one directory is required — please try again.');
         }
         snapshotOpts.dirs = dirs;
@@ -560,13 +625,20 @@ export async function init(_o: CliOptions): Promise<void> {
         // PROFILE_NAMES itself — so this is always one of the known profile names,
         // no re-validation needed (unlike the old free-text prompt).
         snapshotOpts.profile = profileChoice;
+        // #605: each of these used to be a plain one-shot askLine() — an empty answer or
+        // a non-empty but nonexistent (typo'd) path sailed through to the final "Choose a
+        // backend" step and only failed deep inside snapshot(), by which point the catch
+        // block below had already rolled back the primary identity, backup keypair, and
+        // signing keypair from steps 1-3. askExistingPath() (above) loops until the
+        // answer is both non-empty and actually exists, same as the "none" profile's
+        // directory prompt just above.
         if (profileChoice === 'obsidian')
-          snapshotOpts.vault = expandHome(await askLine('Path to your Obsidian vault (must contain .obsidian/)'));
+          snapshotOpts.vault = await askExistingPath('Path to your Obsidian vault (must contain .obsidian/)');
         if (profileChoice === 'chatgpt-export')
-          snapshotOpts.zip = expandHome(await askLine('Path to the official ChatGPT export .zip'));
+          snapshotOpts.zip = await askExistingPath('Path to the official ChatGPT export .zip');
         if (profileChoice === 'o2b')
-          snapshotOpts.export = expandHome(
-            await askLine('Path to the o2b bank-export bundle ("o2b brain bank-export --out <path>.json")'),
+          snapshotOpts.export = await askExistingPath(
+            'Path to the o2b bank-export bundle ("o2b brain bank-export --out <path>.json")',
           );
       }
 
