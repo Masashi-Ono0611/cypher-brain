@@ -402,7 +402,16 @@ export async function loadSignIdentity(path: string): Promise<LoadedSignIdentity
   const keyId = Buffer.from(keyIdHex, 'hex');
   const pemStart = text.indexOf('-----BEGIN PRIVATE KEY-----');
   if (pemStart === -1) throw new Error(`${path}: no PKCS#8 PEM private key block found`);
-  const privateKey = createPrivateKey(text.slice(pemStart));
+  let privateKey: KeyObject;
+  try {
+    privateKey = createPrivateKey(text.slice(pemStart));
+  } catch (e) {
+    // #615: every OTHER failure mode in this function is wrapped with the same
+    // "${path}: ..." prefix — a truncated/corrupt PEM body (marker present, bytes
+    // broken) must not fall through to a raw, file-path-less Node/OpenSSL error
+    // (e.g. an opaque DECODER-routines message) that breaks that pattern.
+    throw new Error(`${path}: malformed PKCS#8 PEM private key block: ${errMsg(e)}`);
+  }
   return { privateKey, keyId };
 }
 

@@ -12,7 +12,7 @@
 // out-dir) can never race a still-running process that would recreate the files.
 import { createReadStream, createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { spawn, type StdioNull, type StdioPipe } from 'node:child_process';
+import { spawn, type ChildProcess, type StdioNull, type StdioPipe } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import {
@@ -282,6 +282,106 @@ export interface PipelineOpts {
   timeoutMs?: number;
 }
 
+// #613: shared by encryptToFile/decryptToChild below (tar->age vs age->tar — the same
+// pipeline in opposite directions), each of which used to hand-roll its own copy of
+// this exact state machine: ACTIVE_CHILDREN registration, a settled/pipelineDone/
+// childClosed flag trio, a fail() that does SIGTERM-then-SIGKILL escalation and only
+// rejects after childExit(), a maybeDone() gate, and timeout wiring. `child` must
+// already be spawned with whatever stdio the direction needs; `runStreamPipeline` is
+// the direction-specific stream wiring (prod.stdout -> encrypt -> outFile, or inFile ->
+// decrypt -> cons.stdin); `onFailCleanup` destroys whatever OTHER stream (the output
+// file, or the input file) that pipeline touches, so a failure never leaves it half-
+// written or dangling; `resolveValue` computes what the returned promise resolves with
+// once BOTH the pipeline and the child have finished cleanly (encryptToFile has
+// nothing to return; decryptToChild optionally returns the child's captured stdout).
+// Rejecting ONLY after the child is dead is the one property that matters most: the
+// caller's catch/finally (rm of .part / stage) must never race a still-running process
+// that would recreate the files (same discipline the old pipe2() had; the signal guard
+// covers signals in the meantime).
+function runChildPipeline<T>(opts: {
+  child: ChildProcess;
+  cmdLabel: string; // the direction's own child command, for exit/timeout error text
+  timeoutMs?: number;
+  timeoutMessage: () => string;
+  pipelineErrorLabel: string; // "age encrypt" / "age decrypt", for the pipeline-rejection message
+  runStreamPipeline: () => Promise<void>;
+  onFailCleanup: () => void;
+  resolveValue: () => T;
+}): Promise<T> {
+  const {
+    child,
+    cmdLabel,
+    timeoutMs,
+    timeoutMessage,
+    pipelineErrorLabel,
+    runStreamPipeline,
+    onFailCleanup,
+    resolveValue,
+  } = opts;
+  return new Promise((resolve, reject) => {
+    ACTIVE_CHILDREN.add(child);
+    let stderrText = '',
+      settled = false,
+      pipelineDone = false,
+      childClosed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const childExit = () =>
+      new Promise<void>((r) => {
+        if (child.exitCode !== null || child.signalCode !== null) return r();
+        child.once('close', () => r());
+      });
+    const fail = (e: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        child.kill('SIGTERM');
+      } catch {}
+      // escalate: a SIGTERM-ignoring child must not linger holding the pipeline open
+      killTimer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {}
+      }, 2000);
+      killTimer.unref?.();
+      onFailCleanup();
+      // Reject ONLY after the child is dead — the caller's catch/finally (rm of
+      // .part / stage) must never race a still-running process that would recreate
+      // the files (same discipline the old pipe2() had; the signal guard covers
+      // signals in the meantime).
+      childExit().then(() => {
+        clearTimeout(killTimer);
+        ACTIVE_CHILDREN.delete(child);
+        reject(e);
+      });
+    };
+    const maybeDone = () => {
+      if (settled || !pipelineDone || !childClosed) return;
+      settled = true;
+      clearTimeout(timer);
+      ACTIVE_CHILDREN.delete(child);
+      resolve(resolveValue());
+    };
+    if (timeoutMs) timer = setTimeout(() => fail(new Error(timeoutMessage())), timeoutMs);
+    child.stderr?.on('data', (d) => (stderrText += d));
+    child.on('error', fail);
+    child.on('close', (code, signal) => {
+      childClosed = true;
+      if (code !== 0)
+        return fail(new Error(`${cmdLabel} exited ${signal ? `on ${signal}` : code}: ${stderrText.trim()}`));
+      maybeDone();
+    });
+    runStreamPipeline().then(
+      () => {
+        pipelineDone = true;
+        maybeDone();
+      },
+      (e: unknown) => fail(new Error(`${pipelineErrorLabel} failed: ${errMsg(e)}`)),
+    );
+  });
+}
+
 // tar(child) stdout → typage encrypt (WebStream) → outPath, all streaming (bounded
 // RSS regardless of snapshot size). Success requires BOTH the encrypted stream to be
 // fully written AND the producer to exit 0: a tar that dies mid-way merely EOFs its
@@ -295,73 +395,24 @@ export function encryptToFile(
   outPath: string,
   { timeoutMs }: PipelineOpts = {},
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const prod = spawn(prodCmd, prodArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
-    ACTIVE_CHILDREN.add(prod);
-    const out = createWriteStream(outPath);
-    let pErr = '',
-      settled = false,
-      pipelineDone = false,
-      prodClosed = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const childExit = () =>
-      new Promise<void>((r) => {
-        if (prod.exitCode !== null || prod.signalCode !== null) return r();
-        prod.once('close', () => r());
-      });
-    const fail = (e: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        prod.kill('SIGTERM');
-      } catch {}
-      // escalate: a SIGTERM-ignoring child must not linger holding the pipeline open
-      killTimer = setTimeout(() => {
-        try {
-          prod.kill('SIGKILL');
-        } catch {}
-      }, 2000);
-      killTimer.unref?.();
+  const prod = spawn(prodCmd, prodArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const out = createWriteStream(outPath);
+  return runChildPipeline({
+    child: prod,
+    cmdLabel: prodCmd,
+    timeoutMs,
+    timeoutMessage: () => `${prodCmd}|age pipeline timed out after ${timeoutMs}ms`,
+    pipelineErrorLabel: 'age encrypt',
+    onFailCleanup: () => {
       prod.stdout?.destroy(); // unblock the encrypt reader so its promise settles too
       out.destroy();
-      // Reject ONLY after the child is dead — the caller's catch/finally (rm of
-      // .part / stage) must never race a still-writing tar (same discipline the
-      // old pipe2() had; the signal guard covers signals in the meantime).
-      childExit().then(() => {
-        clearTimeout(killTimer);
-        ACTIVE_CHILDREN.delete(prod);
-        reject(e);
-      });
-    };
-    const maybeDone = () => {
-      if (settled || !pipelineDone || !prodClosed) return;
-      settled = true;
-      clearTimeout(timer);
-      ACTIVE_CHILDREN.delete(prod);
-      resolve();
-    };
-    if (timeoutMs)
-      timer = setTimeout(() => fail(new Error(`${prodCmd}|age pipeline timed out after ${timeoutMs}ms`)), timeoutMs);
-    prod.stderr?.on('data', (d) => (pErr += d));
-    prod.on('error', fail);
-    prod.on('close', (code, signal) => {
-      prodClosed = true;
-      if (code !== 0) return fail(new Error(`${prodCmd} exited ${signal ? `on ${signal}` : code}: ${pErr.trim()}`));
-      maybeDone();
-    });
-    (async () => {
+    },
+    runStreamPipeline: async () => {
       if (!prod.stdout) throw new Error(`${prodCmd}: no stdout stream`);
       const ct = await encrypter.encrypt(Readable.toWeb(prod.stdout) as ReadableStream<Uint8Array>);
       await pipeline(Readable.fromWeb(ct as never), out);
-    })().then(
-      () => {
-        pipelineDone = true;
-        maybeDone();
-      },
-      (e: unknown) => fail(new Error(`age encrypt failed: ${errMsg(e)}`)),
-    );
+    },
+    resolveValue: () => undefined,
   });
 }
 
@@ -383,76 +434,29 @@ export function decryptToChild(
   consArgs: string[],
   { consStdout = 'inherit', timeoutMs }: PipelineOpts & { consStdout?: StdioNull | StdioPipe } = {},
 ): Promise<string | undefined> {
-  return new Promise((resolve, reject) => {
-    const cons = spawn(consCmd, consArgs, { stdio: ['pipe', consStdout, 'pipe'] });
-    ACTIVE_CHILDREN.add(cons);
-    const src = createReadStream(inPath);
-    let cErr = '',
-      cOut = '',
-      settled = false,
-      pipelineDone = false,
-      consClosed = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const childExit = () =>
-      new Promise<void>((r) => {
-        if (cons.exitCode !== null || cons.signalCode !== null) return r();
-        cons.once('close', () => r());
-      });
-    const fail = (e: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        cons.kill('SIGTERM');
-      } catch {}
-      killTimer = setTimeout(() => {
-        try {
-          cons.kill('SIGKILL');
-        } catch {}
-      }, 2000);
-      killTimer.unref?.();
-      src.destroy();
-      childExit().then(() => {
-        clearTimeout(killTimer);
-        ACTIVE_CHILDREN.delete(cons);
-        reject(e);
-      });
-    };
-    const maybeDone = () => {
-      if (settled || !pipelineDone || !consClosed) return;
-      settled = true;
-      clearTimeout(timer);
-      ACTIVE_CHILDREN.delete(cons);
-      resolve(consStdout === 'pipe' ? cOut : undefined);
-    };
-    if (timeoutMs)
-      timer = setTimeout(() => fail(new Error(`age|${consCmd} pipeline timed out after ${timeoutMs}ms`)), timeoutMs);
-    // Only accumulated when the caller actually asked for it ('pipe') — every other
-    // mode ('inherit'/'ignore') never attaches a 'data' listener, so cons.stdout (which
-    // is null under those modes anyway) costs this function nothing when unused.
-    if (consStdout === 'pipe') cons.stdout?.on('data', (d) => (cOut += d));
-    cons.stderr?.on('data', (d) => (cErr += d));
-    cons.on('error', fail);
-    // EPIPE when the consumer dies early — swallow on the pipe end so the real
-    // failure surfaces via the close handler instead of an uncaught crash.
-    cons.stdin?.on('error', () => {});
-    cons.on('close', (code, signal) => {
-      consClosed = true;
-      if (code !== 0) return fail(new Error(`${consCmd} exited ${signal ? `on ${signal}` : code}: ${cErr.trim()}`));
-      maybeDone();
-    });
-    (async () => {
+  const cons = spawn(consCmd, consArgs, { stdio: ['pipe', consStdout, 'pipe'] });
+  const src = createReadStream(inPath);
+  let cOut = '';
+  // Only accumulated when the caller actually asked for it ('pipe') — every other
+  // mode ('inherit'/'ignore') never attaches a 'data' listener, so cons.stdout (which
+  // is null under those modes anyway) costs this function nothing when unused.
+  if (consStdout === 'pipe') cons.stdout?.on('data', (d) => (cOut += d));
+  // EPIPE when the consumer dies early — swallow on the pipe end so the real failure
+  // surfaces via the close handler instead of an uncaught crash.
+  cons.stdin?.on('error', () => {});
+  return runChildPipeline({
+    child: cons,
+    cmdLabel: consCmd,
+    timeoutMs,
+    timeoutMessage: () => `age|${consCmd} pipeline timed out after ${timeoutMs}ms`,
+    pipelineErrorLabel: 'age decrypt',
+    onFailCleanup: () => src.destroy(),
+    runStreamPipeline: async () => {
       const pt = await decrypter.decrypt(Readable.toWeb(src) as ReadableStream<Uint8Array>);
       if (!cons.stdin) throw new Error(`${consCmd}: no stdin stream`);
       await pipeline(Readable.fromWeb(pt as never), cons.stdin);
-    })().then(
-      () => {
-        pipelineDone = true;
-        maybeDone();
-      },
-      (e: unknown) => fail(new Error(`age decrypt failed: ${errMsg(e)}`)),
-    );
+    },
+    resolveValue: () => (consStdout === 'pipe' ? cOut : undefined),
   });
 }
 

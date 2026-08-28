@@ -16,10 +16,10 @@
 // a save-locator), so there is no positional-TSV backward-compatibility surface to
 // preserve, and JSON-per-line is simpler to extend than a growing positional format would
 // be.
-import { readFile, writeFile, rename, rm, mkdir, stat } from 'node:fs/promises';
+import { writeFile, rename, rm, mkdir, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { errMsg } from './util.js';
+import { errMsg, readJsonlLog } from './util.js';
 
 // One stored line. `fingerprint` is an opaque, caller-computed digest of whatever fields
 // define "the same call" for that tool (snapshot_now's is dirs/pg/recipients/out/backend/
@@ -66,46 +66,44 @@ interface ReadResult {
   corrupted: boolean;
 }
 
-// Every line is read + parsed on both lookup and record — this file is not expected to
-// hold more than a handful of live entries at once (recordIdempotencyResult below drops
-// every expired one on each write), so there is no need for an index or a streaming
-// parser.
+// #612: built on util.ts's shared readJsonlLog() (the same "read -> ENOENT-is-empty ->
+// other-errors-throw -> split lines -> skip blanks -> JSON.parse each line -> validate
+// shape -> count skipped" skeleton receipt.ts/audit.ts already share, per util.ts's own
+// header comment) rather than a third independent hand-rolled copy of it. The one real
+// behavioral difference this module needs — failing closed when a corrupted line exists
+// and no match was found — is expressible via readJsonlLog's skippedLines count, so
+// `corrupted` below is just `skippedLines > 0`. Every line is still read + parsed on
+// both lookup and record — this file is not expected to hold more than a handful of
+// live entries at once (recordIdempotencyResult below drops every expired one on each
+// write), so there is no need for an index or a streaming parser.
 async function readAllRecords(path: string): Promise<ReadResult> {
-  let text: string;
+  let items: StoredLine[], skippedLines: number;
   try {
-    text = await readFile(path, 'utf8');
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { records: [], corrupted: false }; // no prior calls, never an error
-    // Anything else (EACCES, EISDIR, a transient I/O error, ...) must NOT be treated the
-    // same as "no prior calls" — see IdempotencyStoreError's own doc comment above.
-    throw new IdempotencyStoreError(`could not read idempotency log ${path}: ${errMsg(e)}`, { cause: e });
-  }
-  const records: StoredLine[] = [];
-  let corrupted = false;
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed);
+    ({ items, skippedLines } = await readJsonlLog<StoredLine>(path, 'idempotency log', (parsed) => {
+      const p = parsed as Partial<StoredLine> | null;
       if (
-        parsed &&
-        typeof parsed === 'object' &&
-        typeof parsed.key === 'string' &&
-        typeof parsed.tool === 'string' &&
-        typeof parsed.recordedAt === 'string' &&
-        typeof parsed.fingerprint === 'string' &&
-        parsed.result &&
-        typeof parsed.result === 'object'
+        p &&
+        typeof p === 'object' &&
+        typeof p.key === 'string' &&
+        typeof p.tool === 'string' &&
+        typeof p.recordedAt === 'string' &&
+        typeof p.fingerprint === 'string' &&
+        p.result &&
+        typeof p.result === 'object'
       ) {
-        records.push(parsed as StoredLine);
-      } else {
-        corrupted = true; // parses as JSON but not the shape a StoredLine must have
+        return p as StoredLine;
       }
-    } catch {
-      corrupted = true; // malformed line (a truncated write, a hand edit)
-    }
+      return null; // parses as JSON but not the shape a StoredLine must have
+    }));
+  } catch (e) {
+    // readJsonlLog throws (its message already names the label + path) for anything
+    // other than ENOENT (EACCES, EISDIR, a transient I/O error, ...) — must NOT be
+    // treated the same as "no prior calls" — see IdempotencyStoreError's own doc
+    // comment above. Rethrown as this module's own error class so callers keep
+    // catching IdempotencyStoreError, not util.ts's generic Error.
+    throw new IdempotencyStoreError(errMsg(e), { cause: e });
   }
-  return { records, corrupted };
+  return { records: items, corrupted: skippedLines > 0 };
 }
 
 const isFresh = (recordedAt: string, ttlSeconds: number, now: number): boolean => {
@@ -184,7 +182,13 @@ export async function lookupIdempotencyResult(
 // it belongs in a follow-up that widens the lock's scope, not a silent assumption here.
 const LOCK_STALE_MS = 10_000; // longer than this and the holder is presumed crashed, not slow
 const LOCK_RETRY_DELAY_MS = 50;
-const LOCK_MAX_WAIT_MS = 5_000;
+// #617: must stay comfortably LARGER than LOCK_STALE_MS. A waiter that gives up before
+// the staleness threshold can ever be reached would never get a chance to detect and
+// steal a genuinely stale lock — it would just throw on a merely-slow-but-alive holder
+// instead (the exact case the staleness check exists to distinguish from a crash). The
+// margin below LOCK_STALE_MS is a few LOCK_RETRY_DELAY_MS poll cycles, so a waiter still
+// polling past the staleness threshold gets at least one more chance to observe it.
+const LOCK_MAX_WAIT_MS = LOCK_STALE_MS + LOCK_RETRY_DELAY_MS * 20;
 
 async function withLogLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const lockPath = `${path}.lock`;

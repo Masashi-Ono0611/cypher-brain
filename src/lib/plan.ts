@@ -203,6 +203,23 @@ export async function readPlanFile(path: string): Promise<PushPlan> {
         `this plan was not produced by "estimate --out" or has been edited, re-run "estimate --out" for a fresh one`,
     );
   }
+  // #616: recipients_fingerprint/payer_address/remote are OPTIONAL, but this file's own
+  // header comment says a plan "refuses outright rather than silently proceeding" on a
+  // malformed/foreign shape — the same "exactly null-or-string" discipline audit.ts's
+  // readAuditLog() already applies to its own nullable fields. A missing field (absent
+  // key = `undefined`) or an explicit `null` both mean "not configured" and fold to
+  // `null` below; anything else wrong-typed (a number, boolean, array, …) refuses
+  // rather than silently coercing to the SAME `null` a genuinely-unconfigured field
+  // would produce.
+  for (const [field, value] of [
+    ['recipients_fingerprint', p.recipients_fingerprint],
+    ['payer_address', p.payer_address],
+    ['remote', p.remote],
+  ] as const) {
+    if (value !== undefined && value !== null && typeof value !== 'string') {
+      throw new Error(`--plan ${path}: ${field} must be a string or null, got ${typeof value}`);
+    }
+  }
   return {
     cypher_brain_plan_version: PLAN_VERSION,
     backend: p.backend,
