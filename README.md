@@ -1207,14 +1207,24 @@ Tracing: OTEL_EXPORTER_OTLP_ENDPOINT (opt-in, #226 part 3 — a THIRD-PARTY stan
      automatically, matching the OTel spec: 'http://localhost:4318', not
      'http://localhost:4318/v1/traces'). When set, every DISPATCHED CLI command and MCP
      tool call becomes an OpenTelemetry span exported there via '@opentelemetry/api' +
-     'sdk-trace-node' + 'exporter-trace-otlp-http' — optionalDependencies (like
-     '@ardrive/turbo-sdk' above: a normal registry or from-source install already
-     carries them; only an install run with --omit=optional skips them). A missing or
-     broken package WARNS once on stderr and falls back to a no-op, since tracing must
-     never gate a real push/restore/verify the way a missing SDK gates an actual paid
-     upload elsewhere. Unset (the default): a pure passthrough — no OTel package is even
-     imported, so a machine that has never heard of OTel pays nothing for this feature
-     existing.
+     'sdk-trace-node' + 'sdk-trace-base' + 'exporter-trace-otlp-http' + 'resources' —
+     optionalDependencies (like '@ardrive/turbo-sdk' above: a normal registry or
+     from-source install already carries them; only an install run with --omit=optional
+     skips them). Each span's resource 'service.name' defaults to 'cypher-brain' (#476);
+     set OTEL_SERVICE_NAME (or OTEL_RESOURCE_ATTRIBUTES) to override it — both are read
+     via the SDK's own standard env-based resource detection, the same as any other OTel
+     tool honors them. The export itself is bounded to a short fixed timeout (currently
+     3s) rather than the SDK's own much longer defaults, so an unreachable/slow collector
+     never meaningfully delays a command (#474); if a span still fails to export within
+     that bound, a single stderr WARNING says so (once per process) instead of leaving
+     the added latency unexplained. A missing or broken package also WARNS once on
+     stderr and falls back to a no-op — tracing must never gate a real push/restore/
+     verify the way a missing SDK gates an actual paid upload elsewhere. Unset (the
+     default): a pure passthrough — no OTel package is even imported, so a machine that
+     has never heard of OTel pays nothing for this feature existing. Quick local check
+     (#475, no real collector needed): run 'nc -l 4318' in one terminal, then
+     'OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 cypher-brain doctor' in another —
+     watch the first terminal for the raw 'POST /v1/traces' request landing.
 Spend: arweave/turbo PUSH needs --yes or CYPHER_BRAIN_YES=1 (paid, permanent); CYPHER_BRAIN_MAX_SPEND caps the arweave/turbo cost estimate (winston/winc). ton-provider PUSH needs --yes or CYPHER_BRAIN_YES=1 too, plus CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) — signed either by a human in Tonkeeper (no CYPHER_BRAIN_TON_WALLET configured) or auto-signed by a local wallet (CYPHER_BRAIN_TON_WALLET set — issue #396 PR2, the same "runs unattended" shape as arweave/turbo's JWK signer, which is what lets it run under 'schedule install'/MCP too). A turbo push also runs a funds check BEFORE signing: when the estimated cost exceeds even the reachable credit (the signer's own balance + the live approvals CYPHER_BRAIN_AR_PAID_BY selects), the spend is headed for a payment-service refusal that would otherwise arrive only after minutes of signing. On a TTY (a human watching) it aborts with the funding steps spelled out, after confirming the shortfall on a second balance read so a top-up landing that same moment is not blocked; without a TTY (a nightly runner, an MCP host) it only WARNS and proceeds — a balance read has no freshness guarantee, and it must never be what blocks an unattended backup. Skipped entirely when the balance cannot be read at all; CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 (strictly '1') bypasses it for one run. A ton-provider push runs the SAME kind of pre-deploy funds check (querying the owner address's own on-chain balance via tonapi), but only ever WARNS, never aborts — whichever mechanism actually spends (the human's Tonkeeper app, or the auto-sign broadcast itself) already gives its own unambiguous refusal on a real shortfall, so this check exists only to save the trip through the up-to-20-minute wait-for-active-contract poll first. Shares CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 with turbo's check above (not a separate ton-provider-specific flag). PUSH also WARNS (never aborts, same reasoning) before signing if the deploy's computed "bounty" looks below the ~0.05 TON floor providers built on tonutils-storage-provider enforce (issue #403) — a real deploy can otherwise succeed and be paid for, then have the provider's own notify refuse to ever fetch the bag, discovered only after the full notify retry window; ESTIMATE shows the same warning ahead of time.
 Consent: restore --pg (pg_restore --clean --if-exists, irreversible) needs --yes or CYPHER_BRAIN_YES=1.
 Permanence: there is NO delete, at any granularity (#301). cypher-brain has no forget/prune/delete

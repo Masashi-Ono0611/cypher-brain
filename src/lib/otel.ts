@@ -48,6 +48,17 @@
 // having "moved on" after FLUSH_TIMEOUT_MS. Passing FLUSH_TIMEOUT_MS as BOTH options
 // below makes the SDK's own timers the ones that fire early, which is what actually
 // releases the process — confirmed with the same two-process probe.
+//
+// That bound was already enough to keep an unreachable/slow collector from ever
+// GATING a command (#474) — the timeoutMillis above already caps the retryable-network-
+// error backoff (ECONNREFUSED/ETIMEDOUT/etc. are retried with jittered backoff by the
+// exporter's own transport) to ~FLUSH_TIMEOUT_MS. What it did NOT do was tell anyone
+// that happened: a misconfigured collector made every command ~20x slower with byte-
+// identical stdout/stderr to a healthy run — a real dogfooding session had no way to
+// tell "tracing silently failed" from "this machine is just slow today". boundedFlush()
+// below now reports whether the flush actually completed and warns ONCE (the same
+// `warn()`/once-per-process shape the packages-not-available case already uses) when it
+// did not — still never gating: the command's own result is untouched either way.
 import { warn } from './warn.js';
 import { sdkImportAdvice, errMsg } from './util.js';
 
@@ -64,17 +75,37 @@ const FLUSH_TIMEOUT_MS = 3000;
 
 // Races `provider.forceFlush()` against a timer so a slow/unreachable collector delays
 // this run by at most FLUSH_TIMEOUT_MS — never by the exporter's own longer internal
-// timeout. Never throws either way (a flush failure is exactly as inconsequential to
-// the caller as tracing being off entirely).
+// timeout. Never THROWS either way (a flush failure is exactly as inconsequential to
+// the caller as tracing being off entirely) — but it DOES warn once (#474) when the
+// flush did not actually complete, so an operator sees a diagnostic instead of just a
+// mysteriously slower command. `flushed` distinguishes "forceFlush() resolved" from
+// "the outer race's own timer won" (belt-and-suspenders over the SDK's own bound, see
+// the header comment above) — either way, not settling successfully means this run's
+// span(s) may not have reached the collector.
 async function boundedFlush(provider: OtelProvider): Promise<void> {
+  let flushed = false;
   await Promise.race([
-    provider.forceFlush().catch(() => {}),
+    provider
+      .forceFlush()
+      .then(() => {
+        flushed = true;
+      })
+      .catch(() => {}),
     new Promise<void>((resolve) => setTimeout(resolve, FLUSH_TIMEOUT_MS).unref()),
   ]);
+  if (!flushed && !flushWarnedOnce) {
+    flushWarnedOnce = true;
+    warn(
+      `OTEL_EXPORTER_OTLP_ENDPOINT is set but exporting a span did not complete within ` +
+        `${FLUSH_TIMEOUT_MS}ms (the collector may be unreachable, slow, or refusing the request) — ` +
+        `tracing may be incomplete for this run, everything else proceeds normally`,
+    );
+  }
 }
 
 let providerPromise: Promise<TracerHandle | null> | null = null;
 let warnedOnce = false;
+let flushWarnedOnce = false;
 
 async function getTracer(): Promise<TracerHandle | null> {
   // Gate ONLY — never passed to the exporter as its `url` (see the header comment on
@@ -82,11 +113,44 @@ async function getTracer(): Promise<TracerHandle | null> {
   if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT) return null;
   if (providerPromise) return providerPromise;
   providerPromise = (async (): Promise<TracerHandle | null> => {
+    // Tracks which of the imports below is currently in flight, so the catch block can
+    // attribute a resolution failure to the package that ACTUALLY failed (#473), not a
+    // hardcoded one. sdkImportAdvice()'s absent/broken classification hinges on
+    // comparing the failing specifier against the `pkg` name it is given — a hardcoded
+    // name only matched by coincidence (when that exact package happened to be the one
+    // missing), and otherwise always fell into the "broken install" branch even for the
+    // simplest "opted in, never ran npm install" case. Kept as a plain reassigned
+    // variable rather than making the specifiers themselves dynamic (`import(pkg)`):
+    // every other lazy import in this codebase (arweave.ts/wallet.ts/ton-dns.ts/etc.)
+    // uses a literal string specifier, which is what scripts/build.ts's externals
+    // derivation (reads package.json, matches import specifiers) is written against —
+    // a dynamic specifier here would be an unproven deviation from that pattern for a
+    // purely cosmetic gain.
+    let pkg = '@opentelemetry/api';
     try {
       const api = await import('@opentelemetry/api');
+      pkg = '@opentelemetry/sdk-trace-node';
       const { NodeTracerProvider } = await import('@opentelemetry/sdk-trace-node');
+      pkg = '@opentelemetry/sdk-trace-base';
       const { BatchSpanProcessor } = await import('@opentelemetry/sdk-trace-base');
+      pkg = '@opentelemetry/exporter-trace-otlp-http';
       const { OTLPTraceExporter } = await import('@opentelemetry/exporter-trace-otlp-http');
+      pkg = '@opentelemetry/resources';
+      const { resourceFromAttributes, detectResources, envDetector } = await import('@opentelemetry/resources');
+      // #476: without an explicit `resource`, NodeTracerProvider falls back to
+      // defaultResource() (`@opentelemetry/resources`), whose service.name is derived
+      // from the running binary (measured: 'unknown_service:bun' under this project's
+      // own `bun run` dev path) — useless for telling this tool's spans apart from any
+      // other project's in a shared collector, and NOT what OTEL_SERVICE_NAME being set
+      // would lead an operator to expect (the env var was silently not honored at all).
+      // `envDetector` is the SDK's own OTEL_SERVICE_NAME/OTEL_RESOURCE_ATTRIBUTES reader
+      // (genuine detection, not a hand-rolled process.env read) — merged so ITS
+      // attributes win over the 'cypher-brain' default (Resource#merge: the argument's
+      // attributes take precedence, see ResourceImpl.merge), i.e. OTEL_SERVICE_NAME
+      // overrides the default when set, and the default otherwise applies.
+      const resource = resourceFromAttributes({ 'service.name': 'cypher-brain' }).merge(
+        detectResources({ detectors: [envDetector] }),
+      );
       // No `url` option here — deliberately. Per the OTel spec, OTEL_EXPORTER_OTLP_ENDPOINT
       // is a BASE endpoint, and the SDK itself is responsible for appending the per-signal
       // path ('v1/traces' for this exporter) when resolving it. Passing `url` explicitly
@@ -98,6 +162,7 @@ async function getTracer(): Promise<TracerHandle | null> {
       // explicitly. Passing nothing lets the exporter's own env resolution do this
       // correctly, using the exact same OTEL_EXPORTER_OTLP_ENDPOINT this gate already read.
       const provider = new NodeTracerProvider({
+        resource,
         spanProcessors: [
           new BatchSpanProcessor(new OTLPTraceExporter({ timeoutMillis: FLUSH_TIMEOUT_MS }), {
             exportTimeoutMillis: FLUSH_TIMEOUT_MS,
@@ -124,7 +189,9 @@ async function getTracer(): Promise<TracerHandle | null> {
       // returns null, and `problem` stays undefined. Framing that case as "packages
       // are not available" would be actively misleading (Codex review, #226 part 3) —
       // the packages loaded fine; something else about this run's config didn't.
-      const problem = sdkImportAdvice(e, '@opentelemetry/sdk-trace-node');
+      // `pkg` (not a hardcoded package name, #473) names whichever import above was
+      // actually in flight when `e` was thrown.
+      const problem = sdkImportAdvice(e, pkg);
       if (!warnedOnce) {
         warnedOnce = true;
         warn(

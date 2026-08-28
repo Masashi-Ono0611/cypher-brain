@@ -25,6 +25,27 @@
 // accepts the connection but never responds, run with a generous outer
 // deadline — if otel.ts's own bound regresses back to an external-only race,
 // this reintroduces the ~10s hang and the check's deadline catches it.
+//
+// Later checks are regression tests for three follow-up dogfooding issues found
+// after this feature first shipped (#420):
+//   - check 2 / check 2b (#476): the exported span's resource.service.name must
+//     default to 'cypher-brain', and OTEL_SERVICE_NAME must override it — both
+//     verified against the ACTUAL received OTLP/JSON payload, not just that a
+//     request arrived (checks the exporter defaults to JSON serialization,
+//     asserted directly rather than assumed).
+//   - check 3 / check 3b (#474): an unreachable collector must not just avoid
+//     GATING the command (already covered by check 3's original deadline) but
+//     must also leave a stderr diagnostic — before the fix, the exact same
+//     scenario completed with byte-identical output to a healthy run, silently
+//     eating ~20x the latency with no way to tell why. check 3b additionally
+//     covers the connection-REFUSED case from the issue's own repro (nothing
+//     listening at all), distinct from check 3's accepts-but-never-responds
+//     case — the exporter's retry/backoff path only engages for the former.
+//   - check 4 (#473): the advisory printed when the OTel packages are absent
+//     must name the package that ACTUALLY failed to resolve (`@opentelemetry/api`,
+//     the first import attempted) — before the fix, the advisory always claimed
+//     `@opentelemetry/sdk-trace-node` was installed (a hardcoded package name),
+//     which was false and pointed at the wrong remediation doc section.
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -119,29 +140,116 @@ function runDoctor(env, timeoutMs) {
 // version of THIS test masked that bug by including /v1/traces in the env var
 // itself). The receiver asserting exactly `/v1/traces` below is what actually proves
 // the auto-append happened, not just that some request arrived.
-{
+// Starts a receiver that decodes each POST /v1/traces body as OTLP/JSON (the
+// exporter's default serialization — asserted, not assumed: check 2 below fails
+// loudly if a request arrives with a body that is not valid JSON) and hands each
+// parsed payload to `onPayload`. Returns { server, port, requests, getPayloads }.
+function startTraceReceiver(onPayload) {
+  const payloads = [];
   let requests = 0;
+  let parseError = null;
   const server = createServer((req, res) => {
-    if (req.url === '/v1/traces') requests++;
-    req.on('data', () => {});
+    if (req.url !== '/v1/traces') {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(404);
+        res.end();
+      });
+      return;
+    }
+    requests++;
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
+      try {
+        const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        payloads.push(payload);
+        onPayload?.(payload);
+      } catch (e) {
+        parseError = e instanceof Error ? e.message : String(e);
+      }
       res.writeHead(200);
       res.end();
     });
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = server.address().port;
+  return {
+    server,
+    getRequests: () => requests,
+    getPayloads: () => payloads,
+    getParseError: () => parseError,
+  };
+}
+
+// Digs the resource attribute value keyed `key` out of an OTLP/JSON export
+// payload's FIRST resourceSpans entry (this project only ever exports one
+// resource per process — see otel.ts's single memoized provider).
+function resourceAttr(payload, key) {
+  const attrs = payload?.resourceSpans?.[0]?.resource?.attributes ?? [];
+  return attrs.find((a) => a.key === key)?.value?.stringValue;
+}
+
+// check 2: endpoint set + reachable — the span must actually be exported, not merely
+// constructed. A real local OTLP/HTTP receiver counts the requests it gets AND decodes
+// the payload, so this also covers #476: the exported resource's service.name must
+// default to 'cypher-brain' (measured pre-fix: 'unknown_service:bun', since otel.ts
+// passed no `resource` at all and NodeTracerProvider's own fallback derives it from the
+// running binary).
+//
+// OTEL_EXPORTER_OTLP_ENDPOINT is set to the BASE endpoint (no /v1/traces suffix)
+// DELIBERATELY, not as a simplification — per the OTel spec this var is a base
+// endpoint, and the exporter itself appends the per-signal path ('v1/traces')
+// automatically. otel.ts's exporter construction passes no `url` option so that
+// SDK-native env resolution does this (Codex review, #226 part 3: the first draft
+// passed `url: endpoint` directly, which bypasses that resolution and would have
+// posted to the wrong path for any base-endpoint value like this one — the original
+// version of THIS test masked that bug by including /v1/traces in the env var
+// itself). The receiver asserting exactly `/v1/traces` below is what actually proves
+// the auto-append happened, not just that some request arrived.
+{
+  const receiver = startTraceReceiver();
+  await new Promise((resolve) => receiver.server.listen(0, '127.0.0.1', resolve));
+  const port = receiver.server.address().port;
   const r = await runDoctor({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` }, 15000);
-  server.close();
+  receiver.server.close();
+  const serviceName = resourceAttr(receiver.getPayloads()[0], 'service.name');
   if (r.code !== 0) fail(`check 2 (reachable endpoint): doctor exited ${r.code}: ${r.stderr.slice(0, 300)}`);
-  else if (requests !== 1)
+  else if (receiver.getRequests() !== 1)
     fail(
-      `check 2 (reachable endpoint): receiver got ${requests} request(s) to exactly /v1/traces (auto-appended from a base endpoint), expected exactly 1`,
+      `check 2 (reachable endpoint): receiver got ${receiver.getRequests()} request(s) to exactly /v1/traces (auto-appended from a base endpoint), expected exactly 1`,
+    );
+  else if (receiver.getParseError())
+    fail(`check 2 (reachable endpoint): request body was not valid OTLP/JSON: ${receiver.getParseError()}`);
+  else if (serviceName !== 'cypher-brain')
+    fail(
+      `check 2 (reachable endpoint, #476): resource.attributes['service.name'] was ${JSON.stringify(serviceName)}, expected 'cypher-brain'`,
     );
   else
     pass(
-      `check 2: a reachable base OTEL_EXPORTER_OTLP_ENDPOINT gets the /v1/traces path auto-appended and the span is received before the process exits`,
+      `check 2: a reachable base OTEL_EXPORTER_OTLP_ENDPOINT gets the /v1/traces path auto-appended, the span is received before the process exits, and its resource service.name defaults to 'cypher-brain'`,
     );
+}
+
+// check 2b (#476): OTEL_SERVICE_NAME, when set, overrides the 'cypher-brain' default —
+// the SDK's own standard env-based resource detection, honored the same way any other
+// OTel tool honors it (measured pre-fix: setting it made NO difference, resource
+// attributes were byte-identical to check 2's — otel.ts wired no resource detection at
+// all, so the env var was silently never read for this purpose).
+{
+  const receiver = startTraceReceiver();
+  await new Promise((resolve) => receiver.server.listen(0, '127.0.0.1', resolve));
+  const port = receiver.server.address().port;
+  const r = await runDoctor(
+    { OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}`, OTEL_SERVICE_NAME: 'cypher-brain-selftest' },
+    15000,
+  );
+  receiver.server.close();
+  const serviceName = resourceAttr(receiver.getPayloads()[0], 'service.name');
+  if (r.code !== 0) fail(`check 2b (OTEL_SERVICE_NAME override): doctor exited ${r.code}: ${r.stderr.slice(0, 300)}`);
+  else if (serviceName !== 'cypher-brain-selftest')
+    fail(
+      `check 2b (OTEL_SERVICE_NAME override, #476): resource.attributes['service.name'] was ${JSON.stringify(serviceName)}, expected the env var's value 'cypher-brain-selftest'`,
+    );
+  else pass(`check 2b: OTEL_SERVICE_NAME overrides the default resource service.name`);
 }
 
 // check 3: endpoint set + unreachable (accepts the connection, never responds) — must
@@ -158,6 +266,7 @@ function runDoctor(env, timeoutMs) {
   const port = server.address().port;
   const r = await runDoctor({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` }, 8000);
   server.close();
+  const DIAGNOSTIC = /exporting a span did not complete within/;
   if (r.code === null)
     fail(`check 3 (unreachable endpoint): doctor did not exit within 8000ms — tracing is gating the command`);
   else if (r.code !== 0) fail(`check 3 (unreachable endpoint): doctor exited ${r.code}: ${r.stderr.slice(0, 300)}`);
@@ -165,7 +274,51 @@ function runDoctor(env, timeoutMs) {
     fail(
       `check 3 (unreachable endpoint): took ${r.elapsedMs}ms — should be bounded near FLUSH_TIMEOUT_MS (3000ms), not the SDK's own longer defaults`,
     );
-  else pass(`check 3: an unreachable OTEL_EXPORTER_OTLP_ENDPOINT never gates the command (${r.elapsedMs}ms, bounded)`);
+  else if (!DIAGNOSTIC.test(r.stderr))
+    fail(
+      `check 3 (unreachable endpoint, #474): completed within bound but printed no stderr diagnostic — a real ` +
+        `dogfooding session would see this run mysteriously take ${r.elapsedMs}ms with no clue why: ${r.stderr.slice(0, 300)}`,
+    );
+  else
+    pass(
+      `check 3: an unreachable OTEL_EXPORTER_OTLP_ENDPOINT never gates the command (${r.elapsedMs}ms, bounded) and prints a stderr diagnostic`,
+    );
+}
+
+// check 3b (#474 exact repro): endpoint set but NOTHING is listening (connection
+// REFUSED immediately, distinct from check 3's accept-but-never-respond case) — the
+// issue's own repro (`OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4319`, port closed).
+// ECONNREFUSED is one of the exporter transport's own RETRYABLE network error codes
+// (measured against this checkout's installed otlp-exporter-base), so this exercises
+// the retry/backoff path check 3 does not: without otel.ts's timeoutMillis bound, the
+// retrying transport's own defaults (5 attempts, up to 5000ms backoff each) could run
+// well past a single command's normal lifetime. Grabbing then releasing a port is a
+// best-effort way to get a "nothing listening" port cheaply (a TOCTOU window exists in
+// principle, but 127.0.0.1-only + immediate reuse makes it fine for a Node.js port).
+{
+  const probe = createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+  const r = await runDoctor({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` }, 8000);
+  const DIAGNOSTIC = /exporting a span did not complete within/;
+  if (r.code === null)
+    fail(`check 3b (connection refused): doctor did not exit within 8000ms — tracing is gating the command`);
+  else if (r.code !== 0) fail(`check 3b (connection refused): doctor exited ${r.code}: ${r.stderr.slice(0, 300)}`);
+  else if (r.elapsedMs > 6000)
+    fail(
+      `check 3b (connection refused): took ${r.elapsedMs}ms — should be bounded near FLUSH_TIMEOUT_MS (3000ms) ` +
+        `even with the exporter's own ECONNREFUSED retry/backoff engaged`,
+    );
+  else if (!DIAGNOSTIC.test(r.stderr))
+    fail(
+      `check 3b (connection refused, #474): completed within bound but printed no stderr diagnostic: ${r.stderr.slice(0, 300)}`,
+    );
+  else
+    pass(
+      `check 3b: a refused connection (nothing listening, the issue's exact repro) never gates the command ` +
+        `(${r.elapsedMs}ms, bounded) and prints a stderr diagnostic`,
+    );
 }
 
 // check 4: endpoint set but the OpenTelemetry packages are absent — must warn once and
@@ -220,6 +373,17 @@ function runDoctor(env, timeoutMs) {
     // this machine's residual module resolution lands on is not the invariant under
     // test here: whichever it is, the command must still complete normally with a
     // clear advisory, never crash or hang.
+    //
+    // #473 regression check: this isolated dir has NO node_modules at all, so
+    // '@opentelemetry/api' — the FIRST of the four imports getTracer() attempts — is
+    // the one that actually fails to resolve. Before the fix, otel.ts always passed a
+    // hardcoded '@opentelemetry/sdk-trace-node' to sdkImportAdvice() regardless of
+    // which import threw, so this exact scenario produced the WRONG advisory (falsely
+    // claiming sdk-trace-node was installed, sending an operator down the "broken
+    // install" remediation instead of the simple "npm install @opentelemetry/api" the
+    // situation actually calls for). The assertions below fail on either symptom of
+    // that bug: the wrong package named, or the "installed but ... cannot be resolved"
+    // phrasing sdkImportAdvice() only uses for its 'broken' (not 'absent') classification.
     if (r.code !== 0) fail(`check 4 (packages absent): doctor exited ${r.code}: ${r.stderr.slice(0, 300)}`);
     else if (!/OTEL_EXPORTER_OTLP_ENDPOINT is set but the OpenTelemetry packages are not available/.test(r.stderr))
       fail(`check 4 (packages absent): missing the expected advisory on stderr: ${r.stderr.slice(0, 300)}`);
@@ -227,7 +391,22 @@ function runDoctor(env, timeoutMs) {
       fail(
         `check 4 (packages absent): advisory present but missing the "proceeds normally" reassurance: ${r.stderr.slice(0, 300)}`,
       );
-    else pass('check 4: packages unavailable warns once with advice and still completes the command');
+    else if (!/`@opentelemetry\/api` package is not installed — run: npm install @opentelemetry\/api/.test(r.stderr))
+      fail(
+        `check 4 (packages absent, #473 regression): advisory did not correctly name '@opentelemetry/api' as ` +
+          `the absent package (the one that actually failed to import first) — this is exactly the pre-#473 ` +
+          `misattribution bug if it recurs: ${r.stderr.slice(0, 400)}`,
+      );
+    else if (/sdk-trace-node/.test(r.stderr))
+      fail(
+        `check 4 (packages absent, #473 regression): advisory mentions 'sdk-trace-node' — this scenario's ` +
+          `failing import is '@opentelemetry/api', so any mention of sdk-trace-node here means the old ` +
+          `hardcoded-package-name bug is back: ${r.stderr.slice(0, 400)}`,
+      );
+    else
+      pass(
+        'check 4: packages unavailable warns once, correctly names @opentelemetry/api as the absent package, and still completes the command',
+      );
   } catch (e) {
     if (!(e instanceof Error && e.message === 'skip'))
       fail(`check 4 (packages absent): ${e instanceof Error ? e.message : String(e)}`);
