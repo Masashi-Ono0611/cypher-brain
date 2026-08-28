@@ -7,9 +7,12 @@ on:
 # #596: without this, pushing multiple commits to the same branch/PR in quick
 # succession queues every run's macOS jobs behind each other (macOS runner
 # capacity is scarcer than ubuntu's), ballooning wall-clock time well past actual
-# job execution time. Cancel superseded PR runs (only the latest push matters);
-# push-to-main runs are only serialized, not cancelled, so a run that already
-# reached main isn't torn down mid-flight.
+# job execution time. Cancel superseded PR runs outright (only the latest push
+# matters). For push-to-main, cancel-in-progress stays false so an already
+# in-progress run is never torn down mid-flight -- GitHub Actions concurrency
+# groups only ever run one job per group regardless of this setting, so a run
+# that's still queued (not yet started) when a newer push lands is cancelled
+# either way; this setting only decides the in-progress run's fate.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

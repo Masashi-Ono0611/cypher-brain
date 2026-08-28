@@ -26,6 +26,15 @@ concurrency:
 
 jobs:
   publish:
+    # A tag push is inherently restricted to the tag it targets. workflow_dispatch
+    # has no such restriction -- the UI/API lets the caller pick ANY ref -- and this
+    # job runs with contents:write + id-token:write for its entire duration (every
+    # step, including bun/npm install's lifecycle scripts, before the --dry-run
+    # guard is ever reached). Pinning manual runs to main keeps that elevated
+    # access on the same trust boundary a real release already relies on: whoever
+    # can get code into main can already cut a real tag against it (multi-model
+    # review finding, #599).
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
