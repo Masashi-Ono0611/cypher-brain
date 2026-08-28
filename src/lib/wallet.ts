@@ -290,8 +290,29 @@ async function addressFromWallet(o: CliOptions, what: string): Promise<string> {
     }
     throw new Error(`${what}: cannot read JWK wallet at ${walletPath}: ${errMsg(e)}`);
   }
+  // A syntactically-valid-JSON file that isn't shaped like a JWK (`{}`, a JSON blob that
+  // isn't a wallet at all — plausible after a bad edit or a wrong CYPHER_BRAIN_AR_WALLET
+  // pointer) parsed cleanly above, so it never hit the catch's error treatment. Without
+  // this check it would sail straight into jwkToAddress() and surface whatever raw,
+  // unprefixed error arweave-js happens to throw internally instead of this function's
+  // own "cannot read JWK wallet" treatment (#497). Checked field-by-field against
+  // arweave-js's own JWKPublicInterface (kty/e/n — the fields jwkToAddress actually
+  // reads) rather than trusting the parsed value's shape.
+  if (
+    jwk === null ||
+    typeof jwk !== 'object' ||
+    typeof (jwk as { kty?: unknown }).kty !== 'string' ||
+    typeof (jwk as { e?: unknown }).e !== 'string' ||
+    typeof (jwk as { n?: unknown }).n !== 'string'
+  ) {
+    throw new Error(`${what}: ${walletPath} does not look like a JWK wallet (missing kty/e/n fields)`);
+  }
   const ar = await getArweave();
-  return ar.wallets.jwkToAddress(jwk);
+  try {
+    return await ar.wallets.jwkToAddress(jwk);
+  } catch (e) {
+    throw new Error(`${what}: cannot read JWK wallet at ${walletPath}: ${errMsg(e)}`);
+  }
 }
 
 async function walletAddress(o: CliOptions): Promise<void> {

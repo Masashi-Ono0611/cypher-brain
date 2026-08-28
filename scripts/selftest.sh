@@ -1304,6 +1304,48 @@ else
   echo "[PASS] --scan-secrets fails fast (before any pg_dump/tar work) with an actionable error when gitleaks cannot be resolved"
 fi
 
+echo "== #495: a gitleaks report that parses as JSON but is not the array-of-findings shape fails closed with a clear error, never an unhandled crash =="
+# Uses a STUB gitleaks (not the real binary) that writes an arbitrary body to the
+# --report-path and exits 0, exactly like the real tool does after --exit-code 0 —
+# so this runs unconditionally, without needing gitleaks on PATH. Regression test for
+# #495: scanForSecrets() used to cast the parsed report straight to
+# GitleaksRawFinding[] with no shape check, so a report shaped like
+# {Results:[...]} (a plausible future gitleaks wrapper) or a truncated-but-valid
+# `null` write made `for (const f of raw)` throw an unhandled "raw is not iterable"
+# TypeError instead of this function's own documented fail-closed error.
+BADREPORT_SRC="$TMP/badreport-src"; mkdir -p "$BADREPORT_SRC"; printf 'nothing secret here\n' > "$BADREPORT_SRC/note.txt"
+cat > "$STUBBIN/gitleaks-badreport" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" != "dir" ]; then exit 0; fi
+report=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--report-path" ]; then report="$arg"; fi
+  prev="$arg"
+done
+printf '%s' "$GITLEAKS_BADREPORT_BODY" > "$report"
+exit 0
+EOF
+chmod +x "$STUBBIN/gitleaks-badreport"
+
+set +e
+BADSHAPE_ERR=$(GITLEAKS_BADREPORT_BODY='{"Results":[]}' CYPHER_BRAIN_GITLEAKS_BIN="$STUBBIN/gitleaks-badreport" CYPHER_BRAIN_HOME="$TMP/keys" \
+  cb snapshot --dir "$BADREPORT_SRC" --out "$TMP/badshape.age" --scan-secrets warn 2>&1); BADSHAPE_RC=$?
+set -e
+[ "$BADSHAPE_RC" != "0" ] || { echo "[FAIL] --scan-secrets warn with a non-array ({Results:[]}) gitleaks report exited 0 — must not be treated as \"no findings\""; exit 1; }
+printf '%s' "$BADSHAPE_ERR" | grep -qi "TypeError" && { echo "[FAIL] a malformed gitleaks report crashed with a raw TypeError instead of a clean error"; echo "$BADSHAPE_ERR"; exit 1; }
+printf '%s' "$BADSHAPE_ERR" | grep -q "not the array-of-findings shape" || { echo "[FAIL] the error does not explain the report shape mismatch"; echo "$BADSHAPE_ERR"; exit 1; }
+test ! -e "$TMP/badshape.age" || { echo "[FAIL] a snapshot was produced despite the malformed ({Results:[]}) gitleaks report"; exit 1; }
+
+set +e
+BADNULL_ERR=$(GITLEAKS_BADREPORT_BODY='null' CYPHER_BRAIN_GITLEAKS_BIN="$STUBBIN/gitleaks-badreport" CYPHER_BRAIN_HOME="$TMP/keys" \
+  cb snapshot --dir "$BADREPORT_SRC" --out "$TMP/badnull.age" --scan-secrets warn 2>&1); BADNULL_RC=$?
+set -e
+[ "$BADNULL_RC" != "0" ] || { echo "[FAIL] --scan-secrets warn with a \"null\" gitleaks report exited 0"; exit 1; }
+printf '%s' "$BADNULL_ERR" | grep -q "not the array-of-findings shape" || { echo "[FAIL] a null report body was not caught by the shape check"; echo "$BADNULL_ERR"; exit 1; }
+test ! -e "$TMP/badnull.age" || { echo "[FAIL] a snapshot was produced despite a null gitleaks report"; exit 1; }
+echo "[PASS] a gitleaks report that parses as JSON but isn't an array of findings (a wrapped object, or null) fails closed with a clear shape-mismatch error, never an unhandled crash"
+
 echo "== #267: a missing path is reported the same way by every command, and never as a decrypt failure =="
 # One mistyped path, five commands. Before #267 this produced three different answers:
 # push/estimate said "no such file", verify and snapshot --dir leaked the raw Node

@@ -59,6 +59,17 @@ interface GitleaksRawFinding {
   RuleID?: string;
 }
 
+// Shape check for a single report entry — permissive on WHICH fields exist (gitleaks'
+// finding objects carry many we never read) but strict that, if present, RuleID is a
+// string. Mirrors the field-by-field validation every other JSON.parse site in this
+// codebase already does (audit.ts, receipt.ts, idempotency.ts, plan.ts, doctor.ts,
+// buildinfo.ts) rather than trusting a blind `as GitleaksRawFinding[]` cast (#495).
+const isGitleaksFinding = (v: unknown): v is GitleaksRawFinding => {
+  if (v === null || typeof v !== 'object') return false;
+  const ruleId = (v as { RuleID?: unknown }).RuleID;
+  return ruleId === undefined || typeof ruleId === 'string';
+};
+
 export const SCAN_SECRETS_INSTALL_HINT =
   '--scan-secrets requires the gitleaks binary on PATH (https://github.com/gitleaks/gitleaks) ' +
   '— install it with `brew install gitleaks` (macOS/Linuxbrew) or see ' +
@@ -131,16 +142,28 @@ export async function scanForSecrets(dir: string): Promise<SecretFinding[]> {
     // truncated write / disk-full / permissions hiccup here would otherwise let --scan-secrets
     // deny silently proceed as if the source were clean. Fail closed: surface it as a real
     // error instead.
-    let raw: GitleaksRawFinding[];
+    let raw: unknown;
     try {
-      raw = JSON.parse(await readFile(reportPath, 'utf8')) as GitleaksRawFinding[];
+      raw = JSON.parse(await readFile(reportPath, 'utf8'));
     } catch (e) {
       throw new Error(
         `gitleaks ran but its report at ${reportPath} could not be read/parsed (${errMsg(e)}) — refusing to treat this as "no findings"`,
       );
     }
+    // Same fail-closed reasoning as the parse failure above, extended to a report that
+    // parses fine but isn't the shape gitleaks' `--report-format json` actually produces
+    // (a future gitleaks wrapping results in `{Results: [...]}`, or a truncated write
+    // that still happens to be valid JSON, e.g. `null`/`{}`) — `for...of` over a
+    // non-array would otherwise throw an unhandled TypeError instead of this function's
+    // own clear error (#495).
+    if (!Array.isArray(raw) || !raw.every(isGitleaksFinding)) {
+      throw new Error(
+        `gitleaks report at ${reportPath} was valid JSON but not the array-of-findings shape gitleaks --report-format json produces — refusing to treat this as "no findings"`,
+      );
+    }
+    const findings: GitleaksRawFinding[] = raw;
     const counts = new Map<string, number>();
-    for (const f of raw) {
+    for (const f of findings) {
       const id = f.RuleID || 'unknown';
       counts.set(id, (counts.get(id) ?? 0) + 1);
     }
