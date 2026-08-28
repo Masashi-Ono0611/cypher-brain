@@ -18,6 +18,7 @@
 // config contract and described here in our own words.
 import type { Dirent } from 'node:fs';
 import { readdir, readFile, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 
 export type GbrainEngine = 'pglite' | 'postgres';
@@ -56,6 +57,40 @@ export interface GbrainEngineInfo {
    * fields — THAT is a genuine (if uninformative) read, not a failure.
    */
   readError?: true;
+}
+
+/**
+ * Where gbrain's OWN config.json actually lives, mirroring `configDir()` in gbrain's
+ * `src/core/config.ts` (re-confirmed live against v0.47.3.0, lines ~1550-1564, the same
+ * tag detectGbrainEngine's own doc comment cites): `GBRAIN_HOME` is a PARENT directory
+ * that gbrain appends `.gbrain` to itself — `GBRAIN_HOME=/srv/x` puts the config at
+ * `/srv/x/.gbrain/config.json`, not `/srv/x/config.json`. Falls back to `~/.gbrain` only
+ * when the env var is unset (or blank after trimming), same as gbrain.
+ *
+ * Both callers into detectGbrainEngine() (the init wizard's snapshot-source prompt, and
+ * doctor's standalone `gbrain-engine-detection` check) used to hard-code
+ * `join(homedir(), '.gbrain', 'config.json')` independently, so a machine that had
+ * relocated its gbrain home via `GBRAIN_HOME` got a false "not set up" from both — a
+ * fully configured gbrain silently reported as absent. detectGbrainEngine() itself only
+ * reads whatever path it is handed; it has no opinion on where that path comes from. This
+ * function is the one place that opinion lives, and every caller must go through it.
+ *
+ * gbrain VALIDATES the override and THROWS on a bad one (relative, or containing a `..`
+ * segment) because it is about to `mkdir`/write there. This function never throws: an
+ * operator's malformed `GBRAIN_HOME` is a problem for gbrain itself to surface the next
+ * time it runs, not something a read-only wizard/doctor check should crash over. An
+ * invalid override is treated the same as an unset one — falling back to `~/.gbrain` —
+ * which is honest rather than merely convenient: gbrain would refuse to start against
+ * that same invalid value too, so there is no real config to find at the override path
+ * either way, and the fallback location is the only one that could possibly hold one.
+ */
+export function resolveGbrainConfigPath(): string {
+  const override = process.env.GBRAIN_HOME;
+  const trimmed = override?.trim();
+  if (trimmed && isAbsolute(trimmed) && !trimmed.split(/[\\/]/).includes('..')) {
+    return join(trimmed, '.gbrain', 'config.json');
+  }
+  return join(homedir(), '.gbrain', 'config.json');
 }
 
 /**

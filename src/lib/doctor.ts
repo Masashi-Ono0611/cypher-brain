@@ -39,7 +39,6 @@
 import { stat, readFile, writeFile, rename, rm } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { identityToRecipient } from 'age-encryption';
 import {
@@ -63,7 +62,7 @@ import { scheduleStatusReport, ScheduleNotInstalledError } from './schedule.js';
 import { buildInfo, buildAgeDays, BUILD_STALE_DAYS } from './buildinfo.js';
 import { readAuditLog, verifyAuditChain } from './audit.js';
 import { readReceipts } from './receipt.js';
-import { detectGbrainEngine } from './gbrain.js';
+import { detectGbrainEngine, resolveGbrainConfigPath } from './gbrain.js';
 import { printJson, printMascot, moodForVerdict } from './ui.js';
 import type { CliOptions } from './types.js';
 
@@ -595,12 +594,12 @@ async function checkReceiptLedger(): Promise<DoctorCheck> {
 // plumbing this check does not need to do its job.
 async function checkGbrainEngine(): Promise<DoctorCheck> {
   const id = 'gbrain-engine-detection';
-  const gbrainConfigPath = join(homedir(), '.gbrain', 'config.json');
+  const gbrainConfigPath = resolveGbrainConfigPath();
   if (!(await exists(gbrainConfigPath))) {
     return {
       id,
       status: 'skip',
-      message: `no gbrain config found at ${gbrainConfigPath} — gbrain is not set up on this machine (or uses a non-default GBRAIN_HOME)`,
+      message: `no gbrain config found at ${gbrainConfigPath} — gbrain is not set up on this machine`,
     };
   }
   const gbrain = await detectGbrainEngine(gbrainConfigPath);

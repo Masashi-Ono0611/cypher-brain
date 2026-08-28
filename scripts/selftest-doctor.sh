@@ -558,5 +558,27 @@ if (j.verdict !== 'PARTIAL') throw new Error('expected verdict PARTIAL, got ' + 
 " "$TMP/v.json"
 echo "[PASS] an unreadable/malformed gbrain config: gbrain-engine-detection WARN (not FAIL), doctor VERDICT PARTIAL (exit 2)"
 
+echo "== (w) gbrain-engine-detection: GBRAIN_HOME relocates the config away from ~/.gbrain, and is honored =="
+# resolveGbrainConfigPath() (gbrain.ts) mirrors gbrain's own configDir(): GBRAIN_HOME is a
+# PARENT directory gbrain appends '.gbrain' to itself. HOME here has NO .gbrain at all —
+# so a build that still hard-codes join(homedir(), '.gbrain', 'config.json') would SKIP
+# this check ("not set up") against a machine that is, in fact, fully configured.
+export CYPHER_BRAIN_HOME="$TMP/gbrain-relocated-cb-home"
+export HOME="$TMP/gbrain-relocated-home"; mkdir -p "$HOME"
+GBRAIN_RELOCATED="$TMP/gbrain-relocated-elsewhere"; mkdir -p "$GBRAIN_RELOCATED/.gbrain"
+printf '{"engine":"pglite","database_path":"%s/.gbrain/.pglite","api_key":"sk-selftest-decoy-gbrain-home"}\n' \
+  "$GBRAIN_RELOCATED" > "$GBRAIN_RELOCATED/.gbrain/config.json"
+GBRAIN_HOME="$GBRAIN_RELOCATED" cb doctor --json > "$TMP/w.json" 2>&1 \
+  || { echo "[FAIL] doctor --json exited non-zero with a GBRAIN_HOME-relocated config"; cat "$TMP/w.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const g = j.checks.find((c) => c.id === 'gbrain-engine-detection');
+if (!g || g.status !== 'pass') throw new Error('expected gbrain-engine-detection pass for a GBRAIN_HOME-relocated PGLite config, got ' + JSON.stringify(g));
+if (!/PGLite/.test(g.message)) throw new Error('message does not name PGLite: ' + g.message);
+if (!g.message.includes('$GBRAIN_RELOCATED')) throw new Error('message does not name the RELOCATED store path — looks like it fell back to the default ~/.gbrain: ' + g.message);
+if (g.message.includes('sk-selftest-decoy-gbrain-home')) throw new Error('the relocated config secret leaked into the doctor message: ' + g.message);
+" "$TMP/w.json"
+echo "[PASS] GBRAIN_HOME relocated: gbrain-engine-detection reads \$GBRAIN_HOME/.gbrain/config.json instead of falsely SKIPping against the unset default ~/.gbrain"
+
 echo
 echo "all cypher-brain doctor selftests passed"

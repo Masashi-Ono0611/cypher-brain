@@ -696,5 +696,88 @@ node -e '
 ' "$MCP_OUT" "$WARN_MARK"
 echo "[PASS] the MCP snapshot_now result carries it in the structured warnings array"
 
+# ---------------------------------------------------------------------------
+# (e) resolveGbrainConfigPath(): the GBRAIN_HOME override wizard.ts and doctor.ts both
+# route through. Before this, each hard-coded join(homedir(), '.gbrain', 'config.json')
+# independently, so a machine that had relocated its gbrain home via GBRAIN_HOME got a
+# false "not set up" from both — a fully configured gbrain silently reported as absent.
+# ---------------------------------------------------------------------------
+echo "== (e) resolveGbrainConfigPath(): GBRAIN_HOME override, unit-level =="
+RESOLVE_HOME="$TMP/resolve-home"; mkdir -p "$RESOLVE_HOME"
+RESOLVE_ELSEWHERE="$TMP/resolve-elsewhere"
+
+# HOME is set explicitly on every call below (never inherited) so the default-fallback
+# assertions are pinned against a KNOWN value, not whoever happens to run this suite.
+# Routed through `env` (not a bare "VAR=val cmd" prefix): once GBRAIN_HOME=... has
+# passed through "$@" expansion it is plain argv text, and bash — unlike a LITERAL
+# assignment-prefix written in the source — does not re-parse an expanded string as an
+# env assignment; it tries to exec it as the command itself. `env` parses argv for
+# NAME=value pairs explicitly, so it does not care whether they arrived literally or
+# via expansion.
+resolve_path() {
+  local home_env="$1"; shift
+  env HOME="$home_env" "$@" node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs -e "
+import('./src/lib/gbrain.ts').then((m) => { console.log(m.resolveGbrainConfigPath()); });
+"
+}
+
+OUT="$(resolve_path "$RESOLVE_HOME")"
+[ "$OUT" = "$RESOLVE_HOME/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): GBRAIN_HOME unset did not fall back to \$HOME/.gbrain/config.json, got: $OUT"; exit 1; }
+echo "[PASS] GBRAIN_HOME unset -> falls back to \$HOME/.gbrain/config.json"
+
+OUT="$(resolve_path "$RESOLVE_HOME" GBRAIN_HOME="$RESOLVE_ELSEWHERE")"
+[ "$OUT" = "$RESOLVE_ELSEWHERE/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): a valid absolute GBRAIN_HOME was not honored, got: $OUT"; exit 1; }
+echo "[PASS] GBRAIN_HOME=<absolute path> -> \$GBRAIN_HOME/.gbrain/config.json (gbrain appends .gbrain itself — this must not double it, or fall back to \$HOME instead)"
+
+OUT="$(resolve_path "$RESOLVE_HOME" GBRAIN_HOME="")"
+[ "$OUT" = "$RESOLVE_HOME/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): an empty-string GBRAIN_HOME was not treated as unset, got: $OUT"; exit 1; }
+echo "[PASS] GBRAIN_HOME=\"\" (blank) -> treated as unset, matching gbrain's own 'override && override.trim()' check"
+
+OUT="$(resolve_path "$RESOLVE_HOME" GBRAIN_HOME="relative/path")"
+[ "$OUT" = "$RESOLVE_HOME/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): a RELATIVE GBRAIN_HOME was not rejected back to the \$HOME default, got: $OUT"; exit 1; }
+echo "[PASS] GBRAIN_HOME=<relative path> -> falls back to \$HOME/.gbrain/config.json instead of throwing (gbrain itself would refuse to start on this value — a read-only check must not crash over another tool's malformed env var)"
+
+OUT="$(resolve_path "$RESOLVE_HOME" GBRAIN_HOME="/srv/../etc/gbrain")"
+[ "$OUT" = "$RESOLVE_HOME/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): a GBRAIN_HOME containing a '..' segment was not rejected back to the \$HOME default, got: $OUT"; exit 1; }
+echo "[PASS] GBRAIN_HOME containing a '..' segment -> falls back to \$HOME/.gbrain/config.json, matching gbrain's own validation rule"
+
+echo "== (e) GBRAIN_HOME override, through the init wizard =="
+# The wizard must detect a gbrain relocated ENTIRELY away from ~/.gbrain: HOME here has
+# NO .gbrain at all, so a build that still hard-codes the default path would silently
+# SKIP the whole gbrain-detection block (the wizard's own `if (await exists(...))` guard)
+# and fall straight through to the backend prompt with none of PGLITE_BRANCH_MARK /
+# POSTGRES_BRANCH_MARK ever printed — the exact "silently-skipped prompt" failure mode.
+RELOC_HOME="$TMP/case-reloc-home"; mkdir -p "$RELOC_HOME"
+RELOC_CBHOME="$TMP/case-reloc-cb-home"
+RELOC_GBRAIN_HOME="$TMP/case-reloc-gbrain-home"; mkdir -p "$RELOC_GBRAIN_HOME/.gbrain"
+printf '{"engine":"pglite","api_key":"%s"}\n' "$DECOY_SECRET" > "$RELOC_GBRAIN_HOME/.gbrain/config.json"
+cat > "$TMP/qa-reloc.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$CB_SRC"],
+  ["Choose a backend", "\u001b[A"]
+]
+JSON
+CYPHER_BRAIN_HOME="$RELOC_CBHOME" HOME="$RELOC_HOME" GBRAIN_HOME="$RELOC_GBRAIN_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-reloc.json" --out "$TMP/case-reloc.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] reloc: init did not stop cleanly at the ton-provider prerequisites guard"; cat "$TMP/case-reloc.log"; exit 1; }
+grep -qF "CYPHER_BRAIN_TON_PROVIDER_OWNER" "$TMP/case-reloc.log" || { echo "[FAIL] reloc: the run ended for some reason other than the scripted stop"; cat "$TMP/case-reloc.log"; exit 1; }
+grep -qF "$PGLITE_BRANCH_MARK" "$TMP/case-reloc.log" \
+  || { echo "[FAIL] reloc: GBRAIN_HOME-relocated config was not detected — looks like the wizard silently skipped the gbrain-detection block against the empty default \$HOME/.gbrain"; cat "$TMP/case-reloc.log"; exit 1; }
+if grep -qF "$DECOY_SECRET" "$TMP/case-reloc.log"; then
+  echo "[FAIL] reloc: a value from the relocated config.json reached the transcript"; exit 1
+fi
+echo "[PASS] GBRAIN_HOME relocated (with an EMPTY \$HOME/.gbrain): the wizard still detects and reports the engine, instead of silently skipping the whole gbrain-detection prompt"
+
 echo
 echo "selftest-gbrain-pglite: all checks passed"

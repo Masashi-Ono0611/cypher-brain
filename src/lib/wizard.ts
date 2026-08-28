@@ -73,7 +73,7 @@ import {
 import { keygen, keygenAt } from './keys.js';
 import { askNewPassphrase, wrapIdentity } from './crypt.js';
 import { keygenSignAt } from './minisign.js';
-import { detectGbrainEngine, pathCoveredBy } from './gbrain.js';
+import { detectGbrainEngine, pathCoveredBy, resolveGbrainConfigPath } from './gbrain.js';
 import { PROFILE_NAMES } from './profiles.js';
 import { snapshot } from './snapshot.js';
 import { push, PushPartialSuccessError } from './pushpull.js';
@@ -582,7 +582,7 @@ export async function init(_o: CliOptions): Promise<void> {
       // gbrain config is actually detected: everyone else's flow is completely
       // unchanged, and init already documents that anything beyond its opinionated fast
       // path is driven by hand (see requireTTY's own message above).
-      const gbrainConfigPath = join(homedir(), '.gbrain', 'config.json');
+      const gbrainConfigPath = resolveGbrainConfigPath();
       if (await exists(gbrainConfigPath)) {
         // Reads the engine verdict and, on PGLite, the configured store path — and
         // nothing else out of config.json, which holds API keys (see detectGbrainEngine's
