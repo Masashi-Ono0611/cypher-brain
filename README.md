@@ -794,7 +794,11 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       the plain no-clobber behavior above). Separately, a component archive that fails
       to auto-expand for any other reason (e.g. it does not actually parse as gzip)
       makes restore's own exit code non-zero, never masked behind a "restored
-      components into ..." success line.
+      components into ..." success line. This check is skipped entirely under
+      --no-expand-components below: the danger it guards against is auto-expand
+      mis-attributing stale data, and that step never runs in that mode, so a stale
+      collision there is just the plain no-clobber case above (--no-expand-components
+      still means exactly the pre-#181 behavior it always has).
       Every --dir/--profile component's staged tarball is then auto-expanded into
       "<out-dir>/expanded/<NNN>-<source basename>-<digest>/", keyed to the component's
       ORIGINAL absolute source path (from manifest.json) rather than its on-disk name —

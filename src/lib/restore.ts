@@ -1010,7 +1010,6 @@ async function restoreImpl(o: CliOptions): Promise<void> {
     setActiveRestoreScratchDir(null);
     throw e;
   }
-  setActiveRestoreScratchDir(null);
 
   // #527 (multi-model review finding): capture the manifest THIS restore itself just
   // decrypted, straight out of `scratchDir`, before promotion/merge can leave --out-dir's
@@ -1024,9 +1023,25 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   // precisely the class of bug findStaleComponentArchives() above exists to close, just
   // one step further downstream. Captured once, in memory, and used for every step below
   // instead of ever re-reading manifest.json off disk post-promotion.
-  const freshManifestText = (await exists(join(scratchDir, 'manifest.json')))
-    ? await readFile(join(scratchDir, 'manifest.json'), 'utf8')
-    : null;
+  //
+  // Deliberately done BEFORE setActiveRestoreScratchDir(null) below, not after (multi-
+  // model review finding on an earlier draft of this fix): releasing the scratch-dir
+  // signal-guard registration first, then awaiting this read, would open a real — if
+  // narrow — window where a SIGINT/SIGTERM landing mid-read left the just-decrypted
+  // scratchDir on disk, tracked by NEITHER the scratch guard (already cleared) nor the
+  // out-dir guard (not set until promotion below begins). A normal (non-signal) failure
+  // here gets the exact same scratchDir cleanup the decrypt/extract failure above does,
+  // for the same reason.
+  let freshManifestText: string | null;
+  try {
+    const scratchManifestPath = join(scratchDir, 'manifest.json');
+    freshManifestText = (await exists(scratchManifestPath)) ? await readFile(scratchManifestPath, 'utf8') : null;
+  } catch (e) {
+    await rm(scratchDir, { recursive: true, force: true });
+    setActiveRestoreScratchDir(null);
+    throw e;
+  }
+  setActiveRestoreScratchDir(null);
 
   // #218 phase 3 — promote atomically, only now that extraction of an ALREADY-VETTED
   // archive fully succeeded: a fresh --out-dir gets the whole scratch tree renamed into
@@ -1047,7 +1062,16 @@ async function restoreImpl(o: CliOptions): Promise<void> {
       // Refusing the WHOLE restore here (rather than merging what doesn't collide and only
       // warning about what does) means a failed run leaves --out-dir exactly as it was
       // found, and never reaches expandComponents() below on ambiguous ground.
-      const stale = await findStaleComponentArchives(scratchDir, o.out_dir);
+      //
+      // Gated on `!o.no_expand_components` (multi-model review finding): the entire
+      // danger this check exists for is a stale archive later being auto-expanded AND
+      // mis-attributed to the manifest's recorded source — with --no-expand-components,
+      // that step never runs at all, so a stale collision here is just the plain,
+      // documented, general no-clobber case (same as manifest.json/db.dump) restore has
+      // always allowed. Without this gate, --no-expand-components would stop being "exactly
+      // the pre-#181 behavior" it is documented as (see the flag's own help text above) —
+      // it would ALSO start refusing restores that used to succeed under it.
+      const stale = o.no_expand_components ? [] : await findStaleComponentArchives(scratchDir, o.out_dir);
       if (stale.length > 0) {
         const names = stale.map((c) => sanitizeForDisplay(c.name)).join(', ');
         throw new Error(

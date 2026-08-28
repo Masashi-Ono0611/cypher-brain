@@ -270,6 +270,22 @@ set -e
 [ "$IDEMPOTENT_RC" = "0" ] || { echo "FAIL: re-running restore into the SAME --out-dir with the SAME snapshot started refusing (should be a no-op idempotent re-run)"; echo "$IDEMPOTENT_ERR"; exit 1; }
 echo "[PASS] re-running restore into the SAME --out-dir with the SAME snapshot does not trigger the new collision refusal"
 
+echo "== #527 (multi-model review finding): --no-expand-components skips the new collision refusal too -- it means exactly the pre-#181 behavior it always has =="
+# Codex review finding: the collision refusal above exists ONLY to prevent auto-expand
+# from mis-attributing stale data -- with --no-expand-components, auto-expand never runs
+# at all, so a stale collision here is just the plain, documented, general no-clobber
+# case (same as manifest.json/db.dump) restore has always allowed. Without gating the
+# check on this flag, --no-expand-components would stop meaning what its own help text
+# promises (it would ALSO start refusing restores that used to succeed under it).
+NOEXPAND_OUT="$TMP/stale-noexpand-out"; mkdir -p "$NOEXPAND_OUT"
+tar czf "$NOEXPAND_OUT/$STALE_COMPONENT_NAME" -C "$TMP" "$(basename "$UNRELATED_SRC")"
+NOEXPAND_SHA_BEFORE=$(shasum -a 256 "$NOEXPAND_OUT/$STALE_COMPONENT_NAME" | cut -d' ' -f1)
+cb restore --in "$TMP/stale.age" --out-dir "$NOEXPAND_OUT" --no-expand-components >/dev/null
+NOEXPAND_SHA_AFTER=$(shasum -a 256 "$NOEXPAND_OUT/$STALE_COMPONENT_NAME" | cut -d' ' -f1)
+[ "$NOEXPAND_SHA_BEFORE" = "$NOEXPAND_SHA_AFTER" ] || { echo "FAIL: --no-expand-components' plain no-clobber promise was violated (the pre-existing archive's bytes changed)"; exit 1; }
+test ! -d "$NOEXPAND_OUT/expanded" || { echo "FAIL: --no-expand-components still created expanded/"; exit 1; }
+echo "[PASS] --no-expand-components still succeeds and keeps its plain no-clobber promise even with a stale/unrelated component-named file already present"
+
 echo "== #527 related finding: a component archive that fails to expand for a NON-collision reason also makes the OVERALL restore exit non-zero =="
 # Isolates the "Related finding" fix from the stale-collision fix above: a component
 # archive that is corrupt from the moment it is decrypted (no pre-existing --out-dir, so
