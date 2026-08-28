@@ -136,7 +136,7 @@ wizard_case() {
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$answer_dir"],
 $pg_line
   ["Choose a backend", "\u001b[A"]
@@ -290,7 +290,7 @@ cat > "$TMP/qa-e2e.json" <<JSON
   ["Generate a signing keypair now?", "n"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
-  ["Profile [none/", ""],
+  ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$E2E_HOME/.gbrain"],
   ["Choose a backend", ""],
   ["Path to write the recovery kit", "$E2E_KIT_PATH"]
