@@ -185,7 +185,10 @@ export async function readPlanFile(path: string): Promise<PushPlan> {
     typeof p.created_at !== 'string' ||
     typeof p.expires_at !== 'string' ||
     typeof p.estimate !== 'object' ||
-    p.estimate === null
+    p.estimate === null ||
+    (p.recipients_fingerprint !== undefined && p.recipients_fingerprint !== null && typeof p.recipients_fingerprint !== 'string') ||
+    (p.payer_address !== undefined && p.payer_address !== null && typeof p.payer_address !== 'string') ||
+    (p.remote !== undefined && p.remote !== null && typeof p.remote !== 'string')
   ) {
     throw new Error(
       `--plan ${path}: does not look like a cypher-brain plan file (created by "estimate --out <path>") — ` +
