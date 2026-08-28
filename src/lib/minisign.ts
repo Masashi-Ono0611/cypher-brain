@@ -402,7 +402,12 @@ export async function loadSignIdentity(path: string): Promise<LoadedSignIdentity
   const keyId = Buffer.from(keyIdHex, 'hex');
   const pemStart = text.indexOf('-----BEGIN PRIVATE KEY-----');
   if (pemStart === -1) throw new Error(`${path}: no PKCS#8 PEM private key block found`);
-  const privateKey = createPrivateKey(text.slice(pemStart));
+  let privateKey: KeyObject;
+  try {
+    privateKey = createPrivateKey(text.slice(pemStart));
+  } catch (e) {
+    throw new Error(`${path}: malformed PKCS#8 PEM private key block (${errMsg(e)})`);
+  }
   return { privateKey, keyId };
 }
 
