@@ -82,6 +82,10 @@ RELATIVE_PATH_MARK="records the store as a RELATIVE path"
 # #543: the distinct "could not be read" wording for a config read/parse FAILURE, as
 # opposed to the confident POSTGRES_BRANCH_MARK a genuinely-parsed config gets.
 UNREADABLE_MARK="could not be read (defaulting to Postgres)"
+# resolveGbrainConfigPath()'s invalidOverride notice: an invalid GBRAIN_HOME (relative,
+# or containing a '..' segment) must be distinguishable from a genuine detection at the
+# $HOME fallback (multi-model review — see gbrain.ts's own doc comment).
+INVALID_GBRAIN_HOME_MARK="is set but invalid"
 
 CB_SRC="$TMP/plain-src"; mkdir -p "$CB_SRC"
 printf 'gbrain-pglite-selftest\n' > "$CB_SRC/note.txt"
@@ -695,6 +699,135 @@ node -e '
   }
 ' "$MCP_OUT" "$WARN_MARK"
 echo "[PASS] the MCP snapshot_now result carries it in the structured warnings array"
+
+# ---------------------------------------------------------------------------
+# (e) resolveGbrainConfigPath(): the GBRAIN_HOME override wizard.ts and doctor.ts both
+# route through. Before this, each hard-coded join(homedir(), '.gbrain', 'config.json')
+# independently, so a machine that had relocated its gbrain home via GBRAIN_HOME got a
+# false "not set up" from both — a fully configured gbrain silently reported as absent.
+# ---------------------------------------------------------------------------
+echo "== (e) resolveGbrainConfigPath(): GBRAIN_HOME override, unit-level =="
+RESOLVE_HOME="$TMP/resolve-home"; mkdir -p "$RESOLVE_HOME"
+RESOLVE_ELSEWHERE="$TMP/resolve-elsewhere"
+
+# HOME is set explicitly on every call below (never inherited) so the default-fallback
+# assertions are pinned against a KNOWN value, not whoever happens to run this suite.
+# Routed through `env` (not a bare "VAR=val cmd" prefix): once GBRAIN_HOME=... has
+# passed through "$@" expansion it is plain argv text, and bash — unlike a LITERAL
+# assignment-prefix written in the source — does not re-parse an expanded string as an
+# env assignment; it tries to exec it as the command itself. `env` parses argv for
+# NAME=value pairs explicitly, so it does not care whether they arrived literally or
+# via expansion.
+#
+# Prints "<path>\t<0-or-1>" (tab-separated: the resolved path, then whether
+# invalidOverride was set) so one call checks both fields of the return value.
+resolve_path() {
+  local home_env="$1"; shift
+  env HOME="$home_env" "$@" node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs -e "
+import('./src/lib/gbrain.ts').then((m) => {
+  const r = m.resolveGbrainConfigPath();
+  console.log(r.path + '\t' + (r.invalidOverride ? '1' : '0'));
+});
+"
+}
+
+IFS=$'\t' read -r OUT INVALID <<< "$(resolve_path "$RESOLVE_HOME")"
+[ "$OUT" = "$RESOLVE_HOME/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): GBRAIN_HOME unset did not fall back to \$HOME/.gbrain/config.json, got: $OUT"; exit 1; }
+[ "$INVALID" = "0" ] || { echo "[FAIL] resolveGbrainConfigPath(): GBRAIN_HOME unset set invalidOverride, it must not"; exit 1; }
+echo "[PASS] GBRAIN_HOME unset -> falls back to \$HOME/.gbrain/config.json, invalidOverride not set"
+
+IFS=$'\t' read -r OUT INVALID <<< "$(resolve_path "$RESOLVE_HOME" GBRAIN_HOME="$RESOLVE_ELSEWHERE")"
+[ "$OUT" = "$RESOLVE_ELSEWHERE/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): a valid absolute GBRAIN_HOME was not honored, got: $OUT"; exit 1; }
+[ "$INVALID" = "0" ] || { echo "[FAIL] resolveGbrainConfigPath(): a valid absolute GBRAIN_HOME set invalidOverride, it must not"; exit 1; }
+echo "[PASS] GBRAIN_HOME=<absolute path> -> \$GBRAIN_HOME/.gbrain/config.json (gbrain appends .gbrain itself — this must not double it, or fall back to \$HOME instead), invalidOverride not set"
+
+IFS=$'\t' read -r OUT INVALID <<< "$(resolve_path "$RESOLVE_HOME" GBRAIN_HOME="")"
+[ "$OUT" = "$RESOLVE_HOME/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): an empty-string GBRAIN_HOME was not treated as unset, got: $OUT"; exit 1; }
+[ "$INVALID" = "0" ] || { echo "[FAIL] resolveGbrainConfigPath(): an empty-string GBRAIN_HOME set invalidOverride, it must not — blank is 'unset', not 'invalid'"; exit 1; }
+echo "[PASS] GBRAIN_HOME=\"\" (blank) -> treated as unset, matching gbrain's own 'override && override.trim()' check; invalidOverride not set"
+
+IFS=$'\t' read -r OUT INVALID <<< "$(resolve_path "$RESOLVE_HOME" GBRAIN_HOME="relative/path")"
+[ "$OUT" = "$RESOLVE_HOME/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): a RELATIVE GBRAIN_HOME was not rejected back to the \$HOME default, got: $OUT"; exit 1; }
+[ "$INVALID" = "1" ] || { echo "[FAIL] resolveGbrainConfigPath(): a RELATIVE GBRAIN_HOME did not set invalidOverride — a caller cannot tell the \$HOME fallback found here apart from a genuine detection"; exit 1; }
+echo "[PASS] GBRAIN_HOME=<relative path> -> falls back to \$HOME/.gbrain/config.json instead of throwing (gbrain itself would refuse to start on this value — a read-only check must not crash over another tool's malformed env var), invalidOverride IS set (multi-model review — a caller must be able to tell this apart from a real detection)"
+
+IFS=$'\t' read -r OUT INVALID <<< "$(resolve_path "$RESOLVE_HOME" GBRAIN_HOME="/srv/../etc/gbrain")"
+[ "$OUT" = "$RESOLVE_HOME/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): a GBRAIN_HOME containing a '..' segment was not rejected back to the \$HOME default, got: $OUT"; exit 1; }
+[ "$INVALID" = "1" ] || { echo "[FAIL] resolveGbrainConfigPath(): a GBRAIN_HOME containing a '..' segment did not set invalidOverride"; exit 1; }
+echo "[PASS] GBRAIN_HOME containing a '..' segment -> falls back to \$HOME/.gbrain/config.json, matching gbrain's own validation rule; invalidOverride IS set"
+
+IFS=$'\t' read -r OUT INVALID <<< "$(resolve_path "$RESOLVE_HOME" GBRAIN_HOME=" $RESOLVE_ELSEWHERE ")"
+[ "$OUT" = "$RESOLVE_ELSEWHERE/.gbrain/config.json" ] \
+  || { echo "[FAIL] resolveGbrainConfigPath(): a whitespace-padded absolute GBRAIN_HOME was not trimmed the same way gbrain's own configDir() trims it, got: $OUT"; exit 1; }
+[ "$INVALID" = "0" ] || { echo "[FAIL] resolveGbrainConfigPath(): a whitespace-padded but otherwise valid GBRAIN_HOME set invalidOverride, it must not"; exit 1; }
+echo "[PASS] GBRAIN_HOME=\" <absolute path> \" (padded) -> trimmed and honored exactly like gbrain's own configDir() (which validates and joins on the TRIMMED value, not the raw one)"
+
+echo "== (e) GBRAIN_HOME override, through the init wizard =="
+# The wizard must detect a gbrain relocated ENTIRELY away from ~/.gbrain: HOME here has
+# NO .gbrain at all, so a build that still hard-codes the default path would silently
+# SKIP the whole gbrain-detection block (the wizard's own `if (await exists(...))` guard)
+# and fall straight through to the backend prompt with none of PGLITE_BRANCH_MARK /
+# POSTGRES_BRANCH_MARK ever printed — the exact "silently-skipped prompt" failure mode.
+RELOC_HOME="$TMP/case-reloc-home"; mkdir -p "$RELOC_HOME"
+RELOC_CBHOME="$TMP/case-reloc-cb-home"
+RELOC_GBRAIN_HOME="$TMP/case-reloc-gbrain-home"; mkdir -p "$RELOC_GBRAIN_HOME/.gbrain"
+printf '{"engine":"pglite","api_key":"%s"}\n' "$DECOY_SECRET" > "$RELOC_GBRAIN_HOME/.gbrain/config.json"
+cat > "$TMP/qa-reloc.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$CB_SRC"],
+  ["Choose a backend", "\u001b[A"]
+]
+JSON
+CYPHER_BRAIN_HOME="$RELOC_CBHOME" HOME="$RELOC_HOME" GBRAIN_HOME="$RELOC_GBRAIN_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-reloc.json" --out "$TMP/case-reloc.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] reloc: init did not stop cleanly at the ton-provider prerequisites guard"; cat "$TMP/case-reloc.log"; exit 1; }
+grep -qF "CYPHER_BRAIN_TON_PROVIDER_OWNER" "$TMP/case-reloc.log" || { echo "[FAIL] reloc: the run ended for some reason other than the scripted stop"; cat "$TMP/case-reloc.log"; exit 1; }
+grep -qF "$PGLITE_BRANCH_MARK" "$TMP/case-reloc.log" \
+  || { echo "[FAIL] reloc: GBRAIN_HOME-relocated config was not detected — looks like the wizard silently skipped the gbrain-detection block against the empty default \$HOME/.gbrain"; cat "$TMP/case-reloc.log"; exit 1; }
+if grep -qF "$DECOY_SECRET" "$TMP/case-reloc.log"; then
+  echo "[FAIL] reloc: a value from the relocated config.json reached the transcript"; exit 1
+fi
+echo "[PASS] GBRAIN_HOME relocated (with an EMPTY \$HOME/.gbrain): the wizard still detects and reports the engine, instead of silently skipping the whole gbrain-detection prompt"
+
+# An INVALID GBRAIN_HOME (relative here) with NO config at the $HOME fallback either:
+# the wizard must say the override is invalid, not stay silent (there is nothing at the
+# fallback to accidentally misreport as a detection in this case, but the notice must
+# still fire so the operator learns GBRAIN_HOME itself needs fixing).
+INVALID_HOME="$TMP/case-invalid-gbrain-home"; mkdir -p "$INVALID_HOME"
+INVALID_CBHOME="$TMP/case-invalid-gbrain-cb-home"
+cat > "$TMP/qa-invalid.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$CB_SRC"],
+  ["Choose a backend", "\u001b[A"]
+]
+JSON
+CYPHER_BRAIN_HOME="$INVALID_CBHOME" HOME="$INVALID_HOME" GBRAIN_HOME="not/absolute" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-invalid.json" --out "$TMP/case-invalid.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] invalid-gbrain-home: init did not stop cleanly at the ton-provider prerequisites guard"; cat "$TMP/case-invalid.log"; exit 1; }
+grep -qF "CYPHER_BRAIN_TON_PROVIDER_OWNER" "$TMP/case-invalid.log" || { echo "[FAIL] invalid-gbrain-home: the run ended for some reason other than the scripted stop"; cat "$TMP/case-invalid.log"; exit 1; }
+grep -qF "$INVALID_GBRAIN_HOME_MARK" "$TMP/case-invalid.log" \
+  || { echo "[FAIL] invalid-gbrain-home: the wizard did not warn about the invalid GBRAIN_HOME"; cat "$TMP/case-invalid.log"; exit 1; }
+grep -qF "not/absolute" "$TMP/case-invalid.log" \
+  || { echo "[FAIL] invalid-gbrain-home: the wizard did not quote the actual (invalid) GBRAIN_HOME value back"; cat "$TMP/case-invalid.log"; exit 1; }
+if grep -qF "$PGLITE_BRANCH_MARK" "$TMP/case-invalid.log"; then echo "[FAIL] invalid-gbrain-home: no config exists anywhere, yet the wizard claimed a PGLite detection"; cat "$TMP/case-invalid.log"; exit 1; fi
+echo "[PASS] a RELATIVE GBRAIN_HOME (invalid) makes the wizard warn by name, quoting the value, instead of staying silent"
 
 echo
 echo "selftest-gbrain-pglite: all checks passed"
