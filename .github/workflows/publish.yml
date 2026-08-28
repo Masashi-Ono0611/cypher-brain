@@ -56,10 +56,12 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       # Pinned: this is the highest-privilege workflow (the one that actually
-      # publishes releases), so the one unpinned line only executes at real-release
-      # time, where an unexpected npm behavior change would surface with no routine
-      # CI coverage to catch it first. 12.0.2 is the current npm release, verified
-      # working locally; OIDC trusted publishing needs npm >= 11.5.1.
+      # publishes releases). It used to be that the one unpinned line here only
+      # ran at real-release time, where an unexpected npm behavior change would
+      # surface with no routine CI coverage to catch it first -- the
+      # workflow_dispatch dry-run path above now exercises it on manual runs too.
+      # 12.0.2 is the current npm release, verified working locally; OIDC trusted
+      # publishing needs npm >= 11.5.1.
       - run: npm install -g npm@12.0.2
       - run: bun install --frozen-lockfile
 
