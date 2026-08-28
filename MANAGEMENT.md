@@ -360,7 +360,12 @@ it by hand with the same arguments.
   you'd rather restore empty than have missing entirely.
 
 Both are additive to `--pg-table` and to each other, and are ONLY applied when passed —
-omit them and `--pg` behaves exactly as before (a full, unfiltered dump). A typical setup
+omit them and `--pg` behaves exactly as before (a full, unfiltered dump). Passing
+`--pg-filter`/`--pg-table`/`--pg-exclude-table-data` *without* `--pg <conn>` (or with `--pg`
+given but empty) is **refused with an error** rather than silently ignored — these flags
+only mean anything to a `pg_dump` that is actually running, so both `snapshot` and
+`schedule install` reject that combination up front instead of installing/running a backup
+that quietly drops the filter. A typical setup
 runs `schedule install`/a cron job for the full backup (disaster recovery) and a second,
 separate `snapshot --pg-filter ...` for the minimal one (long-term/off-site/lower-risk
 storage):

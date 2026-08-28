@@ -721,6 +721,10 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
         o2b --export <path>          an Open Second Brain bank-export bundle
                                      ("o2b brain bank-export --out <path>.json"), archived
                                      as-is (never extracted; must end in .json)
+      --vault/--zip/--export are each refused unless --profile matches the one that reads
+      them (--vault only with --profile obsidian, --zip only with --profile chatgpt-export,
+      --export only with --profile o2b) — passing one without its matching --profile is an
+      error, not a silently-ignored flag (#525/#526).
       --pg-filter <file> and --pg-exclude-table-data <table> are a thin, literal pass-through
       to pg_dump's OWN standard flags (--filter / --exclude-table-data) — cypher-brain does
       no SQL parsing or filtering of its own; pg_dump does exactly what it would if you ran
@@ -741,6 +745,9 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
                                      absent entirely.
       Both are additive to --pg-table and to each other; omit them and --pg behaves exactly
       as before (a full pg_dump, no filtering).
+      --pg-table/--pg-filter/--pg-exclude-table-data are each refused when --pg <conn> is
+      not also given (or is given empty) — they only filter what pg_dump dumps, so without
+      --pg they would otherwise be silently ignored (#525/#526).
       --scan-secrets warn|deny|off (#215) runs gitleaks (install via
       https://github.com/gitleaks/gitleaks) over each --dir/--profile source's staged
       plaintext BEFORE it is archived+encrypted — Arweave/Turbo are write-once,
@@ -1203,6 +1210,12 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       --pg-only schedule is refused rather than reporting a scan of no component.
       Fail-closed at run time too: if gitleaks later disappears, the nightly FAILS rather
       than silently skipping the scan.
+      Same companion-flag-required checks as 'snapshot' (see above), enforced here too so
+      the two commands never disagree: --vault/--zip/--export are each refused unless
+      --profile matches (obsidian/chatgpt-export/o2b respectively), and
+      --pg-table/--pg-filter/--pg-exclude-table-data are each refused unless --pg <conn> is
+      also given — install REFUSES rather than baking a nightly that would silently drop
+      the flag on every run (#525/#526).
 
   cypher-brain schedule status [--json]
       Report the configured time + backend, whether a dead man's switch ping-url is
