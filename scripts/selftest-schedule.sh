@@ -824,7 +824,7 @@ else
   echo "[PASS] uninstall: trigger + runner removed, data kept, idempotent; status exits 0 and reports 'not installed' (plain + --json, #426)"
 fi
 
-echo "== (e2) uninstall's exists()+rm() pairs are TOCTOU-safe: rm(..., { force: true }), so something else deleting the file between the check and the call reports it as already gone instead of crashing uninstall with an uncaught ENOENT =="
+echo "== (e2) uninstall's exists()+rm() pairs are TOCTOU-safe: rm(..., { force: true }), so something else deleting the file between the check and the call no longer crashes uninstall with an uncaught ENOENT (the target still ends up reported as removed -- it WAS there when exists() checked) =="
 # Source tripwire, not behavior: (e) above proves uninstall is idempotent when it runs
 # TWICE in full — it never exercises a single exists()+rm() pair racing against an
 # external deletion mid-function (that window is nanoseconds wide and cannot be hit
