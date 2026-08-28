@@ -604,7 +604,10 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       a normal state, not an error). A ledger line that cannot be read at all (malformed/
       wrong-shape/future-version) is skipped and WARNS on stderr with a count — never
       silently treated as "no receipts" (a genuinely missing/never-created ledger file
-      still reports zero receipts with no warning).
+      still reports zero receipts with no warning). If EVERY line was unreadable (0
+      receipts survived, but at least 1 was skipped), the human report prints a visibly
+      DIFFERENT line than the true-empty case, naming the skipped count, so "no receipts"
+      is never confused with "no receipts COULD BE READ" (#457).
       Human report (default): total receipt count, cost summed BY BACKEND, BY MONTH and
       BY DAY (UTC, most recent 14 shown) — each sum kept separate PER NATIVE UNIT
       (winston/winc are different currencies, never added together). A receipt with no
@@ -643,10 +646,14 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       exit code, and VERDICT: PASS or FAIL (exit code 1 on FAIL, naming the reason —
       a broken chain link and/or unreadable lines, either one alone is sufficient to fail).
       --json prints one object ({total_entries, chain_valid, broken_at_index,
-      skipped_lines, last_entry}) — chain_valid reflects ONLY whether the entries that
-      COULD be read form a valid chain among themselves; combine it with skipped_lines
-      yourself for the same overall PASS/FAIL the human report and exit code use
-      (chain_valid && skipped_lines === 0).
+      skipped_lines, last_entry, entries}) — chain_valid reflects ONLY whether the
+      entries that COULD be read form a valid chain among themselves; combine it with
+      skipped_lines yourself for the same overall PASS/FAIL the human report and exit
+      code use (chain_valid && skipped_lines === 0). "entries" is every readable entry
+      in log order (oldest first — index N lines up with broken_at_index when set), the
+      full trail to list/browse via the CLI (#458) without reading audit-log.jsonl
+      directly; "last_entry" is kept too (entries[entries.length-1]) for scripts already
+      reading it.
 
   cypher-brain snapshot --out <file.age> [--profile <name>] [--pg <conn>] [--pg-table <t>]...
                          [--pg-filter <file>] [--pg-exclude-table-data <t>]... [--dir <path>]...

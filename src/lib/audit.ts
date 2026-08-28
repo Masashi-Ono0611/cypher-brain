@@ -293,6 +293,14 @@ export async function audit(o: CliOptions): Promise<void> {
       broken_at_index: result.brokenAtIndex,
       skipped_lines: skippedLines,
       last_entry: lastEntry,
+      // #458: the only CLI-level way to list/browse the FULL trail (previously only
+      // last_entry was exposed, forcing anyone who wanted the other entries to read
+      // $CYPHER_BRAIN_HOME/audit-log.jsonl directly, bypassing the CLI's own read/parse/
+      // validate path entirely). Same precedent as ledger.ts's `receipts` array in its
+      // own --json output: the aggregate/summary fields above PLUS every source record,
+      // in one call, kept in log order (oldest first) so index N here lines up with
+      // chain position N (and with `broken_at_index` above, when set).
+      entries,
     });
     if (!overallOk) process.exitCode = 1;
     return;

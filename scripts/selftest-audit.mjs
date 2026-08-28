@@ -238,6 +238,40 @@ try {
     JSON.stringify(jsonReport),
   );
 
+  // #458: `entries` must expose the FULL trail (previously only `last_entry`, forcing
+  // anyone who wanted entries 0/1 to hand-parse audit-log.jsonl outside the CLI). Check
+  // both the count AND field-by-field correctness against the real on-disk log read
+  // directly (readLog()) — not just that SOME array showed up.
+  check(
+    'cypher-brain audit --json "entries" includes all 3 entries, not just the last one',
+    Array.isArray(jsonReport.entries) && jsonReport.entries.length === 3,
+    JSON.stringify(jsonReport.entries),
+  );
+  check(
+    'audit --json "entries" is in log order (oldest first): push, restore, verify',
+    jsonReport.entries?.[0]?.command === 'push' &&
+      jsonReport.entries?.[1]?.command === 'restore' &&
+      jsonReport.entries?.[2]?.command === 'verify',
+    JSON.stringify(jsonReport.entries?.map((e) => e.command)),
+  );
+  for (let i = 0; i < entries.length; i++) {
+    check(
+      `audit --json "entries"[${i}] matches the on-disk entry field-by-field (hash/prev_hash/timestamp/exit_code)`,
+      jsonReport.entries?.[i]?.hash === entries[i].hash &&
+        jsonReport.entries?.[i]?.prev_hash === entries[i].prev_hash &&
+        jsonReport.entries?.[i]?.timestamp === entries[i].timestamp &&
+        jsonReport.entries?.[i]?.command === entries[i].command &&
+        jsonReport.entries?.[i]?.exit_code === entries[i].exit_code &&
+        jsonReport.entries?.[i]?.machine === entries[i].machine,
+      `${JSON.stringify(jsonReport.entries?.[i])} vs ${JSON.stringify(entries[i])}`,
+    );
+  }
+  check(
+    'audit --json "entries"[2] (the last one) equals "last_entry" (same object, not two different reads)',
+    JSON.stringify(jsonReport.entries?.[2]) === JSON.stringify(jsonReport.last_entry),
+    `${JSON.stringify(jsonReport.entries?.[2])} vs ${JSON.stringify(jsonReport.last_entry)}`,
+  );
+
   const humanReport = cbOk({}, 'audit');
   check('cypher-brain audit (human) reports VERDICT: PASS', /VERDICT: PASS/.test(humanReport), humanReport);
 

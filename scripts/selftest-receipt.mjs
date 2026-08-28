@@ -360,6 +360,83 @@ try {
   arlocal.kill();
 }
 
+// ---------------------------------------------------------------------------
+// Part C: #457 — `ledger`'s plain-text empty-state message must distinguish a
+// GENUINELY empty ledger (no file / zero lines) from a ledger where every line
+// exists but is unreadable (0 receipts survived readReceipts(), skippedLines > 0).
+// Before this fix, both cases printed the IDENTICAL "no receipts yet" sentence —
+// audit.ts already avoided this exact confusion for the equivalent scenario
+// (total entries: 0 / unreadable lines skipped: N / VERDICT: FAIL vs a true-empty
+// PASS with no skipped-lines line at all), so this proves ledger.ts now matches
+// that precedent instead of reusing wording that undercuts the "never silently
+// treated as no receipts" guarantee this CLI's own --help text documents.
+// ---------------------------------------------------------------------------
+const tmpC = await mkdtemp(join(tmpdir(), 'fix457458-ledger-emptystate-'));
+try {
+  const envC = { ...process.env, CYPHER_BRAIN_HOME: tmpC };
+  delete envC.CYPHER_BRAIN_RECEIPT_LEDGER;
+  const cbC = (...args) => spawnSync('node', [...DEV_ARGS, BIN, ...args], { env: envC, encoding: 'utf8' });
+
+  // (a) truly empty: no ledger file exists at all yet — must print the ORIGINAL "no
+  // receipts yet" sentence, unchanged (no regression from this fix).
+  const trulyEmpty = cbC('ledger');
+  check(
+    '#457 no-regression: a genuinely empty ledger (no file) still prints the original "no receipts yet" message',
+    trulyEmpty.status === 0 && trulyEmpty.stdout.includes('no receipts yet'),
+    `status=${trulyEmpty.status} stdout=${trulyEmpty.stdout}`,
+  );
+  check(
+    '#457 no-regression: a genuinely empty ledger warns nothing on stderr (no lines to skip)',
+    trulyEmpty.stderr.trim() === '',
+    trulyEmpty.stderr,
+  );
+
+  // (b) all-unreadable: the ledger FILE exists and has lines, but every single one is
+  // garbage (malformed JSON or wrong-shape) — 0 receipts survive readReceipts(), but
+  // skippedLines > 0. Must print a message VISIBLY DIFFERENT from (a)'s, naming the
+  // skipped count, per the issue repro (a receipt-shaped line missing
+  // cypher_brain_receipt_version, plus literal garbage, as the ONLY ledger content).
+  const ledgerPathC = join(tmpC, 'receipt-ledger.jsonl');
+  const garbageLines = [
+    'not json at all — literal garbage',
+    JSON.stringify({ cypher_brain_receipt_version: 2, backend: 'arweave' }), // wrong/future version
+  ];
+  await writeFile(ledgerPathC, `${garbageLines.join('\n')}\n`);
+  const allGarbage = cbC('ledger');
+  check(
+    '#457 fix: an all-unreadable ledger (0 readable, 2 skipped) does NOT print the true-empty "no receipts yet" sentence',
+    !allGarbage.stdout.includes('no receipts yet'),
+    allGarbage.stdout,
+  );
+  check(
+    '#457 fix: the all-unreadable message instead names the skipped count and says this is not necessarily empty',
+    /\b2\b/.test(allGarbage.stdout) && /not necessarily an empty ledger/.test(allGarbage.stdout),
+    allGarbage.stdout,
+  );
+  check(
+    '#457: the all-unreadable case still warns on stderr with the skipped-line count (unchanged warn() behavior)',
+    /2 line\(s\)/.test(allGarbage.stderr) && /could not be read/.test(allGarbage.stderr),
+    allGarbage.stderr,
+  );
+  check(
+    '#457: the two messages ((a) truly empty vs (b) all-unreadable) are genuinely DIFFERENT strings, not just different in the warning',
+    trulyEmpty.stdout.trim() !== allGarbage.stdout.trim(),
+    `(a)=${JSON.stringify(trulyEmpty.stdout)} (b)=${JSON.stringify(allGarbage.stdout)}`,
+  );
+
+  // --json must still be correct in this scenario (already was — this is a
+  // no-regression check on the pre-existing, technically-correct --json data the
+  // issue itself called out as fine).
+  const allGarbageJson = JSON.parse(cbC('ledger', '--json').stdout);
+  check(
+    '#457: --json in the all-unreadable case reports total_receipts=0 and skipped_lines=2 (this part was already correct)',
+    allGarbageJson.total_receipts === 0 && allGarbageJson.skipped_lines === 2,
+    JSON.stringify(allGarbageJson),
+  );
+} finally {
+  await rm(tmpC, { recursive: true, force: true });
+}
+
 async function readReceiptsAt(path) {
   const { readFile } = await import('node:fs/promises');
   let text;
