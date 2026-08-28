@@ -75,25 +75,59 @@ grep -qi "requires stdin to be a TTY" "$TMP/tty.log" || { echo "[FAIL] refusal d
 [ ! -f "$TTY_HOME/identity.age" ] || { echo "[FAIL] an identity was written despite the TTY refusal"; exit 1; }
 echo "[PASS] init refuses promptly (bounded by with_timeout, no hang) when stdin is not a TTY"
 
-echo "== (c) profile=none with an empty directory answer refuses cleanly (no empty snapshot) =="
-NODIR_HOME="$TMP/nodir-home"
+echo "== (c) profile=none with an empty directory answer RE-PROMPTS instead of throwing-and-rolling-back (issue #492) =="
+# Before the fix, hitting Enter with nothing typed (or only whitespace/commas) at
+# this free-text prompt threw immediately -- AFTER steps 1-5 had already written the
+# primary identity, the offline backup keypair, and the signing keypair to disk --
+# and the catch block a few hundred lines down in wizard.ts rolled ALL THREE back.
+# Same bug class as #462 (the Profile prompt, fixed there via a select() menu), but
+# this prompt genuinely cannot become a menu (the paths are free-form), so the fix
+# loops askLine() until at least one directory is given instead of throwing on the
+# first empty answer -- same fix shape the maintainer already chose for the sibling
+# bug. Driving the wizard through an empty answer here must now RE-PROMPT (never
+# fail), and afterwards ALL THREE artifacts (primary identity, backup identity,
+# signing identity) must survive, proving the empty answer never reached the outer
+# rollback catch at all.
+NODIR_HOME="$TMP/nodir-home"; mkdir -p "$NODIR_HOME"
+NODIR_CB_HOME="$TMP/nodir-cb-home"
+NODIR_STORE="$TMP/nodir-store"
+NODIR_SRC="$TMP/nodir-src"; mkdir -p "$NODIR_SRC"
+printf 'nodir-marker\n' > "$NODIR_SRC/note.txt"
+NODIR_KIT_PATH="$NODIR_HOME/recovery-kit.txt"
+NODIR_BACKUP_HOME="${NODIR_CB_HOME}-backup" # the default sibling path the wizard suggests for the backup key
+
 cat > "$TMP/qa-nodir.json" <<JSON
 [
-  ["Generate an offline backup keypair now?", "n"],
-  ["Generate a signing keypair now?", "n"],
+  ["Generate an offline backup keypair now?", "y"],
+  ["Path for the backup keypair", ""],
+  ["Generate a signing keypair now?", "y"],
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile (what to back up)", ""],
-  ["Directory path(s) to back up", ""]
+  ["Directory path(s) to back up", ""],
+  ["At least one directory is required", "$NODIR_SRC"],
+  ["Choose a backend", ""],
+  ["Path to write the recovery kit", "$NODIR_KIT_PATH"]
 ]
 JSON
-if CYPHER_BRAIN_HOME="$NODIR_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
-  with_timeout 30 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-nodir.json" --out "$TMP/nodir.log" \
-  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
-  echo "[FAIL] init accepted an empty directory list for profile=none"; cat "$TMP/nodir.log"; exit 1
-fi
-grep -qi "no directory given" "$TMP/nodir.log" || { echo "[FAIL] refusal does not explain the missing directory"; cat "$TMP/nodir.log"; exit 1; }
-echo "[PASS] init refuses profile=none with no directory given"
+# The retry's waitFor is the wizard's OWN re-prompt message ("At least one directory
+# is required...", printed by the fix right before it loops back to askLine() again)
+# rather than a second copy of the original prompt text -- the original prompt text
+# is already present in the transcript from the first render, so keying the retry to
+# it would let drive-init.mjs fire the second answer immediately, before the wizard
+# has actually re-rendered the prompt and re-attached its input listener.
+
+CYPHER_BRAIN_HOME="$NODIR_CB_HOME" CYPHER_BRAIN_FILE_DIR="$NODIR_STORE" HOME="$NODIR_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-nodir.json" --out "$TMP/nodir.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] the empty-then-valid directory answer made init fail (it should re-prompt, then complete normally)"; cat "$TMP/nodir.log"; exit 1; }
+grep -q 'cypher-brain init: complete' "$TMP/nodir.log" || { echo "[FAIL] empty-directory-answer wizard log lacks its own completion marker"; cat "$TMP/nodir.log"; exit 1; }
+grep -qi "no directory given" "$TMP/nodir.log" && { echo "[FAIL] the empty directory answer still threw the old rollback-triggering error"; cat "$TMP/nodir.log"; exit 1; }
+grep -qi "At least one directory is required" "$TMP/nodir.log" || { echo "[FAIL] the empty directory answer did not re-prompt"; cat "$TMP/nodir.log"; exit 1; }
+[ -f "$NODIR_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity is missing — an empty directory answer should never roll anything back"; exit 1; }
+[ -f "$NODIR_BACKUP_HOME/identity.age" ] || { echo "[FAIL] backup identity is missing — the #492 repro's own rollback target must survive an empty directory answer"; exit 1; }
+[ -f "$NODIR_CB_HOME/sign-identity.key" ] || { echo "[FAIL] signing identity is missing — the #492 repro's own rollback target must survive an empty directory answer"; exit 1; }
+echo "[PASS] an empty directory answer re-prompts instead of throwing — primary, backup AND signing identities all survive (issue #492 fixed)"
 
 echo "== (c2) select() offers ton-provider by name, and picking it with no CYPHER_BRAIN_TON_PROVIDER_OWNER/MAX_SPEND set refuses BEFORE spending (issue #396 Phase B) =="
 TONPROV_USER_HOME="$TMP/tonprov-user-home"; mkdir -p "$TONPROV_USER_HOME" # HOME override, same as test (d)'s WIZ_HOME below: without this, step 6 detects the REAL machine's ~/.gbrain/config.json (if any) and asks an extra --pg prompt this qa.json does not script for
@@ -448,8 +482,10 @@ echo "[PASS] pin=yes suggests a config.env KEY=value line (no export prefix), na
 
 echo "== (h) rollback + clean retry: a failure AFTER identity creation must not brick a retry (P2 fix) =="
 # The primary identity is created in step 1/6, well before later prompts that can
-# fail/abort (declining the paid-backend spend consent, an empty directory answer,
-# ...). Before the fix, any such later failure left the identity behind — and
+# fail/abort (declining the paid-backend spend consent, a cancelled prompt, ...) —
+# an empty directory answer no longer belongs on this list (#492: it re-prompts
+# instead of throwing, see (c) above). Before the fix, any such later failure left
+# the identity behind — and
 # `init` refuses unconditionally whenever an identity already exists — so a
 # declined-then-retried run was permanently stuck needing the scarier `keygen
 # --force`. Drive a run that succeeds through backup-key generation (so BOTH
@@ -1083,6 +1119,9 @@ echo "== (n) the yes/no prompt structurally cannot misread an ambiguous answer a
 # actually accepts for "no answer at all": a bare Enter, which must still honor the
 # prompt's own default (initialValue: true) rather than silently defaulting to false.
 NODEFAULT_HOME="$TMP/confirm-default-home"
+NODEFAULT_USER_HOME="$TMP/confirm-default-user-home"; mkdir -p "$NODEFAULT_USER_HOME"
+NODEFAULT_SRC="$TMP/confirm-default-src"; mkdir -p "$NODEFAULT_SRC"
+printf 'confirm-default-marker\n' > "$NODEFAULT_SRC/note.txt"
 cat > "$TMP/qa-confirm-default.json" <<JSON
 [
   ["Generate an offline backup keypair now?", ""],
@@ -1091,14 +1130,22 @@ cat > "$TMP/qa-confirm-default.json" <<JSON
   ["Protect the primary identity with a passphrase now?", "n"],
   ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
   ["Profile (what to back up)", ""],
-  ["Directory path(s) to back up", ""]
+  ["Directory path(s) to back up", "$NODEFAULT_SRC"],
+  ["Choose a backend", "\u001b[A\u001b[A"]
 ]
 JSON
-if CYPHER_BRAIN_HOME="$NODEFAULT_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+# #492 changed the directory prompt from "throws on empty" to "loops until non-empty"
+# (see (c) above), so this test can no longer use an empty directory answer as its
+# shortcut to a fast, clean exit before push. It now uses the SAME shortcut as test
+# (o) below: a real directory + picking "arweave" with no CYPHER_BRAIN_AR_WALLET
+# configured, which the wizard refuses BEFORE the spend-consent prompt (issue #161)
+# — exit 0, no push, no network call, and it happens right after the backend prompt
+# this QA script already answers.
+unset CYPHER_BRAIN_AR_WALLET # this suite's own environment must not already have one set
+CYPHER_BRAIN_HOME="$NODEFAULT_HOME" HOME="$NODEFAULT_USER_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
   with_timeout 30 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-confirm-default.json" --out "$TMP/confirm-default.log" \
-  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
-  echo "[FAIL] init accepted an empty directory list for profile=none (unexpected pass)"; cat "$TMP/confirm-default.log"; exit 1
-fi
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] the confirm-default run did not exit cleanly via the no-wallet backend precheck (issue #161)"; cat "$TMP/confirm-default.log"; exit 1; }
 grep -qi 'backup identity written to' "$TMP/confirm-default.log" || { echo "[FAIL] a bare Enter on the backup-keypair prompt did not honor its stated default (Yes) — it should have generated a backup keypair"; cat "$TMP/confirm-default.log"; exit 1; }
 if grep -qi 'Skipping the backup key' "$TMP/confirm-default.log"; then echo "[FAIL] a bare Enter on the backup-keypair prompt was silently read as 'no' — the exact #96 failure mode"; cat "$TMP/confirm-default.log"; exit 1; fi
 echo "[PASS] a bare-Enter answer on the security-relevant backup-keypair prompt honors its stated Yes default (never silently reads as 'no') — confirm()'s toggle UI also makes the OLD free-text misread (#96) structurally unreachable"
@@ -1261,6 +1308,36 @@ grep -qi "cypher-brain init: cancelled" "$TMP/nonpipe-stdin.log" || { echo "[FAI
 if grep -qi "is not a function" "$TMP/nonpipe-stdin.log"; then echo "[FAIL] process.stdin.unref() crashed and masked the real error — the P2 regression"; cat "$TMP/nonpipe-stdin.log"; exit 1; fi
 [ ! -f "$P_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity survived the cancellation — rollback should still fire on this path"; exit 1; }
 echo "[PASS] file-redirected (non-pipe) stdin under CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 surfaces the real InitCancelledError instead of a masking 'unref is not a function' crash"
+
+echo "== (q) issue #464: a piped automation transcript is free of clack's OWN color escape codes, with or without NO_COLOR — but still carries clack's non-color cursor-movement escapes (doc-comment accuracy check, wizard.ts header) =="
+# wizard.ts's own header comment (just above InitCancelledError) used to assert "a
+# real terminal is always on the other end of that output" whenever
+# CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 is used -- false for the EXACT way this
+# repo's own scripts/drive-init.mjs drives the wizard for this very selftest (piped
+# stdin AND stdout, no TTY at all). #464 rewrote that comment; this case is the
+# regression guard for what it now claims: (1) Node's own util.styleText -- which
+# every clack render call goes through for COLOR -- already suppresses every color
+# escape code on a non-TTY output stream on its own, NO_COLOR or not (so a captured
+# automation transcript is never colorized by accident); (2) clack's OWN
+# cursor-movement/hide/show/erase escapes (sisteransi, a separate mechanism NOT
+# gated by NO_COLOR/FORCE_COLOR/isTTY at all) are still written unconditionally, so
+# the transcript is NOT plain text either -- reusing test (c)'s own already-captured
+# "$TMP/nodir.log" rather than spawning a whole extra wizard run for this.
+python3 - "$TMP/nodir.log" <<'PY'
+import re
+import sys
+
+data = open(sys.argv[1], "rb").read()
+color_codes = re.findall(rb"\x1b\[[0-9;]*m", data)
+if color_codes:
+    print(f"[FAIL] found {len(color_codes)} SGR color escape code(s) in a plain piped automation transcript -- styleText should have suppressed all of them on this non-TTY output stream (issue #464)")
+    sys.exit(1)
+esc_bytes = data.count(b"\x1b")
+if esc_bytes == 0:
+    print("[FAIL] expected clack's own cursor-movement escapes (sisteransi) to still be present per the doc comment's own claim, but found zero ESC bytes -- this fixture may no longer exercise a real clack render")
+    sys.exit(1)
+print(f"[PASS] zero SGR color escape codes in the piped automation transcript (styleText's own isTTY check holds, NO_COLOR or not); {esc_bytes} non-color cursor-movement ESC byte(s) remain, exactly as the corrected doc comment now says")
+PY
 
 echo
 echo "INIT SELFTEST PASS"
