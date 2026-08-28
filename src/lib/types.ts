@@ -100,6 +100,13 @@ export type FetchShape = 'age' | 'minisig';
 export interface PutOpts {
   yes?: boolean;
   remote?: string; // rclone backend only: the "<remote>:<path>" destination (put() throws without it)
+  // rclone backend only (#533): opts out of that backend's own refuse-by-default
+  // overwrite check (an object already sitting at the exact --remote path). This is
+  // the SAME CliOptions.force push already threads through for --skip-unchanged's
+  // digest override (pushpull.ts) — deliberately reused rather than a second flag,
+  // since both mean "push anyway despite a safety net", not two unrelated behaviors.
+  // Every other backend's put() ignores it, same as `remote` above.
+  force?: boolean;
   // #232 (arweave/turbo), #484 (ton-provider): paid backends call this, right after a
   // successful upload, with a response object and the best available native-unit cost
   // that upload paid, if the backend can name one — turbo's is its SDK response

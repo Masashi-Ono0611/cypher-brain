@@ -671,6 +671,15 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       brain implements none of them itself. Free (like file); needs rclone on
       PATH and a remote already set up via 'rclone config' (or a config-less
       on-the-fly remote, e.g. --remote ":local:/path"). --remote is required.
+      No-clobber for rclone (#533): refuses to upload when an object already
+      exists at that exact --remote path — unlike file's <sha256>.age locator
+      (content-addressed, so a same-path "overwrite" is always byte-identical)
+      or arweave/turbo's (assigned fresh after upload), an rclone --remote is an
+      operator-named, free-form destination (NON_CONTENT_ADDRESSED_BACKENDS in
+      src/lib/config.ts), so reusing one across two DIFFERENT snapshots would
+      otherwise silently replace the earlier one. Pass --force to overwrite it
+      anyway — the SAME flag --skip-unchanged's digest override uses below (both
+      mean "push despite this safety net"); does not apply to any other backend.
       --backend ton stores the ciphertext as a TON Storage bag SEEDED FROM YOUR OWN
       always-on box (the "seeder": a machine running tonutils-storage, reached over
       SSH — CYPHER_BRAIN_TON_SSH_HOST etc., see Settings below). The bag is created
@@ -809,7 +818,10 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       one's result) — pass --force to overwrite it anyway.
       --backend rclone accepts --remote <name>:<path> in place of --locator (the
       rclone backend's locator IS that string — see push's rclone section above);
-      an explicit --locator still wins if both are given.
+      an explicit --locator still wins if both are given. A locator/--remote with
+      no object at it fails with a clean "no object at <locator>" error (#539) —
+      not rclone's own raw, 3x-repeated retry-loop text (which used to mislabel a
+      missing FILE as a missing "directory").
       Authenticity (#214): --sig-locator <id> (or the 6th --from-locator-file field,
       read automatically) ALSO fetches the "<in>.minisig" sidecar push uploaded, into
       "<out>.minisig" — best-effort, never fails the pull itself (restore/verify treat a

@@ -72,8 +72,11 @@ echo "== push --save-locator + pull --from-locator-file (recovery path) =="
 LOCFILE="$TMP/rclone-locator.tsv"
 # Re-push the already-pulled artifact (still on disk as $TMP/got.age, byte-identical
 # to the original) with --save-locator so --from-locator-file has a real file to
-# recover from below.
-cb push --in "$TMP/got.age" --backend rclone --remote "$REMOTE" --save-locator "$LOCFILE" >/dev/null
+# recover from below. $REMOTE already holds an object (the push at the top of this
+# script) — #533's no-clobber check refuses that by default, so --force here is the
+# deliberate opt-in, not a workaround; the dedicated #533 checks further below cover
+# the refusal itself.
+cb push --in "$TMP/got.age" --backend rclone --remote "$REMOTE" --save-locator "$LOCFILE" --force >/dev/null
 cb pull --from-locator-file "$LOCFILE" --out "$TMP/recovered.age"
 [ "$(sha "$TMP/recovered.age")" = "$ORIG" ] && echo "[PASS] --from-locator-file recovery round-trips (backend read back from the saved locator file)" || { echo "[FAIL] recovery byte mismatch"; exit 1; }
 grep -q "^${REMOTE//./\\.}"$'\t'"rclone"$'\t' "$LOCFILE" || { echo "[FAIL] save-locator file did not record backend=rclone"; cat "$LOCFILE"; exit 1; }
@@ -88,6 +91,53 @@ fi
 grep -q "already exists" "$TMP/collide.err" || { echo "[FAIL] no-clobber error message missing 'already exists'"; cat "$TMP/collide.err"; exit 1; }
 [ "$(sha "$TMP/collide.age")" = "$COLLIDE_BEFORE" ] || { echo "[FAIL] the pre-existing --out was modified despite the no-clobber refusal"; exit 1; }
 echo "[PASS] pull refuses to overwrite an existing --out, which survives byte-identical"
+
+echo "== push refuses to overwrite an existing --remote object without --force (#533) =="
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+OVERWRITE_STORE_PATH="$STORE/overwrite-test.age"
+OVERWRITE_REMOTE=":local:$OVERWRITE_STORE_PATH"
+# First push: establishes an object at this remote path (an ordinary push — nothing
+# there yet, so no --force needed).
+cb push --in "$TMP/got.age" --backend rclone --remote "$OVERWRITE_REMOTE" >/dev/null
+OVERWRITE_BEFORE_SHA=$(sha "$OVERWRITE_STORE_PATH")
+OVERWRITE_BEFORE_MTIME=$(mtime "$OVERWRITE_STORE_PATH")
+sleep 1 # so a wrongly-applied overwrite would show a distinguishable mtime below
+# A DIFFERENT snapshot (age's ephemeral file key makes even byte-identical plaintext
+# encrypt to different ciphertext bytes every run, per pushpull.ts's own comment) to
+# the SAME --remote path, deliberately with NO --force.
+cb snapshot --dir "$SRC" --out "$TMP/snap2.age" >/dev/null
+if cb push --in "$TMP/snap2.age" --backend rclone --remote "$OVERWRITE_REMOTE" 2>"$TMP/overwrite-noforce.err"; then
+  echo "[FAIL] push overwrote an existing --remote object without --force"; exit 1
+fi
+grep -q "already exists — refusing to overwrite" "$TMP/overwrite-noforce.err" \
+  || { echo "[FAIL] no-clobber error message missing 'already exists — refusing to overwrite'"; cat "$TMP/overwrite-noforce.err"; exit 1; }
+[ "$(sha "$OVERWRITE_STORE_PATH")" = "$OVERWRITE_BEFORE_SHA" ] || { echo "[FAIL] the existing remote object's BYTES changed despite the no-clobber refusal — an upload was attempted"; exit 1; }
+[ "$(mtime "$OVERWRITE_STORE_PATH")" = "$OVERWRITE_BEFORE_MTIME" ] || { echo "[FAIL] the existing remote object's MTIME changed despite the no-clobber refusal — an upload was attempted"; exit 1; }
+echo "[PASS] push refuses to overwrite an existing --remote object without --force; the object survives byte- and mtime-identical (no upload was attempted)"
+
+echo "== the SAME push WITH --force succeeds and overwrites (#533 — no regression to --force's existing --skip-unchanged meaning) =="
+cb push --in "$TMP/snap2.age" --backend rclone --remote "$OVERWRITE_REMOTE" --force >/dev/null
+[ "$(sha "$OVERWRITE_STORE_PATH")" = "$(sha "$TMP/snap2.age")" ] && echo "[PASS] --force overwrites the existing --remote object, same as before this fix" || { echo "[FAIL] --force did not overwrite the remote object"; exit 1; }
+
+echo "== push to a genuinely NEW/empty --remote path still succeeds without --force (no false-positive refusal, #533) =="
+FRESH_STORE_PATH="$STORE/fresh/brand-new-path/snap.age"
+FRESH_REMOTE=":local:$FRESH_STORE_PATH"
+cb push --in "$TMP/got.age" --backend rclone --remote "$FRESH_REMOTE" >/dev/null
+[ -f "$FRESH_STORE_PATH" ] && [ "$(sha "$FRESH_STORE_PATH")" = "$ORIG" ] \
+  && echo "[PASS] push to a brand-new --remote path succeeds without --force" \
+  || { echo "[FAIL] push to a brand-new --remote path failed, or landed the wrong bytes"; exit 1; }
+
+echo "== pull of a nonexistent --remote object gives a clean 'no object at' error, not raw rclone passthrough (#539) =="
+MISSING_REMOTE=":local:$STORE/does/not/exist.age"
+if cb pull --backend rclone --remote "$MISSING_REMOTE" --out "$TMP/missing-pull.age" 2>"$TMP/missing-pull.err"; then
+  echo "[FAIL] pull of a nonexistent remote object succeeded"; exit 1
+fi
+[ -f "$TMP/missing-pull.age" ] && { echo "[FAIL] pull wrote --out despite the remote object not existing"; exit 1; }
+grep -q "no object at" "$TMP/missing-pull.err" || { echo "[FAIL] missing-object error does not use the clean 'no object at' framing"; cat "$TMP/missing-pull.err"; exit 1; }
+if grep -qi "directory not found" "$TMP/missing-pull.err" || grep -q "Attempt [0-9]*/3" "$TMP/missing-pull.err"; then
+  echo "[FAIL] missing-object error still leaks rclone's raw retry-loop text"; cat "$TMP/missing-pull.err"; exit 1
+fi
+echo "[PASS] pull of a nonexistent --remote object gives a clean, non-repetitive 'no object at' error"
 
 echo "== push --backend rclone without --remote is rejected with an actionable message =="
 if cb push --in "$TMP/got.age" --backend rclone 2>"$TMP/noremote.err"; then

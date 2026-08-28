@@ -11,6 +11,7 @@ import { mkdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { RCLONE_BIN, PIPE_TIMEOUT_MS } from '../config.js';
 import { run } from '../proc.js';
+import { errMsg } from '../util.js';
 import { progressReporter, progressIntervalMs, type ProgressReporter } from '../progress.js';
 import type { StorageBackend, PutOpts } from '../types.js';
 
@@ -52,6 +53,20 @@ export function rcloneArgs(subcommand: string, positionals: string[], intervalMs
 
 // How many of rclone's own messages to keep for a failure. See the catch below.
 const MSG_TAIL = 5;
+
+// rclone's own two "nothing is there" sentinel errors (fs.ErrorDirNotFound /
+// fs.ErrorObjectNotFound in rclone's source) — matched against whatever text a
+// failed rclone call produced, JSON-log `msgs` or plain stderr alike (#539). Real,
+// captured wording (rclone v1.74.4, `:local:` remote, and reproduced against the
+// issue's own repro): a missing SOURCE object for `copyto`/`lsjson`/etc. surfaces as
+// "directory not found" even when the missing thing is a plain FILE — rclone's
+// generic "does this path resolve to a container or a single leaf object?" source
+// resolution tries the leaf as a directory FIRST, so a missing file and a missing
+// directory produce the identical low-level error. `object not found` is included
+// defensively for the sibling sentinel other backends/operations can hit; neither
+// literal has been observed to appear in any OTHER rclone failure this backend
+// surfaces (auth/network/bad-remote-name errors have their own distinct wording).
+const RCLONE_NOT_FOUND_RE = /\bdirectory not found\b|\bobject not found\b/i;
 
 /**
  * One rclone JSON-log line, classified. Exported so the parsing contract — the fragile
@@ -134,9 +149,23 @@ async function runRclone(subcommand: string, positionals: string[], progress?: P
       );
     }
     // run() builds this exact prefix for a non-zero exit (`${cmd} exited ${code}: ...`),
-    // which is the only case where the message body is rclone's JSON rather than ours.
+    // which is the only case where the message body is rclone's JSON (or, with no
+    // `progress` given, rclone's own plain-text stderr) rather than ours.
     const isExitFailure = typeof err?.message === 'string' && err.message.startsWith(`${RCLONE_BIN} exited `);
-    if (isExitFailure && msgs.length > 0) throw new Error(`rclone backend: ${msgs.join('; ')}`);
+    if (!isExitFailure) throw e;
+    // #539: a missing SOURCE object (positionals[0] — the copyto/lsjson argument
+    // rclone actually failed to find) must never reach the operator as rclone's own
+    // raw, 3x-repeated retry-loop text (which also mislabels a missing FILE as a
+    // missing "directory" — see RCLONE_NOT_FOUND_RE above). Checked against the JSON-
+    // log `msgs` when progress was requested, else the plain stderr run() already
+    // captured — either shape carries the same sentinel wording. Translated into
+    // cypher-brain's own clean "no object at" framing, the SAME phrase file.ts's own
+    // not-found error uses (both backends share one CB-E0xx code, MANAGEMENT.md).
+    const failureText = msgs.length > 0 ? msgs.join('; ') : err.message;
+    if (RCLONE_NOT_FOUND_RE.test(failureText)) {
+      throw new Error(`rclone backend: no object at ${positionals[0]}`);
+    }
+    if (msgs.length > 0) throw new Error(`rclone backend: ${msgs.join('; ')}`);
     throw e;
   }
 }
@@ -157,6 +186,29 @@ function assertSafeRemote(value: string, what: string): void {
   }
 }
 
+// #533: does an object already sit at this EXACT remote path? `lsjson <remote>`
+// relies on rclone's own generic "does this path resolve to a container, or a
+// single leaf object?" source resolution — the SAME mechanism that lets a bare
+// `<remote>:<path>/file.age` work as a copyto target at all, uniformly, across all
+// 70+ rclone backends, with no backend-specific code in this file. It lists exactly
+// one entry when something is there, and fails with the SAME "not found" shape
+// runRclone's catch above normalizes into "no object at <remote>" (#539) when
+// nothing is — so that exact message is what this checks for below, rather than
+// re-testing RCLONE_NOT_FOUND_RE a second time against different text.
+async function rcloneObjectExists(remote: string): Promise<boolean> {
+  try {
+    await runRclone('lsjson', [remote]);
+    return true;
+  } catch (e) {
+    if (errMsg(e) === `rclone backend: no object at ${remote}`) return false;
+    // An unrelated failure (auth, network, a typo'd remote name, rclone itself
+    // missing — already turned into its own actionable message above) must never be
+    // silently read as "nothing here yet": that would let push proceed with an
+    // upload whose overwrite-safety this check could not actually verify.
+    throw e;
+  }
+}
+
 // The locator IS the "<remote>:<path>" string itself — the same idea as the file
 // backend using a local filesystem path as its locator (types.ts's StorageBackend
 // doc comment). push --save-locator records it verbatim; pull hands it straight
@@ -168,6 +220,27 @@ export function rcloneBackend(): StorageBackend {
       const remote = opts.remote;
       if (!remote) throw new Error('rclone backend: --remote <rclone-remote-name>:<path> required');
       assertSafeRemote(remote, '--remote');
+      // #533: unlike file's <sha256>.age locator (content-addressed — a same-path
+      // "overwrite" is always byte-identical, no real risk) or arweave/turbo's
+      // (assigned fresh after upload), an rclone --remote is an operator-chosen,
+      // free-form destination (NON_CONTENT_ADDRESSED_BACKENDS, src/lib/config.ts) —
+      // reusing one across two DIFFERENT snapshots silently replaces the earlier one
+      // with no warning. Refuse-by-default, same posture every other output-writing
+      // command in this CLI already takes (pull --out, restore --out-dir, keygen,
+      // wallet create, estimate --out) — --force opts in to overwriting anyway. The
+      // SAME flag push's own --skip-unchanged digest override already uses just
+      // below in pushpull.ts: both mean "push despite this safety net", not two
+      // unrelated behaviors sharing a name by accident.
+      if (!opts.force && (await rcloneObjectExists(remote))) {
+        // Wording matches the OTHER refuse-by-default sites this exact "<subject>
+        // already exists — refusing to overwrite it with <description>" shape is
+        // copied from (pull --out / restore --out-dir, pushpull.ts) on purpose: the
+        // subject comes FIRST so this substring stays contiguous and keeps sharing
+        // CB-E009 (errors.ts) with them, rather than reading as a new, uncoded error.
+        throw new Error(
+          `rclone backend: ${remote} already exists — refusing to overwrite it with a different push (pass --force to overwrite it anyway)`,
+        );
+      }
       // `--` ends option parsing (rclone's cobra/pflag CLI, same convention as GNU
       // getopt) so a --remote value that happens to start with `-` (accidentally, or
       // via a tampered save-locator file feeding pull's locator back in here) is
