@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { parseEnv } from 'node:util';
-import { warnIfLooseKeyPermsSync } from './util.js';
+import { errMsg, warnIfLooseKeyPermsSync } from './util.js';
 import { warn } from './warn.js';
 
 // Every CYPHER_BRAIN_* name this codebase reads, declared exactly once.
@@ -148,7 +148,7 @@ function loadConfigFile(home: string): { file: LoadedConfigFile | null; error: E
   try {
     parsed = parseEnv(readFileSync(path, 'utf8')) as Record<string, string>;
   } catch (e) {
-    return { file: null, error: new Error(`config file ${path} could not be parsed: ${(e as Error)?.message ?? e}`) };
+    return { file: null, error: new Error(`config file ${path} could not be parsed: ${errMsg(e)}`) };
   }
 
   // Both spellings are ours; the legacy CIPHER_BRAIN_* keys are validated and applied

@@ -19,6 +19,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { errMsg } from './util.js';
 
 // Replaced with a string literal by scripts/build.ts. `declare` (not a real binding) so
 // the reference disappears in the bundle; `typeof` guards the dev case where it is
@@ -73,7 +74,7 @@ export function restoreRunbook(): string {
     text = extractSection(readFileSync(path, 'utf8'), RUNBOOK_HEADING);
   } catch (e) {
     throw new Error(
-      `restore runbook unavailable: this build has no inlined copy and ${path} could not be read (${(e as Error)?.message ?? e}). ` +
+      `restore runbook unavailable: this build has no inlined copy and ${path} could not be read (${errMsg(e)}). ` +
         `A shipped build should have it inlined by scripts/build.ts.`,
     );
   }

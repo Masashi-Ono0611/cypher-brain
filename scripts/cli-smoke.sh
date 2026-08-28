@@ -78,6 +78,22 @@ if [ "$ADDR3" != "$ADDR2" ]; then
 fi
 echo "[PASS] dist wallet address: falls back to \$CYPHER_BRAIN_HOME/wallet.json when --wallet and CYPHER_BRAIN_AR_WALLET are both unset"
 
+# (c3) #497: a syntactically-valid-JSON wallet file that is NOT shaped like a JWK
+# (e.g. after a bad edit, or CYPHER_BRAIN_AR_WALLET pointed at the wrong file) must get
+# THIS function's own "cannot read JWK wallet" treatment, not a raw, unprefixed error
+# from arweave-js's internal jwkToAddress() (which used to surface as e.g. "error:
+# Failed to decode string" — no "wallet address:" prefix, no mention of the wallet path).
+NOTJWK="$TMP/not-a-jwk.json"
+printf '{"foo":"bar"}' > "$NOTJWK"
+chmod 600 "$NOTJWK"
+NOTJWK_ERR=$(node "$DIST" wallet address --wallet "$NOTJWK" 2>&1); NOTJWK_RC=$?
+if [ "$NOTJWK_RC" -eq 0 ]; then echo "[FAIL] wallet address accepted a non-JWK JSON file"; echo "$NOTJWK_ERR"; exit 1; fi
+if ! printf '%s' "$NOTJWK_ERR" | grep -q "wallet address: $NOTJWK does not look like a JWK wallet"; then
+  echo "[FAIL] a non-JWK wallet file did not get this function's own error treatment (got a raw/unprefixed error instead)"
+  echo "$NOTJWK_ERR"; exit 1
+fi
+echo "[PASS] dist wallet address: a syntactically-valid but non-JWK wallet.json gets this function's own \"does not look like a JWK wallet\" error, never a raw arweave-js internal error"
+
 # (d) estimate --backend file: offline, deterministic — sizes an existing file (the
 # keygen'd recipient.txt) and must report the free-tier cost without touching the
 # network. Read-only: no upload happens.
