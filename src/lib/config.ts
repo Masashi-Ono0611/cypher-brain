@@ -61,6 +61,9 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL',
   'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS', // test-only override (scripts/selftest-ton-provider.sh) — a real push waits on the 10-minute default
   'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS', // test-only override, same reason
+  'CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS', // test-only override (#480) — a real deploy-confirm wait is bounded at 20 real minutes
+  'CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS', // test-only override, same reason
+  'CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS', // test-only override, same reason (#480 progress-line cadence)
   'CYPHER_BRAIN_TON_WALLET', // PR2: local TON wallet mnemonic file — when set, ton-provider auto-signs (no Tonkeeper deeplink) and derives `owner` from this wallet
   'CYPHER_BRAIN_YES',
   'CYPHER_BRAIN_MAX_SPEND',
@@ -488,6 +491,31 @@ export const TON_PROVIDER_NOTIFY_INTERVAL_MS = parsePositiveMsOverride(
   readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS'),
   15_000,
   'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS',
+);
+// Test-only overrides for waitForContractActive()'s own poll loop (issue #480) — same
+// reason as the notify overrides just above: a real deploy-confirmation wait is bounded
+// at 20 real minutes (a human has to open Tonkeeper and sign, or an auto-signed broadcast
+// has to actually land), and scripts/selftest-ton-provider.sh needs a positive control for
+// BOTH the timeout error message wording (auto-sign vs. Tonkeeper-deeplink guidance) and
+// the periodic progress line without waiting anywhere near that long.
+export const TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS = parsePositiveMsOverride(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS'),
+  20 * 60_000,
+  'CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS',
+);
+export const TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS = parsePositiveMsOverride(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS'),
+  5_000,
+  'CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS',
+);
+// How often waitForContractActive() prints a "still waiting" line while polling (#480: a
+// real 20-minute wait with zero output in between reads as a hang, not a wait) — separate
+// knob from the poll interval above so a test can observe several progress lines without
+// also having to poll tonapi's mock every few milliseconds.
+export const TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS = parsePositiveMsOverride(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS'),
+  30_000,
+  'CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS',
 );
 // PR2 (auto-signing): path to a local TON wallet mnemonic file (`wallet create --chain ton`,
 // src/lib/wallet.ts). When set AND present on disk, ton-provider.ts's put() signs and
