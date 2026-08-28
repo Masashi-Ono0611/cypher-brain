@@ -99,6 +99,20 @@ if cb pull --locator "$CYPHER_BRAIN_FILE_DIR/deadbeef.age" --backend file --out 
 fi
 echo "[PASS] absent locator errors"
 
+echo "== issue #465: --wait warns (but does not error) for a backend that cannot retry (file) =="
+WAIT_ERR=$(cb pull --locator "$LOC" --backend file --out "$TMP/wait-warn.age" --wait 2 2>&1); WAIT_RC=$?
+[ "$WAIT_RC" = "0" ] || { echo "[FAIL] pull with --wait on file backend should still succeed when the object exists"; echo "$WAIT_ERR"; exit 1; }
+printf '%s' "$WAIT_ERR" | grep -q -- '--wait has no effect for --backend file' || { echo "[FAIL] no --wait/file warning printed"; echo "$WAIT_ERR"; exit 1; }
+echo "[PASS] --wait on a non-retrying backend (file) warns"
+
+echo "== issue #465: --wait 0 (default, unset) does not warn =="
+NOWAIT_ERR=$(cb pull --locator "$LOC" --backend file --out "$TMP/wait-nowarn.age" 2>&1); NOWAIT_RC=$?
+[ "$NOWAIT_RC" = "0" ] || { echo "[FAIL] pull without --wait should succeed"; echo "$NOWAIT_ERR"; exit 1; }
+if printf '%s' "$NOWAIT_ERR" | grep -q -- '--wait has no effect'; then
+  echo "[FAIL] unexpected --wait warning with --wait unset"; echo "$NOWAIT_ERR"; exit 1
+fi
+echo "[PASS] no --wait warning when --wait is unset/0"
+
 echo "== issue #93: a locator outside FILE_DIR must be rejected (path traversal / arbitrary local file read) =="
 touch "$TMP/outside.age"
 set +e

@@ -4,7 +4,7 @@
 import { mkdir, writeFile, rm, readFile, rename, link, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { AGE_MAGIC, CIPHER_YES, readEnv } from './config.js';
+import { AGE_MAGIC, CIPHER_YES, readEnv, WAIT_RETRY_BACKENDS } from './config.js';
 import { exists, requireFile, sleep, sha256, readHead, errMsg, RetryableError } from './util.js';
 import { backendFor } from './backends/index.js';
 import { estimateCost, formatEstimate } from './estimate.js';
@@ -691,6 +691,18 @@ export async function pull(o: CliOptions): Promise<void> {
   // -> index); with --wait 0 (the default) pull fails immediately, preserving the old
   // behavior. CYPHER_BRAIN_PULL_RETRY_MS overrides the 30s retry interval (tests use it).
   const waitMs = (Number(o.wait) || 0) * 1000; // `|| 0` OUTSIDE Number → a non-numeric --wait is 0, not NaN (no infinite loop)
+  // #465: --wait only has an effect for backends whose get() can throw RetryableError
+  // (WAIT_RETRY_BACKENDS, config.ts) — for every other backend the retry loop below exits
+  // on attempt 1 regardless of this value, with nothing said about it before this warning
+  // existed. `file` is the explicitly recommended backend for local testing/dogfooding, so
+  // this was an easy trap: an operator simulating "not yet retrievable" locally to sanity-
+  // check their retry logic would see --wait appear to do nothing and could reasonably
+  // conclude the FLAG (not just that backend) was broken.
+  if (waitMs > 0 && o.backend && !WAIT_RETRY_BACKENDS.has(o.backend)) {
+    warn(
+      `--wait has no effect for --backend ${o.backend} — it only retries for ${[...WAIT_RETRY_BACKENDS].join('/')} (a not-yet-retrievable object fails immediately on every other backend)`,
+    );
+  }
   // Unlike waitMs above (where "unset" and "explicit 0" both correctly mean 0ms — a
   // bare `|| 0` is safe there), retryMs's default (30000) and its explicit-zero value
   // (0, immediate retry — the natural choice for a test avoiding a real sleep) are
