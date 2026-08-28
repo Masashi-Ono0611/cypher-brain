@@ -67,10 +67,18 @@ export interface PushPlan {
   backend: string;
   artifact_sha256: string;
   size_bytes: number;
-  // Informational only, carried through for audit — NOT re-checked independently at
-  // apply time. Once artifact_sha256 matches, the recipients it was encrypted to are
-  // implied by those exact bytes; re-gating on this field would only ever agree with
-  // (or, if it somehow disagreed, contradict) the sha256 check, never add a real guarantee.
+  // Re-checked at apply time (#469, validatePlan below) against the "<in>.recipients-
+  // fingerprint" sidecar re-read fresh at push time — the same signal pushpull.ts's
+  // own --skip-unchanged block already compares (recipientsFingerprintFor), applied
+  // here to a hand-edited or stale plan.json instead of a stale --save-locator line.
+  // Previously this field was write-only: computed and stored, but never read back,
+  // on the theory that a matching artifact_sha256 already implies an unchanged
+  // recipient set (different recipients re-encrypt to different ciphertext bytes) —
+  // true for the SIDECAR this field was read from at build time, but that argument
+  // said nothing about the plan.json's own recorded copy of it, which a user editing
+  // the file by hand (or a genuinely stale plan) can disagree with while sha256 still
+  // matches. #469: a plan is a consent artifact a reader reasonably expects every
+  // printed field to be part of the guarantee — this one visibly wasn't.
   recipients_fingerprint: string | null;
   // Best-effort: the wallet/address that would pay, if one was configured when the
   // plan was built (null when none was — e.g. planning before funding a wallet).
@@ -144,9 +152,29 @@ export async function readPlanFile(path: string): Promise<PushPlan> {
     throw new Error(`--plan ${path}: not valid JSON: ${errMsg(e)}`);
   }
   const p = parsed as Partial<PushPlan> | null;
+  if (!p || typeof p !== 'object') {
+    throw new Error(
+      `--plan ${path}: does not look like a cypher-brain plan file (created by "estimate --out <path>") — ` +
+        `missing or wrong-typed required field(s)`,
+    );
+  }
+  // #471: a plan written by a DIFFERENT (older or newer) cypher-brain version used to
+  // fall into the exact same "does not look like a plan file" generic text below as
+  // truly malformed input (e.g. {"not_a_plan": true}) — indistinguishable from the
+  // reader's side. Checked BEFORE the rest of the shape validation, deliberately: a
+  // different version's other fields are free to have moved/renamed/changed shape
+  // entirely, so validating those against v1's exact field set first (and only
+  // mentioning the version mismatch as an aside) would be backwards. Only fires when
+  // the field parsed as a number but the wrong one — a missing/wrong-typed version
+  // field still falls through to the generic "malformed" message below, same as
+  // every other missing/wrong-typed required field.
+  if (typeof p.cypher_brain_plan_version === 'number' && p.cypher_brain_plan_version !== PLAN_VERSION) {
+    throw new Error(
+      `--plan ${path}: unsupported plan version ${p.cypher_brain_plan_version} (expected ${PLAN_VERSION}) — ` +
+        `this plan was created by a different cypher-brain version; re-run "estimate --out" with this build for a compatible one`,
+    );
+  }
   if (
-    !p ||
-    typeof p !== 'object' ||
     p.cypher_brain_plan_version !== PLAN_VERSION ||
     typeof p.backend !== 'string' ||
     typeof p.artifact_sha256 !== 'string' ||
@@ -210,6 +238,7 @@ export function validatePlan(
     freshEstimate: CostEstimate;
     payerAddress: string | null;
     remote: string | null;
+    recipientsFingerprint: string | null;
     now?: Date; // test hook
   },
 ): PlanValidation {
@@ -223,6 +252,43 @@ export function validatePlan(
     return {
       ok: false,
       reason: `plan was built for a different artifact (sha256 ${plan.artifact_sha256}), --in now hashes to ${current.artifactSha256} — re-run "estimate --out" against the artifact you are actually pushing`,
+    };
+  }
+  // #469: recipients_fingerprint used to be write-only — recorded in the plan but
+  // never read back here, so a hand-edited (or genuinely stale) recorded value went
+  // completely unchecked. Re-verified the same null-handling way payer_address is
+  // below: both null (no sidecar either time — nothing to compare) is a legitimate
+  // pass, any other combination is a refusal, since the sidecar-computed fingerprint
+  // really did change (a recovery key added/removed) or disappeared between
+  // plan-build and push time.
+  if (plan.recipients_fingerprint === null && current.recipientsFingerprint !== null) {
+    return {
+      ok: false,
+      reason:
+        `plan was built with no recipients fingerprint recorded (the "<in>.recipients-fingerprint" sidecar was ` +
+        `missing or unreadable at "estimate --out" time), the current push computes ${current.recipientsFingerprint} — ` +
+        `re-run "estimate --out" so the plan actually reviews it`,
+    };
+  }
+  if (plan.recipients_fingerprint !== null && current.recipientsFingerprint === null) {
+    return {
+      ok: false,
+      reason:
+        `plan was built for recipients fingerprint ${plan.recipients_fingerprint}, the current push cannot compute ` +
+        `one (the "<in>.recipients-fingerprint" sidecar is missing or unreadable) — re-run "estimate --out" or restore the sidecar`,
+    };
+  }
+  if (
+    plan.recipients_fingerprint !== null &&
+    current.recipientsFingerprint !== null &&
+    plan.recipients_fingerprint !== current.recipientsFingerprint
+  ) {
+    return {
+      ok: false,
+      reason:
+        `plan was built for recipients fingerprint ${plan.recipients_fingerprint}, the current sidecar now reads ` +
+        `${current.recipientsFingerprint} — the recipient set changed (a recovery key was added or removed) since ` +
+        `the plan was made — re-run "estimate --out"`,
     };
   }
   const now = current.now ?? new Date();

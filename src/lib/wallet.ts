@@ -263,8 +263,18 @@ async function walletCreate(o: CliOptions): Promise<void> {
   await writeKeyFile(outPath, JSON.stringify(jwk), 0o600, !!o.force);
   console.log(`wallet (PRIVATE, keep offline): ${outPath}`);
   console.log(`address (PUBLIC, safe to share — fund THIS address): ${address}`);
+  // #472: CYPHER_BRAIN_AR_WALLET is NOT actually required for push/estimate/wallet
+  // address/balance to find this file — every one of them falls back to
+  // WALLET_DEFAULT_PATH (payerAddressFor/addressFromWallet above) when it is unset.
+  // The old wording ("... then set CYPHER_BRAIN_AR_WALLET=...") implied it always
+  // was, unconditionally, which overstated what a default-path `wallet create` needs.
+  // It is genuinely needed only when --out moved the file somewhere else.
   console.log(
-    `\n⚠  Back up the wallet file now. Fund the address above (app.ardrive.io / turbo.ar.io — crypto or a card), then set CYPHER_BRAIN_AR_WALLET=${outPath}.`,
+    usingDefaultPath
+      ? `\n⚠  Back up the wallet file now. Fund the address above (app.ardrive.io / turbo.ar.io — crypto or a card). ` +
+          `push/estimate and 'wallet address'/'balance' already find it here by default — CYPHER_BRAIN_AR_WALLET is only needed if you move it.`
+      : `\n⚠  Back up the wallet file now. Fund the address above (app.ardrive.io / turbo.ar.io — crypto or a card), ` +
+          `then set CYPHER_BRAIN_AR_WALLET=${outPath} (a non-default --out path is not found automatically).`,
   );
 }
 

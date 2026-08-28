@@ -10,7 +10,7 @@ import { rcloneBackend } from './rclone.js';
 import { tonBackend } from './ton.js';
 import { tonProviderBackend } from './ton-provider.js';
 import { didYouMean, nearestName } from '../suggest.js';
-import type { StorageBackend } from '../types.js';
+import { STORAGE_BACKEND_NAMES, type StorageBackend } from '../types.js';
 
 // #435 (Codex review): backendFor()'s dispatch used to be an if-chain naming each
 // backend twice — once in the chain, once again in the "unknown backend" message's
@@ -65,6 +65,6 @@ export async function backendFor(name: string | undefined): Promise<StorageBacke
   if (factory) return factory();
   const suggestion = name ? nearestName(name, Object.keys(BACKEND_FACTORIES)) : undefined;
   throw new Error(
-    `unknown backend: ${name || '(none)'}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use --backend file|arweave|turbo|rclone|ton|ton-provider`,
+    `unknown backend: ${name || '(none)'}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use --backend ${STORAGE_BACKEND_NAMES.join('|')}`,
   );
 }

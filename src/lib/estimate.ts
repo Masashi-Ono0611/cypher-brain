@@ -17,7 +17,7 @@ import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists, sha256, importQ
 import { printJson } from './ui.js';
 import { buildPlan, writePlanFile, readRecipientsFingerprint } from './plan.js';
 import { didYouMean, nearestName } from './suggest.js';
-import type { CliOptions } from './types.js';
+import { STORAGE_BACKEND_NAMES, type CliOptions } from './types.js';
 
 // Every field is REQUIRED and nullable rather than optional (#268): a `--json`
 // consumer — the whole point of #211 — gets one stable object shape, so
@@ -136,10 +136,10 @@ export async function tonUsdRate(): Promise<number | null> {
 }
 
 // Estimate what pushing `sizeBytes` to `backend` would cost, WITHOUT uploading
-// anything (price queries only). `backend` must be one of file|arweave|turbo|rclone|ton|ton-provider —
-// any other value is a caller bug (mcp.ts validates via requireBackend before calling
-// this; the CLI estimate() below validates too), so it is rejected explicitly
-// rather than silently falling through to the arweave branch.
+// anything (price queries only). `backend` must be one of STORAGE_BACKEND_NAMES
+// (types.ts) — any other value is a caller bug (mcp.ts validates via requireBackend
+// before calling this; the CLI estimate() below validates too), so it is rejected
+// explicitly rather than silently falling through to the arweave branch.
 export async function estimateCost(backend: string, sizeBytes: number): Promise<CostEstimate> {
   const e = await estimateCostFor(backend, sizeBytes);
   // The single normalization point described on PartialCostEstimate above. Written
@@ -184,9 +184,9 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
       size_bytes: sizeBytes,
       cost: '0',
       note:
-        'ton backend seeds the bag from your OWN tonutils-storage box (src/lib/backends/ton.ts) — no per-upload ' +
-        "charge, only that box's own running cost. NOT permanent storage: the bag is retrievable only while at " +
-        'least one reachable seeder retains it (see docs/durability.md).',
+        "ton backend seeds the bag from your OWN tonutils-storage box — no per-upload charge, only that box's " +
+        'own running cost. NOT permanent storage: the bag is retrievable only while at least one reachable ' +
+        'seeder retains it (see docs/durability.md).',
     };
   }
 
@@ -348,9 +348,12 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
   // flags — --backend is an enum-valued flag like --level/--chain, and this is the
   // "unknown backend" copy `estimate` actually hits (backends/index.ts's backendFor()
   // is a separate copy for push/pull, per this function's own header comment on #159).
-  const suggestion = nearestName(backend, ['file', 'arweave', 'turbo', 'rclone', 'ton', 'ton-provider']);
+  // #501: STORAGE_BACKEND_NAMES (types.ts) is the shared list, not a second hand-kept
+  // copy — see that const's own comment for why this file can't just import
+  // backends/index.ts's BACKEND_FACTORIES instead.
+  const suggestion = nearestName(backend, STORAGE_BACKEND_NAMES);
   throw new Error(
-    `unknown backend: ${backend}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use file|arweave|turbo|rclone|ton|ton-provider`,
+    `unknown backend: ${backend}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use ${STORAGE_BACKEND_NAMES.join('|')}`,
   );
 }
 
@@ -391,7 +394,7 @@ export function formatEstimate(e: CostEstimate): string[] {
 // or the MCP estimate_cost tool.
 export async function estimate(o: CliOptions): Promise<void> {
   if (!o.in) throw new Error('--in <file.age> required');
-  if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton|ton-provider> required');
+  if (!o.backend) throw new Error(`--backend <${STORAGE_BACKEND_NAMES.join('|')}> required`);
   await requireFile(o.in); // #267: one shared check/wording across every command
   const st = await stat(o.in);
   if (!st.isFile())
@@ -406,6 +409,16 @@ export async function estimate(o: CliOptions): Promise<void> {
   // module: see wallet.ts's payerAddressFor doc comment for why a static one here
   // would be circular (wallet.ts statically imports this module's own rate functions).
   if (o.out) {
+    // #470: same no-clobber posture as "snapshot --out" (CB-E009) — without this, a
+    // second "estimate --out" at the same path silently discarded whatever plan a
+    // prior run wrote there (and anything already relying on it via "push --plan"),
+    // no warning, no error. --force overwrites anyway, the same escape hatch
+    // push/pull/wallet create already use for this exact refusal.
+    if (!o.force && (await exists(o.out))) {
+      throw new Error(
+        `${o.out} already exists — refusing to overwrite a prior plan (move it aside, choose a new --out, or pass --force)`,
+      );
+    }
     // #468: without --remote, an rclone plan would pin remote: null — and "push
     // --plan" always has a REAL --remote to compare against (rclone requires it,
     // src/lib/backends/rclone.ts's put()), so that plan can never validate; it fails
