@@ -822,7 +822,12 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
                        [--level quick|remote|drill] [--verbose]
       Assert it is real age ciphertext, a wrong key cannot open it, AND (when the
       private identity is on this box) that YOUR key decrypts it into a well-formed
-      bundle. --sha256 also pins the artifact to an expected hash. Authenticity (#214):
+      bundle. --identity overrides the default identity path
+      ($CYPHER_BRAIN_HOME/identity.age) — an EXPLICITLY-given --identity path that does
+      not exist is a hard error (a typo, same as restore's own --identity), never the
+      silent PARTIAL/[SKIP] a genuinely absent private identity gets when --identity is
+      omitted entirely and the default path is also absent (#531). --sha256 also pins
+      the artifact to an expected hash. Authenticity (#214):
       if "<in>.minisig" exists and a signing public key is configured (default
       $CYPHER_BRAIN_HOME/sign-recipient.pub; --sign-recipient overrides), verifies it
       too — an INVALID signature is a hard FAIL and skips the positive-control decrypt
@@ -836,13 +841,19 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       --level (issue #209) picks how deep the check goes, restic/kopia-style — each
       level is a strictly deeper (slower, more expensive) proof than the one before:
         quick  (default, unchanged): everything above, against the LOCAL --in file —
-               no network access. Refuses --locator/--backend/--from-locator-file
-               (those name something to FETCH; quick never fetches anything).
+               no network access. Refuses --locator/--backend/--from-locator-file/
+               --sig-locator (those name something to FETCH; quick never fetches
+               anything).
         remote: pulls the artifact by --locator <id> --backend <name> (or
                --from-locator-file <path>, same contract as "pull") into a scratch temp
                file, then runs the SAME checks above against THAT — proving the object
                is still actually retrievable from storage and unchanged, not merely
                that a local copy still parses. Rejects --in (remote fetches instead).
+               --sig-locator <id> (or the 6th --from-locator-file field, read
+               automatically — same contract as "pull") ALSO fetches the "<in>.minisig"
+               authenticity sidecar before running the checks above, so the signature
+               check (and --require-signature) has something to verify against; omit it
+               and remote/drill behave exactly as before #214 (ciphertext only).
         drill:  does everything remote does, and — only once those checks reach
                PASS — ALSO decrypts and extracts the pulled artifact into a scratch
                out-dir (the same code path "restore" runs), the full
@@ -859,12 +870,14 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       error — retrievability itself is what those two levels test.
       --json prints one JSON object to stdout instead of the human-readable report.
       quick: {file, size_bytes, checks: {age_header, sha256_match, signature,
-      wrong_key_rejected, positive_control}, verdict, exit_code} — the SAME checks
-      computed above, so it never disagrees with the human-readable report or the MCP
-      verify_restore tool. remote adds {level, pulled: {backend, locator, sha256_pin,
-      fetched}} alongside checks. drill replaces positive_control's role with a
-      {full_restore: true|false|"skip", full_restore_error?} pair once the pulled
-      checks reach PASS. The exit code is unchanged either way. If the command ERRORS
+      wrong_key_rejected, positive_control}, level, verdict, exit_code} — the SAME
+      checks computed above, so it never disagrees with the human-readable report or the
+      MCP verify_restore tool ("level" is "quick" — #536, matching remote/drill below;
+      the plain-text report's first line is "level: quick" for the same reason). remote
+      adds {pulled: {backend, locator, sha256_pin, fetched}} alongside checks. drill
+      replaces positive_control's role with a {full_restore: true|false|"skip",
+      full_restore_error?} pair once the pulled checks reach PASS. The exit code is
+      unchanged either way. If the command ERRORS
       instead (#270 — a missing file, an unreadable identity), stdout carries an error
       object ({error, code, exit_code}) rather than nothing, so a --json caller never
       has to fall back to scraping stderr; "code" is the CB-E0xx identifier when the failure
