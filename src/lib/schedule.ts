@@ -1490,11 +1490,21 @@ async function uninstall(o: CliOptions): Promise<void> {
   }
 
   const removed: string[] = [];
+  let plistDrift = false; // #529: set below when the plist was expected but missing
   if (process.platform === 'darwin') {
     sh('launchctl', ['bootout', `gui/${process.getuid?.()}/${LABEL}`]); // failure = was not loaded, fine
     if (await exists(PLIST)) {
       await rm(PLIST);
       removed.push(`launchd plist ${PLIST}`);
+    } else if (priorCfg) {
+      // #529: priorCfg (schedule.json) existing means THIS home recorded an installed
+      // schedule — install writes the plist unconditionally, --no-load or not (see
+      // CYPHER_BRAIN_LAUNCHD_DIR in --help) — so the file was expected here and its
+      // absence is drift (deleted manually, by another tool, or by a prior uninstall
+      // that already removed it). The bare `if` above used to just skip this silently,
+      // making a clean teardown indistinguishable from "the trigger vanished and nobody
+      // knows why" in the output — this is the whole fix for #529.
+      plistDrift = true;
     }
     const legacy = legacyLaunchd(priorCfg);
     if (legacy) {
@@ -1535,10 +1545,19 @@ async function uninstall(o: CliOptions): Promise<void> {
       removed.push(`${what} ${p}`);
     }
   }
-  if (removed.length === 0) {
+  if (removed.length === 0 && !plistDrift) {
     console.error('nothing to remove — schedule is not installed');
   } else {
     for (const r of removed) console.error(`removed: ${r}`);
+    // #529: a note, not a `removed:` line — nothing was actually removed here, the file
+    // was already gone. Distinct wording so a caller (human or doctor/monitoring) can
+    // tell "cleanly tore down a live trigger" apart from "the trigger's registration
+    // artifact silently vanished out-of-band and nobody knows why". Exit code/end state
+    // are unchanged either way — this only makes the drift VISIBLE.
+    if (plistDrift)
+      console.error(
+        `note: launchd plist ${PLIST} was already missing (removed manually, or drift from a prior uninstall?)`,
+      );
     console.error(
       `kept: logs (${LOGS_DIR}), snapshots (${SNAPS_DIR}) and index.tsv — they are your data, delete manually if unwanted`,
     );

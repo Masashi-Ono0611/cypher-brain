@@ -1176,7 +1176,11 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
 
   cypher-brain schedule uninstall
       Unregister the trigger and remove the generated runner/plist/cron entry (idempotent;
-      logs, snapshots and index.tsv are kept — they are your data).
+      logs, snapshots and index.tsv are kept — they are your data). macOS: if the launchd
+      plist this home recorded as installed is ALREADY gone (deleted manually, or by
+      another tool) that is reported as a distinct "note: ... was already missing" line
+      rather than silently dropped from the "removed:" list — still exits 0 either way,
+      the end state (no plist, no bookkeeping) is reached regardless (#529).
 
 Config file: every setting below can also live in $CYPHER_BRAIN_HOME/config.env (KEY=value
      per line, "#" comments) instead of the environment — the same names, one place, read by
