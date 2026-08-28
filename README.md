@@ -786,7 +786,7 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       No signing identity at all -> unchanged pre-#214 behavior (no *.minisig written).
 
   cypher-brain restore --in <file.age> --out-dir <dir> [--identity <file>] [--pg <conn>] [--yes] [--no-expand-components]
-                        [--sign-recipient <file>] [--require-signature] [--verbose]
+                        [--sha256 <hex>] [--sign-recipient <file>] [--require-signature] [--verbose]
       Decrypt with the PRIVATE identity. Extraction never clobbers a file already
       present in --out-dir: an existing file is left untouched, the rest of the
       archive still extracts around it, and the collision itself is not an error.
@@ -827,7 +827,10 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       in the target database — an irreversible operation — so it requires --yes or
       CYPHER_BRAIN_YES=1 to confirm, same as push's paid-backend guard below. Bounded by
       the same pipe timeout as the decrypt/extract step (CYPHER_BRAIN_PIPE_TIMEOUT).
-      Authenticity (#214): checked FIRST, before any decryption. If "<in>.minisig"
+      --sha256 <hex> pins --in to an expected hash, checked FIRST — before authenticity
+      and before any decryption. A mismatch refuses the restore outright (#645); this is
+      the same out-of-band integrity pin pull() and verify() already fail-closed on.
+      Authenticity (#214): checked next, still before any decryption. If "<in>.minisig"
       exists AND a signing public key is configured (default
       $CYPHER_BRAIN_HOME/sign-recipient.pub; --sign-recipient picks a different one),
       an INVALID signature refuses to restore outright (nothing is decrypted or written).

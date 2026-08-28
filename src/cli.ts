@@ -604,7 +604,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       No signing identity at all -> unchanged pre-#214 behavior (no *.minisig written).
 
   cypher-brain restore --in <file.age> --out-dir <dir> [--identity <file>] [--pg <conn>] [--yes] [--no-expand-components]
-                        [--sign-recipient <file>] [--require-signature] [--verbose]
+                        [--sha256 <hex>] [--sign-recipient <file>] [--require-signature] [--verbose]
       Decrypt with the PRIVATE identity. Extraction never clobbers a file already
       present in --out-dir: an existing file is left untouched, the rest of the
       archive still extracts around it, and the collision itself is not an error.
@@ -645,7 +645,10 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       in the target database — an irreversible operation — so it requires --yes or
       CYPHER_BRAIN_YES=1 to confirm, same as push's paid-backend guard below. Bounded by
       the same pipe timeout as the decrypt/extract step (CYPHER_BRAIN_PIPE_TIMEOUT).
-      Authenticity (#214): checked FIRST, before any decryption. If "<in>.minisig"
+      --sha256 <hex> pins --in to an expected hash, checked FIRST — before authenticity
+      and before any decryption. A mismatch refuses the restore outright (#645); this is
+      the same out-of-band integrity pin pull() and verify() already fail-closed on.
+      Authenticity (#214): checked next, still before any decryption. If "<in>.minisig"
       exists AND a signing public key is configured (default
       $CYPHER_BRAIN_HOME/sign-recipient.pub; --sign-recipient picks a different one),
       an INVALID signature refuses to restore outright (nothing is decrypted or written).
@@ -1227,6 +1230,16 @@ function helpForCommand(cmd: string): string | null {
  * "Does not read" is the user-facing phrasing; "never honors" is the precise one — restore()
  * touches o.out only to build the #279 hint, a branch now unreachable from the CLI and left
  * for a direct library caller.
+ *
+ * #647: keyed on the top-level command word by default, but a command with sub-verbs that
+ * disagree with each other (wallet's create|address|balance) can ALSO declare a
+ * subcommand-scoped key (`'wallet address'`, cmd + ' ' + o._) — assertFlagsRelevant() below
+ * tries that exact combination first and only falls back to the plain `cmd` entry when no
+ * such key exists. The static cli-smoke.sh check above only ever looks for the bare `cmd`
+ * key (it derives its expected set from the dispatch switch's case labels, which are never
+ * subcommand-scoped), so a subcommand-scoped key is additive and never satisfies #277's
+ * "every dispatchable command has a declaration" requirement on its own — the plain `cmd`
+ * entry (even `[]`) still has to exist too.
  */
 interface FlagIrrelevance {
   flag: string;
@@ -1277,10 +1290,17 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
     { flag: 'yes', because: 'init is interactive by definition; there is no unattended path to consent to' },
     { flag: 'force', because: 'init never overwrites — it detects what already exists and asks' },
   ],
-  // Empty is an answer, not an omission. These were checked and have no flag that another
-  // command accepts and they silently ignore.
-  push: [],
-  pull: [],
+  // #647: --json is a real, globally-recognized flag (BOOL_FLAGS above) and neither
+  // push() nor pull() had a deny-list entry for it, so both silently accepted it
+  // without ever implementing a JSON success path — push prints a bare locator string
+  // (not JSON), and pull prints no stdout document at all on success, while the
+  // top-level error handler DOES treat --json as a request for a {error, code,
+  // exit_code} object on the failure path. A caller parsing --json output uniformly
+  // got two different shapes depending on success vs. failure. Refused outright
+  // rather than given a half-implemented JSON success path, so the mismatch is a
+  // clear upfront error instead of a silently inconsistent contract.
+  push: [{ flag: 'json', because: 'push has no JSON success output — only the failure path is JSON-shaped' }],
+  pull: [{ flag: 'json', because: 'pull has no JSON success output — only the failure path is JSON-shaped' }],
   // ton-dns.ts's publishLatest() reads only o.domain/o.from_locator_file/o.yes/o.wait —
   // it never pushes/pulls ciphertext or writes a local file, so the flags a user reaching
   // for push/pull's shape would naturally try are named here rather than silently kept.
@@ -1319,7 +1339,20 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
     },
   ],
   schedule: [],
+  // #647: `wallet` covers three sub-verbs (create|address|balance, wallet.ts's
+  // WALLET_SUBCOMMANDS) that do not all read --json the same way — walletBalance()
+  // genuinely implements it (printJson(bal)), so a blanket `{ flag: 'json' }` entry
+  // here would wrongly refuse a working "wallet balance --json". `'wallet address'`
+  // below is the subcommand-scoped key assertFlagsRelevant() tries FIRST (cmd + ' ' +
+  // o._, only when that combination has its own entry) before falling back to this
+  // one — walletAddress() only ever console.log()s a bare address string, never JSON,
+  // so --json there gets the same "clear upfront error" #647 gives push/pull, without
+  // touching wallet balance's real JSON support or wallet create (which the issue
+  // does not report a similar --json gap for).
   wallet: [],
+  'wallet address': [
+    { flag: 'json', because: 'wallet address has no JSON output — it always prints a bare address string' },
+  ],
   // doctor() reads only o.json — every other flag another command takes (--out, --in,
   // --backend, ...) is meaningless here, but none is likely enough to be typed by
   // mistake to warrant naming individually (unlike restore's --out/--out-dir mix-up).
@@ -1384,9 +1417,18 @@ function assertFlagsDeclared(cmd: string | undefined): void {
 }
 
 function assertFlagsRelevant(cmd: string | undefined, o: CliOptions): void {
-  if (cmd === undefined || !Object.hasOwn(FLAG_IRRELEVANT, cmd)) return;
+  if (cmd === undefined) return;
+  // #647: a SUBCOMMAND-scoped key (`${cmd} ${o._}`, e.g. 'wallet address') is tried
+  // first — some sub-verbs of a multi-verb command (wallet's create|address|balance)
+  // disagree on which flags they read (walletBalance() implements --json,
+  // walletAddress() never has), so a single 'wallet' entry cannot answer for all of
+  // them. Falls back to the plain top-level `cmd` key when no such entry exists —
+  // every command without sub-verbs (push, pull, restore, ...) only ever has that one.
+  const subKey = typeof o._ === 'string' ? `${cmd} ${o._}` : undefined;
+  const key = subKey !== undefined && Object.hasOwn(FLAG_IRRELEVANT, subKey) ? subKey : cmd;
+  if (!Object.hasOwn(FLAG_IRRELEVANT, key)) return;
   const rec = o as unknown as Record<string, unknown>;
-  const ignored = FLAG_IRRELEVANT[cmd].filter((r) => rec[r.flag] !== undefined);
+  const ignored = FLAG_IRRELEVANT[key].filter((r) => rec[r.flag] !== undefined);
   if (ignored.length === 0) return;
   // The near-miss suggestion comes from the same helper #305's MCP refusal and restore's own
   // #279 hint use, so a user who typed --out on restore reads the same sentence they did
@@ -1395,7 +1437,7 @@ function assertFlagsRelevant(cmd: string | undefined, o: CliOptions): void {
     .map((r) => `--${r.flag.replace(/_/g, '-')} (${r.because}${r.instead ? ` — ${didYouMean(r.instead)}` : ''})`)
     .join('; ');
   throw new Error(
-    `${cmd} does not read ${ignored.map((r) => `--${r.flag.replace(/_/g, '-')}`).join(', ')}: ${named}. ` +
+    `${key} does not read ${ignored.map((r) => `--${r.flag.replace(/_/g, '-')}`).join(', ')}: ${named}. ` +
       `Refused rather than ignored: a flag that is silently dropped looks exactly like one that was honored.`,
   );
 }

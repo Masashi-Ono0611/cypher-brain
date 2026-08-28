@@ -400,14 +400,26 @@ export async function estimate(o: CliOptions): Promise<void> {
   if (!st.isFile())
     throw new Error(`${o.in} is not a regular file (cannot size a directory/special file for an estimate)`);
   const result = await estimateCost(o.backend, st.size);
-  if (o.json) printJson(result);
-  else for (const line of formatEstimate(result)) console.log(line);
   // --out <path.json> (#231): ALSO write a plan file pinning this estimate to the
   // exact artifact/backend/payer/remote it was computed against, for "push --plan
-  // <path>" to re-validate later. Additive to the normal report above — --out never
+  // <path>" to re-validate later. Additive to the normal report below — --out never
   // suppresses it. A dynamic import for the payer-address lookup only, not the whole
   // module: see wallet.ts's payerAddressFor doc comment for why a static one here
   // would be circular (wallet.ts statically imports this module's own rate functions).
+  //
+  // #646: this whole block runs BEFORE the report is printed below (it used to run
+  // after). estimate() prints result — a success-shaped CostEstimate — straight to
+  // stdout; on --json that IS the one document a machine caller ever sees. Every
+  // check in this block (no-clobber, --remote required for rclone, writePlanFile's
+  // own exclusive-create race guard) can still throw, and main()'s top-level handler
+  // only emits the documented {error, code, exit_code} JSON object when stdout has
+  // NOT already had a document written to it (hasWrittenJson(), ui.ts) — printing
+  // the cost estimate first and validating the plan write second meant a plan-write
+  // failure exited 1 with a stdout that still read as a successful --json estimate,
+  // and no error object at all. Doing every fallible step here FIRST, and printing
+  // exactly once at the bottom only after all of them succeed, makes "a JSON document
+  // reached stdout" and "the command actually succeeded" the same fact again.
+  let planSavedLine: string | null = null;
   if (o.out) {
     // #470: same no-clobber posture as "snapshot --out" (CB-E009) — without this, a
     // second "estimate --out" at the same path silently discarded whatever plan a
@@ -462,6 +474,14 @@ export async function estimate(o: CliOptions): Promise<void> {
       estimate: result,
     });
     await writePlanFile(o.out, plan, { force: !!o.force });
-    console.error(`plan saved -> ${o.out} (valid until ${plan.expires_at})`);
+    // Deferred to stderr AFTER the report below, not printed here: nothing in this
+    // function may write to a stream before every fallible step above has actually
+    // succeeded (#646) — see the comment at the top of this block.
+    planSavedLine = `plan saved -> ${o.out} (valid until ${plan.expires_at})`;
   }
+  // Printed exactly once, and only once every above step (including the plan write)
+  // has succeeded — see the #646 comment above.
+  if (o.json) printJson(result);
+  else for (const line of formatEstimate(result)) console.log(line);
+  if (planSavedLine) console.error(planSavedLine);
 }

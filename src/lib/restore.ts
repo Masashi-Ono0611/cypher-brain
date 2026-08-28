@@ -907,7 +907,40 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   // [CB-E002]", a code MANAGEMENT.md documents as "wrong identity, or a corrupt/
   // truncated artifact" — a key audit in answer to a typo.
   await requireFile(o.in);
-  // Authenticity check FIRST (#214), before any decryption or even the age identity
+  // #645: --sha256 <hex> pins --in to a hash known out-of-band, the exact same shape
+  // pull() already fail-closes on (pushpull.ts) and verify() already reports as
+  // sha256_match — but until now restoreImpl() never read o.sha256 back at all. The
+  // CLI parser accepts the flag (it is a real value flag, VALUE_FLAGS above) and
+  // restore's own deny-list only names --out as unread, so a caller who explicitly
+  // pinned the expected hash (the rollback/substitution protection the flag exists
+  // for) got no error AND no check — a differently-hashed, still-validly-encrypted,
+  // still-correctly-signed ciphertext at the same --in path restored anyway. Checked
+  // HERE: right after the file is confirmed to exist, and before the authenticity
+  // check below — a byte-hash comparison needs no keys, so it fails closed on the
+  // cheapest possible proof first, same ordering principle as the signature check's
+  // own "before any decryption" comment just below.
+  if (o.sha256) {
+    const gotHash = await sha256(o.in);
+    if (gotHash.toLowerCase() !== String(o.sha256).toLowerCase()) {
+      throw new Error(
+        `sha256 mismatch: ${o.in} is ${gotHash}, expected ${o.sha256} (refusing to restore — the artifact at this path ` +
+          `does not match the pinned hash)`,
+      );
+    }
+    console.log(`[PASS] sha256 matches the expected hash`);
+  }
+  // What this proves and what it does not (Codex review): this hashes --in once, here.
+  // The signature check and the decrypt below each independently re-open --in by path,
+  // same as they always have — a local attacker with WRITE access to --in's path DURING
+  // this single restore invocation could in principle swap the bytes between these reads
+  // (a TOCTOU race, not something --sha256 or the signature check close). That is a
+  // materially different threat from the one --sha256 targets: a compromised STORAGE
+  // backend serving a rolled-back/substituted artifact under an otherwise-trusted
+  // locator (the same threat pull()'s own --sha256 check defends against, pushpull.ts).
+  // Closing the local race would mean hashing and decrypting from one already-open file
+  // descriptor rather than re-reading --in by path three times, which the streaming
+  // decrypt-then-tar pipeline below is not structured for — out of scope for #645.
+  // Authenticity check next (#214), still before any decryption or even the age identity
   // check below: age proves confidentiality + tamper detection, but NOT authenticity
   // (a recipient's public key is not secret — anyone holding it can forge ciphertext
   // that decrypts cleanly). A tampered/forged *.minisig always refuses outright. An
