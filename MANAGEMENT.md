@@ -516,8 +516,10 @@ the exact wording — it's meant to stay stable across a future rewording of the
 message (`src/lib/errors.ts`'s registry matches text, so keeping that promise in practice
 means the registry entry is updated in the SAME change that reworks its message — see that
 file's `source` field on each entry). An error with no code just means it hasn't been
-assigned one yet (issue #212 covers the most common ~15 patterns, not every possible
-failure); the plain message is still the full story either way. Over MCP,
+assigned one yet (issue #212 seeded the registry and later issues have grown it since —
+see `src/lib/errors.ts`'s `ERROR_CODES` array for the current, authoritative count — it
+covers the most common failure patterns, not every possible failure); the plain message
+is still the full story either way. Over MCP,
 `verify_restore`/`snapshot_now`/etc.'s error result also carries the code as its own
 `cb_code` field, so an agent can branch on it without parsing the message text.
 
@@ -533,7 +535,7 @@ failure); the plain message is still the full story either way. Over MCP,
 | CB-E008 | `push --in` points at a file that isn't age ciphertext (its header doesn't match) — storage must only ever see ciphertext. | Pass the `.age` file `cypher-brain snapshot` produced, not a plaintext/other file. |
 | CB-E009 | The command's output path already exists and no-clobber refused to overwrite it (protects a prior snapshot/pull result from silent loss) — or `push --backend rclone --remote <name>:<path>` found an object already sitting at that exact remote path (#533: rclone destinations are operator-named, not content-addressed, so a reused `--remote` could otherwise silently replace a different snapshot). | Pick a different `--out`/`--save-locator`/`--remote` path, move the existing file aside, or pass `--force` to overwrite it deliberately. |
 | CB-E010 | A `file`-backend locator resolves outside `CYPHER_BRAIN_FILE_DIR`, or doesn't match the `<sha256>.age` shape `push` itself produces — refused as a possible path-traversal/arbitrary-file-read attempt via a tampered locator. | Only pass locators exactly as `push` printed them (or as saved in a `--save-locator`/index file from a trusted, off-box copy); don't hand-construct one. |
-| CB-E011 | The `arweave`/`turbo` backend needs `CYPHER_BRAIN_AR_WALLET` (a JWK signer) and it's unset, or the path isn't readable. | Run `cypher-brain wallet create` to generate one, then set `CYPHER_BRAIN_AR_WALLET` to its path (`wallet address` shows what to fund). |
+| CB-E011 | The `arweave`/`turbo` backend needs `CYPHER_BRAIN_AR_WALLET` (a JWK signer) and it's unset, or the path isn't readable — or `wallet address`/`wallet balance` was pointed at a wallet file that exists but isn't readable (corrupt/non-JSON contents, a permission error, …; a wallet file that's simply MISSING is CB-E019 instead). | Run `cypher-brain wallet create` to generate one, then set `CYPHER_BRAIN_AR_WALLET` to its path (`wallet address` shows what to fund). If the file exists but won't parse, re-create it or fix its permissions. |
 | CB-E012 | The optional package the backend needs isn't installed — `arweave` (an optional peer) or `@ardrive/turbo-sdk` (an `optionalDependency` a normal install carries, but which can be absent after `--omit=optional` or a tolerated optional-install failure). | Run the `npm install …` command the error itself prints. |
 | CB-E013 | `--backend` was given a value other than `file`, `arweave`, `turbo`, `rclone`, `ton`, or `ton-provider`. | Correct the typo — only those six are valid. |
 | CB-E014 | `schedule status`/`uninstall` ran before `schedule install`, or writing the crontab entry failed. | Run `cypher-brain schedule install` first; a crontab-write failure usually means missing cron permissions/availability in this environment. |
@@ -544,6 +546,8 @@ failure); the plain message is still the full story either way. Over MCP,
 | CB-E019 | `wallet address` (CLI or MCP `wallet_address`) was given a `--wallet`/`wallet` path (or the default `CYPHER_BRAIN_AR_WALLET`) and no JWK file exists there. | Run `cypher-brain wallet create` first, or point `--wallet`/`wallet` at the correct path. |
 | CB-E020 | `snapshot`'s `--recipient`/MCP `snapshot_now`'s `recipients` named something that is neither an `age1...` pubkey nor an existing file of pubkeys (same condition the recovery kit checks for its own recorded recipient). | Run `cypher-brain keygen` first, or pass an `age1...` pubkey / a valid recipients file. |
 | CB-E021 | `restore`'s `--out-dir`/MCP `restore_now`'s `out_dir` already exists as a plain file (or other non-directory) rather than a directory. | Point `--out-dir`/`out_dir` at a path that is either absent or already a directory. |
+| CB-E022 | `snapshot --sign-identity <path>` was given a path that doesn't exist. | Point `--sign-identity` at an existing signing private key (`cypher-brain keygen` writes one to the default path), or drop the flag to use the default. |
+| CB-E023 | `restore`/`verify --sign-recipient <path>` was given a path that doesn't exist. | Point `--sign-recipient` at an existing signing public key, or drop the flag to use the default. |
 
 ## What's proven vs recommended
 

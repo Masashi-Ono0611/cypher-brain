@@ -8,8 +8,9 @@
 // message text. Every entry below is matched AFTER the fact, against the already-
 // formatted error text, at the two places every error funnels through before a human/
 // agent sees it — cli.ts's top-level `main().catch` and mcp.ts's `structuredErr()`. That
-// keeps every one of the ~100 existing `throw new Error(...)` call sites across
-// src/lib/** completely untouched; only those two display boundaries changed.
+// keeps every one of the existing `throw new Error(...)` call sites across src/lib/**
+// (296, as of writing — this design's guarantee doesn't depend on that count staying
+// accurate) completely untouched; only those two display boundaries changed.
 //
 // Coverage is deliberately partial (issue #212 asks for "10-15 representative patterns",
 // not exhaustive). An error that matches nothing here is displayed exactly as before,
@@ -175,7 +176,9 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     pattern: /needs CYPHER_BRAIN_AR_WALLET|cannot read JWK wallet at/,
     origin: 'ours',
     source:
-      'src/lib/backends/arweave.ts + src/lib/backends/turbo.ts ("… needs CYPHER_BRAIN_AR_WALLET …" / "cannot read JWK wallet at …")',
+      'src/lib/backends/arweave.ts + src/lib/backends/turbo.ts ("… needs CYPHER_BRAIN_AR_WALLET …" / "cannot read JWK wallet at …"), ' +
+      'and the same "cannot read JWK wallet at …" text from wallet.ts\'s addressFromWallet() (wallet address/wallet balance, #608) ' +
+      'for any non-ENOENT read failure (corrupt/non-JSON file, permission error, …)',
   },
   // CB-E012's wording is generated once in sdkImportAdvice() (#344) with the package
   // name interpolated, so the pattern anchors on the generated invariant rather than
@@ -258,6 +261,21 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     pattern: /exists and is not a directory/,
     origin: 'ours',
     source: 'src/lib/restore.ts (restoreImpl, "--out-dir … exists and is not a directory")',
+  },
+  {
+    code: 'CB-E022',
+    title: '--sign-identity path does not exist (refusing to write an unsigned snapshot)',
+    pattern: /does not exist — refusing to write an unsigned snapshot/,
+    origin: 'ours',
+    source:
+      'src/lib/snapshot.ts (snapshot, "--sign-identity … does not exist — refusing to write an unsigned snapshot", #601)',
+  },
+  {
+    code: 'CB-E023',
+    title: '--sign-recipient path does not exist',
+    pattern: /--sign-recipient /,
+    origin: 'ours',
+    source: 'src/lib/restore.ts (restoreImpl + runFileChecks, "--sign-recipient … does not exist", #601)',
   },
 ];
 
