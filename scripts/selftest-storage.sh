@@ -99,6 +99,36 @@ if cb pull --locator "$CYPHER_BRAIN_FILE_DIR/deadbeef.age" --backend file --out 
 fi
 echo "[PASS] absent locator errors"
 
+echo "== #465: --wait is a no-op for the file backend, but must now WARN instead of silently ignoring it =="
+# Same absent-locator repro as the negative control above, but with --wait 3: the file
+# backend's "no object at ..." is a plain Error (not RetryableError, src/lib/util.ts),
+# so pull's retry loop (src/lib/pushpull.ts) never engages here — proven below by timing
+# the run well under the 3s --wait budget, not just checking the exit code.
+set +e
+WAIT_START=$(date +%s)
+WAIT_OUT=$(cb pull --wait 3 --locator "$CYPHER_BRAIN_FILE_DIR/deadbeef.age" --backend file --out "$TMP/wait-no.age" 2>&1); WAIT_RC=$?
+WAIT_ELAPSED=$(( $(date +%s) - WAIT_START ))
+set -e
+[ "$WAIT_RC" != "0" ] || { echo "[FAIL] --wait 3 against an absent locator unexpectedly succeeded"; exit 1; }
+test ! -f "$TMP/wait-no.age"
+if [ "$WAIT_ELAPSED" -ge 3 ]; then
+  echo "[FAIL] pull --wait 3 took ${WAIT_ELAPSED}s against the file backend — it should fail immediately, not actually retry"
+  exit 1
+fi
+echo "[PASS] pull --wait 3 against an absent file-backend locator still fails immediately (${WAIT_ELAPSED}s, not ~3s)"
+printf '%s' "$WAIT_OUT" | grep -q 'wait has no effect on the "file" backend' \
+  || { echo "[FAIL] expected a warning that --wait has no effect on the file backend"; echo "$WAIT_OUT"; exit 1; }
+echo "[PASS] pull --wait warns that it has no effect on the file backend"
+
+# Negative control for the warning itself: WITHOUT --wait (the pre-#465 default),
+# the same absent-locator failure must NOT print that warning — proves it is gated on
+# --wait > 0, not printed unconditionally for the file backend.
+NOWAIT_OUT=$(cb pull --locator "$CYPHER_BRAIN_FILE_DIR/deadbeef.age" --backend file --out "$TMP/nowait-no.age" 2>&1) && true
+if printf '%s' "$NOWAIT_OUT" | grep -q 'wait has no effect'; then
+  echo "[FAIL] the --wait warning fired even though --wait was not passed"; echo "$NOWAIT_OUT"; exit 1
+fi
+echo "[PASS] no --wait warning when --wait was not passed"
+
 echo "== issue #93: a locator outside FILE_DIR must be rejected (path traversal / arbitrary local file read) =="
 touch "$TMP/outside.age"
 set +e

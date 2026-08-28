@@ -4,7 +4,7 @@
 import { mkdir, writeFile, rm, readFile, rename, link, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { AGE_MAGIC, CIPHER_YES, readEnv } from './config.js';
+import { AGE_MAGIC, CIPHER_YES, readEnv, WAIT_RETRY_BACKENDS } from './config.js';
 import { exists, requireFile, sleep, sha256, readHead, errMsg, RetryableError } from './util.js';
 import { backendFor } from './backends/index.js';
 import { estimateCost, formatEstimate } from './estimate.js';
@@ -691,6 +691,18 @@ export async function pull(o: CliOptions): Promise<void> {
   // -> index); with --wait 0 (the default) pull fails immediately, preserving the old
   // behavior. CYPHER_BRAIN_PULL_RETRY_MS overrides the 30s retry interval (tests use it).
   const waitMs = (Number(o.wait) || 0) * 1000; // `|| 0` OUTSIDE Number → a non-numeric --wait is 0, not NaN (no infinite loop)
+  // #465: --wait was a SILENT no-op for every backend outside WAIT_RETRY_BACKENDS (its
+  // own doc comment in config.ts) — the retry loop below only ever catches
+  // RetryableError, and file/rclone/ton/ton-provider's get() never throws one, so a
+  // "not yet retrievable" run there failed in the same ~0.1s as --wait 0, with no
+  // indication the flag was accepted and then ignored. Warn up front instead of
+  // teaching those backends' "not found" to retry (a real permanent miss — e.g. a typo'd
+  // rclone remote path — would then wait out the FULL --wait budget before failing).
+  if (waitMs > 0 && !WAIT_RETRY_BACKENDS.has(o.backend)) {
+    warn(
+      `pull: --wait has no effect on the "${o.backend}" backend — only arweave/turbo backends retry while an item is not yet retrievable; ${o.backend} will fail immediately instead of waiting`,
+    );
+  }
   // Unlike waitMs above (where "unset" and "explicit 0" both correctly mean 0ms — a
   // bare `|| 0` is safe there), retryMs's default (30000) and its explicit-zero value
   // (0, immediate retry — the natural choice for a test avoiding a real sleep) are

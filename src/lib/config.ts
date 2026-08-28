@@ -391,6 +391,17 @@ export const AGE_PUBKEY_RE = /age1pq1[0-9a-z]{1900,2000}|age1[0-9a-z]{50,63}/g;
 // seeder fallback, which verifies nothing, and the caller cannot tell which path
 // answered — so the pin warning must stay on (src/lib/backends/ton.ts header).
 export const NON_CONTENT_ADDRESSED_BACKENDS = new Set(['arweave', 'turbo', 'rclone', 'ton']);
+// Backends whose get() can throw RetryableError (src/lib/util.ts) and so actually honor
+// pull's --wait <seconds> (src/lib/pushpull.ts) — only arweave's genuinely has a
+// propagation delay to retry through (a fresh upload not yet mined/indexed; turbo's
+// get() just delegates to arweave's, see src/lib/backends/turbo.ts). Every OTHER
+// backend's get() throws a plain Error on "not found" — file/rclone/ton/ton-provider
+// (#465): --wait silently retried nothing, no warning printed, identical timing/exit
+// code to omitting the flag. pull() (pushpull.ts) checks this set BEFORE the retry loop
+// to warn the human instead, rather than teaching every non-retrying backend's "not
+// found" to masquerade as transient (which would risk masking a REAL permanent miss —
+// e.g. an rclone remote path that's simply wrong — behind a --wait-long timeout).
+export const WAIT_RETRY_BACKENDS = new Set(['arweave', 'turbo']);
 export const FILE_DIR = readEnv('CYPHER_BRAIN_FILE_DIR') || join(HOME, 'store'); // file backend object store
 // rclone backend (#204): the `rclone` binary name/path, same PATH-or-override
 // pattern as PG_BIN above — most machines just need `rclone` on PATH; override

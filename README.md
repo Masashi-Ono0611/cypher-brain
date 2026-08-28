@@ -991,6 +991,9 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       path: identity + this file are all a fresh machine needs; the saved sha256 is applied
       as the integrity pin automatically). --wait retries while the item is not yet
       retrievable (a fresh Turbo/Arweave upload takes ~5-8 min to propagate); default 0.
+      Only arweave/turbo actually retry on "not yet retrievable" — file/rclone/ton/
+      ton-provider fail immediately regardless of --wait (a warning is printed if you
+      pass --wait > 0 with one of those backends).
       --sha256 fail-closes the fetch: the bytes must match the expected hash (sourced
       out-of-band from a trusted index) or pull errors, having written nothing to --out.
       No-clobber by default: refuses to overwrite an existing --out (the recovery steps
