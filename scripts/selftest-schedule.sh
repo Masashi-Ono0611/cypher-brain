@@ -796,11 +796,24 @@ else
   # registered — the launchctl bootout / crontab edit below hit the HOME-scoped (#114)
   # LABEL/CRON_MARKER, which is unique to this test's throwaway CYPHER_BRAIN_HOME and can
   # never match a real, machine-wide schedule, so this is safe to run for real.
+  if [ "$OS" = "Darwin" ]; then
+    # #529: simulate the plist having been removed out-of-band (manually, or by another
+    # tool) BEFORE `schedule uninstall` runs. schedule.json still records this home's own
+    # launchd trigger at this exact PLIST path, so uninstall must report that as drift
+    # instead of just silently omitting the "removed: launchd plist" line it would
+    # otherwise print — see (e) assertions below.
+    [ -f "$PLIST" ] || { echo "[FAIL] test setup: plist missing before (e)'s #529 drift setup"; exit 1; }
+    rm -f "$PLIST"
+  fi
   cb schedule uninstall > "$TMP/uninstall1.log" 2>&1 || { echo "[FAIL] uninstall exited non-zero"; cat "$TMP/uninstall1.log"; exit 1; }
   [ ! -f "$RUNNER" ] || { echo "[FAIL] runner still present after uninstall"; exit 1; }
   [ ! -f "$CONFIG" ] || { echo "[FAIL] schedule.json still present after uninstall"; exit 1; }
   if [ "$OS" = "Darwin" ]; then
     [ ! -f "$PLIST" ] || { echo "[FAIL] plist still present after uninstall"; exit 1; }
+    grep -q 'drift: launchd plist' "$TMP/uninstall1.log" \
+      || { echo "[FAIL] #529: uninstall did not report the plist drift (already missing, but schedule.json recorded it as this home's trigger)"; cat "$TMP/uninstall1.log"; exit 1; }
+    grep -q 'removed: launchd plist' "$TMP/uninstall1.log" \
+      && { echo "[FAIL] #529: uninstall reported removing a plist that was never there to begin with"; cat "$TMP/uninstall1.log"; exit 1; }
   else
     [ ! -f "$CRON_ENTRY" ] || { echo "[FAIL] cron entry artifact still present after uninstall"; exit 1; }
   fi
@@ -821,7 +834,7 @@ else
   SJ_UNINSTALLED=$(cb schedule status --json)
   [ "$SJ_UNINSTALLED" = '{"installed":false}' ] \
     || { echo "[FAIL] status --json after uninstall was [$SJ_UNINSTALLED], expected {\"installed\":false}"; exit 1; }
-  echo "[PASS] uninstall: trigger + runner removed, data kept, idempotent; status exits 0 and reports 'not installed' (plain + --json, #426)"
+  echo "[PASS] uninstall: trigger + runner removed, data kept, idempotent; status exits 0 and reports 'not installed' (plain + --json, #426); plist drift reported distinctly from normal removal on Darwin (#529)"
 fi
 
 echo "== (f) two different CYPHER_BRAIN_HOME schedules never collide: distinct LABEL/CRON_MARKER, installing/uninstalling one never touches the other's REAL registration (#114) =="

@@ -1490,11 +1490,19 @@ async function uninstall(o: CliOptions): Promise<void> {
   }
 
   const removed: string[] = [];
+  const drift: string[] = [];
   if (process.platform === 'darwin') {
     sh('launchctl', ['bootout', `gui/${process.getuid?.()}/${LABEL}`]); // failure = was not loaded, fine
     if (await exists(PLIST)) {
       await rm(PLIST);
       removed.push(`launchd plist ${PLIST}`);
+    } else if (priorCfg?.trigger.type === 'launchd' && priorCfg.trigger.path === PLIST && sameHome(priorCfg.home)) {
+      // #529: schedule.json (this home's own) recorded the launchd trigger at exactly this
+      // PLIST path, yet the file itself is already gone — that's drift (removed/lost
+      // out-of-band by something other than this command), distinct from "was never
+      // installed" (which never reaches this branch: no priorCfg, or its trigger doesn't
+      // match this home/path).
+      drift.push(`launchd plist ${PLIST} already missing — was it removed manually?`);
     }
     const legacy = legacyLaunchd(priorCfg);
     if (legacy) {
@@ -1535,10 +1543,11 @@ async function uninstall(o: CliOptions): Promise<void> {
       removed.push(`${what} ${p}`);
     }
   }
-  if (removed.length === 0) {
+  if (removed.length === 0 && drift.length === 0) {
     console.error('nothing to remove — schedule is not installed');
   } else {
     for (const r of removed) console.error(`removed: ${r}`);
+    for (const d of drift) console.error(`drift: ${d}`);
     console.error(
       `kept: logs (${LOGS_DIR}), snapshots (${SNAPS_DIR}) and index.tsv — they are your data, delete manually if unwanted`,
     );
