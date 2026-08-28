@@ -169,7 +169,19 @@ export async function ledger(o: CliOptions): Promise<void> {
     return;
   }
   if (receipts.length === 0) {
-    console.log('no receipts yet — receipts are written by a successful `push --backend arweave|turbo`');
+    // #457: a ledger with 0 READABLE receipts is not necessarily a ledger with 0
+    // receipts — skippedLines > 0 means the file has content that could not be parsed
+    // (see the warn() above), which is a materially different situation from a
+    // genuinely-empty/never-created ledger and must not be reported with the SAME
+    // sentence (the exact confusion audit.ts's own total/skipped/VERDICT split already
+    // avoids for the equivalent "all lines garbage" case — see audit()).
+    if (skippedLines > 0) {
+      console.log(
+        `0 of ${skippedLines} receipt line(s) could be read (${skippedLines} skipped as unreadable/malformed) — this is not necessarily an empty ledger, see the warning above`,
+      );
+    } else {
+      console.log('no receipts yet — receipts are written by a successful `push --backend arweave|turbo`');
+    }
     return;
   }
   const caveats: string[] = [];
