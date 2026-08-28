@@ -267,11 +267,11 @@ BADRUNNER="$BADSCHED/nightly.sh"; BADCONFIG="$BADSCHED/schedule.json"; BADCRON="
 BADPLIST="$BADLAUNCHD/dev.cypher-brain.nightly.$(home_hash "$BADHOME").plist"
 CYPHER_BRAIN_HOME="$BADHOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] keygen for the bad-profile home exited non-zero"; exit 1; }
 
-# Positive control (the repo's own "陽性対照" rule for guards: prove the thing you are
-# comparing against actually fires before trusting a comparison to it): confirm
-# `snapshot --profile claude-cod` (no schedule involved) really does refuse today, with
-# the message this test expects install() to now match — so the assertions below check
-# schedule install against a working reference, not a silently-broken one.
+# Positive control: prove the reference behavior this test compares against actually
+# fires before trusting a comparison to it. Confirm `snapshot --profile claude-cod` (no
+# schedule involved) really does refuse today, with the message this test expects
+# install() to now match — so the assertions below check schedule install against a
+# working reference, not a silently-broken one.
 set +e
 SNAPERR=$(CYPHER_BRAIN_HOME="$BADHOME" cb snapshot --profile claude-cod --dir "$BADSRC" --dry-run 2>&1); SNAPRC=$?
 set -e
