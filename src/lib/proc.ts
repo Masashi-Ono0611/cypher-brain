@@ -101,6 +101,10 @@ export function run(cmd: string, args: string[], { input, timeoutMs, onStderrLin
       code === 0 ? res({ out, err }) : rej(new Error(`${cmd} exited ${code}: ${err.trim() || out.trim()}`));
     });
     if (input) {
+      // EPIPE when the child exits before consuming its input — swallow on the pipe
+      // end so the real failure surfaces via the close handler instead of an
+      // uncaught crash (same hazard, same guard, as crypt.ts's decryptToChild()).
+      p.stdin?.on('error', () => {});
       p.stdin?.write(input);
       p.stdin?.end();
     }

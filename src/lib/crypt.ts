@@ -25,6 +25,7 @@ import {
 } from 'age-encryption';
 import { AGE_MAGIC, AGE_ARMOR_HEADER, readEnv } from './config.js';
 import { ACTIVE_CHILDREN } from './proc.js';
+import { installEpipeGuard } from './ui.js';
 import { errMsg, warnIfLooseKeyPerms } from './util.js';
 
 // #228: this file's StrykerJS mutation run (`npm run mutation-test`) is deliberately
@@ -236,6 +237,11 @@ export async function askNewPassphrase(): Promise<string> {
 
 function promptHidden(question: string): Promise<string> {
   return new Promise((resolve, reject) => {
+    // The prompt and the trailing newline in cleanup() below both write raw stderr —
+    // guard before either can fire (same hazard ui.ts's printMascot()/warn.ts's
+    // warn() guard against: a downstream reader that closes its pipe early turns an
+    // uncaught EPIPE into a process crash mid-prompt).
+    installEpipeGuard();
     const { stdin } = process;
     if (!stdin.isTTY) {
       return reject(
