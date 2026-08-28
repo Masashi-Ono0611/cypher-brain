@@ -153,8 +153,9 @@ printf '%s' "$LEDGER_HUMAN" | grep -q '1 unreadable line' || { echo "[FAIL] ledg
 echo "[PASS] ledger (human report) surfaces all 3 backends plus the unpriced/undated/skipped-line caveats (#571)"
 
 LEDGER_CSV=$(cb ledger --csv)
-printf '%s\n' "$LEDGER_CSV" | head -1 | grep -qF "$EXPECTED_HEADER" \
-  || { echo "[FAIL] ledger --csv header row is wrong: $(printf '%s\n' "$LEDGER_CSV" | head -1)"; exit 1; }
+CSV_FIRST_LINE=$(printf '%s\n' "$LEDGER_CSV" | head -1)
+[ "$CSV_FIRST_LINE" = "$EXPECTED_HEADER" ] \
+  || { echo "[FAIL] ledger --csv header row is wrong: $CSV_FIRST_LINE"; exit 1; }
 CSV_LINES=$(printf '%s\n' "$LEDGER_CSV" | wc -l | tr -d ' ')
 [ "$CSV_LINES" = "5" ] \
   || { echo "[FAIL] expected 5 csv lines (1 header + 4 receipts, the malformed line excluded), got $CSV_LINES"; echo "$LEDGER_CSV"; exit 1; }
