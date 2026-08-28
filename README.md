@@ -596,18 +596,20 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       SAME computation as the human-readable report, never a re-implementation.
 
   cypher-brain ledger [--json] [--csv]
-      Read-only cumulative-cost report (#232): every "push --backend arweave|turbo" that
-      actually spent money writes a RECEIPT ($CYPHER_BRAIN_HOME/receipt-ledger.jsonl, or
-      CYPHER_BRAIN_RECEIPT_LEDGER — an append-only JSONL file, one object per upload,
-      INCLUDING a separate entry for the .minisig signature sidecar upload when a signed
-      artifact is pushed — that is its own paid upload too) — the best available
-      native-unit cost figure alongside the backend's own response: for the raw arweave
-      L1 backend, the authoritative signed transaction reward; for turbo, the pre-flight
-      estimate that gated that specific upload (Turbo's SDK response has no separately-
-      confirmed charged-amount field to read back — not a confirmed post-hoc debit, the
-      best figure available). This is deliberately separate from "estimate"'s pre-flight
-      forecast (never conflated) — it answers "what did we actually spend" and "how much
-      cumulatively", not "what would this cost". file/rclone/ton/ton-provider pushes never
+      Read-only cumulative-cost report (#232): every "push --backend arweave|turbo|
+      ton-provider" that actually spent money writes a RECEIPT ($CYPHER_BRAIN_HOME/
+      receipt-ledger.jsonl, or CYPHER_BRAIN_RECEIPT_LEDGER — an append-only JSONL file,
+      one object per upload, INCLUDING a separate entry for the .minisig signature
+      sidecar upload when a signed artifact is pushed — that is its own paid upload too)
+      — the best available native-unit cost figure alongside the backend's own response:
+      for the raw arweave L1 backend and for ton-provider, the authoritative amount
+      actually committed (arweave's signed transaction reward; ton-provider's storage
+      cost plus deploy buffer, confirmed on-chain before push returns); for turbo, the
+      pre-flight estimate that gated that specific upload (Turbo's SDK response has no
+      separately-confirmed charged-amount field to read back — not a confirmed post-hoc
+      debit, the best figure available). This is deliberately separate from "estimate"'s
+      pre-flight forecast (never conflated) — it answers "what did we actually spend" and
+      "how much cumulatively", not "what would this cost". file/rclone/ton pushes never
       write a receipt (nothing paid, or no receipt object to persist) and so never appear
       here. With no receipts yet, prints one line saying so (exit 0 — an empty ledger is
       a normal state, not an error). A ledger line that cannot be read at all (malformed/
@@ -619,10 +621,11 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       is never confused with "no receipts COULD BE READ" (#457).
       Human report (default): total receipt count, cost summed BY BACKEND, BY MONTH and
       BY DAY (UTC, most recent 14 shown) — each sum kept separate PER NATIVE UNIT
-      (winston/winc are different currencies, never added together). A receipt with no
-      priceable cost is "unpriced" (excluded from every sum); one with a priced cost but
-      an unparseable timestamp is "undated" (still counted in by-backend, excluded only
-      from by-day/by-month) — the two are reported as distinct counts, never conflated.
+      (winston/winc/nanoton are different currencies, never added together). A receipt
+      with no priceable cost is "unpriced" (excluded from every sum); one with a priced
+      cost but an unparseable timestamp is "undated" (still counted in by-backend,
+      excluded only from by-day/by-month) — the two are reported as distinct counts,
+      never conflated.
       --json prints one object ({total_receipts, unpriced_receipts, undated_receipts,
       skipped_lines, by_backend, by_day, by_month, receipts: [...every receipt...]}) —
       the same computation as the human report, plus the full receipt array for a script
@@ -630,6 +633,12 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       --csv prints one row per receipt (timestamp, backend, locator, artifact_sha256,
       size_bytes, payer_address, cost, unit, raw — RFC 4180 minimal quoting) instead of
       an aggregate — wins over --json if both are given (a raw export, not a summary).
+      Every receipt line — CLI-written or hand-authored/migrated — must ALSO carry a
+      top-level "cypher_brain_receipt_version" field equal to this build's receipt
+      version (currently 1); it is omitted from the --csv/--json field lists above
+      because the CLI always stamps it itself and it never varies per receipt, but a
+      line missing it (or with a mismatched value) is rejected as unreadable, same as
+      malformed JSON — not silently defaulted or dropped from the count.
 
   cypher-brain audit [--json]
       Read-only hash-chain verification (#226): every "push"/"restore"/"verify" run

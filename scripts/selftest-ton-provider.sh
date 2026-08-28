@@ -270,6 +270,46 @@ if grep -q 'balance.*looks lower than' "$TMP/push.err"; then
 fi
 echo "[PASS] the pre-deploy funds check stays silent when the owner's balance is sufficient"
 
+# #484: a successful ton-provider push must now write a receipt (previously onReceipt
+# was arweave/turbo-only, so ledger's cumulative-cost tracking silently excluded a
+# real paid backend with its own MAX_SPEND cap — doctor/audit/estimate/schedule
+# already treated ton-provider on par with the other backends; ledger was the one
+# place it diverged). Verified three ways: the raw receipt-ledger.jsonl line, `ledger`
+# (human), and `ledger --json` — same three-way check selftest-receipt.mjs's own
+# arweave/turbo coverage already does.
+echo "== push --backend ton-provider writes a receipt, and ledger reports it (#484) =="
+RECEIPT_LEDGER_PATH_TP="$CYPHER_BRAIN_HOME/receipt-ledger.jsonl"
+[ -f "$RECEIPT_LEDGER_PATH_TP" ] || { echo "[FAIL] no receipt-ledger.jsonl was written by the ton-provider push"; exit 1; }
+TP_RECEIPT=$(node -e '
+  const fs = require("node:fs");
+  const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const r = lines.find((e) => e.backend === "ton-provider");
+  if (!r) { console.error("no ton-provider receipt found among " + lines.length + " line(s)"); process.exit(1); }
+  console.log(JSON.stringify(r));
+' "$RECEIPT_LEDGER_PATH_TP") || { echo "[FAIL] could not find a ton-provider receipt in $RECEIPT_LEDGER_PATH_TP"; cat "$RECEIPT_LEDGER_PATH_TP"; exit 1; }
+echo "$TP_RECEIPT" | grep -q '"unit":"nanoton"' || { echo "[FAIL] ton-provider receipt unit is not nanoton: $TP_RECEIPT"; exit 1; }
+echo "$TP_RECEIPT" | grep -Eq '"cost":"[0-9]+"' || { echo "[FAIL] ton-provider receipt cost is not a plain digit string: $TP_RECEIPT"; exit 1; }
+printf '%s' "$TP_RECEIPT" | grep -F "\"locator\":\"$LOC\"" >/dev/null \
+  || { echo "[FAIL] ton-provider receipt locator does not match what push printed ($LOC): $TP_RECEIPT"; exit 1; }
+echo "[PASS] a successful ton-provider push writes a receipt (backend/locator/nanoton cost all correct)"
+
+LEDGER_HUMAN_TP=$(cb ledger)
+echo "$LEDGER_HUMAN_TP" | grep -q 'ton-provider' || { echo "[FAIL] ledger (human) does not mention ton-provider: $LEDGER_HUMAN_TP"; exit 1; }
+echo "$LEDGER_HUMAN_TP" | grep -q 'nanoton' || { echo "[FAIL] ledger (human) does not show a nanoton cost: $LEDGER_HUMAN_TP"; exit 1; }
+echo "[PASS] ledger (human report) includes the ton-provider push"
+
+LEDGER_JSON_TP=$(cb ledger --json)
+node -e '
+  const j = JSON.parse(process.argv[1]);
+  const tp = j.by_backend?.["ton-provider"];
+  if (!tp || typeof tp.cost?.nanoton !== "string" || !/^[0-9]+$/.test(tp.cost.nanoton)) {
+    console.error("ledger --json by_backend[\"ton-provider\"] missing/malformed: " + JSON.stringify(tp));
+    process.exit(1);
+  }
+  if (tp.count < 1) { console.error("ledger --json ton-provider count is " + tp.count + ", expected >= 1"); process.exit(1); }
+' "$LEDGER_JSON_TP" || { echo "[FAIL] ledger --json by_backend.ton-provider is missing or malformed"; echo "$LEDGER_JSON_TP"; exit 1; }
+echo "[PASS] ledger --json by_backend.ton-provider reports a real nanoton cost (#484)"
+
 # issue #403: the mock registry's default 800 nanoTON/MB/day rate against this tiny
 # test snapshot computes a bounty far below the provider-side floor — the SAME real
 # math a live tonutils-storage-provider enforces (verified against its own source,
