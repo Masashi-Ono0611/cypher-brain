@@ -22,7 +22,8 @@
 // verifies every piece against it — but the SSH fallback path does not, which is
 // why `ton` sits in NON_CONTENT_ADDRESSED_BACKENDS (config.ts): a pull without a
 // --sha256 pin cannot tell which path served it.
-import { mkdir, mkdtemp, copyFile, readdir } from 'node:fs/promises';
+import { mkdtempSync } from 'node:fs';
+import { mkdir, copyFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, resolve, join, extname, basename } from 'node:path';
 import {
@@ -262,13 +263,29 @@ export async function p2pFetch(bagId: string, expect: FetchShape, out: string): 
   // must not leak the temp tree it was about to use (review W2). What is downloaded
   // here is ciphertext, so the leak class is disk garbage, not secrets — but garbage
   // that accumulates one directory per failed pull is still a leak.
-  const tmpRoot = await mkdtemp(join(tmpdir(), 'cypher-brain-ton-'));
+  //
+  // mkdtempSync (not the async mkdtemp), then register, with NO await in between —
+  // multi-model review: an `await mkdtemp()` creates the directory on disk but leaves
+  // the JS continuation that registers it queued, so a signal landing in that window
+  // finds an untracked directory (the exact same reasoning mcp.ts's makeFetchDir()
+  // documents for its own mkdtempSync usage).
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'cypher-brain-ton-'));
   addActiveTonTmpDir(tmpRoot);
   try {
     await p2pFetchInto(tmpRoot, bagId, expect, out);
   } finally {
-    await rmrf(tmpRoot).catch(() => undefined);
-    removeActiveTonTmpDir(tmpRoot);
+    // Deregister only AFTER rmrf() actually removed it (multi-model review) — if
+    // cleanup itself fails (EACCES under the dir, say), the entry deliberately STAYS
+    // registered so a LATER signal's forceRmSync (chmod+retry) is the one path left
+    // that can still clear it. The failure is still swallowed here (advisory-only
+    // cleanup, same as before this review comment): a leftover temp dir must never
+    // fail an otherwise-successful pull.
+    try {
+      await rmrf(tmpRoot);
+      removeActiveTonTmpDir(tmpRoot);
+    } catch {
+      /* left registered on purpose — see comment above */
+    }
   }
 }
 

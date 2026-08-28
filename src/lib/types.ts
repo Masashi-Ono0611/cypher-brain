@@ -131,6 +131,10 @@ export interface PutOpts {
   // deploy's own amountNano to spentNano once it is known to be within budget — so the
   // cap bounds what the WHOLE push spends, not what either deploy spends in isolation.
   // Every other backend ignores this field entirely, same as `remote`/`force` above.
+  // CONTRACT: the check-then-charge against this box is not atomic — callers must
+  // never run two put() calls against the SAME spendTracker concurrently (await each
+  // to completion before starting the next), or the cap can be bypassed. pushpull.ts's
+  // push() already does this correctly.
   spendTracker?: { spentNano: bigint };
 }
 

@@ -15,7 +15,8 @@
 // The operator opens it, reviews the transaction in their own wallet, and approves (or
 // doesn't) themselves.
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp } from 'node:fs/promises';
+import { mkdtempSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TON_BIN, TON_NETWORK_CONFIG, TON_TONAPI_URL, CIPHER_YES } from './config.js';
@@ -234,7 +235,11 @@ async function assertBagAvailable(bagId: string): Promise<void> {
   // p2pFetch/p2pFetchInto (multi-model review W2 there, mirrored here): the tmp dir is
   // created BEFORE the daemon starts and removed only AFTER daemon.stop() has been
   // awaited — a still-dying daemon writing into a directory mid-removal is a race.
-  const tmpRoot = await mkdtemp(join(tmpdir(), 'cypher-brain-ton-dns-'));
+  //
+  // mkdtempSync (not the async mkdtemp), then register, with NO await in between —
+  // multi-model review (#644): see ton.ts's p2pFetch() for why an async mkdtemp()
+  // would leave a signal-landing window where the directory exists but is untracked.
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'cypher-brain-ton-dns-'));
   addActiveTonTmpDir(tmpRoot);
   try {
     await probeInto(tmpRoot, bagId, deadline);
@@ -246,9 +251,16 @@ async function assertBagAvailable(bagId: string): Promise<void> {
   } finally {
     // Cleanup failure must not be silently swallowed (multi-model review W2): it does
     // not change the PASS/FAIL verdict above (already decided), but an operator running
-    // many publish-latest calls deserves to know disk is being left behind.
-    await rmrf(tmpRoot).catch((e) => warn(`publish-latest: could not remove temp probe dir ${tmpRoot}: ${errMsg(e)}`));
-    removeActiveTonTmpDir(tmpRoot);
+    // many publish-latest calls deserves to know disk is being left behind. Deregister
+    // only AFTER rmrf() actually removed it (multi-model review, #644) — a failed
+    // cleanup leaves the entry registered so a LATER signal's forceRmSync can still
+    // clear it.
+    try {
+      await rmrf(tmpRoot);
+      removeActiveTonTmpDir(tmpRoot);
+    } catch (e) {
+      warn(`publish-latest: could not remove temp probe dir ${tmpRoot}: ${errMsg(e)}`);
+    }
   }
 }
 

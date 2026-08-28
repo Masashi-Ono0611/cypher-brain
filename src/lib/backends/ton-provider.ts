@@ -55,7 +55,8 @@
 // retrieval, correct regardless of who is seeding); there is no seeder-SSH fallback
 // here, because this backend never operates a seeder of its own — a P2P failure is a
 // hard error, not a silent downgrade to a less-verified path.
-import { mkdir, mkdtemp, copyFile, access } from 'node:fs/promises';
+import { mkdtempSync } from 'node:fs';
+import { mkdir, copyFile, access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -931,6 +932,18 @@ export function tonProviderBackend(): StorageBackend {
       // handed to buildDeploy() as its cap below, and spendTracker.spentNano is charged
       // the moment this deploy's own amount is known, so the SECOND call sees the FIRST
       // call's spend already counted against the same cap.
+      //
+      // NOT safe against two overlapping put() calls sharing the SAME spendTracker
+      // concurrently (multi-model review): this read-then-charge is not atomic, so two
+      // in-flight calls could each read the same spentSoFarNano and both pass under the
+      // cap. pushpull.ts's push() never does this — it `await`s the ciphertext's put()
+      // to completion before starting the sidecar's, so the two charges against one
+      // push's tracker are always strictly sequential, never concurrent. A caller
+      // outside pushpull.ts that deliberately ran two put() calls in parallel against
+      // the same spendTracker would defeat this cap; nothing in this codebase does
+      // that, and this is a documented assumption of the contract (types.ts), not an
+      // enforced invariant — same posture as the pre-existing cross-process wallet
+      // seqno race documented above (autoSignAndBroadcastDeploy's KNOWN LIMITATIONS).
       const spentSoFarNano = opts.spendTracker?.spentNano ?? 0n;
       const remainingMaxSpendNano = TON_PROVIDER_MAX_SPEND - spentSoFarNano;
       if (remainingMaxSpendNano <= 0n) {
@@ -976,7 +989,10 @@ export function tonProviderBackend(): StorageBackend {
       // called here before the tmp dir exists so a signal mid-hash/mid-deploy actually
       // kills the ephemeral daemon this put() is about to spawn AND sweeps its dir).
       installStageSignalGuard();
-      const tmpRoot = await mkdtemp(join(tmpdir(), 'cypher-brain-ton-provider-'));
+      // mkdtempSync (not the async mkdtemp), then register, with NO await in between —
+      // multi-model review: see ton.ts's p2pFetch() for why an async mkdtemp() would
+      // leave a signal-landing window where the directory exists but is untracked.
+      const tmpRoot = mkdtempSync(join(tmpdir(), 'cypher-brain-ton-provider-'));
       addActiveTonTmpDir(tmpRoot);
       const dbDir = join(tmpRoot, 'db');
       const bagDir = join(tmpRoot, 'bag');
@@ -1130,8 +1146,18 @@ export function tonProviderBackend(): StorageBackend {
         // review): a daemon.stop() failure must not skip the tmpRoot removal, or a
         // paid-for push leaves both the daemon and its temp directory behind.
         if (daemon) await daemon.stop().catch(() => undefined);
-        await rmrf(tmpRoot).catch(() => undefined);
-        removeActiveTonTmpDir(tmpRoot); // #644: deregister only after rmrf() settles, same discipline as mcp.ts's discardFetchDir
+        // Deregister only AFTER rmrf() actually removed the tree (multi-model review,
+        // #644) — if cleanup itself fails (EACCES under the dir, say), the entry
+        // deliberately STAYS registered so a LATER signal's forceRmSync (chmod+retry)
+        // is the one path left that can still clear it. The failure is still swallowed
+        // (advisory-only cleanup): a leftover temp dir must never fail an
+        // otherwise-successful (or already-failing) push.
+        try {
+          await rmrf(tmpRoot);
+          removeActiveTonTmpDir(tmpRoot);
+        } catch {
+          /* left registered on purpose — see comment above */
+        }
       }
     },
 
