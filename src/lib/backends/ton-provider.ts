@@ -93,7 +93,7 @@ import {
   SKIP_FUNDS_CHECK,
 } from '../config.js';
 import { run } from '../proc.js';
-import { sleep, rmrf, errMsg, SdkMissingError, sdkImportAdvice } from '../util.js';
+import { sleep, rmrf, errMsg, throwForSdkImport } from '../util.js';
 import { warn } from '../warn.js';
 import { tonApi, startLocalTonDaemon, type TonBagDetails, type LocalTonDaemon } from './ton-client.js';
 import { p2pFetch, entryNameFor } from './ton.js';
@@ -112,10 +112,7 @@ async function getTon(): Promise<TonModule> {
     tonModuleCache = await import('@ton/ton');
     return tonModuleCache;
   } catch (e) {
-    const problem = sdkImportAdvice(e, '@ton/ton');
-    if (problem?.kind === 'absent') throw new SdkMissingError(`ton-provider: ${problem.advice}`);
-    if (problem !== null) throw new Error(`ton-provider: ${problem.advice}`);
-    throw e;
+    throwForSdkImport(e, '@ton/ton', 'ton-provider');
   }
 }
 
