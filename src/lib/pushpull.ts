@@ -14,7 +14,17 @@ import { readPlanFile, validatePlan } from './plan.js';
 import { appendReceipt } from './receipt.js';
 import { recordAudit } from './audit.js';
 import { warn } from './warn.js';
-import type { CliOptions } from './types.js';
+import type { CliOptions, ReceiptEvent } from './types.js';
+import { PushPartialSuccessError, PushSignatureUploadError, PushLocatorWriteError } from './push-partial-success.js';
+// Re-exported unchanged so existing `from './pushpull.js'` imports (mcp.ts, wizard.ts)
+// keep working — see push-partial-success.ts's own header comment for why these
+// classes live in a separate, import-cycle-free module in the first place.
+export {
+  PushPartialSuccessError,
+  PushSignatureUploadError,
+  PushLocatorWriteError,
+  PushFundingConfirmedButIncompleteError,
+} from './push-partial-success.js';
 
 // The plaintext content digest for the artifact being pushed: an explicit --digest
 // wins, else the "<in>.digest" sidecar snapshot writes next to its output. Returns
@@ -52,64 +62,6 @@ async function recipientsFingerprintFor(o: CliOptions): Promise<string | null> {
     return line ? line.toLowerCase() : null;
   } catch {
     return null;
-  }
-}
-
-// Thrown for any push() failure that happens AFTER backend.put() (the actual,
-// possibly PAID/PERMANENT ciphertext upload) already succeeded — the point of no
-// return already passed. This is the shape every caller must treat completely
-// differently from every OTHER push() error: the remote ciphertext already exists
-// (and, on arweave/turbo, money was already spent) — a caller that reacts to ANY
-// push() rejection by assuming "nothing happened yet" (e.g. deleting the only
-// identity that can decrypt what was just uploaded, or an MCP idempotency-key
-// caller concluding nothing needs to be remembered for a retry) would turn a mere
-// AFTERMATH failure into permanent, unrecoverable loss or a real double-spend.
-// `locator` (the ciphertext's) is carried on every subclass because it is the one
-// value a caller can still act on once push() has otherwise failed to persist it
-// anywhere; `sigLocator` is carried too, set only when the ".minisig" sidecar
-// upload (below) had ALSO already succeeded before the later failure occurred —
-// PushSignatureUploadError never has one (its own failure IS that upload),
-// PushLocatorWriteError does when a signed push's sidecar landed before the
-// separate --save-locator bookkeeping then failed.
-export abstract class PushPartialSuccessError extends Error {
-  readonly locator: string;
-  readonly sigLocator: string | undefined;
-  constructor(message: string, locator: string, sigLocator: string | undefined) {
-    super(message);
-    this.locator = locator;
-    this.sigLocator = sigLocator;
-  }
-}
-
-// The ciphertext uploaded, but the ".minisig" authenticity sidecar (#214) that
-// snapshot() wrote alongside it then failed to upload (a network blip on the SECOND
-// backend.put() call below — the first, for the ciphertext, already returned). Distinct
-// from PushLocatorWriteError: nothing about --save-locator has even been reached yet,
-// so unlike that error this one never carries a sigLocator (there is no "it uploaded,
-// only the bookkeeping after it failed" story here — the sidecar upload itself is what
-// failed).
-export class PushSignatureUploadError extends PushPartialSuccessError {
-  constructor(locator: string, cause: unknown) {
-    super(
-      `ciphertext upload succeeded (locator: ${locator}) but uploading the .minisig signature sidecar failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-      locator,
-      undefined,
-    );
-    this.name = 'PushSignatureUploadError';
-  }
-}
-
-// Thrown when the ciphertext (and, if the artifact is signed, its ".minisig" sidecar)
-// already uploaded but the LOCAL --save-locator bookkeeping afterward (mkdir, digest,
-// the temp-write+rename) then threw.
-export class PushLocatorWriteError extends PushPartialSuccessError {
-  constructor(locator: string, sigLocator: string | undefined, cause: unknown) {
-    super(
-      `upload succeeded (locator: ${locator}) but writing --save-locator failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-      locator,
-      sigLocator,
-    );
-    this.name = 'PushLocatorWriteError';
   }
 }
 
@@ -417,21 +369,17 @@ async function pushCore(
     );
   }
   const backend = await backendFor(o.backend);
-  type ReceiptBox = {
-    value: { raw: unknown; cost: { amount: string; unit: 'winston' | 'winc' | 'nanoton' } | null } | null;
-  };
-  // A mutable PROPERTY, not a bare `let`: TS's control-flow narrowing sees no direct
-  // assignment to a box's field itself outside the closure and so keeps its declared
-  // union type intact at the `if` check below — a bare `let receipt = null` reassigned
-  // only inside the onReceipt closure gets over-narrowed to the literal `null` (the sole
-  // assignment CFA can see in this function's own linear flow), making a later
-  // `if (receipt)` narrow to `never` rather than the non-null branch.
-  const newReceiptBox = (): ReceiptBox => ({ value: null });
-  // #232: persist a receipt for the ACTUAL cost a paid backend just charged for
-  // `uploadedPath`, separate from estimate.ts's pre-flight forecast printed above. The
-  // upload already succeeded and already spent real funds by the time this runs — a
-  // receipt-write failure (disk full, permissions) must NEVER retroactively fail an
-  // already-completed push (that would misrepresent a successful, paid upload as a
+  // #232: persist a receipt for the ACTUAL cost a paid backend just charged, separate
+  // from estimate.ts's pre-flight forecast printed above. issue #654: called directly
+  // FROM INSIDE the backend's onReceipt callback (awaited by the backend itself), not
+  // deferred until after backend.put() resolves — a backend calls onReceipt at the
+  // moment its spend becomes IRREVERSIBLE, which for ton-provider can be well before
+  // put() itself finishes (notifyProviderWithRetry() still has to run afterward, and
+  // can still throw). Deferring persistence until put() resolves would silently drop
+  // the receipt for exactly that failure shape — the whole point of #654's fix (see
+  // backends/ton-provider.ts's own onReceipt call site and its PushFundingConfirmed-
+  // ButIncompleteError). A receipt-write failure (disk full, permissions) must NEVER
+  // retroactively fail an already-irreversible spend (that would misrepresent it as a
   // failure a caller might retry, risking a double spend) — advisory only, same
   // posture push()'s balance display already takes elsewhere in this file. Shared by
   // both the primary artifact upload below AND the .minisig sidecar upload further
@@ -444,26 +392,29 @@ async function pushCore(
   // captured object resets inside a closure), so `o.backend` alone reads back as
   // `string | undefined` there even though it is provably a `string` by this point.
   const backendName = o.backend;
-  const persistReceiptIfAny = async (uploadedPath: string, uploadedLocator: string, box: ReceiptBox): Promise<void> => {
-    const captured = box.value;
-    if (!captured) return;
+  // Same TS narrowing-reset reasoning as `backendName` above: `if (!o.in) throw` at the
+  // top of this function does not carry through into the `onReceipt: (event) => ...`
+  // closure below (a NEW closure boundary), so `o.in` alone reads back as
+  // `string | undefined` there even though it is provably a `string` by this point.
+  const inPath = o.in;
+  const persistReceipt = async (uploadedPath: string, event: ReceiptEvent): Promise<void> => {
     try {
       const [artifactSha256, payerAddress] = await Promise.all([sha256(uploadedPath), payerAddressFor(backendName, o)]);
       const { size: sizeBytes } = await stat(uploadedPath);
       await appendReceipt({
         timestamp: new Date().toISOString(),
         backend: backendName,
-        locator: uploadedLocator,
+        locator: event.locator,
         artifact_sha256: artifactSha256,
         size_bytes: sizeBytes,
         payer_address: payerAddress,
-        cost: captured.cost?.amount ?? null,
-        unit: captured.cost?.unit ?? null,
-        raw: captured.raw,
+        cost: event.cost?.amount ?? null,
+        unit: event.cost?.unit ?? null,
+        raw: event.raw,
       });
     } catch (e) {
       warn(
-        `${backendName}: could not persist the upload receipt (${errMsg(e)}) — the push itself succeeded (locator ${uploadedLocator} is real); cumulative-cost ledger will be missing this entry`,
+        `${backendName}: could not persist the upload receipt (${errMsg(e)}) — the underlying spend already happened (locator ${event.locator} is real); cumulative-cost ledger will be missing this entry`,
       );
     }
   };
@@ -471,29 +422,26 @@ async function pushCore(
   // `remote` is only meaningful to the rclone backend (its --remote <name>:<path>
   // destination — types.ts's PutOpts) — every other backend's put() ignores it, same
   // as `yes` is only meaningful to arweave/turbo/ton-provider. `onReceipt` (#232, and
-  // #484 for ton-provider) is likewise only ever called by arweave/turbo/ton-provider —
-  // every other backend's receiptBox stays null, and persistReceiptIfAny() above is
-  // then a no-op for it. `force` (#533) is likewise rclone-only — its own no-clobber
-  // check over an existing --remote object, deliberately the SAME o.force that opted
-  // resolveSkipUnchanged() past the digest check above, not a second flag.
+  // #484 for ton-provider, #654 for its locator-aware/async shape) is likewise only
+  // ever called by arweave/turbo/ton-provider — every other backend never calls it, so
+  // persistReceipt() above is simply never invoked for it. `force` (#533) is likewise
+  // rclone-only — its own no-clobber check over an existing --remote object,
+  // deliberately the SAME o.force that opted resolveSkipUnchanged() past the digest
+  // check above, not a second flag.
   //
   // `spendTracker` (#639) is ton-provider-only — a mutable box passed BY REFERENCE to
   // this call and the ".minisig" sidecar's put() call further down, so ton-provider.ts
   // can enforce CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND against their COMBINED spend rather
   // than checking each deploy in isolation. Every other backend ignores it.
-  const receiptBox = newReceiptBox();
   const spendTracker = { spentNano: 0n };
   const locator = await backend.put(o.in, {
     yes,
     remote: o.remote,
     force: o.force,
     spendTracker,
-    onReceipt: (raw, cost) => {
-      receiptBox.value = { raw, cost };
-    },
+    onReceipt: (event) => persistReceipt(inPath, event),
   });
   console.error(`pushed ${o.in} -> ${o.backend}:${locator}`);
-  await persistReceiptIfAny(o.in, locator, receiptBox);
   // Authenticity sidecar (#214): if snapshot() wrote a "<in>.minisig" next to the
   // ciphertext, upload it too — same backend, same already-granted consent (`yes`
   // covers the whole push() call, not a per-file re-prompt for a few-hundred-byte
@@ -505,7 +453,6 @@ async function pushCore(
   const sigPath = `${o.in}.minisig`;
   let sigLocator: string | undefined;
   if (await exists(sigPath)) {
-    const sigReceiptBox = newReceiptBox();
     // A local `const`, typed plain `string`, not the outer `let sigLocator: string |
     // undefined` — TS cannot narrow the outer variable to non-undefined here (its
     // declaration and assignment sit across a try/catch boundary), and the outer
@@ -528,9 +475,7 @@ async function pushCore(
         // is what lets ton-provider.ts see the ciphertext deploy's already-committed
         // spend and enforce the cap against the combined total.
         spendTracker,
-        onReceipt: (raw, cost) => {
-          sigReceiptBox.value = { raw, cost };
-        },
+        onReceipt: (event) => persistReceipt(sigPath, event),
       });
     } catch (e) {
       // The ciphertext (above) already durably uploaded — see PushPartialSuccessError's
@@ -543,9 +488,10 @@ async function pushCore(
     sigLocator = justUploaded;
     console.error(`pushed ${sigPath} -> ${o.backend}:${justUploaded}`);
     // #232: a signed push to a paid backend is TWO separate uploads (ciphertext +
-    // sidecar), each its own charge — without this, the ledger silently understated
-    // every signed arweave/turbo push's true total cost (Codex review).
-    await persistReceiptIfAny(sigPath, justUploaded, sigReceiptBox);
+    // sidecar), each its own charge — the sidecar's own onReceipt (above) already
+    // persisted its receipt from inside backend.put(), same as the ciphertext's own;
+    // without this, the ledger silently understated every signed arweave/turbo push's
+    // true total cost (Codex review).
   }
   // --save-locator <path>: persist the returned locator so operators can back it up
   // alongside their identity (the two things a fresh machine needs to restore).

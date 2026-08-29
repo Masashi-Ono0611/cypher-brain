@@ -290,7 +290,11 @@ export function turboBackend(): StorageBackend {
       // moments before signing) — the closest thing to "actual cost" this response
       // surfaces; null only if that estimate itself could not be obtained (an
       // uncapped push proceeding despite a failed pre-flight query).
-      opts.onReceipt?.(res, uploadWinc !== null ? { amount: String(uploadWinc), unit: 'winc' } : null);
+      await opts.onReceipt?.({
+        locator: res.id,
+        raw: res,
+        cost: uploadWinc !== null ? { amount: String(uploadWinc), unit: 'winc' } : null,
+      });
       return res.id; // 43-char data item id — retrievable like any bundled item
     },
     // reads are identical to the arweave backend (Turbo items are bundled). Pure

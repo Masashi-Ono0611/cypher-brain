@@ -102,6 +102,11 @@ import { p2pFetch, entryNameFor } from './ton.js';
 import { progressReporter } from '../progress.js';
 import { tonWalletConfigured, loadTonWallet } from '../wallet.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
+// issue #654: imported from this NEUTRAL leaf module (never from pushpull.ts) to avoid
+// an import cycle — pushpull.ts imports backendFor() from backends/index.ts, which
+// imports this file; if this file imported from pushpull.ts, that would close the loop.
+// See push-partial-success.ts's own header comment.
+import { PushFundingConfirmedButIncompleteError } from '../push-partial-success.js';
 
 // Lazy loader for @ton/ton's VALUE exports (beginCell/Cell/Dictionary/Address/
 // contractAddress/storeStateInit) — mirrors wallet.ts's getArweave(). Cached after the
@@ -1382,7 +1387,73 @@ export function tonProviderBackend(): StorageBackend {
         );
         console.error(`ton-provider: contract ${deploy.contractAddress.toRawString()} is active on-chain`);
 
-        await notifyProviderWithRetry(provider.pubkey, deploy.contractAddress.toRawString(), bag.dataSizeBytes);
+        // issue #654: computed HERE (not re-derived at the old, later `return` site)
+        // because it is now needed twice — once for the receipt event immediately
+        // below, once for the typed error the notify try/catch further down can throw.
+        // tonProviderLocator() is a pure function of bag.bagId alone (see its own
+        // definition, module-top) — it does not depend on notify ever succeeding.
+        const locator = tonProviderLocator(bag.bagId);
+
+        // #484: ledger's cumulative-cost tracking was arweave/turbo-only despite
+        // ton-provider being a real paid backend with its own MAX_SPEND cap (doctor/
+        // audit/estimate/schedule already treat it on par with the other backends —
+        // ledger was the one place it diverged). `deploy.amountNano` (storage cost +
+        // deploy buffer, see the console.error just above buildDeploy()'s call) is the
+        // AUTHORITATIVE actual spend, not a pre-flight estimate: waitForContractActive()
+        // above has already confirmed the contract is live on-chain, which only happens
+        // once the transfer carrying this exact amount has been processed — same
+        // "confirmed, not just requested" posture as arweave's signed tx.reward
+        // (receipt.ts's own header comment). `raw` is a small normalized summary
+        // (ton-provider has no single SDK response object to defer to, same reasoning
+        // as arweave's own raw L1 backend).
+        //
+        // issue #654: called HERE — right after on-chain confirmation, BEFORE
+        // notifyProviderWithRetry() below — not after notify succeeds. The spend is
+        // already IRREVERSIBLE at this point regardless of whether notify subsequently
+        // succeeds, and pushpull.ts's onReceipt callback now persists the receipt
+        // durably to disk from INSIDE this awaited call (types.ts's PutOpts doc comment)
+        // — so a notify failure right after this line can no longer make an
+        // already-spent amount vanish from the ledger (previously: onReceipt only fired
+        // after notify succeeded, so a notify timeout meant put() threw before ever
+        // reaching it, and the receipt was lost even though the money was already gone).
+        //
+        // issue #638: skipped when alreadyActive — this run did not actually move any
+        // funds (see the money-safety comment above), so `deploy.amountNano` here is a
+        // hypothetical recomputation (possibly against a DIFFERENT provider/rate than
+        // whichever run actually paid), not an "ACTUAL-cost record" receipt.ts's own
+        // contract requires. Recording one would double-count the ledger's cumulative
+        // cost for a single real on-chain spend — even if THIS run's notify below goes
+        // on to succeed, no new receipt is written (the spend, if any, was already
+        // recorded — or never recorded at all — by whichever earlier run actually paid;
+        // see issue #654's own follow-up issues for the residual gaps this does not
+        // attempt to backfill).
+        if (!alreadyActive) {
+          await opts.onReceipt?.({
+            locator,
+            raw: {
+              contract_address: deploy.contractAddress.toRawString(),
+              bag_id: bag.bagId,
+              provider_pubkey: provider.pubkey,
+              cost_nano: deploy.costNano.toString(),
+              deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
+              amount_nano: deploy.amountNano.toString(),
+            },
+            cost: { amount: deploy.amountNano.toString(), unit: 'nanoton' },
+          });
+        }
+
+        // issue #654: notify is the only remaining step, and by now the spend above is
+        // already durably recorded (or, on a retry, was already durably recorded by an
+        // earlier run) — a failure here must be distinguishable from "nothing happened"
+        // (a caller assuming the latter, e.g. an MCP idempotency-key retry or an
+        // unattended `schedule` re-run, could resend a second real transfer). Thrown as
+        // PushFundingConfirmedButIncompleteError, not a plain Error, regardless of
+        // alreadyActive: the on-chain funding fact is true either way by this point.
+        try {
+          await notifyProviderWithRetry(provider.pubkey, deploy.contractAddress.toRawString(), bag.dataSizeBytes);
+        } catch (e) {
+          throw new PushFundingConfirmedButIncompleteError(locator, e);
+        }
         // #652: made explicit here (not just in this file's own doc comments) since this
         // is the line an operator actually sees before their local seed stops — "safe"
         // is the provider's OWN claim, not a cryptographic proof this push verified.
@@ -1392,57 +1463,7 @@ export function tonProviderBackend(): StorageBackend {
             'spot-check retrieval — see docs/ton-storage-status.md and issue #652 for the known gap)',
         );
 
-        // #484: ledger's cumulative-cost tracking was arweave/turbo-only despite
-        // ton-provider being a real paid backend with its own MAX_SPEND cap (doctor/
-        // audit/estimate/schedule already treat it on par with the other backends —
-        // ledger was the one place it diverged). `deploy.amountNano` (storage cost +
-        // deploy buffer, see the console.error just above buildDeploy()'s call) is the
-        // AUTHORITATIVE actual spend, not a pre-flight estimate: by this point
-        // waitForContractActive() has already confirmed the contract is live on-chain,
-        // which only happens once the transfer carrying this exact amount has been
-        // processed — same "confirmed, not just requested" posture as arweave's signed
-        // tx.reward (receipt.ts's own header comment). `raw` is a small normalized
-        // summary (ton-provider has no single SDK response object to defer to, same
-        // reasoning as arweave's own raw L1 backend).
-        //
-        // Known gap (Codex review): if notifyProviderWithRetry() above throws (the
-        // provider never confirms a full download within CYPHER_BRAIN_TON_PROVIDER_
-        // NOTIFY_RETRY_MS), this line is never reached — the deploy transfer is already
-        // confirmed on-chain (real funds committed) but no receipt gets recorded, since
-        // this push did not COMPLETE (receipt.ts's own contract: a receipt is "the best
-        // available ACTUAL-cost record for a completed paid push", matching arweave's/
-        // turbo's own receipts, each recorded at the last step of an upload that fully
-        // succeeds). pushpull.ts's push() only ever persists a receipt for a put() call
-        // that RESOLVES, so recording one for this specific failure path would need a
-        // partial-success signal analogous to PushSignatureUploadError's, threaded back
-        // through pushpull.ts — a deliberately separate follow-up, not folded in here.
-        // The thrown error's own message already tells the operator the contract IS
-        // deployed and may still complete on its own; audit.ts's own log still records
-        // this run (backend=ton-provider, non-zero exit_code) either way.
-        //
-        // issue #638: skipped when alreadyActive — this run did not actually move any
-        // funds (see the money-safety comment above), so `deploy.amountNano` here is a
-        // hypothetical recomputation (possibly against a DIFFERENT provider/rate than
-        // whichever run actually paid), not an "ACTUAL-cost record" receipt.ts's own
-        // contract requires. Recording one would double-count the ledger's cumulative
-        // cost for a single real on-chain spend. This is the SAME pre-existing "no
-        // receipt for a deploy that only completes on a later, notify-only retry" gap
-        // documented just above (Known gap) — not a new one this fix introduces.
-        if (!alreadyActive) {
-          opts.onReceipt?.(
-            {
-              contract_address: deploy.contractAddress.toRawString(),
-              bag_id: bag.bagId,
-              provider_pubkey: provider.pubkey,
-              cost_nano: deploy.costNano.toString(),
-              deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
-              amount_nano: deploy.amountNano.toString(),
-            },
-            { amount: deploy.amountNano.toString(), unit: 'nanoton' },
-          );
-        }
-
-        return tonProviderLocator(bag.bagId);
+        return locator;
       } finally {
         // Each cleanup step runs regardless of whether the other one throws (Codex
         // review): a daemon.stop() failure must not skip the tmpRoot removal, or a

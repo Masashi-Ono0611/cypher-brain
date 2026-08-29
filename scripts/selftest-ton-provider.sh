@@ -893,6 +893,63 @@ grep -q 'already shows on-chain activity' "$TMP/issue638-retry.err" || { echo "[
 echo "[PASS] issue #638: retrying an already-active StorageV1 contract skips re-funding (broadcast count stayed at 1, not 2)"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
+echo "== issue #654: a notify failure AFTER funding is confirmed still persists the receipt (PushFundingConfirmedButIncompleteError) =="
+# A DISTINCT, never-before-pushed source (not issue638.age/got.age — same reasoning as
+# the #651/#640 fixes above: reusing an address this script has already broadcast
+# against would trip the #638 already-active guard before this test ever reaches the
+# notify-timeout path it exists to prove).
+mkdir -p "$TMP/issue654-src"
+printf 'ton-provider issue #654 receipt-on-confirmed-funding test payload\n' > "$TMP/issue654-src/note.txt"
+cb snapshot --dir "$TMP/issue654-src" --out "$TMP/issue654.age"
+I654_SIZE=$(stat -f%z "$TMP/issue654.age" 2>/dev/null || stat -c%s "$TMP/issue654.age")
+echo "1" > "$TMP/notify-downloaded" # far short of I654_SIZE — notify will never confirm within the short retry window below
+
+RECEIPT_COUNT_BEFORE_654=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+: > "$BROADCAST_LOG"
+set +e
+I654_ERR=$(CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS=1500 CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS=300 \
+  cb push --in "$TMP/issue654.age" --backend ton-provider 2>&1 >/dev/null); I654_RC=$?
+set -e
+[ "$I654_RC" != "0" ] \
+  || { echo "[FAIL] push succeeded despite the provider never confirming the download within the retry window"; echo "$I654_ERR"; exit 1; }
+printf '%s' "$I654_ERR" | grep -q 'funding is CONFIRMED on-chain' \
+  || { echo "[FAIL] the notify-timeout error did not report confirmed funding"; echo "$I654_ERR"; exit 1; }
+printf '%s' "$I654_ERR" | grep -q 'already recorded in the receipt ledger' \
+  || { echo "[FAIL] the notify-timeout error did not point at the receipt ledger"; echo "$I654_ERR"; exit 1; }
+[ -s "$BROADCAST_LOG" ] \
+  || { echo "[FAIL] the funding never actually broadcast (test setup is not exercising a REAL confirmed-funding scenario)"; exit 1; }
+RECEIPT_COUNT_AFTER_654=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+[ "$((RECEIPT_COUNT_AFTER_654 - RECEIPT_COUNT_BEFORE_654))" = "1" ] \
+  || { echo "[FAIL] expected exactly ONE new ton-provider receipt despite the notify failure (the funding IS confirmed on-chain) — got $((RECEIPT_COUNT_AFTER_654 - RECEIPT_COUNT_BEFORE_654))"; exit 1; }
+echo "[PASS] issue #654: a notify failure after confirmed funding still persists the receipt, and the thrown error names the confirmed-funding + ledger fact"
+
+echo "== issue #654: retrying the same (now already-active) contract and letting notify succeed does NOT add a second receipt =="
+echo "$I654_SIZE" > "$TMP/notify-downloaded" # restore full size so notify confirms this time
+CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue654.age" --backend ton-provider >/dev/null 2>"$TMP/issue654-retry.err" \
+  || { echo "[FAIL] the retry push failed despite notify now able to confirm the full download"; cat "$TMP/issue654-retry.err"; exit 1; }
+grep -q 'already shows on-chain activity' "$TMP/issue654-retry.err" \
+  || { echo "[FAIL] the retry did not report the contract as already active/skipped"; cat "$TMP/issue654-retry.err"; exit 1; }
+RECEIPT_COUNT_AFTER_RETRY_654=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+[ "$RECEIPT_COUNT_AFTER_RETRY_654" = "$RECEIPT_COUNT_AFTER_654" ] \
+  || { echo "[FAIL] the retry that completed notify added a SECOND receipt for the SAME on-chain spend (double-counted) — count went from $RECEIPT_COUNT_AFTER_654 to $RECEIPT_COUNT_AFTER_RETRY_654"; exit 1; }
+echo "[PASS] issue #654: completing notify on a retry of an already-active contract does not double-count the receipt ledger"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore for any later runs
+
+echo "== issue #654 (MCP-level): a snapshot_now notify timeout classifies as funding_confirmed, not a generic partial-success bucket =="
+# Reuses this run's ALREADY-RUNNING tonapi/mytonprovider/notify mocks (env vars
+# exported above) — the dedicated companion script only adds the MCP stdio/JSON-RPC
+# plumbing, not a second copy of the mock infrastructure. Runs against dist/mcp.mjs,
+# same as scripts/mcp-smoke.mjs — requires `npm run build` to have already run (true
+# for both `npm run verify:suite`'s own ordering and this script's own top-of-file
+# assumption that node_modules/dist are current).
+MCP_PARTIAL_TEST_TMP="$TMP" \
+  MCP_PARTIAL_TEST_TON_WALLET="$TMP/ton-wallet.json" \
+  MCP_PARTIAL_TEST_NOTIFY_DOWNLOADED="$TMP/notify-downloaded" \
+  MCP_PARTIAL_TEST_RECIPIENT="$CYPHER_BRAIN_HOME/recipient.txt" \
+  node scripts/selftest-ton-provider-mcp-partial.mjs
+
 # ========================================================================
 # issue #480: waitForContractActive()'s timeout message must match the path that
 # actually ran (auto-sign vs. Tonkeeper-deeplink) instead of always pointing at "the
