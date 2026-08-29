@@ -15,7 +15,12 @@ import { appendReceipt } from './receipt.js';
 import { recordAudit } from './audit.js';
 import { warn } from './warn.js';
 import type { CliOptions, ReceiptEvent } from './types.js';
-import { PushPartialSuccessError, PushSignatureUploadError, PushLocatorWriteError } from './push-partial-success.js';
+import {
+  PushPartialSuccessError,
+  PushSignatureUploadError,
+  PushLocatorWriteError,
+  PushFundingConfirmedButIncompleteError,
+} from './push-partial-success.js';
 // Re-exported unchanged so existing `from './pushpull.js'` imports (mcp.ts, wizard.ts)
 // keep working — see push-partial-success.ts's own header comment for why these
 // classes live in a separate, import-cycle-free module in the first place.
@@ -478,6 +483,21 @@ async function pushCore(
         onReceipt: (event) => persistReceipt(sigPath, event),
       });
     } catch (e) {
+      // issue #654 (Codex review): a signed ton-provider push's SIDECAR deploy can hit
+      // the exact same "funding confirmed, notify incomplete" scenario the ciphertext
+      // deploy can — ton-provider.ts's put() (called again here, for sigPath) throws
+      // its OWN PushFundingConfirmedButIncompleteError in that case. Unconditionally
+      // wrapping it as PushSignatureUploadError below would discard that identity
+      // entirely: the sidecar's own already-confirmed locator would be lost (this
+      // error's own doc comment: `sigLocator` is what a caller needs to hand-record
+      // it), and the MCP idempotency classification (mcp.ts's `e instanceof
+      // PushFundingConfirmedButIncompleteError` branch) would never fire, misreporting
+      // a confirmed on-chain spend as an ordinary signature-upload failure. Re-thrown
+      // with the CIPHERTEXT's own locator (matching every other PushPartialSuccessError
+      // subclass's convention) and the sidecar's confirmed locator as sigLocator.
+      if (e instanceof PushFundingConfirmedButIncompleteError) {
+        throw new PushFundingConfirmedButIncompleteError(locator, e, e.locator);
+      }
       // The ciphertext (above) already durably uploaded — see PushPartialSuccessError's
       // own doc comment for why this must never be reported the same way as an
       // ordinary push() failure (a caller assuming "nothing happened" here would be

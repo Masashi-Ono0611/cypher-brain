@@ -45,12 +45,31 @@ Design consulted with a second model (Codex, via agmsg) before implementing:
   (no real spend happens on that run) — even when that retry's own notify attempt
   succeeds, no receipt is written a second time for the same on-chain spend.
 
+Multi-model review (bounded `codex exec`, `gpt-5.6-sol`, xhigh effort — money-safety
+scope) on the first draft found two real gaps, both fixed:
+
+- **Warning**: a signed ton-provider push's `.minisig` sidecar deploy can hit the exact
+  same confirmed-funding-notify-incomplete scenario the ciphertext deploy can (it makes
+  its own, separate `put()` call) — but `pushpull.ts`'s sidecar catch block
+  unconditionally wrapped ANY failure as `PushSignatureUploadError`, discarding the
+  sidecar's own confirmed locator and misreporting a real on-chain spend as an ordinary
+  upload failure. The sidecar catch now re-throws a `PushFundingConfirmedButIncompleteError`
+  carrying the ciphertext's own locator plus the sidecar's confirmed locator as
+  `sigLocator` when that's what actually happened.
+- **Warning**: `PushFundingConfirmedButIncompleteError`'s message overclaimed the
+  receipt ledger write as certain ("already recorded"), when `persistReceipt()`
+  deliberately swallows append failures (disk full, permissions) and only warns.
+  Reworded to say the write was *attempted*, pointing an operator who needs certainty
+  at `cypher-brain ledger`.
+
 Verified with real red/green positive controls (temporarily reverted each fix,
 confirmed the new tests fail with the exact expected message, restored, confirmed
-all-PASS): `scripts/selftest-ton-provider.sh` gained a CLI-level test (notify timeout
+all-PASS): `scripts/selftest-ton-provider.sh` gained CLI-level tests (notify timeout
 after confirmed funding persists exactly one receipt and names the confirmed-funding
-fact; a subsequent retry that completes notify does not double-count) and an MCP-level
-test (`scripts/selftest-ton-provider-mcp-partial.mjs`, reusing the same run's mock
+fact; a subsequent retry that completes notify does not double-count; a signed push's
+sidecar deploy hitting this same scenario keeps its own error identity, not a generic
+signature-upload-failed message) and an MCP-level test
+(`scripts/selftest-ton-provider-mcp-partial.mjs`, reusing the same run's mock
 tonapi/mytonprovider/notify infrastructure) proving the idempotency-key replay carries
 the correct classification, not the generic `locator_file_write_failed` fallback.
 Full `selftest-ton-provider.sh`/`selftest-ton.sh`/`selftest-ton-dns.sh`/`selftest.sh`/

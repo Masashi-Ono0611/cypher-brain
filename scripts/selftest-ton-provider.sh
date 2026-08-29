@@ -915,7 +915,7 @@ set -e
   || { echo "[FAIL] push succeeded despite the provider never confirming the download within the retry window"; echo "$I654_ERR"; exit 1; }
 printf '%s' "$I654_ERR" | grep -q 'funding is CONFIRMED on-chain' \
   || { echo "[FAIL] the notify-timeout error did not report confirmed funding"; echo "$I654_ERR"; exit 1; }
-printf '%s' "$I654_ERR" | grep -q 'already recorded in the receipt ledger' \
+printf '%s' "$I654_ERR" | grep -q 'receipt-ledger entry was attempted' \
   || { echo "[FAIL] the notify-timeout error did not point at the receipt ledger"; echo "$I654_ERR"; exit 1; }
 [ -s "$BROADCAST_LOG" ] \
   || { echo "[FAIL] the funding never actually broadcast (test setup is not exercising a REAL confirmed-funding scenario)"; exit 1; }
@@ -1136,5 +1136,49 @@ RECEIPT_COUNT_AFTER_RETRY=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_
 [ "$RECEIPT_COUNT_AFTER_RETRY" = "$RECEIPT_COUNT_BEFORE_RETRY" ] \
   || { echo "[FAIL] expected NO new receipt from a fully-skipped retry (no real spend occurred) — count went from $RECEIPT_COUNT_BEFORE_RETRY to $RECEIPT_COUNT_AFTER_RETRY"; exit 1; }
 echo "[PASS] retrying an already-fully-deployed signed push succeeds under a tiny cap (both deploys skip re-funding, spending nothing, no new receipt)"
+
+echo "== issue #654 (Codex review): a SIGNED push's SIDECAR deploy hitting the confirmed-funding-notify-incomplete scenario keeps its own error identity/locator, not a generic PushSignatureUploadError =="
+# The ciphertext's own notify (call #1 below) always succeeds immediately (matching
+# every other "first call reports full" push in this script) — the point of this test
+# is the SIDECAR's OWN deploy (a SEPARATE ton-provider put() call, per issue #639)
+# hitting the SAME confirmed-funding-notify-incomplete scenario issue #654 fixes for
+# the ciphertext. Before the pushpull.ts sidecar catch block also checked for
+# PushFundingConfirmedButIncompleteError (Codex review), this unconditionally wrapped
+# ANY sidecar failure as PushSignatureUploadError, discarding the sidecar's own
+# confirmed locator and misreporting a real on-chain spend as an ordinary upload
+# failure.
+mkdir -p "$TMP/sidecar654-src"
+printf 'ton-provider issue #654 sidecar-confirmed-funding test payload\n' > "$TMP/sidecar654-src/note.txt"
+cb snapshot --dir "$TMP/sidecar654-src" --out "$TMP/sidecar654.age"
+[ -f "$TMP/sidecar654.age.minisig" ] || { echo "[FAIL] signing is not enabled — cb keygen --sign must have already run earlier in this script"; exit 1; }
+SIDECAR654_CT_SIZE=$(stat -f%z "$TMP/sidecar654.age" 2>/dev/null || stat -c%s "$TMP/sidecar654.age")
+# Sequence: notify call #1 (the ciphertext's own, FIRST deploy) reports the ciphertext's
+# real full size — succeeds immediately, using exactly one call. Every call after that
+# (the SIDECAR's own retry loop, call #2 onward — falls through to the sequence file's
+# last line) reports "1", far short of any real size, so the sidecar's own
+# notifyProviderWithRetry() never confirms and times out.
+printf '%s\n1\n' "$SIDECAR654_CT_SIZE" > "$TMP/notify-downloaded-sequence"
+rm -f "$TMP/notify-call-counter"
+: > "$BROADCAST_LOG"
+set +e
+SIDECAR654_ERR=$(CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS=1500 CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS=300 \
+  cb push --in "$TMP/sidecar654.age" --backend ton-provider 2>&1 >/dev/null); SIDECAR654_RC=$?
+set -e
+rm -f "$TMP/notify-downloaded-sequence" "$TMP/notify-call-counter"
+[ "$SIDECAR654_RC" != "0" ] \
+  || { echo "[FAIL] push succeeded despite the sidecar's own notify never confirming"; echo "$SIDECAR654_ERR"; exit 1; }
+printf '%s' "$SIDECAR654_ERR" | grep -q 'funding is CONFIRMED on-chain' \
+  || { echo "[FAIL] the sidecar's confirmed-funding-notify-incomplete error lost its identity (fell back to a generic signature-upload-failed message instead)"; echo "$SIDECAR654_ERR"; exit 1; }
+if printf '%s' "$SIDECAR654_ERR" | grep -q 'uploading the .minisig signature sidecar failed'; then
+  echo "[FAIL] the sidecar's confirmed-funding notify failure was misreported as a generic PushSignatureUploadError (Codex review regression)"; echo "$SIDECAR654_ERR"; exit 1
+fi
+# Both the ciphertext's deploy AND the sidecar's own deploy actually broadcast (2
+# distinct BOCs) — proving this is a REAL confirmed-funding scenario for the sidecar,
+# not merely a case where the sidecar's own deploy never got that far.
+SIDECAR654_BOC_COUNT=$(grep -c '"boc"' "$BROADCAST_LOG" || true)
+[ "$SIDECAR654_BOC_COUNT" = "2" ] \
+  || { echo "[FAIL] expected exactly 2 broadcasts (ciphertext + sidecar deploys), got $SIDECAR654_BOC_COUNT — test setup did not reach a real confirmed-funding sidecar scenario"; cat "$BROADCAST_LOG"; exit 1; }
+echo "[PASS] issue #654 (Codex review): a signed push's sidecar deploy hitting confirmed-funding-notify-incomplete keeps its own error identity, not a generic signature-upload-failed message"
 
 echo "ALL PASS"

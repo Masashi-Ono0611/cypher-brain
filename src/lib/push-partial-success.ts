@@ -72,26 +72,40 @@ export class PushLocatorWriteError extends PushPartialSuccessError {
 // the push as a whole is not "complete" until notifyProviderWithRetry() also succeeds.
 // Before this error existed, a notify failure after that confirmation made put() throw
 // a plain Error, indistinguishable from "nothing was spent" — the receipt (this file's
-// sibling concern, an ACCOUNTING record) is written separately, right at the
+// sibling concern, an ACCOUNTING record) is ATTEMPTED separately, right at the
 // confirmation checkpoint via the locator-aware onReceipt callback (see types.ts's
-// PutOpts doc comment and backends/ton-provider.ts's own call site), so the money is
-// never actually missing from the ledger by the time this error is thrown — but the
-// CALLER (an MCP idempotency-key retry, wizard.ts's own push() catch, a human reading
-// stderr) still needs a distinct signal that "funding already happened, only the
-// provider handshake remains" rather than treating this as an ordinary,
-// nothing-happened failure a retry can freely resend from scratch. `sigLocator` is
-// always undefined here (see PushPartialSuccessError's own doc comment above).
+// PutOpts doc comment and backends/ton-provider.ts's own call site) — but the CALLER
+// (an MCP idempotency-key retry, wizard.ts's own push() catch, a human reading stderr)
+// still needs a distinct signal that "funding already happened, only the provider
+// handshake remains" rather than treating this as an ordinary, nothing-happened
+// failure a retry can freely resend from scratch. The message deliberately says the
+// ledger write was ATTEMPTED, not that it definitely succeeded (Codex review): a
+// receipt-persist failure (disk full, permissions) is swallowed and only warned about
+// — see pushpull.ts's own `persistReceipt()` — so this error alone cannot promise the
+// ledger entry actually landed; an operator who needs certainty should check
+// `cypher-brain ledger` directly.
+//
+// `sigLocator` is undefined for a STANDALONE deploy (ton-provider.ts's own throw
+// site). It carries the SIDECAR's own confirmed locator when this error is instead
+// RE-THROWN from pushpull.ts's ".minisig" sidecar catch block (Codex review: a naive
+// `catch { throw new PushSignatureUploadError(...) }` there would have discarded this
+// error's identity entirely for a signed ton-provider push whose sidecar deploy hits
+// this exact scenario, misreporting a confirmed-funding notify failure as a plain
+// upload failure and losing the sidecar's own locator). In that re-thrown case,
+// `locator` is the CIPHERTEXT's (already-durably-uploaded) locator — matching every
+// other PushPartialSuccessError subclass's own convention — not the sidecar's.
 export class PushFundingConfirmedButIncompleteError extends PushPartialSuccessError {
   readonly stage = 'provider_notify' as const;
   readonly fundingConfirmed = true as const;
-  constructor(locator: string, cause: unknown) {
+  constructor(locator: string, cause: unknown, sigLocator?: string) {
     super(
-      `ton-provider: contract funding is CONFIRMED on-chain (locator: ${locator}) but notifying the storage ` +
-        `provider failed: ${cause instanceof Error ? cause.message : String(cause)} — the deploy transfer already ` +
-        'happened and is already recorded in the receipt ledger; retry to resume notifying the provider (the ' +
-        'retry will detect the contract is already active and skip re-funding, per issue #638)',
+      `ton-provider: contract funding is CONFIRMED on-chain (locator: ${sigLocator ?? locator}) but notifying the ` +
+        `storage provider failed: ${cause instanceof Error ? cause.message : String(cause)} — the deploy transfer ` +
+        'already happened and a receipt-ledger entry was attempted for it; retry to resume notifying the provider ' +
+        '(the retry will detect the contract is already active and skip re-funding, per issue #638). If you need ' +
+        'to confirm the ledger entry actually landed, check `cypher-brain ledger`.',
       locator,
-      undefined,
+      sigLocator,
     );
     this.name = 'PushFundingConfirmedButIncompleteError';
   }
