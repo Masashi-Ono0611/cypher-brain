@@ -105,14 +105,12 @@ node "$TMP/mock-mytonprovider.mjs" "$MYTONPROVIDER_PORT" "$PROVIDER_PUBKEY" "$PR
 MYTONPROVIDER_PID=$!
 export CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL="http://127.0.0.1:$MYTONPROVIDER_PORT"
 
-# ---- mock tonapi: GET /v2/blockchain/accounts/<addr> -> always 'active', PLUS
-# (#396 Phase B) GET /v2/rates?... for the USD-estimate line and an owner-specific
-# low-balance mode for the pre-deploy funds-check positive control below. The
-# low-balance flag is keyed to the EXACT owner address string this script exports
-# as CYPHER_BRAIN_TON_PROVIDER_OWNER (already in raw workchain:hex form, so
-# Address.parse(...).toRawString() round-trips it unchanged) — any OTHER address
-# (i.e. the deployed contract's own address, polled by waitForContractActive())
-# keeps returning the generous fixed balance, so that polling path is unaffected.
+# ---- mock tonapi: GET /v2/blockchain/accounts/<addr>, PLUS (#396 Phase B) GET
+# /v2/rates?... for the USD-estimate line and an owner-specific low-balance mode for
+# the pre-deploy funds-check positive control below. The low-balance flag is keyed to
+# the EXACT owner address string this script exports as CYPHER_BRAIN_TON_PROVIDER_OWNER
+# (already in raw workchain:hex form, so Address.parse(...).toRawString() round-trips
+# it unchanged) — any OTHER address keeps returning the generous fixed balance.
 # Issue #479: wallet.ts's tonWalletBalance() queries the PLAIN /v2/accounts/<addr>
 # endpoint (no blockchain/ prefix — ton-provider.ts's fetchAccountState() above is the
 # only caller of the blockchain/ one). This mock distinguishes the two prefixes so a
@@ -121,7 +119,19 @@ export CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL="http://127.0.0.1:$MYTONPROVI
 # plain endpoint (matching tonapi.io's real /v2/accounts response for an address that
 # has never sent/received a transaction, confirmed directly against the live API), while
 # any other /v2/accounts/<addr> query — and every /v2/blockchain/accounts/<addr> one —
-# keeps falling through to the generic active/frozen/low-balance handling below.
+# keeps falling through to the generic active/frozen/low-balance/seen-tracking handling
+# below.
+# Issue #638: an address's FIRST-EVER query (across either prefix) reports 'nonexist',
+# and EVERY query after that reports 'active' — unless the frozen/never-active
+# overrides below apply, which always take priority regardless of "seen" state. This
+# simulates a genuine nonexist -> active transition for a truly fresh deploy (so
+# ton-provider.ts's own already-active check, added for #638, sees "not yet funded"
+# and proceeds to fund it — exercising the real broadcast/deeplink path, not skipping
+# it from the very first push), while a genuine RETRY that derives the SAME contract
+# address (same bagId/owner/etc, see buildDeploy()'s own comment) sees 'active'
+# immediately on that check, exactly like a real retry against an already-landed
+# deploy would from a real tonapi — this is what lets the #638 regression test below
+# prove the fix without ever needing a second real broadcast to succeed.
 cat > "$TMP/mock-tonapi.mjs" <<'MOCKEOF'
 import { createServer } from 'node:http';
 import { existsSync, appendFileSync, readFileSync } from 'node:fs';
@@ -134,6 +144,8 @@ const broadcastLogPath = process.argv[7]; // every accepted POST /v2/blockchain/
 const neverActiveFlagPath = process.argv[8]; // if present, every NON-owner address (i.e. a just-deployed contract) reports 'uninitialized' forever — issue #480's waitForContractActive() timeout positive control
 const unfundedAddrFlagPath = process.argv[9]; // if present, its CONTENTS name an address to report 'nonexist'/balance:0 for on plain /v2/accounts/<addr>
 const lookupFailAddrFlagPath = process.argv[10]; // issue #640: if present, its CONTENTS name an address for which GET /v2/blockchain/accounts/<addr> (fetchAccountState's own endpoint) answers HTTP 500 -- a TRANSIENT lookup failure, distinct from every 200-with-status response above (which are all real, non-error account states)
+
+const seenAddrs = new Set(); // issue #638: first-ever query for an address -> 'nonexist'; every query after that -> 'active' (see header comment above)
 
 createServer((req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
@@ -181,7 +193,29 @@ createServer((req, res) => {
   const isFrozenTarget = frozenAddr && url.pathname.includes(frozenAddr);
   const lowBalance = lowBalanceFlagPath && existsSync(lowBalanceFlagPath) && url.pathname.includes(ownerAddr);
   const neverActive = neverActiveFlagPath && existsSync(neverActiveFlagPath) && !url.pathname.includes(ownerAddr);
-  const status = neverActive ? 'uninitialized' : isFrozenTarget ? 'frozen' : 'active';
+  let status;
+  if (isFrozenTarget) {
+    status = 'frozen';
+  } else {
+    // issue #638: see the "seen" tracking header comment above this mock's source.
+    // `firstQuery` is computed even when neverActive applies (below), so a GENUINELY
+    // fresh address still reads as 'nonexist' on its first-ever query even under the
+    // #480 "never confirms" positive control -- otherwise that flag would make ton-
+    // provider.ts's own #638 already-non-fresh check see 'uninitialized' (not
+    // 'nonexist') on the very FIRST query for a brand-new address too, incorrectly
+    // skipping funding before a broadcast ever had a chance to happen.
+    const addrMatch = url.pathname.match(/^\/v2\/(?:blockchain\/)?accounts\/([^/]+)$/);
+    const addr = addrMatch ? addrMatch[1] : null;
+    const firstQuery = addr !== null && !seenAddrs.has(addr);
+    if (addr) seenAddrs.add(addr);
+    if (firstQuery) {
+      status = 'nonexist';
+    } else if (neverActive) {
+      status = 'uninitialized';
+    } else {
+      status = 'active';
+    }
+  }
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ status, balance: lowBalance ? 1 : 5000000000 }));
 }).listen(port, '127.0.0.1');
@@ -700,9 +734,22 @@ rm -f "$TMP/rates-narrow-span-flag"
 echo "[PASS] a live span range that excludes the chosen span refuses the push before any funds move"
 
 echo "== live-rates check: a permissive live-rates response (the default mock) still lets push proceed (#651 control) =="
+# issue #638: got.age's own (auto-sign-wallet, unset-owner) contract address was
+# already broadcast by the "auto-sign path" test above — tonapi's mock now reports it
+# 'active' on every subsequent query (see the mock's "seen" tracking header comment) —
+# so reusing got.age here would trip the #638 already-active guard and skip
+# broadcasting, defeating this control's own point (does a permissive live-rates
+# response actually let a genuinely FRESH push reach broadcast?). Use a distinct,
+# never-before-pushed source instead, same pattern high-price.age/testnet.age/
+# issue638.age already establish elsewhere in this script.
+mkdir -p "$TMP/rates-ok-src"
+printf 'ton-provider #651 control payload (must derive a not-yet-active contract)\n' > "$TMP/rates-ok-src/note.txt"
+cb snapshot --dir "$TMP/rates-ok-src" --out "$TMP/rates-ok.age"
+RATES_OK_SIZE=$(stat -f%z "$TMP/rates-ok.age" 2>/dev/null || stat -c%s "$TMP/rates-ok.age")
+echo "$RATES_OK_SIZE" > "$TMP/notify-downloaded"
 : > "$BROADCAST_LOG"
 CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/rates-ok.err" >/dev/null \
+  cb push --in "$TMP/rates-ok.age" --backend ton-provider 2>"$TMP/rates-ok.err" >/dev/null \
   || { echo "[FAIL] push failed under a permissive live-rates response"; cat "$TMP/rates-ok.err"; exit 1; }
 [ -s "$BROADCAST_LOG" ] || { echo "[FAIL] push never reached broadcast despite a permissive live-rates response"; exit 1; }
 echo "[PASS] a permissive live-rates response does not block the push (the three refusals above are specific to their own override flags)"
@@ -753,19 +800,33 @@ grep -q "CYPHER_BRAIN_TON_PROVIDER_OWNER ($MISMATCHED_OWNER) is set but does not
 echo "[PASS] owner-mismatch guard: refuses to proceed with an ambiguous owner (no silent override, no broadcast)"
 
 echo "== auto-sign: unsetting the stale CYPHER_BRAIN_TON_PROVIDER_OWNER lets the SAME push succeed (the operator-facing fix the error message above points at) =="
+# issue #638: this specific auto-sign wallet + "$TMP/got.age" combination already
+# derived and successfully deployed a contract a few lines above ("no Tonkeeper
+# deeplink needed" test) — reusing got.age here would now correctly trip the #638
+# already-active guard and skip re-funding, which would make THIS test's real point
+# (does fixing the owner mismatch let a genuinely fresh auto-sign push broadcast?)
+# untestable. Use high-price.age instead — same wallet, but a combination never used
+# before, so it derives a brand-new, not-yet-active contract address.
+echo "$HP_SIZE" > "$TMP/notify-downloaded"
 : > "$BROADCAST_LOG"
 CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/mismatch-fixed.err" >/dev/null \
+  cb push --in "$TMP/high-price.age" --backend ton-provider 2>"$TMP/mismatch-fixed.err" >/dev/null \
   || { echo "[FAIL] push failed after unsetting the stale owner"; cat "$TMP/mismatch-fixed.err"; exit 1; }
 grep -q "auto-signing with local wallet $TON_WALLET_ADDR" "$TMP/mismatch-fixed.err" || { echo "[FAIL] did not auto-sign as the wallet's own address"; cat "$TMP/mismatch-fixed.err"; exit 1; }
 [ -s "$BROADCAST_LOG" ] || { echo "[FAIL] push never reached broadcast after unsetting the stale owner"; exit 1; }
 echo "[PASS] unsetting CYPHER_BRAIN_TON_PROVIDER_OWNER resolves the ambiguity and lets auto-sign proceed"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
 echo "== auto-sign: a frozen local wallet refuses to sign (no silent spend attempt from a wallet that cannot act) =="
+# issue #638: same reasoning as above — a fresh wallet+file combination (testnet.age,
+# never pushed with this auto-sign wallet before) so the #638 already-active guard
+# does not skip this run before the frozen-wallet check (inside
+# autoSignAndBroadcastDeploy) ever gets a chance to run. This push never reaches
+# notify (the frozen check throws first), so notify-downloaded does not need touching.
 printf '%s' "$TON_WALLET_ADDR_RAW" > "$FROZEN_ADDR_FLAG"
 : > "$BROADCAST_LOG" # Codex review, xhigh pass: prove the refusal happens BEFORE broadcast, not just that push exits non-zero
 if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/frozen.err"; then
+  cb push --in "$TMP/testnet.age" --backend ton-provider 2>"$TMP/frozen.err"; then
   echo "[FAIL] push succeeded despite the local wallet being frozen on-chain"; exit 1
 fi
 grep -q 'is frozen on-chain' "$TMP/frozen.err" || { echo "[FAIL] wrong frozen-wallet message"; cat "$TMP/frozen.err"; exit 1; }
@@ -774,16 +835,63 @@ rm -f "$FROZEN_ADDR_FLAG"
 echo "[PASS] frozen-wallet guard fired before any broadcast attempt"
 
 echo "== issue #640: a TRANSIENT tonapi lookup failure on the auto-sign wallet's own account-state check must NOT be treated as 'unused wallet, seqno 0' — it must fail loudly instead =="
+# issue #638: same reasoning as the #651 control fix above (and the frozen-wallet
+# test's own testnet.age choice below it originally) — got.age's (auto-sign-wallet,
+# unset-owner) contract is no longer fresh by this point in the script, so the
+# already-active guard would skip autoSignAndBroadcastDeploy() entirely — which is
+# exactly where this lookup-failure check lives — never exercising what this test
+# exists to prove. Use a distinct, never-before-pushed source instead.
+mkdir -p "$TMP/lookup-fail-src"
+printf 'ton-provider #640 lookup-failure payload (must derive a not-yet-active contract)\n' > "$TMP/lookup-fail-src/note.txt"
+cb snapshot --dir "$TMP/lookup-fail-src" --out "$TMP/lookup-fail.age"
+LOOKUP_FAIL_SIZE=$(stat -f%z "$TMP/lookup-fail.age" 2>/dev/null || stat -c%s "$TMP/lookup-fail.age")
+echo "$LOOKUP_FAIL_SIZE" > "$TMP/notify-downloaded"
 printf '%s' "$TON_WALLET_ADDR_RAW" > "$LOOKUP_FAIL_ADDR_FLAG"
 : > "$BROADCAST_LOG" # the whole point of this guard is that broadcast must never be reached on a lookup failure
 if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/lookup-fail.err"; then
+  cb push --in "$TMP/lookup-fail.age" --backend ton-provider 2>"$TMP/lookup-fail.err"; then
   echo "[FAIL] push succeeded despite a transient tonapi lookup failure on the wallet's own account state"; cat "$TMP/lookup-fail.err"; exit 1
 fi
 grep -q 'could not look up local wallet' "$TMP/lookup-fail.err" || { echo "[FAIL] wrong lookup-failure message"; cat "$TMP/lookup-fail.err"; exit 1; }
 [ -s "$BROADCAST_LOG" ] && { echo "[FAIL] a wallet whose lookup failed still reached broadcast — this would have signed with a GUESSED seqno"; exit 1; }
 rm -f "$LOOKUP_FAIL_ADDR_FLAG"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
 echo "[PASS] transient tonapi lookup failure refuses the push instead of guessing seqno 0"
+
+echo "== issue #638: retrying an already-active StorageV1 contract does NOT re-fund it (money-safety fix) =="
+mkdir -p "$TMP/issue638-src"
+printf 'ton-provider issue #638 already-active retry test payload\n' > "$TMP/issue638-src/note.txt"
+cb snapshot --dir "$TMP/issue638-src" --out "$TMP/issue638.age"
+I638_SIZE=$(stat -f%z "$TMP/issue638.age" 2>/dev/null || stat -c%s "$TMP/issue638.age")
+echo "$I638_SIZE" > "$TMP/notify-downloaded"
+
+: > "$BROADCAST_LOG"
+FIRST_LOC=$(CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue638.age" --backend ton-provider 2>"$TMP/issue638-first.err") \
+  || { echo "[FAIL] issue #638 setup: the first (fresh) push failed"; cat "$TMP/issue638-first.err"; exit 1; }
+printf '%s' "$FIRST_LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' || { echo "[FAIL] issue #638 setup: first push did not return a locator: $FIRST_LOC"; exit 1; }
+FIRST_BROADCASTS=$(grep -c '"boc"' "$BROADCAST_LOG" || true)
+[ "$FIRST_BROADCASTS" = "1" ] || { echo "[FAIL] issue #638 setup: expected exactly 1 broadcast on the first (fresh) push, got $FIRST_BROADCASTS"; cat "$BROADCAST_LOG"; exit 1; }
+echo "[PASS] first push against a fresh contract broadcasts exactly once (baseline)"
+
+# The retry: SAME wallet, SAME file -> buildDeploy() derives the IDENTICAL contract
+# address (bagId/owner/dataSizeBytes/pieceSize/merkleHash are all unchanged — see
+# buildDeploy()'s own `data` cell) — simulating an operator (or an agent) retrying
+# after a lost/ambiguous result from the first push, exactly the scenario issue #638
+# describes. BEFORE the fix, this unconditionally re-sent `amountNano` a second time
+# to an address that is ALREADY active on-chain (a genuine double-payment). AFTER the
+# fix, the retry must detect the contract is already active, skip re-funding, and
+# still succeed (going straight to notify).
+SECOND_LOC=$(CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue638.age" --backend ton-provider 2>"$TMP/issue638-retry.err") \
+  || { echo "[FAIL] the retry push failed outright instead of detecting the already-active contract and skipping re-funding"; cat "$TMP/issue638-retry.err"; exit 1; }
+printf '%s' "$SECOND_LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' || { echo "[FAIL] issue #638 retry did not return a locator: $SECOND_LOC"; exit 1; }
+[ "$FIRST_LOC" = "$SECOND_LOC" ] || { echo "[FAIL] the retry derived a DIFFERENT locator than the first push ($FIRST_LOC vs $SECOND_LOC) — test setup is not actually retrying the same bag"; exit 1; }
+SECOND_BROADCASTS=$(grep -c '"boc"' "$BROADCAST_LOG" || true)
+[ "$SECOND_BROADCASTS" = "1" ] || { echo "[FAIL] issue #638 REGRESSION: the retry sent a SECOND broadcast against an already-active contract (double-funding) — broadcast count is now $SECOND_BROADCASTS, expected still 1"; cat "$BROADCAST_LOG"; exit 1; }
+grep -q 'already shows on-chain activity' "$TMP/issue638-retry.err" || { echo "[FAIL] the retry did not report that the contract was already active/skipped"; cat "$TMP/issue638-retry.err"; exit 1; }
+echo "[PASS] issue #638: retrying an already-active StorageV1 contract skips re-funding (broadcast count stayed at 1, not 2)"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
 # ========================================================================
 # issue #480: waitForContractActive()'s timeout message must match the path that
@@ -801,10 +909,24 @@ export CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS=1500
 export CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS=200
 export CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS=400
 
+# issue #638: both pushes below need a GENUINELY FRESH contract address (never queried
+# before in this script run) — the mock's "seen" tracking (see header comment above the
+# mock's source) makes a non-fresh address's FIRST query report 'uninitialized' (not
+# 'nonexist') once NEVER_ACTIVE_FLAG is set below, which would trip ton-provider.ts's
+# own #638 already-non-fresh check and skip funding BEFORE ever reaching the code path
+# each of these tests actually wants to exercise (the real auto-sign broadcast / the
+# real deeplink print). got.age (reused throughout this script) is NOT fresh by this
+# point — two brand-new, never-before-pushed files avoid the collision.
+mkdir -p "$TMP/autosign-timeout-src" "$TMP/manual-timeout-src"
+printf 'ton-provider #480 auto-sign timeout test payload\n' > "$TMP/autosign-timeout-src/note.txt"
+printf 'ton-provider #480 manual (deeplink) timeout test payload\n' > "$TMP/manual-timeout-src/note.txt"
+cb snapshot --dir "$TMP/autosign-timeout-src" --out "$TMP/autosign-timeout.age"
+cb snapshot --dir "$TMP/manual-timeout-src" --out "$TMP/manual-timeout.age"
+
 echo "== auto-sign: a deploy that never confirms on-chain times out with auto-sign-appropriate guidance, NOT the Tonkeeper-deeplink instruction (#480) =="
 touch "$NEVER_ACTIVE_FLAG"
 if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/autosign-timeout.err"; then
+  cb push --in "$TMP/autosign-timeout.age" --backend ton-provider 2>"$TMP/autosign-timeout.err"; then
   echo "[FAIL] push succeeded despite the mock tonapi reporting the contract as never-active"; exit 1
 fi
 grep -q 'did not become active on-chain within' "$TMP/autosign-timeout.err" || { echo "[FAIL] the deploy-confirm timeout did not fire"; cat "$TMP/autosign-timeout.err"; exit 1; }
@@ -821,7 +943,7 @@ grep -Eq 'still waiting for contract .+ to become active on-chain \([0-9]+s elap
 echo "[PASS] the deploy-confirm wait prints periodic progress ($PROGRESS_LINES line(s) in a ${CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS}ms window)"
 
 echo "== Tonkeeper-deeplink path: the SAME timeout keeps the original 'sign the deeplink' guidance (positive control — #480 must not have broken the manual path) =="
-if cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/manual-timeout.err"; then
+if cb push --in "$TMP/manual-timeout.age" --backend ton-provider 2>"$TMP/manual-timeout.err"; then
   echo "[FAIL] push succeeded despite the mock tonapi reporting the contract as never-active"; exit 1
 fi
 grep -q 'sign the deeplink printed above' "$TMP/manual-timeout.err" || { echo "[FAIL] the Tonkeeper-deeplink path lost its original timeout guidance"; cat "$TMP/manual-timeout.err"; exit 1; }
@@ -919,5 +1041,43 @@ CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND="$OVER_CAP" cb push --in "$TMP/combined-spen
 grep -q "pushed $TMP/combined-spend.age.minisig -> ton-provider:" "$TMP/combined-spend-ok.err" \
   || { echo "[FAIL] expected the .minisig sidecar to also be pushed once the combined cap allows it"; cat "$TMP/combined-spend-ok.err"; exit 1; }
 echo "[PASS] a cap covering the combined ciphertext+signature spend lets both deploys succeed"
+
+echo "== regression (rebase-introduced): retrying an ALREADY fully-deployed signed push must not be refused by the spend cap =="
+# This exact combination did not exist in either #638 or #639 individually — it only
+# became reachable once both were merged together (this backend now has BOTH a shared
+# spendTracker across a signed push's two put() calls, #639, AND a per-call
+# already-active skip that must charge NOTHING when a deploy is skipped, #638). The
+# OVER_CAP push just above already made combined-spend.age's ciphertext AND its
+# .minisig sidecar both fully active on-chain. Retrying the EXACT SAME file now must be
+# a pure no-op for BOTH deploys (both already-active, no funds move) — even under a
+# spend cap far too small to cover either deploy's real amountNano, since nothing is
+# actually being spent this time. Before the charge was moved to only fire on the
+# !alreadyActive branch, the tracker was charged the deploy's FULL amountNano the
+# moment it was computed, regardless of whether the deploy turned out to be
+# already-active and skipped — so the ciphertext's phantom "spend" of X against the cap
+# left zero budget for the sidecar's OWN remainingMaxSpendNano check inside
+# buildDeploy(), wrongly refusing a retry that does not need to spend anything at all.
+# Cap set to exactly X (one deploy's own cost, computed above) — enough for a single
+# deploy taken alone (so buildDeploy()'s own per-deploy cap check never itself refuses
+# either deploy on its individual merits) but, pre-fix, not enough for a SECOND deploy
+# once the first one's phantom charge wrongly ate the whole cap. A cap smaller than X
+# would be refused by buildDeploy()'s own check regardless of this fix and would not
+# isolate the bug this test exists to catch.
+RECEIPT_COUNT_BEFORE_RETRY=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND="$X" cb push --in "$TMP/combined-spend.age" --backend ton-provider \
+  >/dev/null 2>"$TMP/combined-spend-retry.err" \
+  || { echo "[FAIL] retrying an already-fully-deployed signed push was refused under a cap equal to only ONE deploy's cost (both sides should skip, spending nothing)"; cat "$TMP/combined-spend-retry.err"; exit 1; }
+# warn() (src/lib/warn.ts) prints each warning immediately AND repeats it in an
+# end-of-run summary block — so a genuinely-once-per-deploy warning naturally appears
+# TWICE in stderr per deploy. Count DISTINCT contract addresses named in the
+# already-active warning, not raw line occurrences, so this assertion is not coupled
+# to warn()'s own print-then-summarize formatting.
+ALREADY_ACTIVE_ADDR_COUNT=$(grep -o 'contract [0-9]*:[0-9a-f]\{64\} already shows on-chain activity' "$TMP/combined-spend-retry.err" | sort -u | wc -l | tr -d ' ')
+[ "$ALREADY_ACTIVE_ADDR_COUNT" = "2" ] \
+  || { echo "[FAIL] expected BOTH the ciphertext and signature deploys (2 distinct contract addresses) to report already-active/skipped on retry, got $ALREADY_ACTIVE_ADDR_COUNT"; cat "$TMP/combined-spend-retry.err"; exit 1; }
+RECEIPT_COUNT_AFTER_RETRY=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+[ "$RECEIPT_COUNT_AFTER_RETRY" = "$RECEIPT_COUNT_BEFORE_RETRY" ] \
+  || { echo "[FAIL] expected NO new receipt from a fully-skipped retry (no real spend occurred) — count went from $RECEIPT_COUNT_BEFORE_RETRY to $RECEIPT_COUNT_AFTER_RETRY"; exit 1; }
+echo "[PASS] retrying an already-fully-deployed signed push succeeds under a tiny cap (both deploys skip re-funding, spending nothing, no new receipt)"
 
 echo "ALL PASS"

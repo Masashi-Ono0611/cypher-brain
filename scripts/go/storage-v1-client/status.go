@@ -17,7 +17,16 @@ const (
 	tonapiTestnetBase = "https://testnet.tonapi.io"
 )
 
+// tonapiBaseOverride is a TEST-ONLY hook (set by deploy_test.go et al. to a local
+// httptest.Server URL so a network-touching run* function can be exercised against a
+// real HTTP round trip without ever reaching the actual internet) — always empty in
+// production, where tonapiBase() falls through to the real mainnet/testnet hosts.
+var tonapiBaseOverride string
+
 func tonapiBase(testnet bool) string {
+	if tonapiBaseOverride != "" {
+		return tonapiBaseOverride
+	}
 	if testnet {
 		return tonapiTestnetBase
 	}

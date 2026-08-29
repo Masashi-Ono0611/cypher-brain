@@ -299,6 +299,63 @@ func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 	if p.testnet {
 		network = "testnet"
 	}
+	statusFlag := ""
+	if f.mainnet {
+		statusFlag = " --mainnet"
+	}
+
+	// issue #638: the StorageV1 contract ADDRESS is fully determined by
+	// bagID/merkleHash/dataSize/pieceSize/owner (PrepareV1DeployData, called inside
+	// buildDeploy above) -- NONE of which depend on --provider-pubkey/
+	// --rate-nano-per-mb-day/--span-days. Re-running `deploy` for the SAME bag+owner
+	// after an ambiguous or lost result (the operator never confirmed whether an
+	// earlier Tonkeeper signature actually landed) therefore reproduces the IDENTICAL
+	// address -- printing another deploy link here unconditionally would let the
+	// operator sign and pay the storage cost for it a SECOND time. Check on-chain
+	// BEFORE ever showing that link, mirroring update-providers.go's own precedent of
+	// treating an unreadable tonapi state as a hard refusal (checkUpdateProvidersGasGuard's
+	// neighboring runUpdateProviders check) rather than proceeding blind: this is a
+	// human-reviewed, low-frequency, mainnet-money operation, so failing closed on an
+	// unknown state is the safer default here (unlike ton-provider.ts's unattended
+	// auto-sign path, which must fail OPEN on a check error so a single tonapi hiccup
+	// can't wedge an automated nightly push — see that file's own comment on the same
+	// trade-off).
+	fmt.Fprintf(stdout, "checking on-chain state of %s (%s) before offering a deploy link ...\n", res.contractAddr.StringRaw(), network)
+	acc, err := fetchAccountState(ctx, res.contractAddr, p.testnet)
+	if err != nil {
+		return fmt.Errorf(
+			"could not fetch account state from tonapi — refusing to offer a deploy link for a contract whose "+
+				"state is unknown (it may already be active, and deploying again would re-send the storage cost): %w",
+			err,
+		)
+	}
+	fmt.Fprintf(stdout, "  status: %s — %s\n", acc.Status, stateVerdict(acc.Status))
+	// Codex review (xhigh pass): checking for literal "active" only left "uninit" (funded,
+	// contract code not yet run — the exact few-second window right after a broadcast
+	// lands) able to slip through and get funded a SECOND time; "frozen" (was deployed,
+	// now suspended) is not a fresh address either. `nonexist` (no funds present at all)
+	// is the ONLY status a genuinely first-time deploy should ever see here, so refuse on
+	// anything else rather than allow-listing just "active".
+	if acc.Status != "nonexist" {
+		followUp := "use `update-providers` instead (gas-only, does NOT re-send the storage cost)"
+		if acc.Status != "active" {
+			followUp = fmt.Sprintf(
+				"wait and re-run `status --contract %s%s` until it settles (tonapi may simply be lagging a recent "+
+					"broadcast) before deciding what to do next",
+				res.contractAddr.StringRaw(), statusFlag,
+			)
+		}
+		return guardf(
+			"contract %s is NOT a fresh address on %s (tonapi reports status=%q — %s) — deploying again would risk "+
+				"sending another %.9f TON (%s nanoTON) to an address that may already hold funds. If it's already "+
+				"active and you need to change or add a provider, %s; to inspect it directly, use "+
+				"`status --contract %s%s`",
+			res.contractAddr.StringRaw(), network, acc.Status, stateVerdict(acc.Status),
+			nanoToFloat(res.amountNano), res.amountNano, followUp,
+			res.contractAddr.StringRaw(), statusFlag,
+		)
+	}
+
 	fmt.Fprintln(stdout, "== deploy ==")
 	fmt.Fprintf(stdout, "  network:        %s\n", network)
 	fmt.Fprintf(stdout, "  bag id:         %x\n", p.bagID)
@@ -317,10 +374,6 @@ func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 	fmt.Fprintln(stdout, "")
 	fmt.Fprintln(stdout, "Review the amount + recipient in your wallet BEFORE approving.")
 	fmt.Fprintln(stdout, "After signing, confirm it landed with:")
-	statusFlag := ""
-	if f.mainnet {
-		statusFlag = " --mainnet"
-	}
 	fmt.Fprintf(stdout, "  storage-v1-client status --contract %s%s\n", res.contractAddr.StringRaw(), statusFlag)
 	fmt.Fprintln(stdout, "then tell the provider it exists with:")
 	fmt.Fprintf(stdout, "  storage-v1-client notify --provider-pubkey %x --contract %s%s\n",
