@@ -36,9 +36,10 @@ Multi-model review made this materially more robust before ship:
   reaches the caller.
 - Concurrent writers of the idempotency log (two processes, or two calls racing on
   different keys) no longer silently clobber each other's records — writes are now
-  serialized through a lockfile. This mitigates, but does not fully close, every
-  concurrency hazard: two SEPARATE processes racing on the exact SAME key can still both
-  read a cache miss and both spend (documented in `src/lib/idempotency.ts`).
+  serialized through a lockfile. (Two SEPARATE processes racing on the exact SAME key
+  reading a cache miss and both spending was a known follow-up gap this lockfile alone
+  did not close — see the separate #636 fix, which closes it with a wider-scope,
+  whole-call cross-process claim.)
 - `idempotency_key` replay now honors a `locator_file` that differs from the original
   call's — the recovery pointer is written to the newly-requested path instead of being
   silently skipped on a cache hit.

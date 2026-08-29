@@ -22,10 +22,39 @@
 //     read-modify-rename has across separate OS processes too: without a lock, both
 //     interleave at the same await points either way. This asserts every key's record
 //     survives once withLogLock serializes the writes.
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+//   - #636 claimIdempotencyKey: a POSITIVE CONTROL for the cross-process claim mcp.ts
+//     now takes for the ENTIRE snapshot_now call (not just the log write above) — proof
+//     the guard actually fires, not just that it exists. A second claim attempt for the
+//     SAME (tool, key) while the first is still held must be rejected outright
+//     (IdempotencyClaimHeldError) — this is the exact mechanism that makes the #636 race
+//     (a second process reading a stale cache-miss while the first is still mid-upload)
+//     impossible: the second process can never even START its own lookup-then-work
+//     sequence while the claim is held, regardless of how long either process's own log
+//     read takes. Also asserts: two DIFFERENT keys never contend; release lets a new
+//     claim through; a manually-removed claim (the supported recovery path for a
+//     confirmed-crashed holder — see claimIdempotencyKey's own doc comment for why there
+//     is deliberately no AUTOMATIC steal) can be re-claimed; and releasing a claim after
+//     it was manually removed and re-claimed by someone else must NOT delete that new
+//     holder's live claim.
+import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { lookupIdempotencyResult, recordIdempotencyResult, IdempotencyStoreError } from '../src/lib/idempotency.ts';
+import { createHash } from 'node:crypto';
+import {
+  lookupIdempotencyResult,
+  recordIdempotencyResult,
+  IdempotencyStoreError,
+  claimIdempotencyKey,
+  IdempotencyClaimHeldError,
+} from '../src/lib/idempotency.ts';
+
+// Mirrors idempotency.ts's own (private) claimLockPath — needed here only to simulate an
+// operator manually removing a confirmed-crashed holder's lock file directly, something
+// the public claimIdempotencyKey/release API has no legitimate reason to expose.
+const claimLockPathFor = (logPath, tool, key) =>
+  `${logPath}.claim.${createHash('sha256')
+    .update(JSON.stringify([tool, key]))
+    .digest('hex')}.lock`;
 
 let failed = 0;
 const check = (name, cond, detail) => {
@@ -153,6 +182,122 @@ try {
       lost.length === 0,
       lost.join(', '),
     );
+  }
+
+  // ---------- #636 claimIdempotencyKey: positive control — the guard actually fires ----------
+  {
+    const logPath = join(tmp, 'claim-log.jsonl');
+
+    // A second claim for the SAME key while the first is still held must be rejected —
+    // this IS the mechanism that closes #636 (a second caller can never start its own
+    // lookup-then-work sequence while the first still holds the claim, no matter how
+    // long either caller's own log read takes).
+    const releaseA = await claimIdempotencyKey(logPath, 'snapshot_now', 'claim-key-1');
+    let secondThrew;
+    try {
+      await claimIdempotencyKey(logPath, 'snapshot_now', 'claim-key-1');
+    } catch (e) {
+      secondThrew = e;
+    }
+    check(
+      'a second claim for the SAME (tool, key) while the first is held is rejected (IdempotencyClaimHeldError)',
+      secondThrew instanceof IdempotencyClaimHeldError,
+      secondThrew ? `${secondThrew.constructor.name}: ${secondThrew.message}` : 'second claim succeeded (BUG)',
+    );
+
+    // A DIFFERENT key must never contend with claim-key-1's still-held claim.
+    const releaseB = await claimIdempotencyKey(logPath, 'snapshot_now', 'claim-key-2');
+    check('a claim for a DIFFERENT key is unaffected by another key’s held claim', true);
+    await releaseB();
+
+    // Release must actually free the key for a new claim.
+    await releaseA();
+    let reclaimThrew;
+    let releaseA2;
+    try {
+      releaseA2 = await claimIdempotencyKey(logPath, 'snapshot_now', 'claim-key-1');
+    } catch (e) {
+      reclaimThrew = e;
+    }
+    check(
+      'releasing a claim lets a subsequent claim for the SAME key succeed',
+      reclaimThrew === undefined,
+      reclaimThrew ? `${reclaimThrew.constructor.name}: ${reclaimThrew.message}` : undefined,
+    );
+    if (releaseA2) await releaseA2();
+  }
+
+  // ---------- #636 claimIdempotencyKey: held claim's error names the lock file + gives an age hint ----------
+  {
+    const logPath = join(tmp, 'claim-message-log.jsonl');
+    const release = await claimIdempotencyKey(logPath, 'snapshot_now', 'message-key');
+    const lockPath = claimLockPathFor(logPath, 'snapshot_now', 'message-key');
+    let threw;
+    try {
+      await claimIdempotencyKey(logPath, 'snapshot_now', 'message-key');
+    } catch (e) {
+      threw = e;
+    }
+    check(
+      "a held claim's error names the lock file path (an operator's recovery entry point) and gives an age hint",
+      threw instanceof IdempotencyClaimHeldError &&
+        threw.message.includes(lockPath) &&
+        /\d+ minute/.test(threw.message),
+      threw ? threw.message : 'did not throw (BUG)',
+    );
+    await release();
+  }
+
+  // ---------- #636 claimIdempotencyKey: manual removal (the supported recovery path) unblocks a new claim ----------
+  {
+    // There is deliberately NO automatic staleness-based steal (see claimIdempotencyKey's
+    // own doc comment) — recovering from a confirmed-crashed holder is an operator action:
+    // remove the named lock file by hand. Simulated here the same way an operator would,
+    // by deleting the file directly rather than calling the crashed holder's own release
+    // (which, by definition, a crashed process never gets to call).
+    const logPath = join(tmp, 'claim-manual-recovery-log.jsonl');
+    await claimIdempotencyKey(logPath, 'snapshot_now', 'crashed-key'); // deliberately never released — simulates a crashed holder
+    const lockPath = claimLockPathFor(logPath, 'snapshot_now', 'crashed-key');
+    await rm(lockPath, { force: true }); // the operator's manual intervention
+
+    let reclaimThrew;
+    let releaseRecovered;
+    try {
+      releaseRecovered = await claimIdempotencyKey(logPath, 'snapshot_now', 'crashed-key');
+    } catch (e) {
+      reclaimThrew = e;
+    }
+    check(
+      'a manually-removed claim can be re-claimed (the supported recovery path for a confirmed-crashed holder)',
+      reclaimThrew === undefined,
+      reclaimThrew ? `${reclaimThrew.constructor.name}: ${reclaimThrew.message}` : undefined,
+    );
+    if (releaseRecovered) await releaseRecovered();
+  }
+
+  // ---------- #636 claimIdempotencyKey: releasing after manual removal + re-claim must not delete the new holder's ----------
+  {
+    const logPath = join(tmp, 'claim-recovered-release-log.jsonl');
+    const releaseOriginal = await claimIdempotencyKey(logPath, 'snapshot_now', 'recovered-key');
+    const lockPath = claimLockPathFor(logPath, 'snapshot_now', 'recovered-key');
+    await rm(lockPath, { force: true }); // an operator, believing the original holder crashed, removes it
+    // A second caller claims the now-vacant key — this is the NEW legitimate holder.
+    const releaseNew = await claimIdempotencyKey(logPath, 'snapshot_now', 'recovered-key');
+    const ownerAfterRecover = await readFile(lockPath, 'utf8');
+
+    // The ORIGINAL caller was not actually gone (the operator's belief was wrong, or it
+    // simply finishes late) and finally calls ITS OWN release — this must be a silent
+    // no-op, not a deletion of the new holder's live claim (deleting it here would let a
+    // THIRD caller in while the second is still working, exactly the bug this claim
+    // exists to prevent).
+    await releaseOriginal();
+    const ownerAfterOriginalRelease = await readFile(lockPath, 'utf8').catch(() => null);
+    check(
+      "releasing a claim after manual removal + re-claim does not delete the new holder's live claim",
+      ownerAfterOriginalRelease === ownerAfterRecover,
+      JSON.stringify({ before: ownerAfterRecover, after: ownerAfterOriginalRelease }),
+    );
+    await releaseNew();
   }
 } finally {
   await rm(tmp, { recursive: true, force: true });

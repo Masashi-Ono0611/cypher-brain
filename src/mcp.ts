@@ -64,7 +64,13 @@ import {
   PushPartialSuccessError,
   writeReplayedSavedLocator,
 } from './lib/pushpull.js';
-import { lookupIdempotencyResult, recordIdempotencyResult, IdempotencyStoreError } from './lib/idempotency.js';
+import {
+  lookupIdempotencyResult,
+  recordIdempotencyResult,
+  claimIdempotencyKey,
+  IdempotencyStoreError,
+  IdempotencyClaimHeldError,
+} from './lib/idempotency.js';
 import { schedule, scheduleStatusReport, ScheduleNotInstalledError } from './lib/schedule.js';
 import { estimateCost } from './lib/estimate.js';
 import { keygenAt } from './lib/keys.js';
@@ -759,7 +765,7 @@ function assertDeclaredEnums(tool: Tool, args: ToolArgs): void {
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// #220: an in-process, per-(tool, key) lock — belt-and-suspenders alongside the
+// #220/#636: an in-process, per-(tool, key) lock — belt-and-suspenders alongside the
 // idempotency log itself. The log alone closes the SEQUENTIAL case (a retry that arrives
 // after this call has already returned and recorded); it does nothing about two calls
 // carrying the SAME key arriving before either has finished (a client that fires a retry
@@ -771,6 +777,19 @@ function assertDeclaredEnums(tool: Tool, args: ToolArgs): void {
 // `await` in between (see the call site below) — that is what makes the check-then-add
 // atomic under Node's single-threaded, cooperative concurrency, with no separate mutex
 // needed.
+//
+// #636 (Codex agentic audit, P1): that check-then-add must run BEFORE this call's own
+// (async) idempotency-log lookup, not after it — the original #220 ordering. With the
+// check after the lookup, call A's lookup misses and A starts working; call B's OWN
+// lookup — already in flight, reading a log snapshot from before A ever wrote to it — can
+// resolve to a miss AFTER A finishes, records its result, and removes itself from this
+// Set, at which point B observes both a cache miss and an empty in-flight set and spends
+// again. Checking (and claiming) first closes this: B's check now happens before B's own
+// lookup even starts, so it observes A's claim regardless of how long either call's log
+// read takes. The call site below also claims the file-based, cross-process counterpart
+// of this same-process Set (idempotency.ts's claimIdempotencyKey) before its own lookup,
+// for the identical reason across two separate cypher-brain-mcp server processes sharing
+// one CYPHER_BRAIN_HOME.
 const idempotencyInFlight = new Set<string>();
 
 // The fields that define "the same snapshot_now call" for #220's idempotency-key replay —
@@ -828,73 +847,21 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
     throw new ToolError('ERR_INVALID_INPUT', 'idempotency_key must be a non-empty string');
   const idempotencyKey = isStr(idempotencyKeyRaw) ? idempotencyKeyRaw : undefined;
 
-  // #220: idempotency-key replay, checked BEFORE the spend gate below — a replay of an
-  // already-completed call must not need confirm_paid supplied again (nothing NEW is being
-  // spent; this only returns what already happened) and must do no work at all. A
-  // fingerprint mismatch means the same key named two DIFFERENT calls, refused rather than
-  // silently answered with the wrong one's result (see snapshotNowFingerprint above).
+  // #636: claim (tool, key) — the in-process Set AND its cross-process file-lock
+  // counterpart — BEFORE this call's own (async) idempotency-log lookup below, not after
+  // it (the original #220 ordering); see idempotencyInFlight's own comment above for why
+  // that ordering is what closes the race, not merely having a lock. Held through the
+  // lookup, the spend gate, the actual paid work, and recordIdempotencyResult — released
+  // only in the `finally` below, on every path out of this function including a
+  // cache-hit replay.
   let fingerprint: string | undefined;
   const lockId = idempotencyKey ? JSON.stringify([SNAPSHOT_NOW_TOOL.name, idempotencyKey]) : undefined;
+  let releaseClaim: (() => Promise<void>) | undefined;
   if (idempotencyKey && lockId) {
-    fingerprint = snapshotNowFingerprint(args);
-    let cached: Awaited<ReturnType<typeof lookupIdempotencyResult>>;
-    try {
-      cached = await lookupIdempotencyResult(
-        IDEMPOTENCY_LOG,
-        SNAPSHOT_NOW_TOOL.name,
-        idempotencyKey,
-        IDEMPOTENCY_TTL_SECONDS,
-      );
-    } catch (e) {
-      if (!(e instanceof IdempotencyStoreError)) throw e; // an unexpected bug, not the fail-closed case below — stays ERR_INTERNAL
-      // Fail-closed (multi-model review, P1): the log could not rule out a prior call
-      // under this exact key — see IdempotencyStoreError's own doc comment in
-      // idempotency.ts. Refusing here means no paid work happens on an uncertain read,
-      // rather than silently treating "could not check" the same as "definitely unused".
-      throw new ToolError(
-        'ERR_IDEMPOTENCY_STORE_UNREADABLE',
-        `could not verify whether idempotency_key ${JSON.stringify(idempotencyKey)} was already used: ${errMsg(e)} ` +
-          '— refused rather than risk re-running a paid operation that may already have completed under this key ' +
-          '(fail-closed). Repair or remove the corrupted line(s) in the idempotency log, or retry once the ' +
-          'underlying I/O issue clears.',
-      );
-    }
-    if (cached) {
-      if (cached.fingerprint !== fingerprint) {
-        throw new ToolError(
-          'ERR_IDEMPOTENCY_KEY_REUSED',
-          `idempotency_key ${JSON.stringify(idempotencyKey)} was already used for a snapshot_now call with ` +
-            `different dirs/pg/recipients/out/backend/scan_secrets within the last ${IDEMPOTENCY_TTL_SECONDS}s ` +
-            '— reuse a key only to retry the exact same call; use a new key for a different one.',
-        );
-      }
-      // #220 P2 (multi-model review): locator_file is deliberately excluded from the
-      // fingerprint (see snapshotNowFingerprint's own comment above) — but a replay must
-      // still honor a locator_file THIS call asked for, even though nothing is
-      // re-uploaded. Without this, a caller reusing a key with a NEW/different
-      // locator_file (e.g. it moved where it keeps its recovery pointer) would get a
-      // reported success while the requested pointer is silently never written anywhere.
-      // Deliberately minimal (locator/backend/sha256 ONLY, no re-derived sidecar
-      // fields) — see writeReplayedSavedLocator's own doc comment in pushpull.ts for why.
-      let replayedResult = cached.result;
-      if (
-        isStr(locatorFile) &&
-        cached.result.pushed === true &&
-        isStr(cached.result.locator) &&
-        isStr(cached.result.backend) &&
-        isStr(cached.result.sha256)
-      ) {
-        await writeReplayedSavedLocator(locatorFile, {
-          locator: cached.result.locator,
-          backend: cached.result.backend,
-          sha256: cached.result.sha256,
-        });
-        replayedResult = { ...replayedResult, locator_file: locatorFile };
-      }
-      return structuredOk({ ...replayedResult, idempotent_replay: true });
-    }
-    // No `await` between this check and the `.add()` below — see idempotencyInFlight's own
-    // comment for why that is what makes it safe against a concurrent duplicate.
+    // No `await` between this check and the `.add()` below — see idempotencyInFlight's
+    // own comment for why that is what makes it safe against a same-process concurrent
+    // duplicate. Checked first because it is free (no I/O) and alone catches the common
+    // case (two calls racing within THIS server process) without ever touching disk.
     if (idempotencyInFlight.has(lockId)) {
       throw new ToolError(
         'ERR_IDEMPOTENCY_IN_FLIGHT',
@@ -903,9 +870,96 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
       );
     }
     idempotencyInFlight.add(lockId);
+    try {
+      // The cross-process counterpart of the Set just above (#636) — see
+      // claimIdempotencyKey's own doc comment in idempotency.ts for exactly what it
+      // closes that a process-local Set cannot: two SEPARATE cypher-brain-mcp server
+      // processes sharing one CYPHER_BRAIN_HOME each have their own idempotencyInFlight.
+      releaseClaim = await claimIdempotencyKey(IDEMPOTENCY_LOG, SNAPSHOT_NOW_TOOL.name, idempotencyKey);
+    } catch (e) {
+      idempotencyInFlight.delete(lockId);
+      if (e instanceof IdempotencyClaimHeldError) {
+        throw new ToolError(
+          'ERR_IDEMPOTENCY_IN_FLIGHT',
+          `a snapshot_now call with idempotency_key ${JSON.stringify(idempotencyKey)} is already running in ` +
+            `another process sharing this CYPHER_BRAIN_HOME — wait for it to finish rather than sending a ` +
+            `concurrent duplicate with the same key (${e.message})`,
+        );
+      }
+      throw e; // an unexpected bug (e.g. an unwritable claim directory), not the held-claim case above
+    }
   }
 
   try {
+    // #220: idempotency-key replay, checked BEFORE the spend gate below — a replay of an
+    // already-completed call must not need confirm_paid supplied again (nothing NEW is
+    // being spent; this only returns what already happened) and must do no work at all. A
+    // fingerprint mismatch means the same key named two DIFFERENT calls, refused rather
+    // than silently answered with the wrong one's result (see snapshotNowFingerprint
+    // above). Runs INSIDE the claim acquired above (#636), so even a pure cache-read
+    // replay is briefly serialized against a concurrent duplicate for the same key — a
+    // rare spurious ERR_IDEMPOTENCY_IN_FLIGHT on a read that would have been harmless on
+    // its own, traded for actually closing the check-lookup race.
+    if (idempotencyKey && lockId) {
+      fingerprint = snapshotNowFingerprint(args);
+      let cached: Awaited<ReturnType<typeof lookupIdempotencyResult>>;
+      try {
+        cached = await lookupIdempotencyResult(
+          IDEMPOTENCY_LOG,
+          SNAPSHOT_NOW_TOOL.name,
+          idempotencyKey,
+          IDEMPOTENCY_TTL_SECONDS,
+        );
+      } catch (e) {
+        if (!(e instanceof IdempotencyStoreError)) throw e; // an unexpected bug, not the fail-closed case below — stays ERR_INTERNAL
+        // Fail-closed (multi-model review, P1): the log could not rule out a prior call
+        // under this exact key — see IdempotencyStoreError's own doc comment in
+        // idempotency.ts. Refusing here means no paid work happens on an uncertain read,
+        // rather than silently treating "could not check" the same as "definitely unused".
+        throw new ToolError(
+          'ERR_IDEMPOTENCY_STORE_UNREADABLE',
+          `could not verify whether idempotency_key ${JSON.stringify(idempotencyKey)} was already used: ${errMsg(e)} ` +
+            '— refused rather than risk re-running a paid operation that may already have completed under this key ' +
+            '(fail-closed). Repair or remove the corrupted line(s) in the idempotency log, or retry once the ' +
+            'underlying I/O issue clears.',
+        );
+      }
+      if (cached) {
+        if (cached.fingerprint !== fingerprint) {
+          throw new ToolError(
+            'ERR_IDEMPOTENCY_KEY_REUSED',
+            `idempotency_key ${JSON.stringify(idempotencyKey)} was already used for a snapshot_now call with ` +
+              `different dirs/pg/recipients/out/backend/scan_secrets within the last ${IDEMPOTENCY_TTL_SECONDS}s ` +
+              '— reuse a key only to retry the exact same call; use a new key for a different one.',
+          );
+        }
+        // #220 P2 (multi-model review): locator_file is deliberately excluded from the
+        // fingerprint (see snapshotNowFingerprint's own comment above) — but a replay must
+        // still honor a locator_file THIS call asked for, even though nothing is
+        // re-uploaded. Without this, a caller reusing a key with a NEW/different
+        // locator_file (e.g. it moved where it keeps its recovery pointer) would get a
+        // reported success while the requested pointer is silently never written anywhere.
+        // Deliberately minimal (locator/backend/sha256 ONLY, no re-derived sidecar
+        // fields) — see writeReplayedSavedLocator's own doc comment in pushpull.ts for why.
+        let replayedResult = cached.result;
+        if (
+          isStr(locatorFile) &&
+          cached.result.pushed === true &&
+          isStr(cached.result.locator) &&
+          isStr(cached.result.backend) &&
+          isStr(cached.result.sha256)
+        ) {
+          await writeReplayedSavedLocator(locatorFile, {
+            locator: cached.result.locator,
+            backend: cached.result.backend,
+            sha256: cached.result.sha256,
+          });
+          replayedResult = { ...replayedResult, locator_file: locatorFile };
+        }
+        return structuredOk({ ...replayedResult, idempotent_replay: true });
+      }
+    }
+
     // Spend gate FIRST — before any snapshot work — so a refused paid push does no
     // work and leaves no artifact behind. Never silently spend: the CLI accepts
     // CYPHER_BRAIN_YES=1 for unattended cadence loops, but via MCP the consent
@@ -1062,7 +1116,13 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
     }
     return structuredOk(result);
   } finally {
+    // #636: release BOTH claims acquired above, on every path out of the `try` above —
+    // the cache-hit replay's `return`, every `throw`, and the real-work success path.
+    // The in-process delete is synchronous and cheap; the cross-process release is
+    // best-effort I/O (see claimIdempotencyKey's own doc comment for what it does and does
+    // not remove — it never touches a claim it did not itself create).
     if (lockId) idempotencyInFlight.delete(lockId);
+    if (releaseClaim) await releaseClaim();
   }
 }
 
