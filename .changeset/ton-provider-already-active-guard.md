@@ -45,3 +45,15 @@ in the brief window where tonapi's indexer hasn't yet reflected a just-broadcast
 transaction (so the address still reads back as `nonexist` for a moment) remains a
 narrower, documented residual gap bounded by TON's own seqno-replay protection (at
 most one of the two transfers is ever accepted on-chain).
+
+**Rebase-time fix (combined with issue #639's shared spend tracker):** the two fixes
+were developed independently and only interact once merged together. The initial
+merge charged a signed push's shared `spendTracker` with a deploy's full `amountNano`
+the moment it was computed, before checking whether the deploy would actually be
+skipped as already-active — so a fully-completed signed push (both the ciphertext and
+its `.minisig` sidecar already deployed) retried under a tight cap would have its
+*second* deploy wrongly refused for insufficient budget, even though neither deploy
+needed to spend anything. The charge now only happens on the `!alreadyActive` branch,
+and a new regression test (retrying an already-fully-deployed signed push under a cap
+equal to only one deploy's cost) verifies the fix — confirmed red on the unfixed
+ordering, green after.

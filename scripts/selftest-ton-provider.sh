@@ -734,9 +734,22 @@ rm -f "$TMP/rates-narrow-span-flag"
 echo "[PASS] a live span range that excludes the chosen span refuses the push before any funds move"
 
 echo "== live-rates check: a permissive live-rates response (the default mock) still lets push proceed (#651 control) =="
+# issue #638: got.age's own (auto-sign-wallet, unset-owner) contract address was
+# already broadcast by the "auto-sign path" test above — tonapi's mock now reports it
+# 'active' on every subsequent query (see the mock's "seen" tracking header comment) —
+# so reusing got.age here would trip the #638 already-active guard and skip
+# broadcasting, defeating this control's own point (does a permissive live-rates
+# response actually let a genuinely FRESH push reach broadcast?). Use a distinct,
+# never-before-pushed source instead, same pattern high-price.age/testnet.age/
+# issue638.age already establish elsewhere in this script.
+mkdir -p "$TMP/rates-ok-src"
+printf 'ton-provider #651 control payload (must derive a not-yet-active contract)\n' > "$TMP/rates-ok-src/note.txt"
+cb snapshot --dir "$TMP/rates-ok-src" --out "$TMP/rates-ok.age"
+RATES_OK_SIZE=$(stat -f%z "$TMP/rates-ok.age" 2>/dev/null || stat -c%s "$TMP/rates-ok.age")
+echo "$RATES_OK_SIZE" > "$TMP/notify-downloaded"
 : > "$BROADCAST_LOG"
 CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/rates-ok.err" >/dev/null \
+  cb push --in "$TMP/rates-ok.age" --backend ton-provider 2>"$TMP/rates-ok.err" >/dev/null \
   || { echo "[FAIL] push failed under a permissive live-rates response"; cat "$TMP/rates-ok.err"; exit 1; }
 [ -s "$BROADCAST_LOG" ] || { echo "[FAIL] push never reached broadcast despite a permissive live-rates response"; exit 1; }
 echo "[PASS] a permissive live-rates response does not block the push (the three refusals above are specific to their own override flags)"
@@ -822,15 +835,27 @@ rm -f "$FROZEN_ADDR_FLAG"
 echo "[PASS] frozen-wallet guard fired before any broadcast attempt"
 
 echo "== issue #640: a TRANSIENT tonapi lookup failure on the auto-sign wallet's own account-state check must NOT be treated as 'unused wallet, seqno 0' — it must fail loudly instead =="
+# issue #638: same reasoning as the #651 control fix above (and the frozen-wallet
+# test's own testnet.age choice below it originally) — got.age's (auto-sign-wallet,
+# unset-owner) contract is no longer fresh by this point in the script, so the
+# already-active guard would skip autoSignAndBroadcastDeploy() entirely — which is
+# exactly where this lookup-failure check lives — never exercising what this test
+# exists to prove. Use a distinct, never-before-pushed source instead.
+mkdir -p "$TMP/lookup-fail-src"
+printf 'ton-provider #640 lookup-failure payload (must derive a not-yet-active contract)\n' > "$TMP/lookup-fail-src/note.txt"
+cb snapshot --dir "$TMP/lookup-fail-src" --out "$TMP/lookup-fail.age"
+LOOKUP_FAIL_SIZE=$(stat -f%z "$TMP/lookup-fail.age" 2>/dev/null || stat -c%s "$TMP/lookup-fail.age")
+echo "$LOOKUP_FAIL_SIZE" > "$TMP/notify-downloaded"
 printf '%s' "$TON_WALLET_ADDR_RAW" > "$LOOKUP_FAIL_ADDR_FLAG"
 : > "$BROADCAST_LOG" # the whole point of this guard is that broadcast must never be reached on a lookup failure
 if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/lookup-fail.err"; then
+  cb push --in "$TMP/lookup-fail.age" --backend ton-provider 2>"$TMP/lookup-fail.err"; then
   echo "[FAIL] push succeeded despite a transient tonapi lookup failure on the wallet's own account state"; cat "$TMP/lookup-fail.err"; exit 1
 fi
 grep -q 'could not look up local wallet' "$TMP/lookup-fail.err" || { echo "[FAIL] wrong lookup-failure message"; cat "$TMP/lookup-fail.err"; exit 1; }
 [ -s "$BROADCAST_LOG" ] && { echo "[FAIL] a wallet whose lookup failed still reached broadcast — this would have signed with a GUESSED seqno"; exit 1; }
 rm -f "$LOOKUP_FAIL_ADDR_FLAG"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
 echo "[PASS] transient tonapi lookup failure refuses the push instead of guessing seqno 0"
 
 echo "== issue #638: retrying an already-active StorageV1 contract does NOT re-fund it (money-safety fix) =="
@@ -1016,5 +1041,43 @@ CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND="$OVER_CAP" cb push --in "$TMP/combined-spen
 grep -q "pushed $TMP/combined-spend.age.minisig -> ton-provider:" "$TMP/combined-spend-ok.err" \
   || { echo "[FAIL] expected the .minisig sidecar to also be pushed once the combined cap allows it"; cat "$TMP/combined-spend-ok.err"; exit 1; }
 echo "[PASS] a cap covering the combined ciphertext+signature spend lets both deploys succeed"
+
+echo "== regression (rebase-introduced): retrying an ALREADY fully-deployed signed push must not be refused by the spend cap =="
+# This exact combination did not exist in either #638 or #639 individually — it only
+# became reachable once both were merged together (this backend now has BOTH a shared
+# spendTracker across a signed push's two put() calls, #639, AND a per-call
+# already-active skip that must charge NOTHING when a deploy is skipped, #638). The
+# OVER_CAP push just above already made combined-spend.age's ciphertext AND its
+# .minisig sidecar both fully active on-chain. Retrying the EXACT SAME file now must be
+# a pure no-op for BOTH deploys (both already-active, no funds move) — even under a
+# spend cap far too small to cover either deploy's real amountNano, since nothing is
+# actually being spent this time. Before the charge was moved to only fire on the
+# !alreadyActive branch, the tracker was charged the deploy's FULL amountNano the
+# moment it was computed, regardless of whether the deploy turned out to be
+# already-active and skipped — so the ciphertext's phantom "spend" of X against the cap
+# left zero budget for the sidecar's OWN remainingMaxSpendNano check inside
+# buildDeploy(), wrongly refusing a retry that does not need to spend anything at all.
+# Cap set to exactly X (one deploy's own cost, computed above) — enough for a single
+# deploy taken alone (so buildDeploy()'s own per-deploy cap check never itself refuses
+# either deploy on its individual merits) but, pre-fix, not enough for a SECOND deploy
+# once the first one's phantom charge wrongly ate the whole cap. A cap smaller than X
+# would be refused by buildDeploy()'s own check regardless of this fix and would not
+# isolate the bug this test exists to catch.
+RECEIPT_COUNT_BEFORE_RETRY=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND="$X" cb push --in "$TMP/combined-spend.age" --backend ton-provider \
+  >/dev/null 2>"$TMP/combined-spend-retry.err" \
+  || { echo "[FAIL] retrying an already-fully-deployed signed push was refused under a cap equal to only ONE deploy's cost (both sides should skip, spending nothing)"; cat "$TMP/combined-spend-retry.err"; exit 1; }
+# warn() (src/lib/warn.ts) prints each warning immediately AND repeats it in an
+# end-of-run summary block — so a genuinely-once-per-deploy warning naturally appears
+# TWICE in stderr per deploy. Count DISTINCT contract addresses named in the
+# already-active warning, not raw line occurrences, so this assertion is not coupled
+# to warn()'s own print-then-summarize formatting.
+ALREADY_ACTIVE_ADDR_COUNT=$(grep -o 'contract [0-9]*:[0-9a-f]\{64\} already shows on-chain activity' "$TMP/combined-spend-retry.err" | sort -u | wc -l | tr -d ' ')
+[ "$ALREADY_ACTIVE_ADDR_COUNT" = "2" ] \
+  || { echo "[FAIL] expected BOTH the ciphertext and signature deploys (2 distinct contract addresses) to report already-active/skipped on retry, got $ALREADY_ACTIVE_ADDR_COUNT"; cat "$TMP/combined-spend-retry.err"; exit 1; }
+RECEIPT_COUNT_AFTER_RETRY=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+[ "$RECEIPT_COUNT_AFTER_RETRY" = "$RECEIPT_COUNT_BEFORE_RETRY" ] \
+  || { echo "[FAIL] expected NO new receipt from a fully-skipped retry (no real spend occurred) — count went from $RECEIPT_COUNT_BEFORE_RETRY to $RECEIPT_COUNT_AFTER_RETRY"; exit 1; }
+echo "[PASS] retrying an already-fully-deployed signed push succeeds under a tiny cap (both deploys skip re-funding, spending nothing, no new receipt)"
 
 echo "ALL PASS"

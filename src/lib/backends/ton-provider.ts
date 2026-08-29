@@ -1222,13 +1222,6 @@ export function tonProviderBackend(): StorageBackend {
           // the comment above spentSoFarNano/remainingMaxSpendNano for why.
           maxSpendNano: remainingMaxSpendNano,
         });
-        // Charge this deploy's amount against the shared tracker THE MOMENT it is known
-        // to be within budget — before autoSignAndBroadcastDeploy()/the Tonkeeper deeplink
-        // below even run — so a SECOND put() call in the same push (the ".minisig"
-        // sidecar) sees this one counted regardless of how far the current call gets
-        // afterward (#639).
-        if (opts.spendTracker) opts.spendTracker.spentNano += deploy.amountNano;
-
         console.error(
           `ton-provider: selected provider ${provider.pubkey} (rating ${provider.rating.toFixed(2)}, uptime ${provider.uptime.toFixed(1)}%)`,
         );
@@ -1306,6 +1299,19 @@ export function tonProviderBackend(): StorageBackend {
               `on-chain history (${errMsg(e)}) — proceeding as if it does not (the pre-#638 behavior for this ` +
               'specific check failure; the broadcast/signature step below still gives its own unambiguous result)',
           );
+        }
+        if (!alreadyActive) {
+          // Charge this deploy's amount against the shared tracker THE MOMENT it is
+          // known to be within budget AND actually going to be broadcast (i.e. after
+          // the #638 already-active check above finds nothing to skip) — before
+          // autoSignAndBroadcastDeploy()/the Tonkeeper deeplink below even run, so a
+          // SECOND put() call in the same push (the ".minisig" sidecar) sees this one
+          // counted regardless of how far the current call gets afterward (#639).
+          // Deliberately NOT charged in the alreadyActive branch: that branch moves no
+          // funds at all (see the money-safety comment above), so charging it there
+          // would falsely shrink the sidecar's remaining budget for a spend that never
+          // happened this run.
+          if (opts.spendTracker) opts.spendTracker.spentNano += deploy.amountNano;
         }
         if (alreadyActive) {
           // warn() (#347), not a raw console.error: this is a safety-relevant skip
