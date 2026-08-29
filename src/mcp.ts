@@ -62,6 +62,7 @@ import {
   signatureGap,
   redactUserinfo,
   PushPartialSuccessError,
+  PushFundingConfirmedButIncompleteError,
   writeReplayedSavedLocator,
 } from './lib/pushpull.js';
 import {
@@ -1023,25 +1024,39 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
       } catch (e) {
         // #220 (multi-model review, P1): a PushPartialSuccessError means the ciphertext
         // upload — the actual paid, permanent spend — already happened even though THIS
-        // call is about to report an error. That covers BOTH the ".minisig" signature
+        // call is about to report an error. That covers the ".minisig" signature
         // sidecar upload failing (PushSignatureUploadError, e.sigLocator undefined —
-        // see its own doc comment in pushpull.ts) and the LOCAL --save-locator
+        // see its own doc comment in pushpull.ts), the LOCAL --save-locator
         // bookkeeping failing after everything durably uploaded (PushLocatorWriteError,
-        // e.sigLocator set when a signed push's sidecar landed first). Either way, a
-        // retry carrying the same idempotency_key must be told the spend already
-        // happened, not sent to spend again for an AFTERMATH failure that has nothing
-        // to do with whether the paid upload itself landed — this is precisely the
-        // "partial success" scenario #220 exists to make retry-safe.
+        // e.sigLocator set when a signed push's sidecar landed first), and issue #654's
+        // PushFundingConfirmedButIncompleteError (a ton-provider deploy whose funding
+        // is confirmed on-chain but whose provider notify handshake did not complete).
+        // Either way, a retry carrying the same idempotency_key must be told the spend
+        // already happened, not sent to spend again for an AFTERMATH failure that has
+        // nothing to do with whether the paid upload/deploy itself landed — this is
+        // precisely the "partial success" scenario #220 exists to make retry-safe.
         if (idempotencyKey && fingerprint && e instanceof PushPartialSuccessError) {
+          // issue #654 (Codex design review): PushFundingConfirmedButIncompleteError
+          // gets its OWN branch, not the `locator_file_write_failed` fallback the other
+          // two subclasses shared — that fallback would misclassify it (this isn't a
+          // --save-locator bookkeeping failure) and `pushed: true` alone overclaims
+          // completeness (the provider has NOT confirmed the download; only the funding
+          // transfer is confirmed). `provider_download_confirmed: false` is explicit
+          // (not merely absent) so a caller cannot mistake "field not present" for
+          // "confirmed false" if this result shape is ever extended later.
+          const stageFields: Record<string, unknown> =
+            e instanceof PushFundingConfirmedButIncompleteError
+              ? { funding_confirmed: true, provider_download_confirmed: false, partial_stage: e.stage }
+              : e.name === 'PushSignatureUploadError'
+                ? { signature_upload_failed: true }
+                : { locator_file_write_failed: true };
           const partialResult: Record<string, unknown> = {
             ...result,
             pushed: true,
             backend,
             locator: e.locator,
             ...(e.sigLocator ? { sig_locator: e.sigLocator } : {}),
-            ...(e.name === 'PushSignatureUploadError'
-              ? { signature_upload_failed: true }
-              : { locator_file_write_failed: true }),
+            ...stageFields,
           };
           try {
             await recordIdempotencyResult(

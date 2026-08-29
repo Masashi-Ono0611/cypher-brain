@@ -542,10 +542,11 @@ export async function arweaveBackend(): Promise<StorageBackend> {
       // a tx cannot be validly signed without one). Never the pre-flight estimate
       // variable directly: if that fetch failed, `reward` is undefined here, but tx.reward
       // is still the real, signed figure either way.
-      opts.onReceipt?.(
-        { tx_id: tx.id, reward: tx.reward, post_status: res.status },
-        { amount: tx.reward, unit: 'winston' },
-      );
+      await opts.onReceipt?.({
+        locator: tx.id,
+        raw: { tx_id: tx.id, reward: tx.reward, post_status: res.status },
+        cost: { amount: tx.reward, unit: 'winston' },
+      });
       return tx.id; // 43-char base64url tx id
     },
     async get(locator: string, out: string, expect: FetchShape = 'age'): Promise<void> {

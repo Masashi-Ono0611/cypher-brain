@@ -97,6 +97,21 @@ export interface CliOptions {
  */
 export type FetchShape = 'age' | 'minisig';
 
+// The event a paid backend hands to onReceipt (below) — issue #654 made this
+// locator-aware and async so pushpull.ts can persist the receipt SYNCHRONOUSLY inside
+// the callback, before put() does anything else. `locator` is whatever put() would
+// otherwise return: known before upload for a content-addressed backend, or assigned
+// by the remote (arweave's tx id, turbo's data item id) — always computable by the
+// backend itself at the point it calls onReceipt, never derived from put()'s own
+// return value (a backend that raises a PushFundingConfirmedButIncompleteError-style
+// partial-success error never gets to return one). `raw`/`cost` carry the same
+// per-backend honesty contract PutOpts.onReceipt's own doc comment below describes.
+export interface ReceiptEvent {
+  locator: string;
+  raw: unknown;
+  cost: { amount: string; unit: 'winston' | 'winc' | 'nanoton' } | null;
+}
+
 // A StorageBackend is { put(file) -> locator, get(locator, outFile) }. Storage
 // only ever sees the *.age ciphertext. The locator is whatever the backend
 // assigns: a content hash for file (known before upload), or a tx id for
@@ -111,21 +126,28 @@ export interface PutOpts {
   // since both mean "push anyway despite a safety net", not two unrelated behaviors.
   // Every other backend's put() ignores it, same as `remote` above.
   force?: boolean;
-  // #232 (arweave/turbo), #484 (ton-provider): paid backends call this, right after a
-  // successful upload, with a response object and the best available native-unit cost
-  // that upload paid, if the backend can name one — turbo's is its SDK response
-  // verbatim (its own official receipt-persistence recommendation); arweave's raw L1
-  // backend has no analogous receipt object, so it passes a small normalized summary
-  // instead (see backends/arweave.ts's onReceipt call, and src/lib/receipt.ts's header
-  // comment for the full per-backend honesty note on both `raw` and `cost`);
+  // #232 (arweave/turbo), #484 (ton-provider): paid backends call this, at the moment
+  // the spend becomes IRREVERSIBLE (not merely "the whole upload/deploy finished" — see
+  // issue #654), with a ReceiptEvent naming a response object and the best available
+  // native-unit cost that spend paid, if the backend can name one — turbo's is its SDK
+  // response verbatim (its own official receipt-persistence recommendation); arweave's
+  // raw L1 backend has no analogous receipt object, so it passes a small normalized
+  // summary instead (see backends/arweave.ts's onReceipt call, and src/lib/receipt.ts's
+  // header comment for the full per-backend honesty note on both `raw` and `cost`);
   // ton-provider passes the deploy amount actually locked into the confirmed on-chain
-  // transfer (see backends/ton-provider.ts's onReceipt call). pushpull.ts's push() uses
-  // it to persist a receipt (src/lib/receipt.ts) SEPARATE from estimate.ts's pre-flight
-  // forecast — never conflated. Backends with no concept of a paid receipt (file/
-  // rclone/ton) never call it, so no entry, cost, or unit field here is ever
-  // optional-but-lying: absence means "this backend has nothing to report", not
-  // "reporting failed".
-  onReceipt?: (raw: unknown, cost: { amount: string; unit: 'winston' | 'winc' | 'nanoton' } | null) => void;
+  // transfer, called right after waitForContractActive() confirms — BEFORE
+  // notifyProviderWithRetry() runs, not after (see backends/ton-provider.ts's own
+  // onReceipt call and its issue #654 comment for why the ordering matters: a notify
+  // failure must never make an already-irreversible spend vanish from the ledger).
+  // pushpull.ts's push() awaits this call and persists a receipt (src/lib/receipt.ts)
+  // from inside it, SEPARATE from estimate.ts's pre-flight forecast — never conflated.
+  // Backends with no concept of a paid receipt (file/rclone/ton) never call it, so no
+  // entry, cost, or unit field here is ever optional-but-lying: absence means "this
+  // backend has nothing to report", not "reporting failed". Async (returns a Promise)
+  // specifically so pushpull.ts's caller can `await` the durable disk write before
+  // the backend moves on to whatever might still fail (e.g. ton-provider's notify) —
+  // a synchronous callback would let the receipt live only in memory across that gap.
+  onReceipt?: (event: ReceiptEvent) => Promise<void>;
   // #639: ton-provider only. A signed push calls put() TWICE — once for the ciphertext,
   // once for its ".minisig" sidecar — and each deploys its OWN StorageV1 contract.
   // pushpull.ts's push() creates ONE mutable box and passes the SAME reference to both
