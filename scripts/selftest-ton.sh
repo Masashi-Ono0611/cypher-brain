@@ -28,6 +28,9 @@ cleanup() {
 trap cleanup EXIT
 
 export CYPHER_BRAIN_HOME="$TMP/keys"
+# issue #643 positive control: exported BEFORE start_ton_seeder so the mock daemon it
+# spawns inherits this — the flag file itself is created/removed later, per-test.
+export MOCK_TONUTILS_INACTIVE_FLAG="$TMP/inactive-flag"
 
 # ---- the "seeder": a mock daemon on loopback + a home directory, reached
 # through PATH-shimmed ssh/scp (start_ton_seeder sets SEEDER_HOME/SEEDER_PID/
@@ -62,6 +65,21 @@ grep -q 'idempotent re-push' "$TMP/repush.err" || { echo "[FAIL] re-push did not
 [ "$(ls "$SEEDER_HOME"/cypher-brain-ton/bags | wc -l | tr -d ' ')" = "1" ] || { echo "[FAIL] re-push created a second bag dir"; exit 1; }
 echo "[PASS] re-push is idempotent"
 
+echo "== issue #643: a re-push of a bag that is completed but no longer ACTIVE must NOT take the idempotent fast path =="
+BAG_ID="${LOC##*:}"
+# Consumed by exactly the idempotency check's own single details() call (see
+# mock-tonutils.mjs's consumeForcedInactive doc comment) — the re-create this triggers
+# then reads the bag's REAL (active) state, so it is not itself wedged by this same flag.
+printf '%s 1' "$BAG_ID" > "$MOCK_TONUTILS_INACTIVE_FLAG"
+LOC3=$(cb push --in "$TMP/snap.age" --backend ton 2>"$TMP/repush-inactive.err")
+[ "$LOC3" = "$LOC" ] || { echo "[FAIL] re-push of an inactive-but-completed bag returned a different locator: $LOC3"; exit 1; }
+if grep -q 'idempotent re-push' "$TMP/repush-inactive.err"; then
+  echo "[FAIL] re-push took the idempotent fast path despite the seeder reporting the bag inactive (#643)"; cat "$TMP/repush-inactive.err"; exit 1
+fi
+grep -q 'created and seeding' "$TMP/repush-inactive.err" || { echo "[FAIL] re-push did not actually re-create/re-seed the bag"; cat "$TMP/repush-inactive.err"; exit 1; }
+[ -f "$MOCK_TONUTILS_INACTIVE_FLAG" ] && [ -s "$MOCK_TONUTILS_INACTIVE_FLAG" ] && { echo "[FAIL] the inactive-flag counter was not consumed — a later assertion could be resting on a stale flag"; exit 1; }
+echo "[PASS] re-push re-creates/re-seeds a completed-but-inactive bag instead of falsely reporting it already seeded"
+
 echo "== pull over the (mock) P2P path — the primary read path, no ssh involved =="
 rm -f "$TMP/snap.age"
 cb pull --backend ton --locator "$LOC" --out "$TMP/got.age" 2>"$TMP/pull.err"
@@ -70,6 +88,52 @@ grep -q 'over the TON Storage P2P network' "$TMP/pull.err" || { echo "[FAIL] pul
 echo "[PASS] P2P pull round-trip"
 cb verify --in "$TMP/got.age" >/dev/null
 echo "[PASS] pulled ciphertext verifies"
+
+echo "== issue #644: SIGTERM mid-P2P-pull kills the ephemeral local daemon and sweeps its temp tree =="
+# A signal tears the process down WITHOUT running the finally-blocks (same P1 class as
+# scripts/selftest.sh's own "SIGINT mid-snapshot" block) — this is the gap install
+# StageSignalGuard()/addActiveTonTmpDir() close for p2pFetch()'s tmpRoot. Pinned to a
+# NAMED phase (not raced): mock-tonutils.mjs's MOCK_TONUTILS_PARK_ON_ADD makes the
+# ephemeral daemon announce, then hang forever on the P2P `add` call, so the signal
+# reliably lands while the daemon child + its temp db dir both still exist. Run BEFORE
+# the "bag gone from the network" positive control further below — that test wipes the
+# shared mock registry for the rest of this script, which would make this pull fail
+# before ever reaching the parked phase.
+ORIG_TMPDIR="${TMPDIR:-}"
+export TMPDIR="$TMP/ton-sigterm-tmpdir"; mkdir -p "$TMPDIR"
+PARK_SENTINEL="$TMP/ton-sigterm.sentinel"; rm -f "$PARK_SENTINEL"
+OUT_SIGTERM="$TMP/ton-sigterm-out.age"
+MOCK_TONUTILS_PARK_ON_ADD="$PARK_SENTINEL" \
+  node "${BIN_DEV_ARGS[@]}" "$BIN" pull --backend ton --locator "$LOC" --out "$OUT_SIGTERM" >/dev/null 2>&1 &
+PULL_PID=$!
+WAITED=0
+while [ ! -s "$PARK_SENTINEL" ]; do
+  if ! kill -0 "$PULL_PID" 2>/dev/null; then
+    echo "[FAIL] pull exited before reaching the P2P-add phase — the SIGTERM assertions below never ran"; exit 1
+  fi
+  sleep 0.1; WAITED=$((WAITED + 1))
+  if [ "$WAITED" -ge 300 ]; then
+    echo "[FAIL] P2P-add phase not reached within 30s — BLOCKED, refusing to report a pass"
+    kill "$PULL_PID" 2>/dev/null || true; exit 1
+  fi
+done
+# The ephemeral daemon's temp tree must exist RIGHT NOW, while parked — proof the test
+# is actually exercising the resource #644's fix registers, not a vacuous no-op window.
+BEFORE_TMP_DIRS=$(find "$TMPDIR" -maxdepth 1 -name 'cypher-brain-ton-*' -type d 2>/dev/null | wc -l | tr -d ' ')
+if [ "$BEFORE_TMP_DIRS" -lt 1 ]; then
+  echo "[FAIL] no cypher-brain-ton-* temp dir exists while the P2P daemon is parked (test setup bug, not the fix under test)"
+  kill "$PULL_PID" 2>/dev/null || true; exit 1
+fi
+kill -TERM "$PULL_PID" || { echo "[FAIL] could not SIGTERM the parked pull — it exited early"; exit 1; }
+set +e; wait "$PULL_PID"; SIGTERM_RC=$?; set -e
+# Require death BY SIGTERM (128+15), never just "exited non-zero" — otherwise this block
+# would degrade into a false PASS if the signal handler under test never ran at all.
+[ "$SIGTERM_RC" = "143" ] || { echo "[FAIL] pull exited $SIGTERM_RC, expected 143 (SIGTERM) — the handler under test never ran"; exit 1; }
+AFTER_TMP_DIRS=$(find "$TMPDIR" -maxdepth 1 -name 'cypher-brain-ton-*' -type d 2>/dev/null)
+[ -z "$AFTER_TMP_DIRS" ] || { echo "[FAIL] SIGTERM mid-P2P-pull left temp dir(s) behind:"; printf '%s\n' "$AFTER_TMP_DIRS"; exit 1; }
+test ! -f "$OUT_SIGTERM" || { echo "[FAIL] SIGTERM mid-P2P-pull left a partial output file"; exit 1; }
+echo "[PASS] SIGTERM mid-P2P-pull kills the ephemeral daemon and sweeps its temp dir"
+if [ -n "$ORIG_TMPDIR" ]; then export TMPDIR="$ORIG_TMPDIR"; else unset TMPDIR; fi
 
 echo "== issue #496: --wait warns (but does not error) for --backend ton, same as file (#465) =="
 WAIT_ERR=$(cb pull --backend ton --locator "$LOC" --out "$TMP/wait-warn.age" --wait 2 2>&1); WAIT_RC=$?

@@ -54,10 +54,36 @@ if (!apiAddr) {
   const [host, port] = apiAddr.split(':');
   // Bags this instance holds (created here, or "downloaded" via add).
   const local = new Map(); // bag_id -> {path, entry, size}
+  // issue #643 positive control (scripts/selftest-ton.sh): if MOCK_TONUTILS_INACTIVE_FLAG
+  // is set AND the file it names exists, its CONTENTS ("<bag_id> <remaining_count>") name
+  // a bag_id to report `completed: true, active: false` for the next `remaining_count`
+  // details() calls that match it — a bag the seeder still fully retains (all bytes
+  // present, nothing missing) but has stopped ACTIVELY seeding (daemon restarted, disk
+  // pressure evicted the piece cache, ...). A COUNTER, not a plain sticky flag: the
+  // idempotency check this simulates (ton.ts's put()) makes exactly ONE details() call
+  // before falling through to re-create the bag, but re-creation's OWN "wait until
+  // completed && active" poll loop (the SAME check the initial-create path always uses)
+  // would starve for the full 10-minute CREATE_READY_TIMEOUT_MS if the SAME flag kept
+  // reporting inactive forever — self-clearing after `remaining_count` matches lets a test
+  // force exactly the idempotency check's own read without also wedging the re-create it
+  // triggers. Read/rewritten fresh on every request (not cached at startup), matching
+  // scripts/selftest-ton-provider.sh's own mock-tonapi.mjs flag-file convention. Unset/
+  // absent is a no-op — selftest-ton-provider.sh's ephemeral local daemons never set this.
+  const inactiveFlagPath = process.env.MOCK_TONUTILS_INACTIVE_FLAG;
+  const consumeForcedInactive = (id) => {
+    if (!inactiveFlagPath || !existsSync(inactiveFlagPath)) return false;
+    const [flagId, countRaw] = readFileSync(inactiveFlagPath, 'utf8').trim().split(/\s+/);
+    const count = Number(countRaw);
+    if (flagId !== id || !Number.isInteger(count) || count <= 0) return false;
+    const remaining = count - 1;
+    writeFileSync(inactiveFlagPath, remaining > 0 ? `${flagId} ${remaining}` : '');
+    return true;
+  };
 
   const details = (id) => {
     const b = local.get(id);
     if (!b) return null;
+    const forcedInactive = consumeForcedInactive(id);
     return {
       bag_id: id,
       description: b.description ?? 'mock',
@@ -68,8 +94,8 @@ if (!apiAddr) {
       completed: true,
       header_loaded: true,
       info_loaded: true,
-      active: true,
-      seeding: true,
+      active: !forcedInactive,
+      seeding: !forcedInactive,
       path: b.path,
       files: [{ index: 0, name: b.entry, size: b.size }],
       // Additive fields for scripts/selftest-ton-provider.sh (src/lib/backends/
@@ -137,6 +163,19 @@ if (!apiAddr) {
           const id = String(bag_id).toLowerCase();
           const reg = readRegistry();
           if (!reg[id]) return reply(500, { error: 'mock: bag not on the network' });
+          // #644 positive control (scripts/selftest-ton.sh's SIGTERM-mid-P2P-pull test):
+          // if MOCK_TONUTILS_PARK_ON_ADD names a sentinel path, announce that this
+          // request was reached and then never reply — pins ton.ts's p2pFetchInto() at
+          // its `await tonAdd(...)` call so a test can SIGTERM the CLI process with the
+          // ephemeral local daemon (this process) and its temp db dir both deterministically
+          // still alive, instead of racing real (sub-millisecond, on this trivial mock)
+          // download completion. Read fresh per-request, same convention as the
+          // MOCK_TONUTILS_INACTIVE_FLAG counter above; unset is a no-op for every other
+          // caller of this mock.
+          if (process.env.MOCK_TONUTILS_PARK_ON_ADD) {
+            writeFileSync(process.env.MOCK_TONUTILS_PARK_ON_ADD, 'reached\n');
+            return; // never reply — this request just hangs until the process is killed
+          }
           const dir = join(path, id, 'bag');
           mkdirSync(dir, { recursive: true });
           copyFileSync(reg[id].source, join(dir, reg[id].entry));
