@@ -723,9 +723,22 @@ export async function pull(o: CliOptions): Promise<void> {
   // operator to know that the two happen to be interchangeable for this backend.
   // An explicit --locator still wins if both are somehow given.
   if (o.backend === 'rclone' && !o.locator && o.remote) o.locator = o.remote;
+  if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton> required');
+  // #677: reciprocal of push's own #655 refusal (assertRemoteRequiresRcloneBackend,
+  // above) — pull's rclone-locator shortcut just above only CONSUMES --remote when
+  // --backend IS rclone; for every other backend it was silently dropped with zero
+  // signal (e.g. an operator copy-pasting a push invocation, or a leftover --remote
+  // after switching --backend for local testing). Placed FIRST among pull's required-
+  // flag checks — right after the --backend-required check above, so o.backend is
+  // guaranteed defined here (mirroring pushCore's placement of the same call right
+  // after ITS --backend-required check) — and before --locator/--out below, so a
+  // --remote/--backend mismatch is always refused with the specific, actionable
+  // message, never masked by a generic "--locator required"/"--out required" error
+  // when those are ALSO missing. --locator is still checked before --out, preserving
+  // their original relative order (unrelated to this fix) for every other case.
+  assertRemoteRequiresRcloneBackend(o);
   if (!o.locator) throw new Error('--locator <id> required (or --from-locator-file <path>, or --remote for rclone)');
   if (!o.out) throw new Error('--out <file.age> required');
-  if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton> required');
   // No-clobber (#107): refuse to overwrite an existing --out by default. wizard.ts's
   // printed recovery command reuses a FIXED path ("~/restored.age"), so a second pull
   // (a different backup, or a re-run of the recovery steps) would otherwise destroy
