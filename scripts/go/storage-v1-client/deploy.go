@@ -283,13 +283,6 @@ func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 
-	if f.mainnet {
-		fmt.Fprintln(stdout, "")
-		fmt.Fprintln(stdout, "!! MAINNET MODE — REAL TON, REAL MONEY. Review the deeplink in your wallet !!")
-		fmt.Fprintln(stdout, "!! before approving. There is no undo.                                    !!")
-		fmt.Fprintln(stdout, "")
-	}
-
 	res, err := buildDeploy(*p)
 	if err != nil {
 		return err
@@ -354,6 +347,13 @@ func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 			nanoToFloat(res.amountNano), res.amountNano, followUp,
 			res.contractAddr.StringRaw(), statusFlag,
 		)
+	}
+
+	if f.mainnet {
+		fmt.Fprintln(stdout, "")
+		fmt.Fprintln(stdout, "!! MAINNET MODE — REAL TON, REAL MONEY. Review the deeplink in your wallet !!")
+		fmt.Fprintln(stdout, "!! before approving. There is no undo.                                    !!")
+		fmt.Fprintln(stdout, "")
 	}
 
 	fmt.Fprintln(stdout, "== deploy ==")
