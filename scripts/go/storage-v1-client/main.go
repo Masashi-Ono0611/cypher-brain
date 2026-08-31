@@ -182,7 +182,10 @@ const deployHelp = `deploy: derives the StorageV1 contract address, builds its S
 modify_providers deploy body (with --provider-pubkey already included — see
 the "field notes" in main.go), computes a suggested funding amount, and
 prints a Tonkeeper deeplink. Refuses (exit 2) if the computed amount exceeds
---max-spend-ton.
+--max-spend-ton. Also refuses (exit 2) if the derived contract address is
+not 'nonexist' on-chain — re-running deploy after an unconfirmed or lost
+result would otherwise resend the storage cost; use update-providers/status
+instead.
 
   --bag-id <64hex>          required. The bag's TON Storage torrent hash
                              (== StorageV1.TorrentHash). This is the same
