@@ -340,8 +340,11 @@ fix) accepted a provider's TON wallet address instead of its pubkey, so the
 provider daemon could never find itself in the contract. Confirmed the
 contract's data cell (which determines its address) never depends on the
 provider list, so this repairs in place — see main.go field notes.
-REFUSES (exit 2) if --contract is 'nonexist' (use 'deploy' for a new
-contract instead).
+REFUSES (exit 2) unless --contract's on-chain status is 'active' — this
+covers not just 'nonexist' (use 'deploy' for a new contract instead) but
+also 'uninit' and 'frozen', neither of which a body-only modify_providers
+message can initialize or revive; wait for 'status' to report 'active' and
+retry.
 
   IMPORTANT: this REPLACES the entire on-chain provider list with the single
   entry given here, not a merge — any other providers already on the
@@ -377,6 +380,9 @@ paid for it the moment this lands.
   to independently re-derive the contract address as a cross-check, and this
   REFUSES (exit 2) if the derived address doesn't match --contract, rather
   than building a deeplink against the wrong account.
+
+  Also REFUSES (exit 2) unless --contract's on-chain status is 'active' —
+  withdraw is only meaningful against a deployed, running contract.
 
   --contract <raw-addr>         required. The EXISTING contract's address.
   --bag-id <64hex>               required. Must match this contract's deploy.
