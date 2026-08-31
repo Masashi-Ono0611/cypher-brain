@@ -130,8 +130,6 @@ type updateProvidersFlags struct {
 	mainnet           bool
 }
 
-var defaultUpdateProvidersGasNano = big.NewInt(50_000_000) // 0.05 TON — message-processing gas only; the contract keeps its existing balance
-
 func parseUpdateProvidersFlags(args []string) (*updateProvidersParams, error) {
 	fs := newFlagSet("update-providers")
 	f := &updateProvidersFlags{}
