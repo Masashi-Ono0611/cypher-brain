@@ -923,6 +923,9 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       no object at it fails with a clean "no object at <locator>" error (#539) —
       not rclone's own raw, 3x-repeated retry-loop text (which used to mislabel a
       missing FILE as a missing "directory").
+      --remote only applies to --backend rclone — every other backend ignores it, so
+      passing --remote with a different --backend is refused up front rather than
+      silently doing nothing, mirroring push's own refusal (#655/#677).
       Authenticity (#214): --sig-locator <id> (or the 6th --from-locator-file field,
       read automatically) ALSO fetches the "<in>.minisig" sidecar push uploaded, into
       "<out>.minisig" — best-effort, never fails the pull itself (restore/verify treat a

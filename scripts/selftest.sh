@@ -970,6 +970,50 @@ if printf '%s' "$FILE_NO_REMOTE_ERR" | grep -q -- '--remote <name>:<path> only a
 fi
 echo "[PASS] push --backend file without --remote is unaffected"
 
+echo "== issue #677: pull's --remote is refused when passed with --backend file (reciprocal of #655) =="
+# pull's own rclone-locator shortcut (pushpull.ts, just above the #677 comment) only
+# CONSUMES --remote when --backend IS rclone — for every other backend it used to be
+# silently dropped with zero signal, same as push's pre-#655 bug (repro: an operator
+# copy-pasting a push invocation, or a leftover --remote after switching --backend for
+# local testing). Now reuses push's own assertRemoteRequiresRcloneBackend(), so it
+# refuses before any locator/backend work runs — a bogus --locator is fine here.
+set +e
+PULL_FILE_REMOTE_ERR=$(cb pull --locator "doesnotexist" --backend file --remote "someremote:/some/path" --out "$TMP/pull-remote-refuse.age" 2>&1 >/dev/null); PULL_FILE_REMOTE_RC=$?
+set -e
+[ "$PULL_FILE_REMOTE_RC" != "0" ] \
+  || { echo "[FAIL] pull --backend file --remote exited 0 (should have been refused)"; echo "$PULL_FILE_REMOTE_ERR"; exit 1; }
+printf '%s' "$PULL_FILE_REMOTE_ERR" | grep -q -- '--remote <name>:<path> only applies to --backend rclone' \
+  || { echo "[FAIL] pull --backend file --remote did not refuse with the expected message"; echo "$PULL_FILE_REMOTE_ERR"; exit 1; }
+test -f "$TMP/pull-remote-refuse.age" && { echo "[FAIL] pull wrote --out despite being refused"; exit 1; }
+echo "[PASS] pull --backend file --remote <val> is refused before any backend work runs"
+
+echo "== issue #677: the --remote refusal fires even when --locator AND --out are ALSO omitted =="
+# The assertion runs right after the --backend-required check — before EITHER the
+# --out-required or --locator-required checks below it (deliberately, see the
+# ordering comment above assertRemoteRequiresRcloneBackend(o) in pushpull.ts) — so a
+# --remote/--backend mismatch is never masked by either of those generic errors when
+# the operator also forgot --out and/or --locator (only --backend/--remote given).
+set +e
+PULL_MINIMAL_ARGS_ERR=$(cb pull --backend file --remote "someremote:/some/path" 2>&1 >/dev/null); PULL_MINIMAL_ARGS_RC=$?
+set -e
+[ "$PULL_MINIMAL_ARGS_RC" != "0" ] \
+  || { echo "[FAIL] pull --backend file --remote (no --out/--locator) exited 0 (should have been refused)"; echo "$PULL_MINIMAL_ARGS_ERR"; exit 1; }
+printf '%s' "$PULL_MINIMAL_ARGS_ERR" | grep -q -- '--remote <name>:<path> only applies to --backend rclone' \
+  || { echo "[FAIL] pull --backend file --remote (no --out/--locator) did not refuse with the --remote message (got a generic --out/--locator-required error instead?)"; echo "$PULL_MINIMAL_ARGS_ERR"; exit 1; }
+echo "[PASS] pull's --remote refusal is not masked by a missing --out or --locator"
+
+echo "== issue #677 control: pull --backend file WITHOUT --remote is not refused by the --remote check =="
+# A bogus --locator means this pull is EXPECTED to fail (for an unrelated "no such
+# locator" reason) — guard the substitution with set +e like the refusal test above,
+# so that expected non-zero exit doesn't trip set -euo pipefail and abort the suite.
+set +e
+PULL_FILE_NO_REMOTE_ERR=$(cb pull --locator "doesnotexist" --backend file --out "$TMP/pull-remote-refuse.age" 2>&1 >/dev/null)
+set -e
+if printf '%s' "$PULL_FILE_NO_REMOTE_ERR" | grep -q -- '--remote <name>:<path> only applies to'; then
+  echo "[FAIL] the --remote refusal fired despite --remote not being given"; echo "$PULL_FILE_NO_REMOTE_ERR"; exit 1
+fi
+echo "[PASS] pull --backend file without --remote is unaffected by the --remote check"
+
 echo "== pipeline timeout: a wedged, SIGTERM-IGNORING tar can't hang the CLI (#38) =="
 # TAR_STUB_MODE=wedge swaps the pipeline tar for a node stub that IGNORES SIGTERM and
 # stays alive 30s (exec'd — no grandchild, so SIGKILL on it leaks nothing). This
