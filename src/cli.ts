@@ -1341,7 +1341,24 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
         'recovery-kit reads the standard layout under CYPHER_BRAIN_HOME so the identity and recipient.txt cannot be mismatched — relocate with the env var, not per-file flags',
     },
   ],
+  // #672: `schedule` covers three sub-verbs (install|status|uninstall,
+  // schedule.ts's own dispatch) that do not all read --json the same way —
+  // status() genuinely implements it (printJson(r) / printJson({installed:
+  // false})), so a blanket `{ flag: 'json' }` entry here would wrongly refuse
+  // a working "schedule status --json". `'schedule install'` and `'schedule
+  // uninstall'` below are the subcommand-scoped keys assertFlagsRelevant()
+  // tries FIRST (cmd + ' ' + o._, only when that combination has its own
+  // entry) before falling back to this one — install() and uninstall() never
+  // read o.json at all, so --json there gets the same "clear upfront error"
+  // #647 gave 'wallet address' for the identical gap, without touching
+  // schedule status's real JSON support.
   schedule: [],
+  'schedule install': [
+    { flag: 'json', because: 'schedule install has no JSON output — it only prints plain-text install progress' },
+  ],
+  'schedule uninstall': [
+    { flag: 'json', because: 'schedule uninstall has no JSON output — it only prints plain-text removal progress' },
+  ],
   // #647: `wallet` covers three sub-verbs (create|address|balance, wallet.ts's
   // WALLET_SUBCOMMANDS) that do not all read --json the same way — walletBalance()
   // genuinely implements it (printJson(bal)), so a blanket `{ flag: 'json' }` entry
