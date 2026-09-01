@@ -344,13 +344,16 @@ export const ESTIMATE_COST_TOOL: Tool = {
     'cost from a real priced query against the live mytonprovider.org registry (only listed when a ' +
     'local TON wallet is configured — the estimate itself never spends, but the underlying push ' +
     "would; see wallet_create's description for how to set one up); file → free (local disk), " +
-    'returned with a zero-cost note. All seven fields (backend, size_bytes, cost, ' +
-    'unit, approx_ar, usd_estimate, note) are ALWAYS present — null, never absent, where they do ' +
-    'not apply (#268), so do not test for a key to decide whether a value exists. For ' +
+    'returned with a zero-cost note. All eight fields (backend, size_bytes, cost, ' +
+    'unit, approx_ar, usd_estimate, note, warnings) are ALWAYS present — null, never absent, where they do ' +
+    'not apply (#268), so do not test for a key to decide whether a value exists (warnings is always an ' +
+    'array, possibly empty, never absent). For ' +
     'turbo/arweave, usd_estimate carries an approximate USD figure when a USD/AR rate is ' +
     'fetchable — a direct HTTP call to the public Turbo rate endpoint, so it works with or ' +
     'without @ardrive/turbo-sdk installed — and is null on any rate failure; the native estimate ' +
-    'in cost/unit never fails because of it.',
+    "in cost/unit never fails because of it. warnings (#749) carries the same risk flags note's " +
+    "free text already describes (e.g. ton-provider's below-the-bounty-floor warning) as a " +
+    'machine-detectable string list, for a caller that wants to gate on one without pattern-matching note.',
   inputSchema: {
     type: 'object',
     properties: {

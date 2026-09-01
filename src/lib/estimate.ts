@@ -34,6 +34,13 @@ export interface CostEstimate {
   approx_ar: number | null;
   usd_estimate: number | null; // null when the USD/AR rate could not be fetched
   note: string;
+  // #749: machine-detectable risk flags alongside `note`'s free-text prose — e.g. the
+  // ton-provider bounty-floor warning below, which used to be discoverable only by
+  // grepping `note` for a fixed substring (fragile, undocumented). Always an array,
+  // possibly empty, never optional/null — same "one stable shape" contract as every
+  // other field here (#268): a caller checks `warnings.length`, never whether the key
+  // exists at all.
+  warnings: string[];
 }
 
 // What the per-backend branches below actually build: the priced ones set unit/
@@ -41,8 +48,8 @@ export interface CostEstimate {
 // unavailable ones set none of them. estimateCost() normalizes every branch's
 // result to the full CostEstimate shape in ONE place, so a future backend branch
 // cannot forget a key and quietly reintroduce the drifting shape #268 fixed.
-type PartialCostEstimate = Omit<CostEstimate, 'unit' | 'approx_ar' | 'usd_estimate'> &
-  Partial<Pick<CostEstimate, 'unit' | 'approx_ar' | 'usd_estimate'>>;
+type PartialCostEstimate = Omit<CostEstimate, 'unit' | 'approx_ar' | 'usd_estimate' | 'warnings'> &
+  Partial<Pick<CostEstimate, 'unit' | 'approx_ar' | 'usd_estimate' | 'warnings'>>;
 
 // Current USD price of 1 AR via a plain, unauthenticated GET against Turbo's public
 // rate endpoint (AR_USD_RATE_URL — no @ardrive/turbo-sdk involved, #170: that SDK is an
@@ -153,6 +160,7 @@ export async function estimateCost(backend: string, sizeBytes: number): Promise<
     approx_ar: e.approx_ar ?? null,
     usd_estimate: e.usd_estimate ?? null,
     note: e.note,
+    warnings: e.warnings ?? [],
   };
 }
 
@@ -208,23 +216,29 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
       // circular dependency. The check itself is one line; not worth restructuring
       // either module to share it.
       const autoSigns = !!TON_WALLET && (await exists(TON_WALLET));
+      // #749: built once and reused both in `note` (prefixed with the "⚠" a human
+      // reads) and in `warnings` (the plain sentence, for a script/agent to detect
+      // without pattern-matching `note`'s free text) — so the two can never drift on
+      // what this risk actually says.
+      const bountyFloorWarning = est.belowBountyFloor
+        ? `computed bounty (${est.bountyNano} nanoTON) looks below the ~0.05 TON floor providers built on ` +
+          "tonutils-storage-provider enforce — this provider's notify may refuse to ever fetch the bag even " +
+          'though the deploy itself would still succeed and be paid for (issue #403)'
+        : null;
       return {
         backend,
         size_bytes: sizeBytes,
         cost: est.amountNano.toString(),
         unit: 'nanoTON',
         ...(rate !== null ? { usd_estimate: Number(((Number(est.amountNano) / 1e9) * rate).toFixed(6)) } : {}),
+        warnings: bountyFloorWarning ? [bountyFloorWarning] : [],
         note:
           `ton-provider backend pays a live mytonprovider.org provider (pubkey ${est.provider.pubkey}, ` +
           `rating ${est.provider.rating.toFixed(2)}) to hold the bag for ${est.spanDays} day(s) ` +
           `(cost ${est.costNano} nanoTON + ${est.amountNano - est.costNano} nanoTON deploy buffer). ` +
           'Durability depends on that provider continuing to renew/serve the contract — weaker than ' +
           "Arweave's one-time, network-guaranteed permanence (see docs/durability.md). " +
-          (est.belowBountyFloor
-            ? `⚠ computed bounty (${est.bountyNano} nanoTON) looks below the ~0.05 TON floor providers built on ` +
-              "tonutils-storage-provider enforce — this provider's notify may refuse to ever fetch the bag even " +
-              'though the deploy itself would still succeed and be paid for (issue #403). '
-            : '') +
+          (bountyFloorWarning ? `⚠ ${bountyFloorWarning}. ` : '') +
           (autoSigns
             ? 'CYPHER_BRAIN_TON_WALLET is configured — this push will auto-sign and broadcast the deploy itself, no human needed.'
             : 'This mode requires a human to sign a Tonkeeper deeplink at push time (set CYPHER_BRAIN_TON_WALLET to auto-sign instead).'),

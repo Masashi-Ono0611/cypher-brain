@@ -385,28 +385,31 @@ TP_RECEIPT=$(node -e '
   if (!r) { console.error("no ton-provider receipt found among " + lines.length + " line(s)"); process.exit(1); }
   console.log(JSON.stringify(r));
 ' "$RECEIPT_LEDGER_PATH_TP") || { echo "[FAIL] could not find a ton-provider receipt in $RECEIPT_LEDGER_PATH_TP"; cat "$RECEIPT_LEDGER_PATH_TP"; exit 1; }
-printf '%s' "$TP_RECEIPT" | grep -q '"unit":"nanoton"' || { echo "[FAIL] ton-provider receipt unit is not nanoton: $TP_RECEIPT"; exit 1; }
+printf '%s' "$TP_RECEIPT" | grep -q '"unit":"nanoTON"' || { echo "[FAIL] ton-provider receipt unit is not nanoTON: $TP_RECEIPT"; exit 1; }
 printf '%s' "$TP_RECEIPT" | grep -Eq '"cost":"[0-9]+"' || { echo "[FAIL] ton-provider receipt cost is not a plain digit string: $TP_RECEIPT"; exit 1; }
 printf '%s' "$TP_RECEIPT" | grep -F "\"locator\":\"$LOC\"" >/dev/null \
   || { echo "[FAIL] ton-provider receipt locator does not match what push printed ($LOC): $TP_RECEIPT"; exit 1; }
-echo "[PASS] a successful ton-provider push writes a receipt (backend/locator/nanoton cost all correct)"
+echo "[PASS] a successful ton-provider push writes a receipt (backend/locator/nanoTON cost all correct)"
 
 LEDGER_HUMAN_TP=$(cb ledger)
 printf '%s' "$LEDGER_HUMAN_TP" | grep -q 'ton-provider' || { echo "[FAIL] ledger (human) does not mention ton-provider: $LEDGER_HUMAN_TP"; exit 1; }
-printf '%s' "$LEDGER_HUMAN_TP" | grep -q 'nanoton' || { echo "[FAIL] ledger (human) does not show a nanoton cost: $LEDGER_HUMAN_TP"; exit 1; }
+# #751: the same casing ("nanoTON") that estimate --json and the receipt above use —
+# previously this printed lowercase 'nanoton', the one place this physical unit's
+# casing disagreed across surfaces.
+printf '%s' "$LEDGER_HUMAN_TP" | grep -q 'nanoTON' || { echo "[FAIL] ledger (human) does not show a nanoTON cost: $LEDGER_HUMAN_TP"; exit 1; }
 echo "[PASS] ledger (human report) includes the ton-provider push"
 
 LEDGER_JSON_TP=$(cb ledger --json)
 node -e '
   const j = JSON.parse(process.argv[1]);
   const tp = j.by_backend?.["ton-provider"];
-  if (!tp || typeof tp.cost?.nanoton !== "string" || !/^[0-9]+$/.test(tp.cost.nanoton)) {
+  if (!tp || typeof tp.cost?.nanoTON !== "string" || !/^[0-9]+$/.test(tp.cost.nanoTON)) {
     console.error("ledger --json by_backend[\"ton-provider\"] missing/malformed: " + JSON.stringify(tp));
     process.exit(1);
   }
   if (tp.count < 1) { console.error("ledger --json ton-provider count is " + tp.count + ", expected >= 1"); process.exit(1); }
 ' "$LEDGER_JSON_TP" || { echo "[FAIL] ledger --json by_backend.ton-provider is missing or malformed"; echo "$LEDGER_JSON_TP"; exit 1; }
-echo "[PASS] ledger --json by_backend.ton-provider reports a real nanoton cost (#484)"
+echo "[PASS] ledger --json by_backend.ton-provider reports a real nanoTON cost, consistently cased with estimate --json (#484, #751)"
 
 # issue #403: the mock registry's default 800 nanoTON/MB/day rate against this tiny
 # test snapshot computes a bounty far below the provider-side floor — the SAME real
@@ -442,6 +445,35 @@ rm -f "$TMP/high-price-flag" # back to the default (low) rate so this estimate i
 EST2=$(cb estimate --in "$TMP/high-price.age" --backend ton-provider --json)
 printf '%s' "$EST2" | grep -q 'looks below the ~0.05 TON floor' || { echo "[FAIL] estimate's note did not carry the bounty-floor warning: $EST2"; exit 1; }
 echo "[PASS] estimate warns about an under-floor bounty before any funds move"
+
+# #749: the SAME risk, ALSO surfaced as a machine-detectable string in the structured
+# `warnings` array — not just buried in `note`'s free text (which the check above
+# already covers). A script/agent gating on this risk should never have to pattern-
+# match `note`.
+node -e '
+  const j = JSON.parse(process.argv[1]);
+  if (!Array.isArray(j.warnings)) {
+    console.error("estimate --json warnings is not an array: " + JSON.stringify(j.warnings));
+    process.exit(1);
+  }
+  if (!j.warnings.some((w) => typeof w === "string" && w.includes("looks below the ~0.05 TON floor"))) {
+    console.error("estimate --json warnings does not include the bounty-floor warning: " + JSON.stringify(j.warnings));
+    process.exit(1);
+  }
+' "$EST2" || { echo "[FAIL] estimate --json warnings did not carry the machine-readable bounty-floor warning (#749)"; echo "$EST2"; exit 1; }
+echo "[PASS] estimate --json warnings carries the bounty-floor warning as a machine-readable string (#749)"
+
+# Negative control: once the computed bounty clears the floor (the same high-price
+# mock the push-side positive control above used), `warnings` must be an EMPTY array —
+# never omitted, never carrying a stale/unrelated entry (#749's "always an array,
+# possibly empty" contract, #268's "never absent" contract applied to this new field).
+touch "$TMP/high-price-flag"
+EST_ABOVE_FLOOR=$(cb estimate --in "$TMP/high-price.age" --backend ton-provider --json)
+rm -f "$TMP/high-price-flag" # back to the default (low) rate for everything after this
+printf '%s' "$EST_ABOVE_FLOOR" | grep -q '"warnings":\[\]' \
+  || { echo "[FAIL] estimate --json warnings is not an empty array once the bounty clears the floor: $EST_ABOVE_FLOOR"; exit 1; }
+echo "[PASS] estimate --json warnings is an empty array when there is nothing to warn about (#749)"
+
 echo "$SIZE" > "$TMP/notify-downloaded" # restore for the pull test below
 
 echo "== notify uses --mainnet by default (issue #404, no CYPHER_BRAIN_TON_NETWORK_CONFIG set) =="

@@ -280,7 +280,10 @@ export async function ledger(o: CliOptions): Promise<void> {
         `0 of ${skippedLines} receipt line(s) could be read (${skippedLines} skipped as unreadable/malformed) — this is not necessarily an empty ledger, see the warning above`,
       );
     } else {
-      console.log('no receipts yet — receipts are written by a successful `push --backend arweave|turbo`');
+      // #748: ton-provider has written receipts since #484 — this literal was never
+      // updated then, so a first-time ton-provider user checking `ledger` before their
+      // first push was told (incorrectly) that a ton-provider push would never show up.
+      console.log('no receipts yet — receipts are written by a successful `push --backend arweave|turbo|ton-provider`');
     }
     return;
   }

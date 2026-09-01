@@ -639,7 +639,7 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       is never confused with "no receipts COULD BE READ" (#457).
       Human report (default): total receipt count, cost summed BY BACKEND, BY MONTH and
       BY DAY (UTC, most recent 14 shown) — each sum kept separate PER NATIVE UNIT
-      (winston/winc/nanoton are different currencies, never added together). A receipt
+      (winston/winc/nanoTON are different currencies, never added together). A receipt
       with no priceable cost is "unpriced" (excluded from every sum); one with a priced
       cost but an unparseable timestamp is "undated" (still counted in by-backend,
       excluded only from by-day/by-month) — the two are reported as distinct counts,
@@ -1070,12 +1070,17 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       off disk). The SAME computation backs the MCP estimate_cost tool, so the two
       never disagree.
       --json prints the same CostEstimate object as one JSON line on stdout
-      (backend, size_bytes, cost, unit, approx_ar, usd_estimate, note) instead of
-      the human-readable report — field-for-field identical to what estimate_cost
-      returns. All seven keys are ALWAYS present (#268): a backend with no native
-      unit, or a query that could not run, reports null rather than dropping the key,
-      so the object shape does not depend on which backend was asked about. On an
-      ERROR, stdout carries {error, code, exit_code} instead (#270 — see verify).
+      (backend, size_bytes, cost, unit, approx_ar, usd_estimate, note, warnings)
+      instead of the human-readable report — field-for-field identical to what
+      estimate_cost returns. All eight keys are ALWAYS present (#268): a backend
+      with no native unit, or a query that could not run, reports null rather than
+      dropping the key, so the object shape does not depend on which backend was
+      asked about; warnings is always an array (possibly empty), never omitted.
+      warnings (#749) carries the SAME risk flags note's free text already
+      describes (e.g. ton-provider's below-the-bounty-floor warning) as a
+      machine-detectable string list, for a caller that wants to gate on one
+      without pattern-matching note. On an ERROR, stdout carries
+      {error, code, exit_code} instead (#270 — see verify).
       --out <path.json> (#231): ALSO write a "plan" pinning this exact estimate to the
       artifact (sha256 of --in), --backend, --remote (rclone only, null otherwise), the
       configured payer address (if any wallet is set up for this backend — null

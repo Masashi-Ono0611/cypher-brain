@@ -48,9 +48,18 @@ cb snapshot --dir "$SRC" --out "$TMP/snap.age"
 ORIG=$(sha "$TMP/snap.age")
 
 echo "== push --backend ton (bag born on the seeder; locator = ton:v1:<bag-id>) =="
-LOC=$(cb push --in "$TMP/snap.age" --backend ton --save-locator "$TMP/loc.tsv")
+LOC=$(cb push --in "$TMP/snap.age" --backend ton --save-locator "$TMP/loc.tsv" 2>"$TMP/push.err")
 printf '%s' "$LOC" | grep -Eq '^ton:v1:[0-9a-f]{64}$' || { echo "[FAIL] locator shape: $LOC"; exit 1; }
 echo "[PASS] locator matches ton:v1:<64-hex>"
+# #724: ton's own locator already carries the "ton:v1:" prefix (util.ts's
+# makeBagLocator()), unlike file/arweave/turbo's locators — naively prepending
+# "${backend}:" to it in the "pushed ... -> <backend>:<locator>" stderr line doubled
+# it ("ton:ton:v1:<hex>"). Assert the line shows it exactly once.
+grep -qF "pushed $TMP/snap.age -> $LOC" "$TMP/push.err" \
+  || { echo "[FAIL] push did not print the expected single-prefix locator line: "; cat "$TMP/push.err"; exit 1; }
+grep -q 'ton:ton:v1:' "$TMP/push.err" \
+  && { echo "[FAIL] push printed a doubled backend prefix (ton:ton:v1:...)"; cat "$TMP/push.err"; exit 1; }
+echo "[PASS] push's locator line shows a single backend prefix, not doubled (#724)"
 BAG_FILE=$(ls "$SEEDER_HOME"/cypher-brain-ton/bags/*/snapshot.age 2>/dev/null | head -1)
 [ -n "$BAG_FILE" ] || { echo "[FAIL] no snapshot.age landed under the seeder bags dir"; exit 1; }
 [ "$(sha "$BAG_FILE")" = "$ORIG" ] || { echo "[FAIL] seeder-side bytes differ from source"; exit 1; }

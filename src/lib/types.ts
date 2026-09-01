@@ -109,7 +109,7 @@ export type FetchShape = 'age' | 'minisig';
 export interface ReceiptEvent {
   locator: string;
   raw: unknown;
-  cost: { amount: string; unit: 'winston' | 'winc' | 'nanoton' } | null;
+  cost: { amount: string; unit: 'winston' | 'winc' | 'nanoTON' } | null;
 }
 
 // A StorageBackend is { put(file) -> locator, get(locator, outFile) }. Storage
