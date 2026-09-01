@@ -1,6 +1,7 @@
 // ---------- utils ----------
-import { access, chmod, lstat, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { access, chmod, lstat, readdir, rm, stat } from 'node:fs/promises';
 import { createReadStream, statSync, constants as FS, type Dirent } from 'node:fs';
+import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { warn } from './warn.js';
@@ -187,18 +188,19 @@ function statKind(st: { isDirectory(): boolean; isFIFO(): boolean; isSocket(): b
 // receipt.ts as the precedent it consciously reimplemented rather than shared) —
 // read -> ENOENT means "empty, not an error" -> any OTHER read failure THROWS (an
 // audit/cost tool must never let "could not read the log" read the same as "there is
-// nothing to read") -> split lines -> skip blanks -> parse each line, counting a
-// skipped line for either malformed JSON or a shape `validateAndParse` rejects.
+// nothing to read") -> stream lines (#765) -> skip blanks -> parse each line, counting
+// a skipped line for either malformed JSON or a shape `validateAndParse` rejects.
 // `validateAndParse` is deliberately the ONLY thing callers vary: receipt.ts and
 // audit.ts have genuinely different, independently-evolved per-entry validation
 // (audit.ts's is stricter — exact null-vs-string checks on every nullable field,
 // Codex review, Critical — see its own header comment for why), which stays local to
 // each module rather than being forced into a shared shape here.
 //
-// #695: stat()s the path and refuses to readFile() anything that is not a regular file,
+// #695: stat()s the path and refuses to read anything that is not a regular file,
 // mirroring doctor.ts's own checkIdentityRecipientPairing() guard (Codex review, #333)
-// — readFile() below would BLOCK indefinitely on e.g. a FIFO with no writer on the
-// other end, and every caller of this helper (doctor.ts's audit-chain-integrity/
+// — reading below (readFile() originally; a stream since #765, see its own comment)
+// would BLOCK indefinitely on e.g. a FIFO with no writer on the other end, and every
+// caller of this helper (doctor.ts's audit-chain-integrity/
 // receipt-ledger-readability checks, AND the standalone `cypher-brain audit`/`ledger`
 // CLI commands that share this same helper) is exactly the kind of routine, read-only
 // diagnostic that hang would turn into an indefinite freeze instead of a clean FAIL. A
@@ -207,11 +209,11 @@ function statKind(st: { isDirectory(): boolean; isFIFO(): boolean; isSocket(): b
 // yet", not "the log is unreadable". Deliberately NOT ENOTDIR too (unlike doctor.ts's
 // own statOrNotFound(), which folds ENOTDIR into "not found" for a diagnostic's
 // different posture) — a path with a non-directory component IS a real misconfiguration
-// for a log this code itself created via mkdir+append, and the pre-existing readFile()
-// path below never special-cased it either; this stays byte-for-byte the same "which
-// errno means empty" policy this function already had.
+// for a log this code itself created via mkdir+append, and the read path below never
+// special-cased it either; this stays byte-for-byte the same "which errno means empty"
+// policy this function already had.
 //
-// Same stat()-then-readFile() TOCTOU window checkIdentityRecipientPairing() already
+// Same stat()-then-read TOCTOU window checkIdentityRecipientPairing() already
 // accepts (Codex review, #333, and unchanged since): a path swapped for a FIFO in the
 // gap between the two calls could still hang. Not closed here either — doing so would
 // mean switching every caller of this helper (and the identity-file check) to an
@@ -235,32 +237,40 @@ export async function readJsonlLog<T>(
   if (!st.isFile()) {
     throw new Error(`${path} is not a regular file (${statKind(st)}) — refusing to read it as the ${label}`);
   }
-  let text: string;
-  try {
-    text = await readFile(path, 'utf8');
-  } catch (e) {
-    // TOCTOU: the path could have been removed or replaced between the stat() above and
-    // this readFile() — ENOENT here means the same "nothing to read" as a path that was
-    // never there in the first place.
-    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { items: [], skippedLines: 0 };
-    throw new Error(`cannot read ${label} at ${path}: ${errMsg(e)}`);
-  }
+  // #765: line-by-line via readline over a read stream, not readFile()+split('\n') —
+  // the old form held the ENTIRE file as one in-memory string just to throw it away a
+  // line at a time a moment later, multiplying peak memory for every caller of this
+  // shared helper (audit.ts's `--json`, receipt.ts feeding ledger.ts's `--csv`) well
+  // beyond the raw log size for a large history, and can outright fail once a single
+  // JS string would exceed V8's own string-length ceiling. Nothing downstream of this
+  // point changes: `items`/`skippedLines` are built exactly the same way, one line at
+  // a time — this only changes how a line gets INTO that loop.
   const items: T[] = [];
   let skippedLines = 0;
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      const item = validateAndParse(parsed);
-      if (item === null) {
-        skippedLines++; // wrong shape (foreign line, future version) — skip, don't crash a read
-        continue;
+  try {
+    const rl = createInterface({ input: createReadStream(path, { encoding: 'utf8' }), crlfDelay: Infinity });
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        const item = validateAndParse(parsed);
+        if (item === null) {
+          skippedLines++; // wrong shape (foreign line, future version) — skip, don't crash a read
+          continue;
+        }
+        items.push(item);
+      } catch {
+        skippedLines++; // malformed JSON on this one line — skip it, keep reading the rest
       }
-      items.push(item);
-    } catch {
-      skippedLines++; // malformed JSON on this one line — skip it, keep reading the rest
     }
+  } catch (e) {
+    // TOCTOU: the path could have been removed or replaced between the stat() above and
+    // this stream being opened — ENOENT here means the same "nothing to read" as a path
+    // that was never there in the first place. (An ENOENT surfacing only here, this
+    // early, also means no items have been collected yet — nothing partial to discard.)
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { items: [], skippedLines: 0 };
+    throw new Error(`cannot read ${label} at ${path}: ${errMsg(e)}`);
   }
   return { items, skippedLines };
 }

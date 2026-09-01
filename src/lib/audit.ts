@@ -17,9 +17,9 @@
 // was ALREADY `null` be tampered to any other value and silently launder back to the
 // SAME `null` the stored hash was computed against; every nullable field here must be
 // exactly `null` or a `string`, or the whole line is rejected).
-import { appendFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { hostname } from 'node:os';
 import { AUDIT_LOG } from './config.js';
 import { errMsg, readJsonlLog, sha256 } from './util.js';
@@ -156,32 +156,147 @@ export async function readAuditLog(): Promise<ReadAuditLogResult> {
   return { entries: items, skippedLines };
 }
 
-// Append one entry, hash-chained to the log's current LAST line. No lock (unlike
-// idempotency.ts): this is an audit/observability record, not a spend-safety gate — a
-// concurrent-append race (two processes both reading the same prev_hash and appending
-// against it) is a KNOWN, ACCEPTED limitation for this MVP, same posture receipt.ts's
-// own header comment takes toward a similar concurrent-append edge case, not silently
-// assumed away. Reads the WHOLE file to find the last hash (not tail-only): matches
+// #744: cross-process serialization for the read-tail -> append critical section
+// below. A bare "read the last hash, then append" has no mutual exclusion between two
+// processes racing the same await point — both can read the SAME tail hash, each
+// append an entry whose prev_hash points at it, and the SECOND becomes a sibling
+// rather than a child of the first. verifyAuditChain() then reports that as a broken
+// link — a PERMANENT, false "possible tamper" verdict for what was actually two
+// legitimate concurrent runs (two CLI/MCP processes finishing push/restore/verify at
+// the same time is ordinary, not adversarial). This was a KNOWN, ACCEPTED limitation
+// for the MVP (this file's header comment used to say so); it no longer is one.
+//
+// Exclusive-create lockfile (`wx`) with a staleness-based steal, mirroring
+// idempotency.ts's own withLogLock (#617/#636) — duplicated rather than imported, same
+// posture this file already takes toward receipt.ts's JSONL-read shape (see this
+// file's header comment: independently-evolved per-module logic stays local rather
+// than being forced into a shared shape). An OS-level flock(2) would close the
+// crash-while-holding case more completely with no staleness guessing at all, but
+// Node's core `fs` module does not expose one, and adding a native dependency is out
+// of scope for this fix (same reasoning idempotency.ts's own claimIdempotencyKey doc
+// comment already gives for not doing the equivalent there).
+//
+// Ownership-TOKEN-checked, not bare-pid (Codex review): withLogLock's own release
+// unconditionally `rm()`s the lock path with no check that it is still OUR lock. Two
+// compounding races that omission opens: (a) this waiter's OWN staleness-steal below
+// racing the original holder's normal (non-crashed, just slow) completion — the
+// original holder finishes and releases, a THIRD process acquires a fresh lock in that
+// gap, and this waiter's `rm()` (believing it is removing an abandoned lock) deletes
+// the fresh holder's live one instead; (b) the ORIGINAL holder's own delayed release,
+// AFTER having been stolen from under it in scenario (a), deleting whatever NEW lock
+// happens to occupy that path by the time it finally gets there. Either lets two
+// processes into the critical section at once — exactly the fork this whole mechanism
+// exists to prevent. A random per-attempt token (mirroring claimIdempotencyKey's own
+// token, not shared with it) written as the lock file's CONTENT lets both removal
+// sites verify "is this still the lock I think it is" immediately beforehand, closing
+// the specific "delete a DIFFERENT, unrelated holder's live lock" failure mode.
+//
+// This does NOT make the lock fully race-free — see claimIdempotencyKey's own doc
+// comment for why closing that fully needs an OS-level lock this file already ruled
+// out above — a content check immediately before rm() still leaves a (much narrower)
+// window between that check and the rm() call itself. Reaching it requires the
+// ORIGINAL holder to legitimately run longer than AUDIT_LOCK_STALE_MS (10s — ordinary
+// push/restore/verify audit-log appends read+write a small file, taking milliseconds,
+// not seconds) AND a third process to land inside a now-microsecond-scale gap. Refusing
+// to pretend this is fully closed (rather than silently asserting a stronger guarantee
+// than the mechanism actually provides) matches this codebase's own posture toward the
+// analogous residual gap in claimIdempotencyKey's release.
+const AUDIT_LOCK_STALE_MS = 10_000; // longer than this and the holder is presumed crashed, not slow
+const AUDIT_LOCK_RETRY_DELAY_MS = 50;
+const AUDIT_LOCK_MAX_WAIT_MS = AUDIT_LOCK_STALE_MS + AUDIT_LOCK_RETRY_DELAY_MS * 20;
+
+// Best-effort, ownership-checked removal: only removes `lockPath` if its current
+// content still equals `token` (the value observed a moment ago, or this call's own
+// acquisition token) — never a blind `rm()` of whatever currently occupies that path.
+async function removeOwnedLock(lockPath: string, token: string): Promise<void> {
+  try {
+    const current = await readFile(lockPath, 'utf8');
+    if (current === token) await rm(lockPath, { force: true });
+    // else: the content changed since we last observed it — a different holder now
+    // owns this path (or nobody does and it raced to ENOENT already, caught below);
+    // leave it alone either way.
+  } catch {
+    // ENOENT (already gone) or any other read failure: best-effort only, never throw
+    // out of a lock-cleanup path.
+  }
+}
+
+async function withAuditLogLock<T>(fn: () => Promise<T>): Promise<T> {
+  const lockPath = `${AUDIT_LOG}.lock`;
+  await mkdir(dirname(AUDIT_LOG), { recursive: true });
+  // Pid+timestamp+128-bit-random, same shape claimIdempotencyKey's own token uses —
+  // enough entropy that an accidental collision with any other lock attempt, this
+  // process or another, is astronomically unlikely.
+  const token = `${process.pid}.${Date.now()}.${randomBytes(16).toString('hex')}`;
+  const deadline = Date.now() + AUDIT_LOCK_MAX_WAIT_MS;
+  for (;;) {
+    try {
+      // Exclusive create: succeeds only if no OTHER holder currently owns the lock —
+      // this (not the read-then-append itself) is the actual mutual-exclusion primitive.
+      await writeFile(lockPath, token, { flag: 'wx' });
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') throw e;
+      // Someone else holds it — unless it looks abandoned (a process that crashed
+      // between acquiring and releasing it), in which case steal it rather than wait
+      // forever for a lock nobody will ever release.
+      try {
+        const st = await stat(lockPath);
+        if (Date.now() - st.mtimeMs > AUDIT_LOCK_STALE_MS) {
+          // Ownership-checked steal (see this function group's own doc comment above):
+          // re-read the content we are ABOUT to remove and only remove exactly that
+          // value, narrowing (not eliminating) the window against the original holder
+          // finishing normally and a third process acquiring a fresh lock in between.
+          const staleContent = await readFile(lockPath, 'utf8').catch(() => null);
+          if (staleContent !== null) await removeOwnedLock(lockPath, staleContent);
+          continue;
+        }
+      } catch {
+        continue; // the lock disappeared between our failed create and this stat — retry now
+      }
+      if (Date.now() > deadline) {
+        throw new Error(
+          `timed out after ${AUDIT_LOCK_MAX_WAIT_MS}ms waiting for the audit log lock at ${lockPath} ` +
+            `(held by another process) — refusing to append without it rather than risk forking the chain`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, AUDIT_LOCK_RETRY_DELAY_MS));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await removeOwnedLock(lockPath, token);
+  }
+}
+
+// Append one entry, hash-chained to the log's current LAST line — the read-tail ->
+// append sequence below runs under withAuditLogLock (#744, see its own doc comment
+// above) so two racing processes can no longer both read the same tail and fork the
+// chain. Reads the WHOLE file to find the last hash (not tail-only): matches
 // idempotency.ts's own "read whole file" philosophy — this log grows at
 // CLI-invocation cadence (a handful of runs a day), not high-frequency-log cadence.
 //
-// Best-effort: NEVER throws to the caller. A write failure here must not mask a real
-// push/restore/verify outcome — the exact posture pushpull.ts's persistReceiptIfAny()
-// already takes toward its own (cost) receipt writes.
+// Best-effort: NEVER throws to the caller. A write failure here (including a lock
+// timeout) must not mask a real push/restore/verify outcome — the exact posture
+// pushpull.ts's persistReceiptIfAny() already takes toward its own (cost) receipt
+// writes.
 export async function appendAuditEntry(
   partial: Omit<AuditEntry, 'cypher_brain_audit_version' | 'prev_hash' | 'hash'>,
 ): Promise<void> {
   try {
-    const { entries } = await readAuditLog();
-    const prevHash = entries.length > 0 ? entries[entries.length - 1].hash : null;
-    const withoutHash: Omit<AuditEntry, 'hash'> = {
-      cypher_brain_audit_version: AUDIT_VERSION,
-      prev_hash: prevHash,
-      ...partial,
-    };
-    const entry: AuditEntry = { ...withoutHash, hash: computeHash(withoutHash) };
-    await mkdir(dirname(AUDIT_LOG), { recursive: true });
-    await appendFile(AUDIT_LOG, `${JSON.stringify(entry)}\n`, { flag: 'a' });
+    await withAuditLogLock(async () => {
+      const { entries } = await readAuditLog();
+      const prevHash = entries.length > 0 ? entries[entries.length - 1].hash : null;
+      const withoutHash: Omit<AuditEntry, 'hash'> = {
+        cypher_brain_audit_version: AUDIT_VERSION,
+        prev_hash: prevHash,
+        ...partial,
+      };
+      const entry: AuditEntry = { ...withoutHash, hash: computeHash(withoutHash) };
+      await mkdir(dirname(AUDIT_LOG), { recursive: true });
+      await appendFile(AUDIT_LOG, `${JSON.stringify(entry)}\n`, { flag: 'a' });
+    });
   } catch (e) {
     warn(`could not append to the audit log (${errMsg(e)}) — the ${partial.command} itself is unaffected`);
   }
