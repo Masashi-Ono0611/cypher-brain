@@ -31,7 +31,6 @@ let ACTIVE_RESTORE_OUT_DIR_PREEXISTED = false; // whether restore() created out-
 // process, and two unrelated resources sharing one slot would let one clobber the
 // other's cleanup).
 let ACTIVE_RESTORE_SCRATCH_DIR: string | null = null;
-let ACTIVE_SCAN_REPORT_DIR: string | null = null; // secrets-scan's gitleaks report temp dir while a scan is in flight
 let ACTIVE_VERIFY_SCRATCH_DIR: string | null = null; // verify --level remote/drill's pulled-ciphertext (+, for drill, decrypted-plaintext) scratch dir, for its ENTIRE lifetime
 // The MCP server's own fetch dirs (src/mcp.ts): verify_restore and restore_now each pull
 // a locator into a private temp dir (`pulled.age`), and restore_now additionally copies a
@@ -41,7 +40,7 @@ let ACTIVE_VERIFY_SCRATCH_DIR: string | null = null; // verify --level remote/dr
 // server: an operator Ctrl-C or a launchd/shutdown SIGTERM is the ordinary way it ends,
 // not an exceptional one.
 //
-// A Set rather than a scalar slot, unlike every field above it. Those all belong to
+// A Set rather than a scalar slot, unlike every scalar field above it. Those all belong to
 // one-shot CLI invocations that hold at most one such resource at a time; this server can
 // have two verify_restore calls (or a verify_restore and a restore_now) in flight at once
 // — the request handlers interleave, only captureCall()'s console capture is serialized —
@@ -50,6 +49,16 @@ let ACTIVE_VERIFY_SCRATCH_DIR: string | null = null; // verify --level remote/dr
 // That is the same "two unrelated resources must not share one slot" reasoning that gave
 // ACTIVE_RESTORE_SCRATCH_DIR its own field, applied WITHIN one resource kind.
 const ACTIVE_MCP_FETCH_DIRS = new Set<string>();
+// scanForSecrets()'s gitleaks report temp dir while a scan is in flight — a Set for the
+// exact same reason ACTIVE_MCP_FETCH_DIRS above is one: mcp.ts's snapshot_now handler only
+// takes an idempotency lock when a caller-supplied idempotency_key is given, so two
+// snapshot_now calls (no key, or two different keys) run their scans fully concurrently. A
+// scalar slot here (as this used to be, and as scanForSecrets()'s own comment flagged) let
+// the second scan's registration evict the first scan's dir, and the first scan's finally
+// then clear the slot out from under the second — a signal landing while the second scan
+// was still running would find ACTIVE_SCAN_REPORT_DIR already null and leak its gitleaks
+// report dir under os.tmpdir() forever instead of being swept by forceRmSync (#696).
+const ACTIVE_SCAN_REPORT_DIRS = new Set<string>();
 // #644: the ephemeral temp trees src/lib/backends/ton.ts's p2pFetch(),
 // src/lib/backends/ton-provider.ts's put(), and src/lib/ton-dns.ts's
 // assertBagAvailable() each mkdtemp() to hold a LOCAL tonutils-storage daemon's db
@@ -116,16 +125,6 @@ export const setActiveStage = (v: string | null): void => {
 export const setActiveOutPart = (v: string | null): void => {
   ACTIVE_OUT_PART = v;
 };
-// scanForSecrets()'s own temp dir, holding gitleaks' JSON report while a scan is in
-// flight. It leans on a finally-block exactly like the stage dir does, and a signal
-// skips it exactly the same way — which stopped being hypothetical when #301 made the
-// scan run by default, so the window now exists on an ordinary snapshot rather than only
-// when someone asked for the gate. The report is redacted (rule IDs, no match text), so
-// this is tidiness rather than plaintext exposure; it is registered here anyway because
-// "a temp dir the finally would have removed" is precisely what this module is for.
-export const setActiveScanReportDir = (v: string | null): void => {
-  ACTIVE_SCAN_REPORT_DIR = v;
-};
 // restore() calls this right after it creates/confirms --out-dir and before the tar
 // child starts extracting into it, then clears it (v=null) once the extract settles
 // (success, or its own catch-block cleanup already ran) — a LATER signal (e.g. during
@@ -169,6 +168,23 @@ export const addActiveMcpFetchDir = (dir: string): void => {
 export const removeActiveMcpFetchDir = (dir: string): void => {
   ACTIVE_MCP_FETCH_DIRS.delete(dir);
 };
+// scanForSecrets()'s own temp dir, holding gitleaks' JSON report while a scan is in
+// flight. It leans on a finally-block exactly like the stage dir does, and a signal
+// skips it exactly the same way — which stopped being hypothetical when #301 made the
+// scan run by default, so the window now exists on an ordinary snapshot rather than only
+// when someone asked for the gate. The report is redacted (rule IDs, no match text), so
+// this is tidiness rather than plaintext exposure; it is registered here anyway because
+// "a temp dir the finally would have removed" is precisely what this module is for.
+// Registered/deregistered the SAME way addActiveMcpFetchDir/removeActiveMcpFetchDir are —
+// add() in the same tick mkdtempSync creates the dir, delete() only after
+// scanForSecrets()'s own `rm` has actually finished removing it — for the same "two
+// concurrent calls must not share one slot" reason ACTIVE_SCAN_REPORT_DIRS is a Set (#696).
+export const addActiveScanReportDir = (dir: string): void => {
+  ACTIVE_SCAN_REPORT_DIRS.add(dir);
+};
+export const removeActiveScanReportDir = (dir: string): void => {
+  ACTIVE_SCAN_REPORT_DIRS.delete(dir);
+};
 // #644: ton.ts/ton-provider.ts/ton-dns.ts call these the SAME way mcp.ts's
 // makeFetchDir/discardFetchDir do — register in the same tick mkdtemp() returns (no
 // await in between), deregister only after their own rmrf() has actually finished —
@@ -208,10 +224,6 @@ export function installStageSignalGuard(): void {
           rmSync(ACTIVE_OUT_PART, { force: true });
         } catch {}
         ACTIVE_OUT_PART = null;
-      }
-      if (ACTIVE_SCAN_REPORT_DIR) {
-        forceRmSync(ACTIVE_SCAN_REPORT_DIR);
-        ACTIVE_SCAN_REPORT_DIR = null;
       }
       if (ACTIVE_RESTORE_SCRATCH_DIR) {
         // Always safe to erase outright — restore's scratch dir is never anything
@@ -254,6 +266,12 @@ export function installStageSignalGuard(): void {
       // itself, never a caller-owned path.
       for (const dir of ACTIVE_MCP_FETCH_DIRS) forceRmSync(dir);
       ACTIVE_MCP_FETCH_DIRS.clear();
+      // Every scan report dir currently in flight (see ACTIVE_SCAN_REPORT_DIRS above) — a
+      // set, so concurrent snapshot_now scans are each erased rather than only whichever
+      // registered last. Always safe to erase outright: each one is a directory
+      // scanForSecrets() mkdtempSync'd itself, never a caller-owned path.
+      for (const dir of ACTIVE_SCAN_REPORT_DIRS) forceRmSync(dir);
+      ACTIVE_SCAN_REPORT_DIRS.clear();
       // #644: same "always ours, always safe to erase outright" reasoning as every set/
       // slot above — each dir here is one ton.ts/ton-provider.ts/ton-dns.ts mkdtemp()'d
       // itself. The daemon CHILD living inside one of these dirs was already SIGKILLed
