@@ -228,6 +228,25 @@ async function checkKeyPerms(
   return { id, status: 'pass', message: `${label} permissions are 0600 (${path})` };
 }
 
+// Doctor-local wrapper around keys.ts's recipientEntries(): confirms `path` is a
+// regular file FIRST. recipientEntries() calls readFile() directly with no such
+// guard — on e.g. a FIFO with no writer, that would BLOCK INDEFINITELY, turning this
+// routine, read-only diagnostic into a hang (#742) exactly like an unchecked read of
+// IDENTITY would (see checkIdentityRecipientPairing()'s own statOrNotFound()+isFile()
+// guard on IDENTITY below, and util.ts's readJsonlLog(), which takes the identical
+// stance for AUDIT_LOG/RECEIPT_LEDGER, #695). Same narrow TOCTOU window those two
+// already accept, for the same reason (readJsonlLog()'s own doc comment): a path
+// swapped for a FIFO in the gap between this stat() and recipientEntries()'s own
+// readFile() could still hang — closing that would mean reading the path BLIND,
+// reintroducing the exact hang this guard exists to prevent.
+async function safeRecipientEntries(path: string): Promise<string[]> {
+  const st = await statOrNotFound(path);
+  if (st && !st.isFile()) {
+    throw new Error(`${path} is not a regular file (${statKind(st)}) — refusing to read it`);
+  }
+  return recipientEntries(path);
+}
+
 // Does the age identity actually derive the public key recipient.txt records? A
 // mismatch means one of the two files was replaced independently of the other — a
 // stale recipient.txt copied from elsewhere, or an identity restored from the wrong
@@ -301,7 +320,7 @@ async function checkIdentityRecipientPairing(): Promise<DoctorCheck> {
     };
   }
   const derivedSet = new Set(derived);
-  const actual = new Set(await recipientEntries(RECIPIENT));
+  const actual = new Set(await safeRecipientEntries(RECIPIENT));
   const anyMatch = derived.some((d) => actual.has(d));
   if (!anyMatch) {
     return {
@@ -397,7 +416,21 @@ async function checkPinRecipients(): Promise<DoctorCheck[]> {
   // entry matched, even with a second, un-allowlisted recipient sitting right next to
   // it — reporting doctor as healthy for a setup where the very next plain snapshot
   // would refuse to run (Codex review, #333).
-  const primary = await recipientEntries(RECIPIENT);
+  //
+  // Caught locally (#742), not left to propagate: an unreadable/non-regular
+  // recipient.txt here must FAIL just this one sub-check, not throw away the
+  // pin-recipients-config PASS already pushed onto `results` above.
+  let primary: string[];
+  try {
+    primary = await safeRecipientEntries(RECIPIENT);
+  } catch (e) {
+    results.push({
+      id: includedId,
+      status: 'fail',
+      message: `could not check ${RECIPIENT} against the CYPHER_BRAIN_PIN_RECIPIENTS allowlist: ${errMsg(e)}`,
+    });
+    return results;
+  }
   const notAllowed = primary.filter((r) => !allowed.has(r));
   if (notAllowed.length > 0) {
     results.push({
@@ -816,13 +849,34 @@ interface DoctorStateFile {
 
 const doctorStatePath = (): string => join(HOME, 'doctor-state.json');
 
+// A structurally valid non_passing ENTRY: report assembly below reads entry.since as a
+// string unconditionally (`.slice(0, 10)`) — a hand-edited or corrupted doctor-state.json
+// with e.g. `"since": null` on just one entry must not crash report assembly for every
+// check that already ran successfully (#763). Any entry that doesn't match this shape is
+// dropped rather than accepted or used to reject the WHOLE file's history.
+function isValidNonPassingEntry(v: unknown): v is DoctorStateFile['non_passing'][string] {
+  if (typeof v !== 'object' || v === null) return false;
+  const e = v as Record<string, unknown>;
+  return (e.status === 'warn' || e.status === 'fail') && typeof e.since === 'string' && e.since.length > 0;
+}
+
 async function loadDoctorState(statePath: string): Promise<DoctorStateFile | null> {
   try {
     const parsed = JSON.parse(await readFile(statePath, 'utf8')) as Partial<DoctorStateFile>;
     if (parsed.schema !== STATE_SCHEMA || typeof parsed.non_passing !== 'object' || parsed.non_passing === null) {
       return null; // unknown/corrupt shape — treat as "no history" rather than guessing
     }
-    return parsed as DoctorStateFile;
+    // Validate every entry INDEPENDENTLY (#763) rather than trusting the object shape
+    // check above to mean every value inside it is well-formed too.
+    const non_passing: DoctorStateFile['non_passing'] = {};
+    for (const [id, entry] of Object.entries(parsed.non_passing)) {
+      if (isValidNonPassingEntry(entry)) non_passing[id] = entry;
+    }
+    return {
+      schema: STATE_SCHEMA,
+      last_run: typeof parsed.last_run === 'string' ? parsed.last_run : '',
+      non_passing,
+    };
   } catch {
     return null; // missing (first-ever run) or unreadable
   }
@@ -860,6 +914,21 @@ async function saveDoctorState(
 
 const STATUS_TAG: Record<CheckStatus, string> = { pass: 'PASS', warn: 'WARN', fail: 'FAIL', skip: 'SKIP' };
 
+// Every line below can embed a value this process does not fully control — an
+// environment variable a check echoes back verbatim (e.g. GBRAIN_HOME), a path built
+// from one, a recipient string read from a file the operator (or, on a shared/
+// compromised machine, someone else) wrote. --json output already can't be abused this
+// way: JSON.stringify() never emits a literal control character, so an embedded
+// newline or ANSI escape sequence shows up escaped, not literally. This is the plain
+// renderer's equivalent (#764): a raw newline could forge a convincing extra
+// "[PASS] forged-health" line, and a raw ANSI escape sequence (ESC = \x1b, always a C0
+// control character) could redraw or clear whatever is already on screen. Collapse
+// newlines to a space so the line stays readable, then strip every other C0/DEL
+// character outright — none should ever appear in a genuine message.
+function sanitizeForPlainText(s: string): string {
+  return s.replace(/[\r\n]+/g, ' ').replace(/[\x00-\x1f\x7f]/g, '');
+}
+
 function printDoctorReport(report: DoctorReport): void {
   console.log('cypher-brain doctor — environment health check\n');
   for (const c of report.checks) {
@@ -869,12 +938,12 @@ function printDoctorReport(report: DoctorReport): void {
         : c.marker === 'carryover'
           ? ` (known since ${(c.since ?? '').slice(0, 10)})`
           : '';
-    console.log(`[${STATUS_TAG[c.status]}]${marker} ${c.message}`);
-    if (c.remediation) console.log(`         remediation: ${c.remediation}`);
+    console.log(sanitizeForPlainText(`[${STATUS_TAG[c.status]}]${marker} ${c.message}`));
+    if (c.remediation) console.log(sanitizeForPlainText(`         remediation: ${c.remediation}`));
   }
   if (report.resolved.length > 0) {
     console.log('\nResolved since last run:');
-    for (const r of report.resolved) console.log(`  [RESOLVED] ${r.message}`);
+    for (const r of report.resolved) console.log(sanitizeForPlainText(`  [RESOLVED] ${r.message}`));
   }
   const scoreNote =
     report.new_count === 0 && report.carryover_count === 0
@@ -884,33 +953,72 @@ function printDoctorReport(report: DoctorReport): void {
   console.log(`VERDICT: ${report.verdict}`);
   if (!report.state_saved && (report.new_count > 0 || report.carryover_count > 0)) {
     console.log(
-      `(note: could not persist ${report.state_path} — known-vs-new tracking will not carry over to the next run)`,
+      sanitizeForPlainText(
+        `(note: could not persist ${report.state_path} — known-vs-new tracking will not carry over to the next run)`,
+      ),
     );
   }
 }
 
+// Every entry below is one INDEPENDENT check, run in isolation from every other one
+// (#742): a single check's own I/O failure (a chmod'd-000 IDENTITY, a non-regular
+// RECIPIENT) used to reject the `await` chain computeDoctorReport() built these from
+// directly, which propagated out of the whole function — the CLI printed a raw
+// top-level error instead of a DoctorReport, and every check listed AFTER the failing
+// one never ran at all. `id` here is only the fallback id used if `run()` itself
+// throws (checks that report more than one sub-id, like pin-recipients/schedule,
+// already convert their OWN internal failures into named DoctorChecks — this is the
+// last-resort net for anything that still gets through uncaught).
+const CHECK_DEFS: ReadonlyArray<{
+  id: string;
+  run: () => DoctorCheck | DoctorCheck[] | Promise<DoctorCheck | DoctorCheck[]>;
+}> = [
+  { id: 'build-provenance', run: () => checkBuildProvenance() },
+  { id: 'home-dir-perms', run: () => checkHomeDirPerms() },
+  { id: 'identity-perms', run: () => checkKeyPerms('identity-perms', IDENTITY, 'age identity (private key)') },
+  {
+    id: 'sign-identity-perms',
+    run: () => checkKeyPerms('sign-identity-perms', SIGN_IDENTITY, 'signing identity (private key)'),
+  },
+  {
+    id: 'wallet-perms',
+    run: () => checkKeyPerms('wallet-perms', AR_WALLET || WALLET_DEFAULT_PATH, 'arweave JWK wallet', AR_WALLET !== ''),
+  },
+  {
+    id: 'ton-wallet-perms',
+    run: () =>
+      checkKeyPerms(
+        'ton-wallet-perms',
+        TON_WALLET || TON_WALLET_DEFAULT_PATH,
+        'TON wallet mnemonic',
+        TON_WALLET !== '',
+        'CYPHER_BRAIN_TON_WALLET',
+      ),
+  },
+  { id: 'identity-recipient-pairing', run: () => checkIdentityRecipientPairing() },
+  { id: 'pin-recipients-config', run: () => checkPinRecipients() },
+  { id: 'offline-backup-different-disk', run: () => checkOfflineBackupDisk() },
+  { id: 'schedule-last-run', run: () => checkSchedule() },
+  { id: 'audit-chain-integrity', run: () => checkAuditChain() },
+  { id: 'receipt-ledger-readability', run: () => checkReceiptLedger() },
+  { id: 'gbrain-engine-detection', run: () => checkGbrainEngine() },
+];
+
 export async function computeDoctorReport(): Promise<DoctorReport> {
-  const checks: DoctorCheck[] = [
-    checkBuildProvenance(),
-    await checkHomeDirPerms(),
-    await checkKeyPerms('identity-perms', IDENTITY, 'age identity (private key)'),
-    await checkKeyPerms('sign-identity-perms', SIGN_IDENTITY, 'signing identity (private key)'),
-    await checkKeyPerms('wallet-perms', AR_WALLET || WALLET_DEFAULT_PATH, 'arweave JWK wallet', AR_WALLET !== ''),
-    await checkKeyPerms(
-      'ton-wallet-perms',
-      TON_WALLET || TON_WALLET_DEFAULT_PATH,
-      'TON wallet mnemonic',
-      TON_WALLET !== '',
-      'CYPHER_BRAIN_TON_WALLET',
-    ),
-    await checkIdentityRecipientPairing(),
-    ...(await checkPinRecipients()),
-    await checkOfflineBackupDisk(),
-    ...(await checkSchedule()),
-    await checkAuditChain(),
-    await checkReceiptLedger(),
-    await checkGbrainEngine(),
-  ];
+  const checks: DoctorCheck[] = [];
+  for (const def of CHECK_DEFS) {
+    try {
+      const result = await def.run();
+      checks.push(...(Array.isArray(result) ? result : [result]));
+    } catch (e) {
+      checks.push({
+        id: def.id,
+        status: 'fail',
+        message: `the '${def.id}' check crashed unexpectedly and could not complete: ${errMsg(e)}`,
+        remediation: 'this is a bug in doctor itself — please report it, including the message above',
+      });
+    }
+  }
 
   const statePath = doctorStatePath();
   const prior = await loadDoctorState(statePath);

@@ -29,9 +29,9 @@
 // without touching launchctl/crontab — so the selftest never registers anything
 // on the machine that runs it.
 
-import { mkdir, writeFile, readFile, rm, readdir, chmod } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, rm, readdir, chmod, stat, open } from 'node:fs/promises';
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { realpathSync, type Stats } from 'node:fs';
 import { createHash } from 'node:crypto';
 
 import { join, resolve, dirname, basename } from 'node:path';
@@ -233,8 +233,18 @@ const parseAt = (at: string): { hour: number; minute: number } => {
   return { hour: Number(m[1]), minute: Number(m[2]) };
 };
 
+// Bounds every subprocess this file spawns (launchctl/crontab/pg_dump/`command -v`),
+// including the ones doctor's schedule check reads back through scheduleStatusReport()
+// (#743): a hostile or simply broken PATH shim for `launchctl`/`crontab` that never
+// returns would otherwise hang spawnSync() — and therefore this whole process —
+// indefinitely. These are all fast, local, non-interactive commands, so a generous
+// bound still fails fast on anything genuinely stuck. SIGKILL (not spawnSync's default
+// SIGTERM): the same "a stuck script can ignore SIGTERM but not SIGKILL" reasoning
+// proc.ts's own run() applies to a stuck child.
+const SH_TIMEOUT_MS = 15_000;
+
 function sh(cmd: string, args: string[], { input }: { input?: string } = {}): SpawnSyncReturns<string> {
-  return spawnSync(cmd, args, { encoding: 'utf8', input });
+  return spawnSync(cmd, args, { encoding: 'utf8', input, timeout: SH_TIMEOUT_MS, killSignal: 'SIGKILL' });
 }
 
 // ---------- generated artifact bodies (deterministic) ----------
@@ -1183,6 +1193,17 @@ async function readConfig(): Promise<ScheduleConfig> {
   return parsed;
 }
 
+// Only the TRAILING bytes of a nightly log are ever needed here: the runner
+// guarantees a final "OK rc=0 warnings=N" / "FAILED rc=N warnings=N" line, and that
+// line (never the middle of the file) is all this function reads for. A same-day log
+// can still grow large across repeated manual retries (the runner APPENDS — see
+// runnerBody()'s own LOG_START_LINES comment), so capping at a fixed byte budget
+// bounds this read's memory/time regardless of how large the file has grown, without
+// the false "unreadable" verdict an outright size-reject would give a large but
+// perfectly legitimate log (#743). 64 KiB is comfortably larger than any realistic
+// trailing rc line.
+const LOG_TAIL_BYTES = 64 * 1024;
+
 async function lastLog(): Promise<{ name: string; rcLine: string; warningCount: number | null } | null> {
   let names: string[] = [];
   try {
@@ -1192,7 +1213,42 @@ async function lastLog(): Promise<{ name: string; rcLine: string; warningCount: 
   }
   if (names.length === 0) return null;
   const name = names[names.length - 1];
-  const lines = (await readFile(join(LOGS_DIR, name), 'utf8')).split('\n').filter((l) => l.trim());
+  const logPath = join(LOGS_DIR, name);
+  // Confirm it is a plain file BEFORE ever opening it (#743): open()/readFile() on a
+  // FIFO with no writer BLOCKS INDEFINITELY at the open() call itself (a blocking
+  // open() on a named pipe waits for a writer to show up) — the exact same reasoning
+  // checkIdentityRecipientPairing()'s IDENTITY guard and util.ts's readJsonlLog()
+  // already document for their own stat()-then-open() checks, including the same
+  // narrow TOCTOU window (a path swapped for a FIFO between this stat() and the
+  // open() below) they explicitly accept rather than close: doing so would mean
+  // opening the path BLIND, reintroducing the exact hang this guard exists to
+  // prevent. Anything that fails this (vanished, or not a regular file) reads as an
+  // unrecognized status line below — the same "possibly a truncated or corrupted
+  // log" fallback an actually corrupt log already gets — rather than a hang.
+  let st: Stats | undefined;
+  try {
+    st = await stat(logPath);
+  } catch {
+    st = undefined;
+  }
+  if (!st?.isFile()) {
+    return { name, rcLine: '(unreadable log)', warningCount: null };
+  }
+  let text: string;
+  try {
+    const handle = await open(logPath, 'r');
+    try {
+      const start = Math.max(0, st.size - LOG_TAIL_BYTES);
+      const buf = Buffer.alloc(st.size - start);
+      await handle.read(buf, 0, buf.length, start);
+      text = buf.toString('utf8');
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  } catch {
+    return { name, rcLine: '(unreadable log)', warningCount: null };
+  }
+  const lines = text.split('\n').filter((l) => l.trim());
   // The runner guarantees a trailing OK/FAILED rc line per run; take the last one. The
   // trailing " warnings=N" suffix is #432 and OPTIONAL in this regex specifically so a
   // log written by an OLDER runner (pre-#432, bare "OK rc=0"/"FAILED rc=N") still
@@ -1322,7 +1378,13 @@ export async function scheduleStatusReport(): Promise<ScheduleStatusReport> {
     legacy = !!prior;
     const label = prior ? prior.label : LABEL;
     const r = sh('launchctl', ['print', `gui/${process.getuid?.()}/${label}`]);
-    loadedYesNo = !r.error && r.status === 0 ? 'yes' : 'no';
+    // Same "an error from the check ITSELF is UNKNOWN, not a confident no" posture the
+    // cron branch below already takes — r.error now also covers sh()'s own timeout
+    // (#743): a launchctl that is merely SLOW (or a broken PATH shim) must not be
+    // reported as a confident "not registered" the moment it is bounded away, since
+    // this check genuinely could not tell either way.
+    loadedYesNo = 'unknown';
+    if (!r.error) loadedYesNo = r.status === 0 ? 'yes' : 'no';
     triggerPath = cfg.trigger.path;
     if (prior) legacyNote = legacyLaunchdNote(prior.label);
   } else {

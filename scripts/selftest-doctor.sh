@@ -47,6 +47,18 @@
 #       shape against whatever verdict is ambient at that point in the script, never
 #       specifically forcing PARTIAL — so a regression only visible in --json's
 #       verdict/exit-code pairing could have shipped unnoticed).
+#   (z) POSITIVE CONTROL — #742: an uncaught read failure in ONE check (chmod 000
+#       identity.age) FAILs only that check — every other independent check still runs
+#       and doctor still emits a full DoctorReport, not a raw top-level error.
+#   (z2) POSITIVE CONTROL — #742: recipient.txt as a FIFO with no writer FAILs fast
+#       (never hangs), naming the FIFO, with every other check still running.
+#   (z3) POSITIVE CONTROL — #763: a structurally malformed doctor-state.json entry
+#       (`since: null`) is skipped rather than crashing report assembly.
+#   (z4) POSITIVE CONTROL — #764: a raw newline embedded in GBRAIN_HOME (exact issue
+#       repro) cannot forge an extra, believable report line in the plain-text
+#       renderer (--json was already safe by construction).
+#   (z5) POSITIVE CONTROL — #764: a raw ANSI escape byte embedded in GBRAIN_HOME
+#       cannot reach the plain-text renderer either.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -638,6 +650,90 @@ grep -qF 'a FIFO/named pipe' "$TMP/y-receipt.log" \
   || { echo "[FAIL] expected the FAIL message to name the FIFO, not a generic read error"; cat "$TMP/y-receipt.log"; exit 1; }
 grep -q '^VERDICT: FAIL$' "$TMP/y-receipt.log" || { echo "[FAIL] expected doctor's overall VERDICT to be FAIL"; cat "$TMP/y-receipt.log"; exit 1; }
 echo "[PASS] RECEIPT_LEDGER as a FIFO: receipt-ledger-readability FAILs fast (no hang) naming the FIFO, doctor VERDICT FAIL (exit 1)"
+
+echo "== (z) POSITIVE CONTROL — #742: an uncaught read failure in ONE check (chmod 000 identity.age) FAILs only that check — every other independent check still runs, and doctor still emits a full DoctorReport instead of a raw top-level error =="
+export CYPHER_BRAIN_HOME="$TMP/uncaught-throw-home"
+cb keygen > "$TMP/z-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/z-keygen.log"; exit 1; }
+chmod 000 "$CYPHER_BRAIN_HOME/identity.age"
+RC=0
+cb doctor --json > "$TMP/z.json" 2>"$TMP/z.err" || RC=$?
+[ "$RC" = "1" ] || { echo "[FAIL] doctor with an unreadable identity.age exited $RC, expected 1"; cat "$TMP/z.json" "$TMP/z.err"; exit 1; }
+grep -q '^error:' "$TMP/z.err" \
+  && { echo "[FAIL] doctor printed a raw top-level error instead of a DoctorReport — the #742 regression: ONE check's uncaught read failure aborted the whole report"; cat "$TMP/z.err"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const byId = Object.fromEntries(j.checks.map((c) => [c.id, c]));
+if (!byId['identity-recipient-pairing'] || byId['identity-recipient-pairing'].status !== 'fail') {
+  throw new Error('expected identity-recipient-pairing to FAIL, got ' + JSON.stringify(byId['identity-recipient-pairing']));
+}
+for (const id of ['home-dir-perms', 'identity-perms', 'gbrain-engine-detection', 'pin-recipients-config']) {
+  if (!byId[id]) throw new Error(id + ' is missing from the report — a check after the failing one never ran (#742 regression)');
+}
+" "$TMP/z.json"
+echo "[PASS] an unreadable identity.age FAILs only identity-recipient-pairing; every other check still ran; doctor still emitted a full DoctorReport (exit 1)"
+
+echo "== (z2) POSITIVE CONTROL — #742: recipient.txt as a FIFO with no writer must FAIL FAST, never hang, and every other independent check still runs =="
+export CYPHER_BRAIN_HOME="$TMP/recipient-fifo-home"
+cb keygen > "$TMP/z2-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/z2-keygen.log"; exit 1; }
+rm -f "$CYPHER_BRAIN_HOME/recipient.txt"
+mkfifo "$CYPHER_BRAIN_HOME/recipient.txt"
+RC=0
+with_timeout 8 cb doctor --json > "$TMP/z2.json" 2>"$TMP/z2.err" || RC=$?
+[ "$RC" != "137" ] || { echo "[FAIL] doctor HUNG reading recipient.txt as a FIFO with no writer (killed after 8s) — the #742 hang regressed"; cat "$TMP/z2.json" "$TMP/z2.err"; exit 1; }
+[ "$RC" = "1" ] || { echo "[FAIL] doctor with recipient.txt as a FIFO exited $RC, expected 1 (FAIL, not a hang or a silent pass)"; cat "$TMP/z2.json" "$TMP/z2.err"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const byId = Object.fromEntries(j.checks.map((c) => [c.id, c]));
+if (!byId['identity-recipient-pairing'] || byId['identity-recipient-pairing'].status !== 'fail') {
+  throw new Error('expected identity-recipient-pairing to FAIL, got ' + JSON.stringify(byId['identity-recipient-pairing']));
+}
+if (!/FIFO/i.test(byId['identity-recipient-pairing'].message)) {
+  throw new Error('expected the FAIL message to name the FIFO, got: ' + byId['identity-recipient-pairing'].message);
+}
+for (const id of ['home-dir-perms', 'identity-perms', 'gbrain-engine-detection']) {
+  if (!byId[id]) throw new Error(id + ' is missing from the report — a check after the hanging one never ran (#742 regression)');
+}
+" "$TMP/z2.json"
+echo "[PASS] recipient.txt as a FIFO: identity-recipient-pairing FAILs fast (no hang) naming the FIFO; every other check still ran; doctor exit 1"
+
+echo "== (z3) POSITIVE CONTROL — #763: a structurally malformed doctor-state.json entry (since: null) is skipped, not a crash — doctor still runs every check and prints a full report =="
+export CYPHER_BRAIN_HOME="$TMP/malformed-state-home"
+cb keygen > "$TMP/z3-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/z3-keygen.log"; exit 1; }
+cat > "$CYPHER_BRAIN_HOME/doctor-state.json" <<'JSONEOF'
+{"schema":1,"last_run":"x","non_passing":{"stale-check-id":{"status":"fail","since":null}}}
+JSONEOF
+RC=0
+cb doctor --json > "$TMP/z3.json" 2>"$TMP/z3.err" || RC=$?
+[ "$RC" = "0" ] || { echo "[FAIL] doctor with a malformed doctor-state.json entry exited $RC, expected 0 (a healthy keygen'd home with an unrelated stale entry)"; cat "$TMP/z3.json" "$TMP/z3.err"; exit 1; }
+grep -q '^error:' "$TMP/z3.err" \
+  && { echo "[FAIL] doctor crashed on a malformed doctor-state.json entry instead of skipping it — the #763 regression"; cat "$TMP/z3.err"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+if (j.verdict !== 'PASS') throw new Error('expected verdict PASS, got ' + j.verdict + ' — ' + JSON.stringify(j.checks));
+" "$TMP/z3.json"
+echo "[PASS] a structurally malformed doctor-state.json entry is skipped rather than crashing report assembly; doctor still runs every check (exit 0)"
+
+echo "== (z4) POSITIVE CONTROL — #764: a raw newline embedded in GBRAIN_HOME cannot forge an extra, believable report line in the plain-text renderer (exact issue repro; --json was already safe by construction) =="
+export CYPHER_BRAIN_HOME="$TMP/sanitize-home"
+cb keygen > "$TMP/z4-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/z4-keygen.log"; exit 1; }
+RC=0
+GBRAIN_HOME=$'not/absolute\n[PASS] forged-health' cb doctor > "$TMP/z4.log" 2>&1 || RC=$?
+grep -qE '^\[PASS\] forged-health' "$TMP/z4.log" \
+  && { echo "[FAIL] the forged '[PASS] forged-health' line was injected as its own believable report line — the #764 regression"; cat "$TMP/z4.log"; exit 1; }
+grep -qF 'GBRAIN_HOME=' "$TMP/z4.log" \
+  || { echo "[FAIL] expected the gbrain-engine-detection WARN naming the invalid GBRAIN_HOME to still be present (sanitized, not dropped)"; cat "$TMP/z4.log"; exit 1; }
+echo "[PASS] a raw newline embedded in GBRAIN_HOME is neutralized (collapsed to a space); no forged standalone report line appears"
+
+echo "== (z5) POSITIVE CONTROL — #764: a raw ANSI escape byte embedded in GBRAIN_HOME cannot reach the plain-text renderer (same unsanitized sink, a control character other than newline) =="
+export CYPHER_BRAIN_HOME="$TMP/sanitize-home-ansi"
+cb keygen > "$TMP/z5-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/z5-keygen.log"; exit 1; }
+RC=0
+GBRAIN_HOME=$'\x1b[2Jnot/absolute' cb doctor > "$TMP/z5.log" 2>&1 || RC=$?
+grep -q $'\x1b' "$TMP/z5.log" \
+  && { echo "[FAIL] a raw ANSI escape byte reached the plain-text report — the #764 regression"; cat "$TMP/z5.log"; exit 1; }
+grep -qF 'GBRAIN_HOME=' "$TMP/z5.log" \
+  || { echo "[FAIL] expected the gbrain-engine-detection WARN naming the invalid GBRAIN_HOME to still be present (sanitized, not dropped)"; cat "$TMP/z5.log"; exit 1; }
+echo "[PASS] a raw ANSI escape byte embedded in GBRAIN_HOME is stripped from the plain-text report"
 
 echo
 echo "all cypher-brain doctor selftests passed"
