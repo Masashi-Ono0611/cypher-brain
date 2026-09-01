@@ -77,11 +77,25 @@ grep -qF "NFT address: $MOCK_ADDR" "$TMP/happy.err" || { echo "[FAIL] resolved N
 grep -q "Bag id: $BAG_ID" "$TMP/happy.err" || { echo "[FAIL] bag id not printed"; exit 1; }
 grep -q 'cypher-brain never signs transactions' "$TMP/happy.err" || { echo "[FAIL] never-signs disclosure missing"; exit 1; }
 echo "[PASS] domain, NFT address, bag id and the never-signs disclosure were all printed"
+grep -qF "view on tonviewer: https://tonviewer.com/$MOCK_ADDR" "$TMP/happy.err" || { echo "[FAIL] default tonviewer.com cross-check link not printed"; cat "$TMP/happy.err"; exit 1; }
+grep -qF "against https://tonviewer.com/$MOCK_ADDR, a different service" "$TMP/happy.err" || { echo "[FAIL] default tonviewer.com link missing from the cross-check warning"; cat "$TMP/happy.err"; exit 1; }
+echo "[PASS] default (unset CYPHER_BRAIN_TON_TONVIEWER_URL) cross-check link is https://tonviewer.com"
 grep -q "CONFIRMED: test.ton's DNS storage record now resolves to $BAG_ID" "$TMP/happy.err" || { echo "[FAIL] --wait did not report CONFIRMED"; cat "$TMP/happy.err"; exit 1; }
 echo "[PASS] --wait polled the mock resolve endpoint until it flipped, then reported CONFIRMED"
 
 echo "== happy path: decoded deeplink BOC carries op 0x4eb1f0f9 and the bag id bytes =="
 node "$ROOT/scripts/decode-tonkeeper-deeplink.mjs" "$DEEPLINK" "$BAG_ID"
+
+echo "== positive control (#693): CYPHER_BRAIN_TON_TONVIEWER_URL overrides the printed cross-check link =="
+TESTNET_TONVIEWER="https://testnet.tonviewer.com"
+CYPHER_BRAIN_TON_TONVIEWER_URL="$TESTNET_TONVIEWER" \
+  cb publish-latest --domain test.ton --from-locator-file "$TMP/loc.tsv" --yes >/dev/null 2>"$TMP/tonviewer-override.err"
+grep -qF "view on tonviewer: $TESTNET_TONVIEWER/$MOCK_ADDR" "$TMP/tonviewer-override.err" || { echo "[FAIL] CYPHER_BRAIN_TON_TONVIEWER_URL override not reflected in the printed link"; cat "$TMP/tonviewer-override.err"; exit 1; }
+grep -qF "against $TESTNET_TONVIEWER/$MOCK_ADDR, a different service" "$TMP/tonviewer-override.err" || { echo "[FAIL] CYPHER_BRAIN_TON_TONVIEWER_URL override not reflected in the cross-check warning"; cat "$TMP/tonviewer-override.err"; exit 1; }
+if grep -qF "https://tonviewer.com/$MOCK_ADDR" "$TMP/tonviewer-override.err"; then
+  echo "[FAIL] mainnet tonviewer.com link still printed despite CYPHER_BRAIN_TON_TONVIEWER_URL override"; cat "$TMP/tonviewer-override.err"; exit 1
+fi
+echo "[PASS] CYPHER_BRAIN_TON_TONVIEWER_URL overrides the printed cross-check link (e.g. to testnet.tonviewer.com)"
 
 echo "== positive control: non-ton locator file is REFUSED =="
 printf 'fake-arweave-tx-id\tarweave\tdeadbeef\n' > "$TMP/nonton-loc.tsv"

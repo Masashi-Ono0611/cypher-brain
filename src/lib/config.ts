@@ -55,6 +55,7 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_TON_NO_FALLBACK',
   'CYPHER_BRAIN_TON_NETWORK_CONFIG',
   'CYPHER_BRAIN_TON_TONAPI_URL',
+  'CYPHER_BRAIN_TON_TONVIEWER_URL',
   'CYPHER_BRAIN_TON_PROVIDER_OWNER',
   'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND',
   'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN',
@@ -460,6 +461,13 @@ export const TON_NETWORK_CONFIG = readEnv('CYPHER_BRAIN_TON_NETWORK_CONFIG') || 
 // scripts/selftest-ton-dns.sh can point it at a local mock HTTP server instead of the
 // real service (no real-network calls in CI).
 export const TON_TONAPI_URL = readEnv('CYPHER_BRAIN_TON_TONAPI_URL') || 'https://tonapi.io';
+// `publish-latest` (src/lib/ton-dns.ts) only — base URL for the human-facing "cross-check
+// this address on a second, independent service" link printed alongside the Tonkeeper
+// deeplink (multi-model review W1's destination-trust mitigation). Unlike TON_TONAPI_URL,
+// this has no auto-derivation from TON_NETWORK_CONFIG (#693): mainnet tonviewer does not
+// index testnet addresses, so an operator running against testnet must set this to
+// https://testnet.tonviewer.com themselves, same as they already do for TON_TONAPI_URL.
+export const TON_TONVIEWER_URL = readEnv('CYPHER_BRAIN_TON_TONVIEWER_URL') || 'https://tonviewer.com';
 // ton-provider backend (src/lib/backends/ton-provider.ts, issue #396): pays a live
 // mytonprovider.org market provider instead of self-hosting a seeder. Mainnet-only —
 // the provider market itself is a mainnet market (docs/ton-storage-status.md), so unlike
