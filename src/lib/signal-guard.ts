@@ -13,7 +13,7 @@
 // itself does not have: that scratch dir outlives restoreImpl()'s own out-dir tracking
 // (component auto-expand still runs after restoreImpl() clears ACTIVE_RESTORE_OUT_DIR),
 // so it needs its OWN, longer-lived tracked variable rather than reusing that one.
-import { rmSync, readdirSync, chmodSync, writeFileSync, type Dirent } from 'node:fs';
+import { rmSync, readdirSync, chmodSync, writeFileSync, lstatSync, type Dirent } from 'node:fs';
 import { join } from 'node:path';
 import { ACTIVE_CHILDREN } from './proc.js';
 
@@ -241,12 +241,36 @@ export function installStageSignalGuard(): void {
           // touched it — drop a durable sentinel instead (a console.error here could be
           // lost: the process is about to die and stderr writes are not guaranteed to
           // flush before that happens).
+          const sentinelPath = join(ACTIVE_RESTORE_OUT_DIR, '.cypher-brain-restore-INCOMPLETE');
+          // #741: writeFileSync() opens the path with O_CREAT|O_WRONLY|O_TRUNC — if
+          // something (an attacker who predicted this exact name, or an accidental
+          // leftover) already made that name a FIFO, open() blocks synchronously
+          // forever waiting for a reader that will never come, since this IS the
+          // signal handler. That hangs the whole handler: every cleanup after this
+          // point (verify/MCP/gitleaks/TON scratch dirs, the signal re-raise below)
+          // never runs, and the process needs SIGKILL. A symlink is just as unsafe —
+          // it would silently truncate whatever writable file it points at instead of
+          // this sentinel. lstatSync (never following the link/FIFO itself) lets this
+          // rule both out before ever calling open(); a plain ENOENT (the ordinary
+          // case — nothing there yet) or an already-ordinary file (a leftover sentinel
+          // from a prior interrupted run, safe to overwrite) are the only paths that
+          // reach the write below.
+          let safeToWrite = true;
           try {
-            writeFileSync(
-              join(ACTIVE_RESTORE_OUT_DIR, '.cypher-brain-restore-INCOMPLETE'),
-              `restore interrupted by ${sig} at ${new Date().toISOString()} — this directory may hold a partially-extracted tree; discard it before trusting the contents\n`,
-            );
-          } catch {}
+            safeToWrite = lstatSync(sentinelPath).isFile();
+          } catch {
+            // ENOENT/ENOTDIR (nothing there yet) or any other lstat failure — leave
+            // safeToWrite at its default `true` and let the write attempt itself (still
+            // best-effort, still swallowed below) be the final word.
+          }
+          if (safeToWrite) {
+            try {
+              writeFileSync(
+                sentinelPath,
+                `restore interrupted by ${sig} at ${new Date().toISOString()} — this directory may hold a partially-extracted tree; discard it before trusting the contents\n`,
+              );
+            } catch {}
+          }
         }
         ACTIVE_RESTORE_OUT_DIR = null;
         ACTIVE_RESTORE_OUT_DIR_PREEXISTED = false;

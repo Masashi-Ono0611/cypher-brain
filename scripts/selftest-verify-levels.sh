@@ -318,6 +318,35 @@ QFIRST=$(printf '%s\n' "$QPLAIN" | head -1)
   && echo "[PASS] --level quick's plain-text output starts with 'level: quick'" \
   || { echo "[FAIL] --level quick's first output line was '$QFIRST', expected 'level: quick'"; exit 1; }
 
+echo "== #745: 'level: quick' must not print to stdout before --in is validated =="
+# Sibling commands (restore, and #528/#536 above's own remote/drill checks) print
+# nothing to stdout on a basic usage/argument error — only the error line goes to
+# stderr. quick used to violate that: the "level: quick" console.log two lines above
+# this test's setup fired unconditionally, BEFORE runFileChecks()'s own --in
+# presence/existence check ever ran — so a caller with no --in, or a typo'd path, still
+# saw a stdout line ahead of the stderr error.
+set +e
+NOIN_OUT=$(cb verify 2>"$TMP/745-noin.err"); NOIN_RC=$?
+set -e
+[ "$NOIN_RC" != "0" ] || { echo "[FAIL] verify with no --in exited 0"; exit 1; }
+[ -z "$NOIN_OUT" ] \
+  && echo "[PASS] verify with no --in prints nothing to stdout" \
+  || { echo "[FAIL] verify with no --in printed to stdout: $NOIN_OUT"; exit 1; }
+grep -q 'required' "$TMP/745-noin.err" \
+  && echo "[PASS] verify with no --in reports the error on stderr" \
+  || { echo "[FAIL] verify with no --in stderr missing the expected error"; cat "$TMP/745-noin.err"; exit 1; }
+
+set +e
+BADIN_OUT=$(cb verify --in "$TMP/745-does-not-exist.age" 2>"$TMP/745-badin.err"); BADIN_RC=$?
+set -e
+[ "$BADIN_RC" != "0" ] || { echo "[FAIL] verify --in <nonexistent> exited 0"; exit 1; }
+[ -z "$BADIN_OUT" ] \
+  && echo "[PASS] verify --in <nonexistent> prints nothing to stdout" \
+  || { echo "[FAIL] verify --in <nonexistent> printed to stdout: $BADIN_OUT"; exit 1; }
+grep -q 'no such file' "$TMP/745-badin.err" \
+  && echo "[PASS] verify --in <nonexistent> reports the error on stderr" \
+  || { echo "[FAIL] verify --in <nonexistent> stderr missing the expected error"; cat "$TMP/745-badin.err"; exit 1; }
+
 echo "== #528 setup: a genuinely signed artifact, pushed with --save-locator (records the sig_locator as the 6th field) =="
 SIGHOME528="$TMP/sig-keys-528"; mkdir -p "$SIGHOME528"
 CYPHER_BRAIN_HOME="$SIGHOME528" cb keygen >/dev/null
