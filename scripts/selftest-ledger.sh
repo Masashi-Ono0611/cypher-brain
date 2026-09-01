@@ -103,7 +103,10 @@ import('$ROOT/src/lib/receipt.ts').then(async (m) => {
     raw: { note: 'unpriced arweave receipt' },
   });
   // undated (priced, but an unparseable timestamp): must still land in by_backend
-  // (ton-provider), but must NOT create a by_day/by_month bucket.
+  // (ton-provider), but must NOT create a by_day/by_month bucket. Also the LEGACY
+  // lowercase 'nanoton' casing (receipt.ts accepts it for backward-read compatibility —
+  // see the next receipt below, which uses the current 'nanoTON' casing for the SAME
+  // backend, to prove the two get merged rather than reported as two separate units).
   await m.appendReceipt({
     timestamp: 'not-a-valid-timestamp',
     backend: 'ton-provider',
@@ -114,6 +117,21 @@ import('$ROOT/src/lib/receipt.ts').then(async (m) => {
     cost: '77',
     unit: 'nanoton',
     raw: { note: 'undated ton-provider receipt' },
+  });
+  // #751 follow-up (Codex review): priced + dated, SAME backend (ton-provider) as the
+  // receipt above but with the CURRENT 'nanoTON' casing — a ledger spanning the casing
+  // fix must aggregate both under ONE key (by_backend/by_day/by_month), not report the
+  // same physical unit split across 'nanoton' and 'nanoTON'.
+  await m.appendReceipt({
+    timestamp: '2026-03-05T00:00:00.000Z',
+    backend: 'ton-provider',
+    locator: 'tp-loc-dated-nanoTON',
+    artifact_sha256: 'e'.repeat(64),
+    size_bytes: 555,
+    payer_address: null,
+    cost: '23',
+    unit: 'nanoTON',
+    raw: { note: 'dated ton-provider receipt, current casing' },
   });
 });
 "
@@ -126,7 +144,7 @@ printf 'not json at all\n' >> "$RECEIPT_LEDGER_PATH"
 LEDGER_JSON=$(cb ledger --json)
 node -e '
   const j = JSON.parse(process.argv[1]);
-  if (j.total_receipts !== 4) throw new Error("expected total_receipts 4 (the malformed line is not a receipt), got " + j.total_receipts);
+  if (j.total_receipts !== 5) throw new Error("expected total_receipts 5 (the malformed line is not a receipt), got " + j.total_receipts);
   if (j.skipped_lines !== 1) throw new Error("expected skipped_lines 1, got " + j.skipped_lines);
   if (j.unpriced_receipts !== 1) throw new Error("expected unpriced_receipts 1, got " + j.unpriced_receipts);
   if (j.undated_receipts !== 1) throw new Error("expected undated_receipts 1, got " + j.undated_receipts);
@@ -135,16 +153,30 @@ node -e '
   if (ar.cost.winston !== "1000") throw new Error("expected by_backend.arweave.cost.winston 1000 (unpriced receipt excluded from the sum), got " + JSON.stringify(ar));
   const tb = j.by_backend.turbo;
   if (!tb || tb.count !== 1 || tb.cost.winc !== "500") throw new Error("expected by_backend.turbo count 1 / cost.winc 500, got " + JSON.stringify(tb));
+  // #751 follow-up (Codex review): one receipt was written with the legacy lowercase
+  // "nanoton" and one with the current "nanoTON" — summarizeLedger() must merge them
+  // under the SINGLE canonical "nanoTON" key (77 + 23 = 100), never report the same
+  // physical unit split across two keys, and never leave the legacy "nanoton" key
+  // present at all in the aggregated view.
   const tp = j.by_backend["ton-provider"];
-  if (!tp || tp.count !== 1 || tp.cost.nanoton !== "77") throw new Error("expected by_backend[ton-provider] count 1 / cost.nanoton 77 (undated but priced -> still counted here), got " + JSON.stringify(tp));
+  if (!tp || tp.count !== 2) throw new Error("expected by_backend[ton-provider].count 2 (one legacy-cased + one current-cased receipt), got " + JSON.stringify(tp));
+  if (tp.cost.nanoTON !== "100") throw new Error("expected by_backend[ton-provider].cost.nanoTON 100 (77 legacy-cased + 23 current-cased, merged), got " + JSON.stringify(tp));
+  if ("nanoton" in tp.cost) throw new Error("by_backend[ton-provider].cost still has a separate legacy \"nanoton\" key (not merged): " + JSON.stringify(tp));
   if (j.by_day["2026-01-15"]?.winston !== "1000") throw new Error("expected by_day[2026-01-15].winston 1000, got " + JSON.stringify(j.by_day));
   if (j.by_month["2026-01"]?.winston !== "1000") throw new Error("expected by_month[2026-01].winston 1000, got " + JSON.stringify(j.by_month));
   if (j.by_day["2026-02-20"]?.winc !== "500") throw new Error("expected by_day[2026-02-20].winc 500, got " + JSON.stringify(j.by_day));
-  if (Object.keys(j.by_day).length !== 2) throw new Error("expected exactly 2 by_day buckets (the undated receipt must not create a 3rd), got " + JSON.stringify(j.by_day));
-  if (Object.keys(j.by_month).length !== 2) throw new Error("expected exactly 2 by_month buckets (the undated receipt must not create a 3rd), got " + JSON.stringify(j.by_month));
-  if (j.receipts.length !== 4) throw new Error("expected the receipts array to have all 4 valid receipts, got " + j.receipts.length);
+  if (j.by_day["2026-03-05"]?.nanoTON !== "23") throw new Error("expected by_day[2026-03-05].nanoTON 23, got " + JSON.stringify(j.by_day));
+  if (j.by_month["2026-03"]?.nanoTON !== "23") throw new Error("expected by_month[2026-03].nanoTON 23, got " + JSON.stringify(j.by_month));
+  if (Object.keys(j.by_day).length !== 3) throw new Error("expected exactly 3 by_day buckets (the undated receipt must not create a 4th), got " + JSON.stringify(j.by_day));
+  if (Object.keys(j.by_month).length !== 3) throw new Error("expected exactly 3 by_month buckets (the undated receipt must not create a 4th), got " + JSON.stringify(j.by_month));
+  if (j.receipts.length !== 5) throw new Error("expected the receipts array to have all 5 valid receipts, got " + j.receipts.length);
+  // The raw receipts array is verbatim, unlike the aggregated sums above — it must
+  // still show the ORIGINAL "nanoton" casing for the receipt that was actually written
+  // that way (receipt.ts never normalizes what a receipt says on read).
+  const rawUndated = j.receipts.find((r) => r.locator === "tp-loc-undated");
+  if (!rawUndated || rawUndated.unit !== "nanoton") throw new Error("expected the raw receipts array to preserve the legacy \"nanoton\" casing verbatim, got " + JSON.stringify(rawUndated));
 ' "$LEDGER_JSON" || { echo "[FAIL] ledger --json multi-backend/unpriced/undated aggregation is wrong"; echo "$LEDGER_JSON"; exit 1; }
-echo "[PASS] ledger --json: 3 backends aggregated correctly; unpriced receipt counted but excluded from cost sums; undated-but-priced receipt counted in by_backend but excluded from by_day/by_month; malformed line counted as skipped_lines (#571)"
+echo "[PASS] ledger --json: 3 backends aggregated correctly; unpriced receipt counted but excluded from cost sums; undated-but-priced receipt counted in by_backend but excluded from by_day/by_month; malformed line counted as skipped_lines; legacy/current nanoTON casing merged in aggregation but preserved verbatim in the raw receipts array (#571, #751)"
 
 LEDGER_HUMAN=$(cb ledger)
 printf '%s' "$LEDGER_HUMAN" | grep -q 'arweave' || { echo "[FAIL] ledger (human) does not mention arweave: $LEDGER_HUMAN"; exit 1; }
@@ -160,14 +192,19 @@ CSV_FIRST_LINE=$(printf '%s\n' "$LEDGER_CSV" | head -1)
 [ "$CSV_FIRST_LINE" = "$EXPECTED_HEADER" ] \
   || { echo "[FAIL] ledger --csv header row is wrong: $CSV_FIRST_LINE"; exit 1; }
 CSV_LINES=$(printf '%s\n' "$LEDGER_CSV" | wc -l | tr -d ' ')
-[ "$CSV_LINES" = "5" ] \
-  || { echo "[FAIL] expected 5 csv lines (1 header + 4 receipts, the malformed line excluded), got $CSV_LINES"; echo "$LEDGER_CSV"; exit 1; }
+[ "$CSV_LINES" = "6" ] \
+  || { echo "[FAIL] expected 6 csv lines (1 header + 5 receipts, the malformed line excluded), got $CSV_LINES"; echo "$LEDGER_CSV"; exit 1; }
 printf '%s' "$LEDGER_CSV" | grep -q 'ar-loc-1' || { echo "[FAIL] ledger --csv missing the arweave receipt's locator: $LEDGER_CSV"; exit 1; }
 printf '%s' "$LEDGER_CSV" | grep -q 'turbo-loc-1' || { echo "[FAIL] ledger --csv missing the turbo receipt's locator: $LEDGER_CSV"; exit 1; }
 printf '%s' "$LEDGER_CSV" | grep -q 'tp-loc-undated' || { echo "[FAIL] ledger --csv missing the undated ton-provider receipt's locator: $LEDGER_CSV"; exit 1; }
+printf '%s' "$LEDGER_CSV" | grep -q 'tp-loc-dated-nanoTON' || { echo "[FAIL] ledger --csv missing the current-cased ton-provider receipt's locator: $LEDGER_CSV"; exit 1; }
 printf '%s' "$LEDGER_CSV" | grep -q 'ar-loc-unpriced' \
   || { echo "[FAIL] ledger --csv missing the unpriced receipt's locator (--csv is a raw export, unpriced receipts ARE included): $LEDGER_CSV"; exit 1; }
-echo "[PASS] ledger --csv: one row per receipt (4), correct header, malformed line not included (#571)"
+# --csv is a raw per-receipt export (unlike --json's aggregated sums above) — it must
+# show each receipt's ORIGINAL unit casing verbatim, including the legacy "nanoton".
+printf '%s' "$LEDGER_CSV" | grep 'tp-loc-undated' | grep -q ',77,nanoton,' \
+  || { echo "[FAIL] ledger --csv did not preserve the legacy 'nanoton' casing verbatim for tp-loc-undated: $LEDGER_CSV"; exit 1; }
+echo "[PASS] ledger --csv: one row per receipt (5), correct header, malformed line not included, legacy unit casing preserved verbatim (#571, #751)"
 
 echo "== (c) --csv wins when both --json and --csv are given (documented mutual exclusivity) =="
 LEDGER_BOTH=$(cb ledger --json --csv)

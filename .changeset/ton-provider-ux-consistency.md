@@ -25,4 +25,8 @@ Fixes several TON/ton-provider UX/consistency rough edges found during dogfoodin
 - The `nanoTON` unit casing is now consistent everywhere this physical unit appears
   (`estimate --json`, receipts, `ledger`) — `ton-provider`'s own receipts previously wrote
   lowercase `nanoton` while `estimate.ts` used `nanoTON` everywhere else. Receipts already
-  on disk with the old lowercase casing are still read back correctly (#751).
+  on disk with the old lowercase casing are still read back correctly, and `ledger`'s
+  aggregated sums (`by_backend`/`by_day`/`by_month`) merge the legacy and current casing
+  under the one canonical `nanoTON` key instead of reporting the same spend split across
+  two units — the raw `receipts` array and `--csv` export still show each receipt's
+  original casing verbatim (#751).
