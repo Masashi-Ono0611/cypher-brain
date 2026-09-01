@@ -13,7 +13,7 @@
 // itself does not have: that scratch dir outlives restoreImpl()'s own out-dir tracking
 // (component auto-expand still runs after restoreImpl() clears ACTIVE_RESTORE_OUT_DIR),
 // so it needs its OWN, longer-lived tracked variable rather than reusing that one.
-import { rmSync, readdirSync, chmodSync, writeFileSync, lstatSync, type Dirent } from 'node:fs';
+import { rmSync, readdirSync, chmodSync, writeFileSync, type Dirent } from 'node:fs';
 import { join } from 'node:path';
 import { ACTIVE_CHILDREN } from './proc.js';
 
@@ -242,7 +242,7 @@ export function installStageSignalGuard(): void {
           // lost: the process is about to die and stderr writes are not guaranteed to
           // flush before that happens).
           const sentinelPath = join(ACTIVE_RESTORE_OUT_DIR, '.cypher-brain-restore-INCOMPLETE');
-          // #741: writeFileSync() opens the path with O_CREAT|O_WRONLY|O_TRUNC — if
+          // #741: plain writeFileSync() opens with O_CREAT|O_WRONLY|O_TRUNC — if
           // something (an attacker who predicted this exact name, or an accidental
           // leftover) already made that name a FIFO, open() blocks synchronously
           // forever waiting for a reader that will never come, since this IS the
@@ -250,27 +250,27 @@ export function installStageSignalGuard(): void {
           // point (verify/MCP/gitleaks/TON scratch dirs, the signal re-raise below)
           // never runs, and the process needs SIGKILL. A symlink is just as unsafe —
           // it would silently truncate whatever writable file it points at instead of
-          // this sentinel. lstatSync (never following the link/FIFO itself) lets this
-          // rule both out before ever calling open(); a plain ENOENT (the ordinary
-          // case — nothing there yet) or an already-ordinary file (a leftover sentinel
-          // from a prior interrupted run, safe to overwrite) are the only paths that
-          // reach the write below.
-          let safeToWrite = true;
+          // this sentinel.
+          //
+          // An lstat-then-write check (an earlier draft of this fix) is NOT enough:
+          // it is two syscalls, and anything able to plant a FIFO/symlink at a
+          // predictable path can just as easily re-plant it in the gap between the
+          // lstat and the writeFileSync() that follows (multi-model review finding).
+          // The `wx` flag makes this one atomic syscall instead: O_CREAT|O_EXCL fails
+          // outright — before the kernel ever treats the name as a FIFO/device/symlink
+          // — the instant ANYTHING already exists at this path, hostile or not. The
+          // one case this intentionally no longer refreshes is a LEGITIMATE leftover
+          // sentinel from an earlier interrupted run at the same --out-dir: it is left
+          // untouched rather than overwritten with a newer timestamp, which is an
+          // acceptable trade for closing the race — the directory is already correctly
+          // flagged incomplete either way.
           try {
-            safeToWrite = lstatSync(sentinelPath).isFile();
-          } catch {
-            // ENOENT/ENOTDIR (nothing there yet) or any other lstat failure — leave
-            // safeToWrite at its default `true` and let the write attempt itself (still
-            // best-effort, still swallowed below) be the final word.
-          }
-          if (safeToWrite) {
-            try {
-              writeFileSync(
-                sentinelPath,
-                `restore interrupted by ${sig} at ${new Date().toISOString()} — this directory may hold a partially-extracted tree; discard it before trusting the contents\n`,
-              );
-            } catch {}
-          }
+            writeFileSync(
+              sentinelPath,
+              `restore interrupted by ${sig} at ${new Date().toISOString()} — this directory may hold a partially-extracted tree; discard it before trusting the contents\n`,
+              { flag: 'wx' },
+            );
+          } catch {}
         }
         ACTIVE_RESTORE_OUT_DIR = null;
         ACTIVE_RESTORE_OUT_DIR_PREEXISTED = false;
