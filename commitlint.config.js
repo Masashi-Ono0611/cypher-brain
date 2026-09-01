@@ -6,7 +6,7 @@
 // commits: this repo squash-merges, so the PR title is the message that lands on
 // main and is the only one that ends up in `git log`. Linting per-commit would
 // enforce a shape on messages that are about to be discarded, while leaving the
-// one that survives unchecked. See .github/workflows/ci.yml's `commitlint` job.
+// one that survives unchecked. See .github/workflows/pr-hygiene.yml's `commitlint` job.
 export default {
   extends: ['@commitlint/config-conventional'],
   rules: {

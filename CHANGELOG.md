@@ -43,7 +43,7 @@ project's major milestones so far, from the initial proof-of-concept to today.
   unattended nightly cadence via `schedule install|uninstall|status`.
 - **`verify` / recovery tooling**, including a `PARTIAL` verdict (never a
   false `PASS`) when run on a public-key-only box, and recipient pinning
-  via `CIPHER_BRAIN_PIN_RECIPIENTS` to guard against silent re-keying.
+  via `CYPHER_BRAIN_PIN_RECIPIENTS` to guard against silent re-keying.
 - **TypeScript conversion** with a strict `tsc` gate on CI, and a
   `src/` + `Bun.build` bundle split with a `npm run verify` gate covering
   build, typecheck, and the full selftest suite (core, profiles, interop,
@@ -51,7 +51,7 @@ project's major milestones so far, from the initial proof-of-concept to today.
   deps) plus CLI and MCP smoke tests.
 - **`doctor` / `ledger` / `audit` commands.** Read-only diagnostics:
   `doctor` is an environment health check (permissions, key/recipient
-  pairing, schedule state, ...) with a PASS/WARN/PARTIAL/FAIL verdict and a
+  pairing, schedule state, ...) with a PASS/PARTIAL/FAIL verdict and a
   health score; `ledger` is a cumulative cost report over every paid push's
   receipt; `audit` verifies the hash-chained log of every push/restore/verify
   run. All three support `--json`.

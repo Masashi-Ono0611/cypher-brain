@@ -442,7 +442,11 @@ string is passed as a process argument; for password auth use `~/.pgpass` or
 `PGPASSWORD` so secrets stay out of the process list. Binary paths are overridable
 for non-PATH installs: `CYPHER_BRAIN_PG_BIN` (dir holding
 `pg_dump`/`pg_restore`), `CYPHER_BRAIN_HOME`. Storage backends read
-`CYPHER_BRAIN_FILE_DIR` (file backend object store).
+`CYPHER_BRAIN_FILE_DIR` (file backend object store). `CYPHER_BRAIN_PULL_RETRY_MS`
+overrides `pull --wait`'s internal retry-poll interval (default 30000ms,
+i.e. 30s) — a test-focused knob (selftests set it to avoid a real sleep,
+the same role the `CYPHER_BRAIN_TON_PROVIDER_*_MS` vars play for
+`ton-provider`); most operators won't need it.
 
 ### CLI reference
 
@@ -1396,9 +1400,12 @@ they are not peers:
   scheme) to hold the bag instead of seeding it yourself — no always-on box of
   your own required, the same "pay once, don't operate infrastructure
   yourself" shape `turbo` has for Arweave. `push` deploys a per-bag StorageV1
-  contract, signed via a **Tonkeeper deeplink** — a human must be present to
-  approve it; unlike arweave/turbo's locally-held JWK there is no wallet that
-  signs unattended yet — then notifies the chosen provider over ADNL/RLDP
+  contract, signed via a **Tonkeeper deeplink** by default — a human must be
+  present to approve it; setting `CYPHER_BRAIN_TON_WALLET` to a local TON
+  wallet (`wallet create --chain ton`) auto-signs instead, the same "runs
+  unattended" shape arweave/turbo's locally-held JWK has, which is what makes
+  this backend `schedule install`/MCP-eligible too — then notifies the
+  chosen provider over ADNL/RLDP
   (shelling out to a locally built `scripts/go/storage-v1-client` binary; no
   mature TypeScript implementation exists for that query) and waits for it to
   report a full P2P fetch, printing a rate/ETA progress line the same way
@@ -1525,7 +1532,7 @@ node dist/mcp.mjs        # bundled build (npm run build), or: bin/cypher-brain-m
 | `schedule_install` | **writes a real system file, can commit to ongoing spend** (no spend by itself) | register the nightly snapshot+push (a launchd plist or crontab entry), the MCP equivalent of `cypher-brain schedule install` (issue #174 follow-up). `arweave`/`turbo` require `max_spend` (a positive integer cap on every unattended run); always requires `confirm_install: true` before any write happens. `backend: "ton-provider"` (only listed when a local TON wallet is configured; no MCP tool can create one, see `snapshot_now` above) is also paid and unattended-capable, but its spend cap is a separate, env-only mechanism (`CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND`, in nanoTON) — this tool's own `max_spend` argument does not apply to it. `no_load: true` writes the artifacts without registering the trigger. `scan_secrets: "warn"\|"deny"\|"off"` bakes the gitleaks gate into the generated nightly (#307). Install resolves the **effective** mode even when none is given and bakes that in (#301) — `warn` when there is a `dirs` entry and gitleaks is resolvable, `off` otherwise — so the nightly never re-derives a default from whatever is on `PATH` at 03:30. An explicit mode other than `off` needs at least one `dirs` entry, and fails rather than installing when gitleaks cannot be resolved |
 | `schedule_status` | read-only | the same report as `cypher-brain schedule status`: configured time/backend, which config file supplied settings, trigger registration state, last run log + its final rc line, next scheduled run. **Structured fields**, not the printed lines — `cypher-brain schedule status --json`, this tool and the resource below all return one object built by a single function, so they cannot disagree |
 | `keygen` | **writes a keypair** (no spend) | generate a fresh age identity/recipient keypair at `<CYPHER_BRAIN_HOME>/{identity.age,recipient.txt}` — first-run setup for a shell-less agent. `pq: true` generates a post-quantum HYBRID keypair (ML-KEM-768 + X25519) instead of plain X25519. Refuses if one already exists unless `force: true` (destructive — discards the old identity) |
-| `wallet_create` | **writes a wallet** (no spend) | generate a fresh Arweave JWK wallet (default `<CYPHER_BRAIN_HOME>/wallet.json`, `out` overrides). Refuses if one already exists at the target path unless `force: true` (destructive — discards spend authority over any funds already sent to it). **Arweave only** (issue #439, still open as a design decision) — no `chain` parameter, so this cannot create a TON wallet; see `snapshot_now` above for the CLI-bootstrap-then-restart steps `backend: "ton-provider"` needs instead |
+| `wallet_create` | **writes a wallet** (no spend) | generate a fresh Arweave JWK wallet (default `<CYPHER_BRAIN_HOME>/wallet.json`, `out` overrides). Refuses if one already exists at the target path unless `force: true` (destructive — discards spend authority over any funds already sent to it). **Arweave only** (issue #439 — resolved by documenting the CLI-bootstrap-then-restart path below rather than adding a `chain` parameter) — this cannot create a TON wallet; see `snapshot_now` above for the CLI-bootstrap-then-restart steps `backend: "ton-provider"` needs instead |
 | `wallet_address` | read-only | derive and show the Arweave address for a JWK wallet file (the address to fund before pushing to `arweave`/`turbo`). **Arweave only** — same #439 scope as `wallet_create` above; a TON wallet's address is printed once by `cypher-brain wallet create --chain ton` at creation time |
 
 **`cypher-brain ledger`, `cypher-brain audit`, and `cypher-brain wallet balance` are CLI-only** (#477):
