@@ -19,7 +19,7 @@ import { mkdtempSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TON_BIN, TON_NETWORK_CONFIG, TON_TONAPI_URL, CIPHER_YES } from './config.js';
+import { TON_BIN, TON_NETWORK_CONFIG, TON_TONAPI_URL, TON_TONVIEWER_URL, CIPHER_YES } from './config.js';
 import { errMsg, exists, rmrf, sdkImportAdvice, sleep } from './util.js';
 import { warn } from './warn.js';
 import { installStageSignalGuard, addActiveTonTmpDir, removeActiveTonTmpDir } from './signal-guard.js';
@@ -43,8 +43,10 @@ const DNS_UPDATE_GAS_NANO = 20_000_000n; // 0.02 TON
 // A SECOND, independent place to look up the same address (multi-model review W1's
 // destination-trust mitigation below) — a different service than tonapi, so an operator
 // who bothers to check has genuine cross-source corroboration, not a second look at the
-// same answer.
-const TONVIEWER_BASE = 'https://tonviewer.com';
+// same answer. TON_TONVIEWER_URL (config.ts) is overridable — set
+// CYPHER_BRAIN_TON_TONVIEWER_URL=https://testnet.tonviewer.com alongside
+// CYPHER_BRAIN_TON_TONAPI_URL when running against testnet (#693), or the mainnet default
+// here will not resolve a testnet address at all.
 
 // --domain: lowercase dot-labels ending in ".ton" (multi-model review S1). Rejects
 // mixed case/other TLDs/empty labels up front rather than letting a typo travel all the
@@ -324,7 +326,7 @@ export async function publishLatest(o: CliOptions): Promise<void> {
 
   console.error(`Domain: ${domain}`);
   console.error(`NFT address: ${nftAddrStr}`);
-  console.error(`  view on tonviewer: ${TONVIEWER_BASE}/${nftAddrStr}`);
+  console.error(`  view on tonviewer: ${TON_TONVIEWER_URL}/${nftAddrStr}`);
   console.error(`Bag id: ${bagId}`);
   // Destination-trust disclosure (multi-model review W1): tonapi is the SOLE source of
   // the domain -> NFT ADDRESS mapping above (the Tonkeeper transfer's actual
@@ -341,7 +343,7 @@ export async function publishLatest(o: CliOptions): Promise<void> {
   warn(
     `publish-latest: the NFT address above came from tonapi.io and is NOT independently verified on-chain here — ` +
       `before approving in Tonkeeper, confirm the recipient address it shows equals ${nftAddrStr} (cross-check ` +
-      `against ${TONVIEWER_BASE}/${nftAddrStr}, a different service). Do not approve if they differ.`,
+      `against ${TON_TONVIEWER_URL}/${nftAddrStr}, a different service). Do not approve if they differ.`,
   );
   console.error(
     'cypher-brain never signs transactions — the deeplink below only asks YOUR OWN wallet to review and approve a ' +
