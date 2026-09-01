@@ -12,11 +12,13 @@ Fixes three signal-safety/UX gaps found during dogfooding round 4:
   directory — still full of decrypted plaintext — on disk forever, untracked by either
   guard (#721).
 - The signal handler's own INCOMPLETE-sentinel write (dropped into a pre-existing
-  `--out-dir` it cannot safely delete) now `lstat`s the target path first and skips the
-  write unless it is an ordinary file or does not exist yet. Previously
-  `writeFileSync()` could block forever opening a FIFO planted at that exact path (no
-  reader ever attaches), wedging the signal handler and every cleanup step after it —
-  SIGKILL was the only way out (#741).
+  `--out-dir` it cannot safely delete) now opens with `{ flag: 'wx' }`
+  (`O_CREAT|O_EXCL`), so the write atomically refuses outright — before the kernel ever
+  treats the name as a FIFO/symlink/device — the instant anything already exists at
+  that exact path. Previously `writeFileSync()` could block forever opening a FIFO
+  planted there (no reader ever attaches), or silently write through a symlink into
+  whatever it pointed at, wedging or misdirecting the signal handler and every cleanup
+  step after it — SIGKILL was the only way out (#741).
 - `verify --level quick`'s `level: quick` stdout line now prints only after `--in` has
   been checked for presence and existence, matching every sibling command's contract of
   printing nothing to stdout on a basic usage/argument error (#745).
