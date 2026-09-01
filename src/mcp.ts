@@ -1407,6 +1407,7 @@ interface ResolvedRestoreTarget {
   pulled?: Record<string, unknown>;
   signature?: Record<string, unknown>;
   effectivePin?: string;
+  warning?: string;
 }
 
 async function resolveRestoreTarget(args: ToolArgs): Promise<ResolvedRestoreTarget> {
@@ -1421,6 +1422,7 @@ async function resolveRestoreTarget(args: ToolArgs): Promise<ResolvedRestoreTarg
   let tdir: string | null = null;
   let pulled: Record<string, unknown> | undefined;
   let signature: Record<string, unknown> | undefined;
+  let warning: string | undefined;
   try {
     if (file === undefined) {
       if (locator !== undefined) {
@@ -1461,6 +1463,19 @@ async function resolveRestoreTarget(args: ToolArgs): Promise<ResolvedRestoreTarg
         log: pullLog,
         ...(locatorFile !== undefined ? { locator_file: locatorFile } : {}),
       };
+      // #689: mirrors handleVerifyRestore's identical check (above) — restore_now is the
+      // MORE consequential of the two to have this gap, since (unlike verify_restore) it
+      // actually decrypts, extracts to out_dir, and — when pg is given — runs pg_restore
+      // --clean --if-exists against a live database, all with zero warning that an
+      // arweave/turbo locator with no sha256 pin cannot detect a gateway rollback/substitution.
+      if (!effectivePin && pullOpts.backend && NON_CONTENT_ADDRESSED_BACKENDS.has(pullOpts.backend)) {
+        warning =
+          `integrity pin NOT applied: ${pullOpts.backend} locators are not content hashes (post-assigned ids for ` +
+          'arweave/turbo, an operator-chosen remote path for rclone), so a gateway rollback/substitution that ' +
+          'still decrypts with your key would go undetected — this restore is proceeding against unverified ' +
+          'bytes. Pass sha256 (the expected ciphertext digest from a trusted off-box record, e.g. index.tsv) ' +
+          'or use locator_file (a push --save-locator file, which carries the pin) to fail closed like the CLI recovery path.';
+      }
     } else if (!isStr(file)) {
       throw new ToolError('ERR_INVALID_INPUT', 'file must be a string path');
     } else if (effectivePin) {
@@ -1494,7 +1509,7 @@ async function resolveRestoreTarget(args: ToolArgs): Promise<ResolvedRestoreTarg
         );
       }
     }
-    return { target, tdir, pulled, signature, effectivePin };
+    return { target, tdir, pulled, signature, effectivePin, warning };
   } catch (e) {
     await discardFetchDir(tdir);
     throw e;
@@ -1573,7 +1588,7 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
     );
   }
 
-  const { target, tdir, pulled, signature } = await resolveRestoreTarget(args);
+  const { target, tdir, pulled, signature, warning } = await resolveRestoreTarget(args);
   // #650: cleanup of the fetch/scratch dir used to live in a `finally` wrapping the try
   // block below. A `finally` that throws REPLACES whatever the try block already
   // returned/threw — so a transient EIO/EACCES removing `tdir` (an NFS-backed TMPDIR,
@@ -1629,7 +1644,7 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
     // #559: non-blocking — see outsideHomeWarning()'s own comment for why restore_now
     // warns rather than refuses when out_dir sits outside CYPHER_BRAIN_HOME.
     const homeWarning = outsideHomeWarning(outDir);
-    const warnings = [...(homeWarning ? [homeWarning] : []), ...res.warnings];
+    const warnings = [...(homeWarning ? [homeWarning] : []), ...(warning ? [warning] : []), ...res.warnings];
     resultPayload = {
       out_dir: outDir,
       ...(pulled ? { pulled } : {}),
