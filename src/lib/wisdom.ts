@@ -3,9 +3,9 @@
 // installEpipeGuard), and NEVER part of machine-readable output. Callers are
 // limited, on purpose, to two moments in src/cli.ts's interactive dispatch:
 //   - `init` completion (a note from the person who built this)
-//   - a successful `push` to the arweave/turbo PAID backends (a precursor
-//     quote) — never the free `file` backend, which is not the "first paid,
-//     permanent upload" moment this is meant to mark.
+//   - a successful `push` to the arweave/turbo/ton-provider PAID backends (a
+//     precursor quote) — never the free `file` backend, which is not the
+//     "first paid, permanent upload" moment this is meant to mark.
 // mcp.ts calls snapshot/push/verify directly (never through cli.ts's
 // dispatch), so an MCP tool call never triggers either of these.
 import { installEpipeGuard } from './ui.js';
@@ -66,8 +66,9 @@ export function printFounderNote(): void {
 
 /**
  * Print one precursor quote (random pick, no rotation bookkeeping needed —
- * this fires at most once per process, right after a successful arweave/turbo
- * push) to STDERR. Decoration only — same EPIPE-safety as printMascot.
+ * this fires at most once per process, right after a successful push to any
+ * paid backend: arweave/turbo/ton-provider) to STDERR. Decoration only —
+ * same EPIPE-safety as printMascot.
  */
 export function printWisdomQuote(): void {
   const q = pick(QUOTES);
