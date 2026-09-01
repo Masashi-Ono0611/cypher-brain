@@ -224,13 +224,20 @@ try {
     ? pass('spend cap: an under-cap CYPHER_BRAIN_MAX_SPEND still lets the push through')
     : fail(`under-cap push unexpectedly failed: status=${capOk.status} stderr=${(capOk.stderr || '').slice(0, 200)}`);
 
-  // error body surfaces on a failed post (#165): a wallet that was never funded/minted
-  // gets a real gateway body on the post — arlocal returns HTTP 410
-  // {code:410, msg:"You don't have enough tokens"} for insufficient balance — and that
-  // body must show up in the thrown error, not just the bare status (the opaque failure
-  // mode #165 reports dogfooding a real gateway's 400 against an unfunded wallet).
-  log('post failure surfaces the gateway response body, not just the bare status');
-  const brokeJwk = await ar.wallets.generate(); // never minted -> arlocal 410s the post
+  // pre-upload balance check (#701): a wallet that was never funded/minted is now
+  // refused UPFRONT — before ar.transactions.sign()/post() ever run — with an
+  // actionable message naming the shortfall, instead of signing and broadcasting a
+  // transaction that only fails afterward. This fixture used to exercise a DIFFERENT
+  // thing (#165's describeArweavePostError() body-surfacing: arlocal's own HTTP 410
+  // "You don't have enough tokens" reaching the thrown error, not just a bare status) —
+  // #701 intentionally moves this exact scenario earlier, so an unfunded wallet no
+  // longer reaches post() at all and can no longer exercise that specific 410 path.
+  // describeArweavePostError() itself is unchanged; it stays responsible for surfacing
+  // post()-level failures unrelated to balance (a genuinely malformed tx, a broadcast
+  // rejected for some other reason) — this offline arlocal harness has no clean way to
+  // construct one of those independent of a balance shortfall.
+  log('pre-upload balance check refuses an unfunded wallet before signing/broadcasting');
+  const brokeJwk = await ar.wallets.generate(); // never minted -> 0 balance
   const brokeWalletPath = join(tmp, 'broke-wallet.json');
   await writeFile(brokeWalletPath, JSON.stringify(brokeJwk), { mode: 0o600 });
   const brokePush = spawnSync(
@@ -239,11 +246,12 @@ try {
     { env: { ...env, CYPHER_BRAIN_AR_WALLET: brokeWalletPath }, encoding: 'utf8' },
   );
   brokePush.status !== 0 &&
-  /arweave post failed: HTTP 410/.test(brokePush.stderr) &&
-  /enough tokens/i.test(brokePush.stderr)
-    ? pass('post failure error includes the gateway response body (not a bare "HTTP 410")')
+  /this upload needs/.test(brokePush.stderr) &&
+  /only holds 0 winston/.test(brokePush.stderr) &&
+  !/arweave post failed/.test(brokePush.stderr) // never reached the broadcast at all
+    ? pass('an unfunded wallet is refused upfront by the balance check, before any broadcast attempt')
     : fail(
-        `post failure did not surface the response body: status=${brokePush.status} stderr=${(brokePush.stderr || '').slice(0, 300)}`,
+        `pre-upload balance check did not refuse as expected: status=${brokePush.status} stderr=${(brokePush.stderr || '').slice(0, 300)}`,
       );
 
   // push -> the locator is the Arweave tx id (assigned at upload, not the content hash)
