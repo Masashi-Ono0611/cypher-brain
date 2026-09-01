@@ -288,7 +288,14 @@ function promptHidden(question: string): Promise<string> {
       stdin.off('close', onStreamEnd);
       stdin.off('error', onStreamError);
       setActiveRawInputRestore(null);
-      stdin.setRawMode(wasRaw);
+      // Codex review: guard, don't let this throw skip pause()/the trailing newline
+      // (and, via onStreamError/onStreamEnd, the reject() right after this call) — the
+      // exact broken-stdin conditions those two handlers exist for are also the ones
+      // where the native setRawMode() binding can itself throw (e.g. the fd is no
+      // longer a valid tty).
+      try {
+        stdin.setRawMode(wasRaw);
+      } catch {}
       stdin.pause();
       process.stderr.write('\n');
     };
