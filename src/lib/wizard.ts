@@ -478,6 +478,21 @@ export async function init(_o: CliOptions): Promise<boolean> {
     let pushSucceeded = false;
     let pushedBackend: string | null = null;
     let pushedLocatorPath: string | null = null;
+    // #734 (review-hardened): true from the moment push() below is CALLED, not only
+    // once it resolves. A normal thrown error (network failure, declined consent, a
+    // genuine PushPartialSuccessError, ...) still reaches the async catch below via
+    // ordinary control flow, which already distinguishes "the upload never happened"
+    // from "it did, just something after it failed" correctly — pushSucceeded alone
+    // is the right signal there. A SIGNAL is different: it can land at ANY point
+    // while this Promise is still pending, including after a paid backend's HTTP
+    // request has already been durably accepted server-side but before the response
+    // resolves this process's own await — this process has NO way to know, at that
+    // instant, whether the remote already committed an irreversible spend. The
+    // synchronous rollback below cannot afford to guess wrong: deleting the only
+    // keys that could ever decrypt an already-paid-for, permanent upload is
+    // categorically worse than leaving an identity behind for a human to clean up by
+    // hand (`keygen --force`, or just picking a fresh CYPHER_BRAIN_HOME).
+    let pushAttemptStarted = false;
     // #734 (review-hardened): keygenAt()/keygenSignAt() each do TWO sequential file
     // writes (identity, then recipient/public key) before their caller ever assigns
     // `backup`/`signing` below — a signal landing INSIDE that window (between the two
@@ -507,7 +522,11 @@ export async function init(_o: CliOptions): Promise<boolean> {
     // that never existed, and a wrapping try/catch protects each individually so one
     // failing removal never blocks the rest.
     const rollbackKeysAndSnapshotSync = (): void => {
-      if (pushSucceeded) return; // once pushed, never delete — identical rule to the async catch below
+      // #734 (review-hardened): `pushAttemptStarted` too, not only `pushSucceeded` —
+      // see that variable's own doc comment above for why an in-flight push must be
+      // treated as ambiguous (possibly-already-committed), never as "definitely not
+      // pushed yet", from a signal handler's point of view.
+      if (pushSucceeded || pushAttemptStarted) return;
       try {
         rmSync(IDENTITY, { force: true });
       } catch {}
@@ -1266,6 +1285,10 @@ export async function init(_o: CliOptions): Promise<boolean> {
       // for anyone who does not go through this confirmation (push.ts is untouched).
       if (paid) pushOpts.yes = true;
       let savedLocatorLine: string;
+      // #734 (review-hardened): set BEFORE calling push(), not after — see this
+      // variable's own doc comment above (near `let pushAttemptStarted`) for why the
+      // signal-based rollback must treat the entire in-flight window as ambiguous.
+      pushAttemptStarted = true;
       try {
         await push(pushOpts);
         // Push has now durably happened — see the pushSucceeded declaration above for
