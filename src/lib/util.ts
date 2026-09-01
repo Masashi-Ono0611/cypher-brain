@@ -202,9 +202,24 @@ function statKind(st: { isDirectory(): boolean; isFIFO(): boolean; isSocket(): b
 // receipt-ledger-readability checks, AND the standalone `cypher-brain audit`/`ledger`
 // CLI commands that share this same helper) is exactly the kind of routine, read-only
 // diagnostic that hang would turn into an indefinite freeze instead of a clean FAIL. A
-// missing path (ENOENT/ENOTDIR from stat() itself) is still "empty, not an error" —
-// unchanged from before — so a not-yet-created log continues to mean "nothing has been
-// recorded yet", not "the log is unreadable".
+// missing path (ENOENT from stat() itself) is still "empty, not an error" — unchanged
+// from before — so a not-yet-created log continues to mean "nothing has been recorded
+// yet", not "the log is unreadable". Deliberately NOT ENOTDIR too (unlike doctor.ts's
+// own statOrNotFound(), which folds ENOTDIR into "not found" for a diagnostic's
+// different posture) — a path with a non-directory component IS a real misconfiguration
+// for a log this code itself created via mkdir+append, and the pre-existing readFile()
+// path below never special-cased it either; this stays byte-for-byte the same "which
+// errno means empty" policy this function already had.
+//
+// Same stat()-then-readFile() TOCTOU window checkIdentityRecipientPairing() already
+// accepts (Codex review, #333, and unchanged since): a path swapped for a FIFO in the
+// gap between the two calls could still hang. Not closed here either — doing so would
+// mean switching every caller of this helper (and the identity-file check) to an
+// open()+fstat()-on-the-descriptor design, which is a bigger, cross-cutting change than
+// this fix's scope. A local attacker who can race-replace CYPHER_BRAIN_HOME/AUDIT_LOG/
+// RECEIPT_LEDGER between these two calls already has write access to the same
+// directory these files' real writers use, at which point this narrow race is not the
+// most direct way in.
 export async function readJsonlLog<T>(
   path: string,
   label: string,
