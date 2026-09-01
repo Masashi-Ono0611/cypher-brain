@@ -602,5 +602,42 @@ if (j.verdict !== 'PARTIAL') throw new Error('expected verdict PARTIAL, got ' + 
 " "$TMP/x.json"
 echo "[PASS] an invalid GBRAIN_HOME WARNs by name (not FAIL) even with a genuine config sitting at the \$HOME fallback, and never presents that stale config as a confident detection; doctor VERDICT PARTIAL (exit 2)"
 
+echo "== (y) POSITIVE CONTROL — #695: AUDIT_LOG/RECEIPT_LEDGER as a FIFO with no writer must FAIL FAST, never hang (mirrors (k)'s identity-file guard, Codex review #333) =="
+# A plain readFile() on a FIFO with no writer on the other end blocks indefinitely —
+# the exact hang class checkIdentityRecipientPairing() already guards against for
+# IDENTITY (statOrNotFound()+isFile() before ever opening it). #695 found that
+# checkAuditChain()/checkReceiptLedger() shared readJsonlLog() (util.ts) never got the
+# same guard. with_timeout below is the actual regression detector: if the guard were
+# ever removed, `cb doctor` would hang and with_timeout would kill it (rc 137), not
+# return doctor's own exit code — a silent, un-diffable timeout is exactly the failure
+# mode a POSITIVE CONTROL exists to turn into a loud, specific one.
+export CYPHER_BRAIN_HOME="$TMP/fifo-home"
+mkdir -p "$CYPHER_BRAIN_HOME"; chmod 700 "$CYPHER_BRAIN_HOME"
+AUDIT_FIFO="$TMP/audit-log.fifo"
+mkfifo "$AUDIT_FIFO"
+RC=0
+CYPHER_BRAIN_AUDIT_LOG="$AUDIT_FIFO" with_timeout 8 cb doctor > "$TMP/y-audit.log" 2>&1 || RC=$?
+[ "$RC" != "137" ] || { echo "[FAIL] doctor HUNG reading an AUDIT_LOG FIFO with no writer (killed after 8s) — the #695 hang regressed"; cat "$TMP/y-audit.log"; exit 1; }
+[ "$RC" = "1" ] || { echo "[FAIL] doctor with AUDIT_LOG pointed at a FIFO exited $RC, expected 1 (FAIL, not a hang or a silent pass)"; cat "$TMP/y-audit.log"; exit 1; }
+grep -qE '^\[FAIL\].*could not read the audit log' "$TMP/y-audit.log" \
+  || { echo "[FAIL] expected audit-chain-integrity to FAIL naming the unreadable audit log"; cat "$TMP/y-audit.log"; exit 1; }
+grep -qF 'a FIFO/named pipe' "$TMP/y-audit.log" \
+  || { echo "[FAIL] expected the FAIL message to name the FIFO, not a generic read error"; cat "$TMP/y-audit.log"; exit 1; }
+grep -q '^VERDICT: FAIL$' "$TMP/y-audit.log" || { echo "[FAIL] expected doctor's overall VERDICT to be FAIL"; cat "$TMP/y-audit.log"; exit 1; }
+echo "[PASS] AUDIT_LOG as a FIFO: audit-chain-integrity FAILs fast (no hang) naming the FIFO, doctor VERDICT FAIL (exit 1)"
+
+RECEIPT_FIFO="$TMP/receipt-ledger.fifo"
+mkfifo "$RECEIPT_FIFO"
+RC=0
+CYPHER_BRAIN_RECEIPT_LEDGER="$RECEIPT_FIFO" with_timeout 8 cb doctor > "$TMP/y-receipt.log" 2>&1 || RC=$?
+[ "$RC" != "137" ] || { echo "[FAIL] doctor HUNG reading a RECEIPT_LEDGER FIFO with no writer (killed after 8s) — the #695 hang regressed"; cat "$TMP/y-receipt.log"; exit 1; }
+[ "$RC" = "1" ] || { echo "[FAIL] doctor with RECEIPT_LEDGER pointed at a FIFO exited $RC, expected 1 (FAIL, not a hang or a silent pass)"; cat "$TMP/y-receipt.log"; exit 1; }
+grep -qE '^\[FAIL\].*could not read the receipt ledger' "$TMP/y-receipt.log" \
+  || { echo "[FAIL] expected receipt-ledger-readability to FAIL naming the unreadable receipt ledger"; cat "$TMP/y-receipt.log"; exit 1; }
+grep -qF 'a FIFO/named pipe' "$TMP/y-receipt.log" \
+  || { echo "[FAIL] expected the FAIL message to name the FIFO, not a generic read error"; cat "$TMP/y-receipt.log"; exit 1; }
+grep -q '^VERDICT: FAIL$' "$TMP/y-receipt.log" || { echo "[FAIL] expected doctor's overall VERDICT to be FAIL"; cat "$TMP/y-receipt.log"; exit 1; }
+echo "[PASS] RECEIPT_LEDGER as a FIFO: receipt-ledger-readability FAILs fast (no hang) naming the FIFO, doctor VERDICT FAIL (exit 1)"
+
 echo
 echo "all cypher-brain doctor selftests passed"
