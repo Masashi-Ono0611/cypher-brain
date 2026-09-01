@@ -860,7 +860,10 @@ function validateSpendCaps(o: CliOptions, backend: string): void {
   } else if (o.max_spend) {
     throw new Error(
       `--max-spend only applies to arweave/turbo (native units: winc/winston); --backend ${backend} either is free ` +
-        'or (ton-provider) uses its own CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) instead — see below',
+        // #754: the alternative is named directly (CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND)
+        // rather than via a "see below" cross-reference — over MCP there is nothing
+        // "below" for that to point at, and this message is now self-contained without it.
+        'or (ton-provider) uses its own CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) instead.',
     );
   }
   // ton-provider (#396 PR2) has its OWN spend-cap variable — CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND

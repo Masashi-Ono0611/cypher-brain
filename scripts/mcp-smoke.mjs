@@ -853,6 +853,48 @@ async function run(tmp) {
       }
     }
 
+    // 1c-ii. #756: the ton-provider "bootstrap a TON wallet" tangent used to be repeated
+    // near-verbatim across 5 tool descriptions. Now exactly ONE tool description (wallet_create's
+    // own, the canonical explanation) carries the full CLI-bootstrap-then-restart steps; every
+    // other tool that mentions the prerequisite points AT wallet_create's description instead of
+    // repeating it.
+    const bootstrapTangentTools = (list.result?.tools ?? []).filter((t) =>
+      /CLI-bootstrap-then-restart steps/.test(t.description ?? ''),
+    );
+    if (bootstrapTangentTools.length !== 1 || bootstrapTangentTools[0].name !== 'wallet_address') {
+      throw new Error(
+        `expected exactly one tool (wallet_address, pointing at wallet_create's description) to still ` +
+          `contain the phrase "CLI-bootstrap-then-restart steps", found: ${bootstrapTangentTools.map((t) => t.name).join(', ') || '(none)'}`,
+      );
+    }
+    for (const toolName of ['snapshot_now', 'estimate_cost', 'schedule_install']) {
+      const tool = (list.result?.tools ?? []).find((t) => t.name === toolName);
+      if (!/wallet_create's description/.test(tool?.description ?? '')) {
+        throw new Error(
+          `${toolName}'s description no longer points at wallet_create's description for the ton-provider ` +
+            `wallet prerequisite: ${(tool?.description ?? '').slice(0, 300)}`,
+        );
+      }
+    }
+
+    // 1d. #728: an unknown tool name must offer the SAME "did you mean" suggestion an
+    // undeclared argument name / an out-of-enum value already get (src/lib/suggest.ts) —
+    // TOOLS_BY_NAME's own keys are the candidate set, so the reproduction that was filed
+    // (a 1-2 edit-distance typo of a real tool name, getting zero suggestion) is exercised
+    // here rather than merely trusted to follow from those other two call sites.
+    send({ jsonrpc: '2.0', id: 9003, method: 'tools/call', params: { name: 'snapshotnow', arguments: {} } });
+    const unknownTool = await waitFor(9003);
+    const unknownToolSc = unknownTool.result?.structuredContent;
+    if (
+      unknownTool.result?.isError !== true ||
+      unknownToolSc?.code !== 'ERR_INVALID_INPUT' ||
+      !(unknownToolSc.message ?? '').includes('did you mean snapshot_now?')
+    ) {
+      throw new Error(
+        `Unknown tool "snapshotnow" was not answered with a did-you-mean suggestion: ${JSON.stringify(unknownTool.result).slice(0, 300)}`,
+      );
+    }
+
     // 2a. spend gate: paid backend without confirm_paid must be refused —
     // BEFORE any snapshot work (outAge must not exist afterwards) — even
     // though CYPHER_BRAIN_YES=1 is set in the server's environment.
@@ -884,6 +926,29 @@ async function run(tmp) {
     );
     if (guardLeftArtifact)
       throw new Error('spend gate fired but a snapshot artifact was still produced (gate must run before any work)');
+
+    // 2a-ii. #726 — the reproduction that issue was filed on: snapshot() shares this
+    // "nothing to snapshot" validation verbatim with the CLI, which used to reach an MCP
+    // caller naming --profile/--pg/--dir (flags this tool has no way to pass — recipients
+    // is required by the schema, so a call with neither dirs nor pg is the minimal way to
+    // reach it) and land as the generic, unclassified ERR_INTERNAL.
+    send({
+      jsonrpc: '2.0',
+      id: 9005,
+      method: 'tools/call',
+      params: { name: 'snapshot_now', arguments: { recipients: [recipientPath], out: join(tmp, 'never.age') } },
+    });
+    const nothingToSnapshot = await waitFor(9005);
+    const nothingToSnapshotSc = nothingToSnapshot.result?.structuredContent;
+    if (
+      !nothingToSnapshot.result?.isError ||
+      nothingToSnapshotSc?.code !== 'ERR_INVALID_INPUT' ||
+      nothingToSnapshotSc.message !== 'nothing to snapshot: pass dirs and/or pg'
+    ) {
+      throw new Error(
+        `snapshot_now (no dirs, no pg) was not translated to this tool's own field names: ${JSON.stringify(nothingToSnapshot.result).slice(0, 300)}`,
+      );
+    }
 
     // 2b. real snapshot_now round-trip on the free file backend
     send({
@@ -1377,6 +1442,14 @@ async function run(tmp) {
     if (verWrongSc?.cb_code !== 'CB-E001') {
       throw new Error(`wrong-sha256 pin result lacks cb_code=CB-E001: ${JSON.stringify(verWrongSc).slice(0, 300)}`);
     }
+    // #727: the doc pointer is a full GitHub URL, not a bare relative filename — MANAGEMENT.md
+    // is not part of the published npm package (package.json's `files` ships only `dist`), so
+    // a relative "MANAGEMENT.md#error-codes" resolves to nothing for an npx/global install.
+    if (!/https:\/\/github\.com\/[^\s]+\/MANAGEMENT\.md#error-codes/.test(verWrongSc?.message ?? '')) {
+      throw new Error(
+        `wrong-sha256 pin message doc-ref is not a full GitHub URL: ${JSON.stringify(verWrongSc).slice(0, 300)}`,
+      );
+    }
 
     // 2g. restore_now: without confirm_write must refuse BEFORE any work (mirrors
     // the snapshot_now spend gate at 2a) — out_dir must not even be created. Uses a
@@ -1565,6 +1638,33 @@ async function run(tmp) {
       );
     }
 
+    // 2i-iv. #753 — requireBackend's OWN refusal (backend missing entirely: `required`
+    // is a schema keyword nothing enforces at runtime, so assertDeclaredEnums — which
+    // only ever sees a DEFINED value — never gets a chance to fire) must read the same
+    // shape as assertDeclaredEnums' "present but wrong" refusal above: the SAME quoted,
+    // comma-joined list via formatAllowedValues, not the old bare "file|arweave|turbo".
+    send({
+      jsonrpc: '2.0',
+      id: 9006,
+      method: 'tools/call',
+      params: { name: 'estimate_cost', arguments: { size_bytes: 1 } },
+    });
+    const missingBackend = await waitFor(9006);
+    const missingBackendSc = missingBackend.result?.structuredContent;
+    if (missingBackend.result?.isError !== true || missingBackendSc?.code !== 'ERR_INVALID_INPUT') {
+      throw new Error(
+        `estimate_cost (no backend) did not refuse ERR_INVALID_INPUT: ${JSON.stringify(missingBackend.result).slice(0, 300)}`,
+      );
+    }
+    if (
+      !/"file", "arweave", "turbo"/.test(missingBackendSc.message) ||
+      /file\|arweave\|turbo/.test(missingBackendSc.message)
+    ) {
+      throw new Error(
+        `estimate_cost (no backend) allowed-value list is not the same quoted shape as the enum refusal: ${missingBackendSc.message}`,
+      );
+    }
+
     // 2j. schedule_install: without confirm_install must refuse BEFORE any file is
     // written (mirrors the restore_now/snapshot_now gates above).
     send({
@@ -1600,10 +1700,8 @@ async function run(tmp) {
       },
     });
     const schedInstallNoSpend = await waitFor(20);
-    if (
-      !schedInstallNoSpend.result?.isError ||
-      !/max-spend|max_spend/i.test(schedInstallNoSpend.result?.structuredContent?.message ?? '')
-    ) {
+    const schedInstallNoSpendSc = schedInstallNoSpend.result?.structuredContent;
+    if (!schedInstallNoSpend.result?.isError || !/max-spend|max_spend/i.test(schedInstallNoSpendSc?.message ?? '')) {
       throw new Error(
         `schedule_install (backend=turbo, no max_spend) did not refuse for the expected reason: ${JSON.stringify(schedInstallNoSpend.result).slice(0, 300)}`,
       );
@@ -1611,6 +1709,106 @@ async function run(tmp) {
     if (existsSync(join(home, 'schedule'))) {
       throw new Error(
         'schedule_install (backend=turbo, no max_spend) still wrote the runner/config dir before refusing',
+      );
+    }
+    // #726: this message is schedule()'s own validation (shared verbatim with the CLI's
+    // `schedule install`), so it used to name the CLI's `--max-spend` flag rather than
+    // this tool's own max_spend field, and land as the generic, unclassified
+    // ERR_INTERNAL rather than ERR_INVALID_INPUT (a plain, fixable caller mistake).
+    if (schedInstallNoSpendSc?.code !== 'ERR_INVALID_INPUT') {
+      throw new Error(
+        `schedule_install (backend=turbo, no max_spend) was not classified ERR_INVALID_INPUT: ${JSON.stringify(schedInstallNoSpendSc).slice(0, 300)}`,
+      );
+    }
+    if (/--max-spend/.test(schedInstallNoSpendSc.message)) {
+      throw new Error(
+        `schedule_install (backend=turbo, no max_spend) leaked the CLI's --max-spend flag syntax rather than ` +
+          `naming this tool's own max_spend field: ${schedInstallNoSpendSc.message}`,
+      );
+    }
+
+    // #726: schedule_install {ping_url_fail, no ping_url} — same reclassification/
+    // translation, for schedule()'s OTHER CLI-flag-shaped validation message
+    // (--ping-url-fail requires --ping-url).
+    send({
+      jsonrpc: '2.0',
+      id: 9001,
+      method: 'tools/call',
+      params: {
+        name: 'schedule_install',
+        arguments: { backend: 'file', dirs: [data], no_load: true, confirm_install: true, ping_url_fail: 'x' },
+      },
+    });
+    const schedInstallPingFail = await waitFor(9001);
+    const schedInstallPingFailSc = schedInstallPingFail.result?.structuredContent;
+    if (!schedInstallPingFail.result?.isError || schedInstallPingFailSc?.code !== 'ERR_INVALID_INPUT') {
+      throw new Error(
+        `schedule_install {ping_url_fail, no ping_url} did not refuse ERR_INVALID_INPUT: ${JSON.stringify(schedInstallPingFail.result).slice(0, 300)}`,
+      );
+    }
+    if (
+      !/ping_url_fail requires ping_url/.test(schedInstallPingFailSc.message) ||
+      /--ping-url-fail|--ping-url\b/.test(schedInstallPingFailSc.message)
+    ) {
+      throw new Error(
+        `schedule_install {ping_url_fail, no ping_url} did not translate the CLI flags to this tool's own ` +
+          `fields: ${schedInstallPingFailSc.message}`,
+      );
+    }
+
+    // #754: the free-backend/max_spend refusal used to end in a dangling "— see below"
+    // cross-reference (a leftover from a CLI/terminal context where a longer usage block
+    // might print underneath in stdout) — over MCP there is nothing "below" for that to
+    // point at. It already names the actual alternative (CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND)
+    // right before that phrase, so the fix is simply to drop the dangling reference.
+    send({
+      jsonrpc: '2.0',
+      id: 9002,
+      method: 'tools/call',
+      params: {
+        name: 'schedule_install',
+        arguments: { backend: 'file', dirs: [data], no_load: true, confirm_install: true, max_spend: '1' },
+      },
+    });
+    const schedInstallFreeSpend = await waitFor(9002);
+    const schedInstallFreeSpendSc = schedInstallFreeSpend.result?.structuredContent;
+    if (
+      !schedInstallFreeSpend.result?.isError ||
+      !/max-spend only applies to arweave\/turbo/.test(schedInstallFreeSpendSc?.message ?? '')
+    ) {
+      throw new Error(
+        `schedule_install (backend=file, max_spend set) did not refuse for the expected reason: ${JSON.stringify(schedInstallFreeSpend.result).slice(0, 300)}`,
+      );
+    }
+    if (/see below/.test(schedInstallFreeSpendSc.message)) {
+      throw new Error(
+        `schedule_install (backend=file, max_spend set) still ends with a dangling "see below" ` +
+          `cross-reference: ${schedInstallFreeSpendSc.message}`,
+      );
+    }
+
+    // #726 (sibling defect): schedule.ts's OWN "nothing to snapshot" copy (validateInstallInputs)
+    // is byte-identical to snapshot.ts's, and reachable the same way — no dirs and no pg —
+    // so it needs the same MCP-native translation, checked here rather than only assumed
+    // from handleSnapshotNow's own coverage below.
+    send({
+      jsonrpc: '2.0',
+      id: 9004,
+      method: 'tools/call',
+      params: {
+        name: 'schedule_install',
+        arguments: { backend: 'file', dirs: [], no_load: true, confirm_install: true },
+      },
+    });
+    const schedInstallNoSrc = await waitFor(9004);
+    const schedInstallNoSrcSc = schedInstallNoSrc.result?.structuredContent;
+    if (
+      !schedInstallNoSrc.result?.isError ||
+      schedInstallNoSrcSc?.code !== 'ERR_INVALID_INPUT' ||
+      schedInstallNoSrcSc.message !== 'nothing to snapshot: pass dirs and/or pg'
+    ) {
+      throw new Error(
+        `schedule_install (no dirs, no pg) was not translated to this tool's own field names: ${JSON.stringify(schedInstallNoSrc.result).slice(0, 300)}`,
       );
     }
 
@@ -2091,6 +2289,26 @@ async function run(tmp) {
     if (nearEnum.result?.isError !== true || !(nearEnumSc?.message ?? '').includes('did you mean file?')) {
       throw new Error(
         `verify_restore backend="fille" was not answered with the near miss: ${JSON.stringify(nearEnum.result).slice(0, 300)}`,
+      );
+    }
+    // #753: the allowed-value list is quoted (formatAllowedValues), the SAME shape
+    // requireBackend's own "missing entirely" refusal renders below — not the bare,
+    // unquoted "file, arweave, turbo" the old inline .join(', ') produced.
+    if (!/"file", "arweave", "turbo"/.test(nearEnumSc.message)) {
+      throw new Error(`verify_restore backend="fille" allowed-value list is not quoted: ${nearEnumSc.message}`);
+    }
+    // #755: the long design-rationale sentence ("the tool publishes that set for every
+    // call, so a value outside it is refused whichever branch...") is gone — the
+    // actionable part (given value, near miss, accepted set) is the message, ending with
+    // "Accepts only: ..." as the clear final takeaway rather than being buried mid-paragraph.
+    if (/publishes that set for every call/.test(nearEnumSc.message)) {
+      throw new Error(
+        `verify_restore backend="fille" still carries the long design-rationale sentence: ${nearEnumSc.message}`,
+      );
+    }
+    if (!/Accepts only: "file", "arweave", "turbo"\.$/.test(nearEnumSc.message)) {
+      throw new Error(
+        `verify_restore backend="fille" does not end with the accepted-set list as the final takeaway: ${nearEnumSc.message}`,
       );
     }
 

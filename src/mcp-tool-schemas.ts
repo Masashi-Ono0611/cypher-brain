@@ -48,14 +48,10 @@ export const SNAPSHOT_NOW_TOOL: Tool = {
     'directories and/or a Postgres database, and optionally push the ciphertext to a storage ' +
     'backend. Backend "file" is free; "arweave" and "turbo" are PAID, PERMANENT stores; ' +
     '"ton-provider" is also PAID, but weaker-durability than arweave/turbo (depends on a live ' +
-    'provider continuing to renew/serve the contract) — and, UNLIKE arweave/turbo, this MCP server ' +
-    'has NO tool that can create the TON wallet ton-provider needs: "ton-provider" only appears in ' +
-    "this tool's backend enum at all when CYPHER_BRAIN_TON_WALLET was already set to an existing " +
-    'wallet file when this server started. There is no in-MCP way to bootstrap one — an operator ' +
-    'must run `cypher-brain wallet create --chain ton` from a shell, set CYPHER_BRAIN_TON_WALLET to ' +
-    'the printed path in this server\'s environment, and RESTART the server before "ton-provider" ' +
-    'shows up here at all; wallet_create/wallet_address in this server are Arweave-only and cannot ' +
-    'do this. Pushing to any of arweave/turbo/ton-provider REQUIRES confirm_paid=true (the MCP equivalent of the CLI --yes ' +
+    "provider continuing to renew/serve the contract), and only appears in this tool's backend " +
+    "enum when a local TON wallet is already configured (see wallet_create's description for how " +
+    'to set one up — this MCP server has no tool that creates it). Pushing to any of ' +
+    'arweave/turbo/ton-provider REQUIRES confirm_paid=true (the MCP equivalent of the CLI --yes ' +
     'guard; the CYPHER_BRAIN_YES env escape hatch is NOT honored here, so nothing can be spent ' +
     'without an explicit confirm_paid in the call). Snapshotting itself needs only the PUBLIC ' +
     'recipient key(s); storage only ever sees ciphertext. Pass idempotency_key to make a RETRY ' +
@@ -95,8 +91,8 @@ export const SNAPSHOT_NOW_TOOL: Tool = {
         enum: BACKENDS,
         description:
           'When given, push the snapshot: file (free) or arweave|turbo|ton-provider (PAID — needs confirm_paid; ' +
-          'ton-provider only appears when a local TON wallet is configured — no tool on this server can create ' +
-          "one; see this tool's own description for the CLI-bootstrap-then-restart steps).",
+          "ton-provider only appears when a local TON wallet is configured — see wallet_create's description " +
+          'for how to set one up).',
       },
       locator_file: {
         type: 'string',
@@ -347,8 +343,8 @@ export const ESTIMATE_COST_TOOL: Tool = {
     'arweave → network price in winston from the gateway /price endpoint; ton-provider → nanoTON ' +
     'cost from a real priced query against the live mytonprovider.org registry (only listed when a ' +
     'local TON wallet is configured — the estimate itself never spends, but the underlying push ' +
-    "would; no tool on this server can create that wallet — see snapshot_now's description for the " +
-    'CLI-bootstrap-then-restart steps); file → free (local disk), returned with a zero-cost note. All seven fields (backend, size_bytes, cost, ' +
+    "would; see wallet_create's description for how to set one up); file → free (local disk), " +
+    'returned with a zero-cost note. All seven fields (backend, size_bytes, cost, ' +
     'unit, approx_ar, usd_estimate, note) are ALWAYS present — null, never absent, where they do ' +
     'not apply (#268), so do not test for a key to decide whether a value exists. For ' +
     'turbo/arweave, usd_estimate carries an approximate USD figure when a USD/AR rate is ' +
@@ -389,8 +385,8 @@ export const SCHEDULE_INSTALL_TOOL: Tool = {
     'the generated runner for unattended consent, so it ALSO REQUIRES max_spend (a positive integer ' +
     'cap in native units — winston for arweave, winc for turbo): an uncapped unattended spender is ' +
     'refused, same as the CLI. backend=ton-provider (only listed when a local TON wallet is ' +
-    "configured — no tool on this server can create one; see snapshot_now's description for the " +
-    'CLI-bootstrap-then-restart steps) is ALSO paid and unattended-capable, but its spend cap is a SEPARATE, env-only ' +
+    "configured — see wallet_create's description for how to set one up) is ALSO paid and " +
+    'unattended-capable, but its spend cap is a SEPARATE, env-only ' +
     'mechanism (CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND, in nanoTON — must already be set in the ' +
     "environment before this call; this tool's own max_spend argument does not apply to it and is " +
     'refused if passed for it, matching the CLI). Requires confirm_install=true before ANY work happens — the MCP ' +
@@ -409,8 +405,7 @@ export const SCHEDULE_INSTALL_TOOL: Tool = {
           'Where the nightly push goes: file (free), arweave|turbo (PAID — requires max_spend), or ' +
           'ton-provider (PAID — requires CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND set in the environment ' +
           'instead, not the max_spend argument; only listed when a local TON wallet is configured — ' +
-          "no tool on this server can create one; see snapshot_now's description for the " +
-          'CLI-bootstrap-then-restart steps).',
+          "see wallet_create's description for how to set one up).",
       },
       dirs: {
         type: 'array',

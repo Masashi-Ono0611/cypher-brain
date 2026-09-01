@@ -120,6 +120,26 @@ const NO_WALLET_AT_PATTERN = /no wallet at /;
 const NO_RECIPIENT_AT_PATTERN = /no recipient at /;
 const OUT_DIR_NOT_A_DIRECTORY_PATTERN = /exists and is not a directory/;
 
+// #726: three more lib-level messages reclassified the SAME way as the four above, but
+// with their TEXT also rewritten — snapshot()/schedule() are the CLI's own validation
+// functions, shared verbatim with the MCP handlers below, so their "pass --profile/--pg/
+// --dir" and "--max-spend"/"--ping-url-fail" guidance is phrased for a shell. An MCP
+// caller has no flags to pass at all, only this tool's own JSON fields (dirs/pg,
+// max_spend, ping_url/ping_url_fail — --profile has no MCP-side equivalent to offer, so
+// it is dropped rather than translated), so a --flag-shaped refusal names something the
+// caller literally cannot supply. Detected here by the same substring-match convention;
+// the replacement text is built at each call site below (it needs the caller's own
+// `backend` value interpolated, which a module-level constant cannot carry).
+//
+// NOTHING_TO_SNAPSHOT_PATTERN matches TWO throw sites with byte-identical text —
+// snapshot.ts's (reclassified in handleSnapshotNow) and schedule.ts's OWN copy in
+// validateInstallInputs (reclassified in handleScheduleInstall): schedule_install's
+// dirs/pg are exactly as optional-but-one-required as snapshot_now's, and its schema
+// has no `profile` field either, so the same sibling defect and the same fix apply.
+const NOTHING_TO_SNAPSHOT_PATTERN = /^nothing to snapshot: pass --profile/;
+const MAX_SPEND_REQUIRED_PATTERN = /--max-spend <n> is required for an unattended schedule/;
+const PING_URL_FAIL_REQUIRES_PATTERN = /^--ping-url-fail requires --ping-url/;
+
 // Untyped JSON-RPC tool-call arguments (an MCP client can send anything) — every
 // handler below validates its own shape at runtime (isStr/isStrArray etc), so
 // `unknown` per-field is the honest type until a check narrows it.
@@ -503,6 +523,13 @@ function outsideHomeWarning(outDir: string): string | undefined {
   );
 }
 
+// #753: shared quoted, comma-joined rendering of an allowed-value list — used by both
+// requireBackend and assertDeclaredEnums below, so a caller sees the SAME list shape
+// whichever of the two "value must be one of a fixed set" checks refused it.
+function formatAllowedValues(values: readonly unknown[]): string {
+  return values.map((v) => JSON.stringify(v)).join(', ');
+}
+
 // The PRESENCE half of the backend rule — the part no schema keyword states and the
 // dispatcher's central enum check (#308) therefore cannot enforce. Four of its five call
 // sites need a backend to be THERE: estimate_cost and schedule_install declare it
@@ -514,11 +541,23 @@ function outsideHomeWarning(outDir: string): string | undefined {
 // to drift. On snapshot_now — the one site where the value is optional, and so the one
 // the central check now fully covers at runtime — it stays because it is also the
 // assertion that narrows `backend` to a string for the rest of that handler.
+//
+// #753: the SAME list formatting (and did-you-mean handling, for a present string that
+// misses) as assertDeclaredEnums' "unrecognized value" refusal below — via the shared
+// formatAllowedValues() helper — so "backend must be from this fixed set" reads the same
+// way whichever of the two violations (missing entirely, caught here since `required` is
+// a schema keyword nothing enforces at runtime; present but wrong, caught by
+// assertDeclaredEnums before this handler even runs) triggered it. Before this, a missing
+// backend got a bare pipe-joined list here while a present-but-wrong one got
+// assertDeclaredEnums' quoted list plus a did-you-mean — an agent that had only ever
+// pattern-matched one shape would not recognize the other as the same refusal.
 function requireBackend(value: unknown, what: string): asserts value is string {
   if (typeof value !== 'string' || !BACKENDS.includes(value)) {
+    const near = typeof value === 'string' ? nearestName(value, BACKENDS) : undefined;
     throw new ToolError(
       'ERR_INVALID_INPUT',
-      `${what} must be one of ${BACKENDS.join('|')} — got ${JSON.stringify(value)}`,
+      `${what} must be one of: ${formatAllowedValues(BACKENDS)}` +
+        ` — got ${JSON.stringify(value)}${near ? ` (${didYouMean(near)})` : ''}.`,
     );
   }
 }
@@ -753,11 +792,8 @@ function assertDeclaredEnums(tool: Tool, args: ToolArgs): void {
     throw new ToolError(
       'ERR_INVALID_INPUT',
       `${tool.name} got an unrecognized value for ${key}: ${JSON.stringify(value)}` +
-        `${near ? ` (${didYouMean(near)})` : ''} — it accepts only: ` +
-        `${allowed.map((v) => JSON.stringify(v)).join(', ')}. ` +
-        'Refused rather than ignored: the tool publishes that set for every call, so a value outside it is ' +
-        'refused whichever branch this call would have taken — being ignored on one of them is exactly what ' +
-        'used to make an unusable value look honored.',
+        `${near ? ` (${didYouMean(near)})` : ''} — refused rather than ignored. Accepts only: ` +
+        `${formatAllowedValues(allowed)}.`,
     );
   }
 }
@@ -984,6 +1020,13 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
       // INPUT, not a server fault — see NO_RECIPIENT_AT_PATTERN's own comment above.
       if (e instanceof Error && NO_RECIPIENT_AT_PATTERN.test(e.message)) {
         throw reclassify('ERR_INVALID_INPUT', e.message, e);
+      }
+      // #726: same reclassification, with the message translated from the CLI's
+      // --profile/--pg/--dir flags to this tool's own dirs/pg fields — see
+      // NOTHING_TO_SNAPSHOT_PATTERN's own comment above. --profile has no MCP-side
+      // equivalent, so it is dropped rather than translated.
+      if (e instanceof Error && NOTHING_TO_SNAPSHOT_PATTERN.test(e.message)) {
+        throw reclassify('ERR_INVALID_INPUT', 'nothing to snapshot: pass dirs and/or pg', e);
       }
       throw e;
     }
@@ -1793,7 +1836,36 @@ async function handleScheduleInstall(args: ToolArgs): Promise<CallToolResult> {
     scan_secrets: scanSecrets,
     tables: [],
   };
-  const res = await captureCall(() => schedule(installOpts));
+  let res: CaptureResult<void>;
+  try {
+    res = await captureCall(() => schedule(installOpts));
+  } catch (e) {
+    // #726: same reclassification/translation as handleSnapshotNow's — schedule()'s
+    // --max-spend/--ping-url-fail flag guidance rewritten to this tool's own
+    // max_spend/ping_url_fail fields — see MAX_SPEND_REQUIRED_PATTERN's own comment
+    // above. The backend name is read off the ALREADY-VALIDATED local `backend`
+    // (requireBackend narrowed it to a string above), not parsed back out of e.message.
+    if (e instanceof Error && MAX_SPEND_REQUIRED_PATTERN.test(e.message)) {
+      throw reclassify(
+        'ERR_INVALID_INPUT',
+        `backend "${backend}" is a paid store: max_spend is required for an unattended schedule ` +
+          '(native units: winc for turbo, winston for arweave L1) — the runner gets ' +
+          'CYPHER_BRAIN_YES=1, so it must also get a spend cap',
+        e,
+      );
+    }
+    if (e instanceof Error && PING_URL_FAIL_REQUIRES_PATTERN.test(e.message)) {
+      throw reclassify('ERR_INVALID_INPUT', 'ping_url_fail requires ping_url (the success URL) to also be set', e);
+    }
+    // #726 (sibling of snapshot()'s own check reclassified in handleSnapshotNow above):
+    // validateInstallInputs() throws this SAME "nothing to snapshot" text for the SAME
+    // reason — schedule_install's dirs/pg are as optional-but-one-required as
+    // snapshot_now's, and its schema has no `profile` field either.
+    if (e instanceof Error && NOTHING_TO_SNAPSHOT_PATTERN.test(e.message)) {
+      throw reclassify('ERR_INVALID_INPUT', 'nothing to snapshot: pass dirs and/or pg', e);
+    }
+    throw e;
+  }
   return structuredOk({
     backend,
     at: at || '03:30',
@@ -2074,7 +2146,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToo
         // which is the hole this whole change is about, one level up (multi-model review
         // finding). Being unlisted therefore means uncallable, not unchecked.
         const tool = TOOLS_BY_NAME.get(name);
-        if (!tool) return structuredErr(new ToolError('ERR_INVALID_INPUT', `Unknown tool: ${name}`));
+        if (!tool) {
+          // #728: the same "did you mean" idiom assertDeclaredArgs (unknown argument
+          // names) and assertDeclaredEnums (out-of-enum values) already use for a
+          // near-miss — TOOLS_BY_NAME's own keys are exactly the candidate set a tool
+          // name is checked against, so wiring it in here needs no new list to drift.
+          const near = nearestName(name, TOOLS_BY_NAME.keys());
+          return structuredErr(
+            new ToolError('ERR_INVALID_INPUT', `Unknown tool: ${name}${near ? ` (${didYouMean(near)})` : ''}`),
+          );
+        }
         // Before anything else, and deliberately before the argument checks: a tool nobody has
         // answered the branch-relevance question for must not serve a call at all (#308). Put
         // last it would be unreachable for exactly the calls the every-tool CI pass makes,
