@@ -857,6 +857,10 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       just pushes normally: skip is an optimization, never a gate. --force uploads even
       when unchanged. (The digest is plaintext-side by necessity: age's ephemeral file
       key makes identical content encrypt to different ciphertext bytes every run.)
+      --digest only applies with --save-locator — every reader of it (the comparison
+      above, AND the content_digest this push records in --save-locator's file for a
+      LATER --skip-unchanged run) requires --save-locator, so passing --digest without
+      it is refused up front rather than silently doing nothing (#723).
 
   cypher-brain estimate --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--json] [--out <path.json>] [--remote <name>:<path>] [--force]
       Read-only preview: print what pushing --in to --backend would cost WITHOUT
@@ -1264,7 +1268,15 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   // restore's destination is --out-dir; src/lib/restore.ts's restore() never reads o.out.
   // The single highest-traffic instance, since --out means the output on snapshot, pull and
   // wallet create — restore is the one command that spells it differently.
-  restore: [{ flag: 'out', because: 'restore extracts into a directory', instead: '--out-dir' }],
+  //
+  // #722: restore()/restoreImpl() never read o.json either (verify() elsewhere in the
+  // same file does implement it — a different exported function, not restore's own path)
+  // — same "flag accepted, only honored on the failure path" gap #647 fixed for
+  // push/pull/wallet address, just never extended to this sibling command.
+  restore: [
+    { flag: 'out', because: 'restore extracts into a directory', instead: '--out-dir' },
+    { flag: 'json', because: 'restore has no JSON success output — only the failure path is JSON-shaped' },
+  ],
   // verify() reads neither: it inspects --in in place and writes nothing.
   verify: [
     { flag: 'out', because: 'verify writes nothing — it inspects --in in place' },
@@ -1272,9 +1284,12 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   ],
   // src/lib/keys.ts reads neither o.out nor o.backend: keygen writes to the paths under
   // CYPHER_BRAIN_HOME and never touches storage.
+  //
+  // #722: keygen() also never reads o.json — same sibling gap as restore above.
   keygen: [
     { flag: 'out', because: 'keygen writes to the identity/recipient paths under CYPHER_BRAIN_HOME' },
     { flag: 'backend', because: 'keygen never touches a storage backend' },
+    { flag: 'json', because: 'keygen has no JSON success output — only the failure path is JSON-shaped' },
   ],
   // estimate.ts reads o.backend but never o.yes: pricing spends nothing, so there is no
   // consent to give.
@@ -1284,12 +1299,15 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   // The CLI's snapshot does NOT push (unlike the MCP snapshot_now tool, which takes a
   // backend and pushes): snapshot() reads neither o.backend nor o.locator, so both are
   // accepted and dropped today. Pipe it into `push` to upload.
+  //
+  // #722: snapshot() also never reads o.json — same sibling gap as restore/keygen above.
   snapshot: [
     {
       flag: 'backend',
       because: 'the CLI snapshot does not push — run `push --in <file.age> --backend <name>` after it',
     },
     { flag: 'locator', because: 'a locator names an artifact already in storage; snapshot produces a local file' },
+    { flag: 'json', because: 'snapshot has no JSON success output — only the failure path is JSON-shaped' },
   ],
   // init's implementation is `init(_o)` — it ignores the options bag entirely and asks
   // interactively instead, so every flag is unread. The four here are the ones a user is
@@ -1372,15 +1390,23 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   // WALLET_SUBCOMMANDS) that do not all read --json the same way — walletBalance()
   // genuinely implements it (printJson(bal)), so a blanket `{ flag: 'json' }` entry
   // here would wrongly refuse a working "wallet balance --json". `'wallet address'`
-  // below is the subcommand-scoped key assertFlagsRelevant() tries FIRST (cmd + ' ' +
-  // o._, only when that combination has its own entry) before falling back to this
-  // one — walletAddress() only ever console.log()s a bare address string, never JSON,
-  // so --json there gets the same "clear upfront error" #647 gives push/pull, without
-  // touching wallet balance's real JSON support or wallet create (which the issue
-  // does not report a similar --json gap for).
+  // and `'wallet create'` below are the subcommand-scoped keys assertFlagsRelevant()
+  // tries FIRST (cmd + ' ' + o._, only when that combination has its own entry)
+  // before falling back to this one — walletAddress() only ever console.log()s a
+  // bare address string and walletCreate() only ever console.log()s the wallet/
+  // address paths as plain text, neither ever JSON, so --json on either gets the
+  // same "clear upfront error" #647 gave push/pull, without touching wallet
+  // balance's real JSON support. `'wallet create'` was left undeclared by #647 —
+  // #722 closes that gap, the same sibling omission as restore/keygen/snapshot above.
   wallet: [],
   'wallet address': [
     { flag: 'json', because: 'wallet address has no JSON output — it always prints a bare address string' },
+  ],
+  'wallet create': [
+    {
+      flag: 'json',
+      because: 'wallet create has no JSON output — it always prints the wallet/address paths as plain text',
+    },
   ],
   // doctor() reads only o.json — every other flag another command takes (--out, --in,
   // --backend, ...) is meaningless here, but none is likely enough to be typed by
