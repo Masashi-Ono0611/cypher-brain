@@ -264,8 +264,11 @@ into `--save-locator`/stdout or the MCP server's output.
 
 #### Choosing a paid store: Arweave vs. TON Storage
 
-`init`'s wizard presents both as a straight choice (a `select()` prompt, one hint
-line per option) — this is the same tradeoff spelled out:
+`init`'s wizard actually offers four choices in that `select()` prompt (one hint
+line per option) — `turbo`, `arweave` (raw L1), `ton-provider`, and the free
+`file` backend. This section focuses on `turbo` and `ton-provider` — the two
+general-purpose, no-size-cap "pay once, don't run your own server" options;
+this is the tradeoff between them:
 
 | | Arweave (`turbo`) | TON Storage (`ton-provider`) |
 |---|---|---|
@@ -276,9 +279,14 @@ line per option) — this is the same tradeoff spelled out:
 | **Recommended for** | Most users — the default | An explicit TON-network choice |
 
 Both are real, working "pay once, don't run your own server" options — see
-[Backends](#backends) for the full mechanics of every backend, including the
-self-hosted `ton` seeder mode this table deliberately leaves out (that one needs
-an always-on box of your own, so it isn't part of the wizard's default choice).
+[Backends](#backends) for the full mechanics of every backend. This table also
+omits two other entries the same `select()` prompt shows: raw
+`arweave` L1 (the same network as `turbo`, but a direct single-transaction
+upload capped at ~10 MiB — a materially different cost/size tradeoff) and the
+free, local-only `file` backend (not reachable from another machine, not
+offsite). Separately, the self-hosted `ton` seeder mode isn't in the
+`select()` at all (that one needs an always-on box of your own, so it isn't
+part of the wizard's menu).
 
 ### Manual flow
 
