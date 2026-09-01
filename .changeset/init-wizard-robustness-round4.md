@@ -63,12 +63,36 @@ child's stdin mid-wizard instead of answering a prompt, for #718's regression te
 Three existing tests ((c2), (n)/(o), (o2)) had their exit-code assertions inverted to
 match #731's fix.
 
-A first-pass multi-model review (`codex exec`) additionally caught and fixed, before
-merge: `snapshotOutPath`/the recovery-kit overwrite confirmation both needed a
-pre-existence guard to avoid deleting/clobbering something this run never created
-(#733, #717); the new `installStageSignalGuard()` call needed to happen as soon as
-the rollback is registered, not left to whenever `snapshot()` gets around to it, so
-steps 2-6 are also covered (#734); an in-flight write tracker was added so a signal
-landing between `keygenAt()`/`keygenSignAt()`'s own two sequential writes is also
-rolled back (#734); and the signing-keypair consistency check needed to also compare
-the minisign key id, not just the cryptographic keys (#736).
+Three rounds of multi-model review (`codex exec`) additionally caught and fixed,
+before merge:
+
+- `snapshotOutPath`/the recovery-kit overwrite confirmation both needed a
+  pre-existence guard to avoid deleting/clobbering something this run never created
+  (#733, #717); same for each of the `.digest`/`.recipients-fingerprint`/`.minisig`
+  sidecars individually, tracked separately from the main file (#733).
+- `installStageSignalGuard()` needed to be called as soon as the rollback is
+  registered, not left to whenever `snapshot()` gets around to it, so steps 2-6 are
+  also covered; an in-flight write tracker was added so a signal landing between
+  `keygenAt()`/`keygenSignAt()`'s own two sequential writes is also rolled back
+  (#734).
+- The signing-keypair consistency check needed to also compare the minisign key id,
+  not just the cryptographic keys (#736).
+- Fixing the wizard's own wallet precheck (#735) surfaced that `arweave`/`turbo`
+  `put()` never actually supported the default wallet path they were being checked
+  against — fixed in `backends/arweave.ts`/`backends/turbo.ts` too (confirmed
+  empirically against a local arlocal + a real Turbo free-tier upload), otherwise a
+  default-path-only wallet would sail through the whole wizard flow only to fail at
+  the final push.
+- A new `pushAttemptStarted` flag makes the signal rollback treat an IN-FLIGHT push
+  (not only one already known to have succeeded) as ambiguous and preserves
+  everything — a signal can land after a paid backend's upload is already durably
+  accepted server-side but before the response resolves this process's own await.
+  It is cleared once push() settles with a definitively non-ambiguous rejection, so
+  a signal during the async rollback that follows is still handled correctly (#734).
+
+Two residual, narrow limitations were identified and deliberately left as documented,
+out-of-scope edge cases (each has an inline comment explaining why): a signal landing
+inside `keygen()`'s own two-write window for the PRIMARY identity (before the wizard's
+rollback is even registered, unchanged from before this pass); and a second,
+independent process racing to create the exact same dated snapshot path between this
+wizard's own pre-existence check and `snapshot()`'s later one.

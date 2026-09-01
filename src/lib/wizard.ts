@@ -391,6 +391,18 @@ export async function init(_o: CliOptions): Promise<boolean> {
     // rollback to "only what this invocation itself created", the same principle the
     // backup-key rollback below applies.
     const recipientPreExisted = await exists(RECIPIENT);
+    // Known, accepted limitation (out of scope for #734 here): keygen()'s own
+    // keygenAt() does TWO sequential file writes (identity, then recipient) before
+    // this call resolves either way. The catch below handles a THROWN error in that
+    // window (a genuine JS exception unwinds into it normally), but #734's own
+    // signal-based rollback (setActiveInitRollback below) is not registered until
+    // AFTER this whole try/catch already completed successfully — a fatal OS signal
+    // landing IN this specific window is covered by neither mechanism, same as it
+    // always was before this pass. Closing it would mean installing the signal
+    // guard and tracking candidate paths before we even know keygen() will succeed
+    // at all; #734's repro (and every fix in this pass) is about steps AFTER the
+    // primary identity already exists, so this narrower, pre-existing gap is left
+    // as-is here.
     try {
       await keygen({ dirs: [], tables: [], recipients: [] });
     } catch (e) {
@@ -465,6 +477,17 @@ export async function init(_o: CliOptions): Promise<boolean> {
     // immediately having written nothing, and unconditionally tracking it here would
     // make rollback delete a file this run never created.
     let snapshotOutPath: string | null = null;
+    // Review-hardened: snapshot()'s own no-clobber check (snapshot.ts) only ever
+    // inspects the MAIN `.age` path above — it does not check its sidecars at all,
+    // and writes them with a plain (non-exclusive) writeFile. An ORPHANED
+    // `.digest`/`.recipients-fingerprint`/`.minisig` from some unrelated earlier
+    // event (a process killed mid-way through a PRIOR run's OWN rollback sequence,
+    // before every sidecar in it got deleted, on an earlier day whose dated path
+    // happens to collide with today's) could still be sitting there even though the
+    // main file is not. Tracked individually, mirroring identityPreExisted/
+    // recipientPreExisted above, so rollback only ever deletes a sidecar THIS run
+    // could plausibly have written.
+    let snapshotSidecarsPreExisted = { digest: false, fingerprint: false, minisig: false };
     // True once push() below actually returns successfully. From that point on the
     // ciphertext already exists, durably, in the chosen backend's store — for
     // arweave/turbo that store is PAID and PERMANENT (irreversible; real funds were
@@ -491,7 +514,13 @@ export async function init(_o: CliOptions): Promise<boolean> {
     // synchronous rollback below cannot afford to guess wrong: deleting the only
     // keys that could ever decrypt an already-paid-for, permanent upload is
     // categorically worse than leaving an identity behind for a human to clean up by
-    // hand (`keygen --force`, or just picking a fresh CYPHER_BRAIN_HOME).
+    // hand (`keygen --force`, or just picking a fresh CYPHER_BRAIN_HOME). Cleared
+    // back to false the moment push() SETTLES with a definitively non-ambiguous
+    // rejection (the "any other push() failure" branch below) — once that happens
+    // the outcome is known for certain, and the sync rollback must go back to acting
+    // normally (including covering a signal landing during the ASYNC cleanup that
+    // follows, a separate window pushSucceeded/pushAttemptStarted together must not
+    // block).
     let pushAttemptStarted = false;
     // #734 (review-hardened): keygenAt()/keygenSignAt() each do TWO sequential file
     // writes (identity, then recipient/public key) before their caller ever assigns
@@ -553,15 +582,23 @@ export async function init(_o: CliOptions): Promise<boolean> {
         try {
           rmSync(snapshotOutPath, { force: true });
         } catch {}
-        try {
-          rmSync(`${snapshotOutPath}.digest`, { force: true });
-        } catch {}
-        try {
-          rmSync(`${snapshotOutPath}.recipients-fingerprint`, { force: true });
-        } catch {}
-        try {
-          rmSync(`${snapshotOutPath}.minisig`, { force: true });
-        } catch {}
+        // Review-hardened: each sidecar only if it did NOT pre-exist — see
+        // snapshotSidecarsPreExisted's own doc comment above.
+        if (!snapshotSidecarsPreExisted.digest) {
+          try {
+            rmSync(`${snapshotOutPath}.digest`, { force: true });
+          } catch {}
+        }
+        if (!snapshotSidecarsPreExisted.fingerprint) {
+          try {
+            rmSync(`${snapshotOutPath}.recipients-fingerprint`, { force: true });
+          } catch {}
+        }
+        if (!snapshotSidecarsPreExisted.minisig) {
+          try {
+            rmSync(`${snapshotOutPath}.minisig`, { force: true });
+          } catch {}
+        }
       }
       // #734 (review-hardened): a generation attempt still mid-flight (see
       // inFlightSecretWrites's own doc comment above) — its target paths are not yet
@@ -1217,9 +1254,34 @@ export async function init(_o: CliOptions): Promise<boolean> {
       // touched it. Recording snapshotOutPath unconditionally in that case would make
       // rollback delete a file THIS run never created. Check pre-existence first —
       // same idiom as identityPreExisted/recipientPreExisted above — and only track
-      // it for rollback when it did NOT already exist.
+      // it for rollback when it did NOT already exist. Known, accepted residual: this
+      // check and snapshot()'s OWN later no-clobber check are two independent points
+      // in time — a DIFFERENT process creating a file at this exact dated path in
+      // between them would make snapshot() refuse (having written nothing) while
+      // this run still believes the path is its own to clean up, deleting that other
+      // process's file. Requires two independent writers targeting the identical
+      // CYPHER_BRAIN_HOME and calendar day at the same moment; closing it fully
+      // would mean snapshot() itself reporting whether IT was the one that found the
+      // path already occupied (mirroring push()'s own PushPartialSuccessError
+      // idiom) rather than the wizard polling exists() up front — a snapshot.ts
+      // change, out of scope here.
       const outPathPreExisted = await exists(outPath);
-      if (!outPathPreExisted) snapshotOutPath = outPath;
+      if (!outPathPreExisted) {
+        snapshotOutPath = outPath;
+        // Review-hardened: each sidecar's OWN pre-existence, independent of the main
+        // file's — see snapshotSidecarsPreExisted's own doc comment above for why an
+        // orphaned sidecar with no matching main file is a real (if narrow) scenario.
+        const [digestPreExisted, fingerprintPreExisted, minisigPreExisted] = await Promise.all([
+          exists(`${outPath}.digest`),
+          exists(`${outPath}.recipients-fingerprint`),
+          exists(`${outPath}.minisig`),
+        ]);
+        snapshotSidecarsPreExisted = {
+          digest: digestPreExisted,
+          fingerprint: fingerprintPreExisted,
+          minisig: minisigPreExisted,
+        };
+      }
       await snapshot(snapshotOpts);
 
       if (paid) {
@@ -1324,6 +1386,25 @@ export async function init(_o: CliOptions): Promise<boolean> {
         // Any other push() failure (declined paid-backend consent, a network error
         // during backend.put() itself, etc.) means the upload never happened —
         // pushSucceeded stays false and the pre-push rollback path below still fires.
+        // Known, accepted limitation (out of scope here): this assumes backend.put()
+        // itself correctly classifies every failure mode it can hit — a network call
+        // that times out AFTER a paid backend's gateway already durably accepted the
+        // upload, but before the response reaches this process, would still land
+        // here as an ordinary thrown Error and trigger a full rollback. Closing that
+        // fully requires each backend (arweave.ts/turbo.ts) to positively identify
+        // "accepted, response lost" as its own case (the way PushPartialSuccessError
+        // already does for the ones it recognizes) — a backend-level concern, not
+        // this wizard's; unchanged by this pass.
+        // Review-hardened: push() has now SETTLED (rejected, not merely pending), so
+        // the ambiguity pushAttemptStarted exists to cover (a signal landing while
+        // the outcome is still genuinely unknown) is gone — this specific outcome is
+        // known for certain. Clearing it here matters for a DIFFERENT window than the
+        // one it was introduced for: the async rollback just below (and the outer
+        // catch's own async cleanup once this throw propagates there) does several
+        // sequential `await rm(...)` calls — if a signal landed DURING that async
+        // cleanup with this flag still (stale-ly) true, the sync rollback would
+        // wrongly bail out and preserve everything instead of finishing the job.
+        pushAttemptStarted = false;
         throw pushErr;
       }
 
@@ -1497,9 +1578,14 @@ export async function init(_o: CliOptions): Promise<boolean> {
       }
       if (snapshotOutPath) {
         await rm(snapshotOutPath, { force: true });
-        await rm(`${snapshotOutPath}.digest`, { force: true });
-        await rm(`${snapshotOutPath}.recipients-fingerprint`, { force: true });
-        await rm(`${snapshotOutPath}.minisig`, { force: true }); // #733: snapshot() can write this sidecar before later throwing
+        // #733: snapshot() can write these sidecars before later throwing. Review-
+        // hardened: each one only if it did NOT already exist before this run touched
+        // anything — see snapshotSidecarsPreExisted's own doc comment above.
+        if (!snapshotSidecarsPreExisted.digest) await rm(`${snapshotOutPath}.digest`, { force: true });
+        if (!snapshotSidecarsPreExisted.fingerprint) {
+          await rm(`${snapshotOutPath}.recipients-fingerprint`, { force: true });
+        }
+        if (!snapshotSidecarsPreExisted.minisig) await rm(`${snapshotOutPath}.minisig`, { force: true });
       }
       throw err;
     }
