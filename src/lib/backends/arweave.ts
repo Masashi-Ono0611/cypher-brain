@@ -442,6 +442,12 @@ function l1ChunkRead(ar: ArweaveClient, locator: string, timeoutMs: number): Pro
 // hangs `push` forever, with the tx already signed. `sign()` itself is local crypto
 // (no network call) when a JWK is supplied, so patching fetch for both calls together
 // is harmless — it simply has nothing to intercept during sign().
+// Deliberately NOT armed before `sign()` runs (unlike l1ChunkRead(), which fetches
+// immediately with no such gap): signing hashes/signs the whole (already-buffered)
+// payload, which is local compute this stall timer must not budget against — arming
+// early would let a slow-but-healthy sign() alone burn through timeoutMs and abort
+// post()'s first request before any network call was ever made (Codex review). The
+// timer starts on the FIRST fetch call instead, which is always post()'s doing.
 // NOT reentrant, same caveat as l1ChunkRead(): mutates the process-global `fetch` for
 // the duration of one call; safe because put() is only ever awaited sequentially (one
 // backend.put() per CLI process).
@@ -458,9 +464,8 @@ function l1SignAndPost(
     clearTimeout(stall);
     stall = setTimeout(() => ctl.abort(), timeoutMs);
   };
-  arm();
   globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-    arm(); // a new request (each chunk) = forward progress; reset the stall deadline
+    arm(); // first call arms the timer; each subsequent one (a new chunk) resets it
     return realFetch(input, { ...init, redirect: 'error', signal: ctl.signal });
   }) as typeof fetch;
   const p = (async () => {
