@@ -1510,14 +1510,30 @@ async function main(): Promise<void> {
 
 async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<void> {
   switch (cmd) {
-    case 'init':
+    case 'init': {
       // A note from the person who built this, right after the wizard's own
       // completion summary above (issue #195) — CLI-only: init has no MCP
       // tool, so this never touches an agent's machine-readable output.
-      await init(o);
+      //
+      // #731: init() returns false (rather than throwing) for its two deliberate
+      // "a chosen paid backend's prerequisites are missing" early exits — those
+      // print "nothing has been rolled back ... cannot be re-run" and are NOT a
+      // completed setup, even though (like one) they neither throw nor roll
+      // anything back. Decorating that outcome with the SAME happy mascot/founder's
+      // note a genuinely completed run gets, at the SAME exit code (0), let a
+      // script/agent checking $? see success either way. Only a completed run
+      // (init() returned true — a snapshot was actually created AND pushed) gets
+      // the happy decoration; the early-exit case instead sets a non-zero exit
+      // code, same as any other command that did not finish what it set out to do.
+      const completed = await init(o);
+      if (!completed) {
+        process.exitCode = 1;
+        return;
+      }
       printMascot('happy');
       printFounderNote();
       return;
+    }
     case 'keygen':
       return keygen(o);
     case 'snapshot':

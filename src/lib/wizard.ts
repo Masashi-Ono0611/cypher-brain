@@ -55,7 +55,7 @@
 // rather than hanging or behaving unpredictably under a CI/pipe invocation.
 import { text, confirm, select, isCancel } from '@clack/prompts';
 import { readFile, writeFile, rm, stat, access, realpath } from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { rmSync, constants as fsConstants } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import {
@@ -68,22 +68,25 @@ import {
   TON_PROVIDER_OWNER,
   TON_PROVIDER_MAX_SPEND,
   TON_PROVIDER_NOTIFY_BIN,
+  AR_WALLET,
   readEnv,
 } from './config.js';
 import { keygen, keygenAt } from './keys.js';
 import { askNewPassphrase, wrapIdentity } from './crypt.js';
-import { keygenSignAt } from './minisign.js';
+import { keygenSignAt, loadSignIdentity, parsePubkeyFile, signingKeypairMatches } from './minisign.js';
 import { detectGbrainEngine, pathCoveredBy, resolveGbrainConfigPath } from './gbrain.js';
 import { PROFILE_NAMES } from './profiles.js';
 import { snapshot } from './snapshot.js';
 import { push, PushPartialSuccessError } from './pushpull.js';
 import { estimateCost, formatEstimate } from './estimate.js';
 import { BACKEND_NAMES } from './backends/index.js';
-import { walletConfigured, tonWalletConfigured } from './wallet.js';
+import { walletConfigured, tonWalletConfigured, WALLET_DEFAULT_PATH } from './wallet.js';
 import { exists, errMsg } from './util.js';
+import { warn } from './warn.js';
 import { buildRecoveryKit, writeRecoveryKitFile } from './recoverykit.js';
 import type { BackupKey, SigningKey } from './recoverykit.js';
 import type { CliOptions } from './types.js';
+import { setActiveInitRollback } from './signal-guard.js';
 
 // Thrown when a clack prompt reports a cancel (Ctrl+C, or Esc on the ones that support
 // it) — turning that into a normal thrown Error routes it through init()'s own
@@ -104,6 +107,40 @@ class InitCancelledError extends Error {
     );
     this.name = 'InitCancelledError';
   }
+}
+
+// #718: stdin reaching EOF (a closed pipe, a piped process exiting upstream, Ctrl-D,
+// `< /dev/null`) while a clack prompt is awaiting an answer leaves that prompt's own
+// Promise UNSETTLED forever — @clack/prompts' TextPrompt/ConfirmPrompt/SelectPrompt
+// only resolve on a DECODED KEYPRESS (see InitCancelledError's own doc comment above
+// for why a Ctrl-C is different: raw mode makes it arrive as an ordinary keypress
+// instead of an OS signal — but EOF is neither a signal nor a keypress, it is the
+// stream itself ending), so with nothing else pending, Node's event loop simply
+// drains and the process exits 0, silently, with whatever this run had already
+// generated (a fresh identity, an offline backup keypair, ...) left orphaned on disk
+// — none of init()'s own try/catch, and none of its documented InitCancelledError
+// rollback, ever runs. Race every prompt call below against stdin's own 'end'/
+// 'close' event so an EOF mid-wizard takes the EXACT SAME cancel-and-roll-back path a
+// Ctrl-C already does, instead of a silent, orphan-leaving exit 0.
+//
+// One shared, lazily-created promise — NOT a fresh listener attached fresh for each
+// individual prompt call — because 'end'/'close' fire AT MOST ONCE per stream
+// lifetime: a listener scoped to only the CURRENT prompt would miss an EOF landing in
+// the (tiny, but real) gap between two prompts (a readFile, a stat() call, ...),
+// hanging the NEXT prompt's own race forever instead of ever seeing it. Consumed via
+// Promise.race() at every call site below, so a rejection here surfaces as though the
+// prompt itself had thrown — this promise is expected to reject at most once, ever,
+// and every consumer already treats that rejection the same way isCancel() does.
+let stdinEndedPromise: Promise<never> | null = null;
+function stdinEnded(): Promise<never> {
+  if (!stdinEndedPromise) {
+    stdinEndedPromise = new Promise<never>((_resolve, reject) => {
+      const onEnd = (): void => reject(new InitCancelledError());
+      process.stdin.once('end', onEnd);
+      process.stdin.once('close', onEnd);
+    });
+  }
+  return stdinEndedPromise;
 }
 
 // `init` is fundamentally interactive: a plain non-TTY invocation (piped/redirected
@@ -146,7 +183,11 @@ async function askLine(question: string, def = ''): Promise<string> {
   // finding). placeholder just shows the default as dimmed ghost text before anything
   // is typed; pass undefined rather than '' so an empty def does not render a stray
   // placeholder.
-  const answer = await text({ message: question, placeholder: def || undefined, defaultValue: def });
+  // #718: raced against stdin ending — see stdinEnded()'s own doc comment above.
+  const answer = await Promise.race([
+    text({ message: question, placeholder: def || undefined, defaultValue: def }),
+    stdinEnded(),
+  ]);
   if (isCancel(answer)) throw new InitCancelledError();
   return answer.trim() || def;
 }
@@ -163,6 +204,23 @@ function expandHome(path: string): string {
   if (path === '~') return homedir();
   if (path.startsWith('~/')) return join(homedir(), path.slice(2));
   return path;
+}
+
+// #761: the per-day snapshot filename below (step 7) is meant to reflect the
+// OPERATOR's own local calendar day — the wizard's own comment there calls --out
+// "dated per-day" so a same-day retry lands on the same path — but
+// `new Date().toISOString().slice(0, 10)` reports the UTC date instead. For roughly
+// the first several hours of any local day in a timezone AHEAD of UTC (JST and most
+// of Asia/Australia among them), the UTC date is still the PREVIOUS calendar day, so
+// the wizard named "today's" backup after yesterday purely as a display/naming
+// artifact (no data loss: a later failure still fully rolls back whatever this
+// produces, unchanged). Read the LOCAL calendar fields (getFullYear/getMonth/getDate,
+// which resolve against the process's own timezone) instead of UTC ones.
+function localDateStamp(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 // #605: the obsidian/chatgpt-export/o2b free-text path prompts (--vault/--zip/--export)
@@ -231,7 +289,8 @@ async function askExistingPath(
 // exactly two labelled options (default "Yes"/"No"), not a parsed string, so there is
 // no "unrecognized answer" state left to re-prompt for.
 async function askYesNo(question: string, def: boolean): Promise<boolean> {
-  const answer = await confirm({ message: question, initialValue: def });
+  // #718: raced against stdin ending — see stdinEnded()'s own doc comment above.
+  const answer = await Promise.race([confirm({ message: question, initialValue: def }), stdinEnded()]);
   if (isCancel(answer)) throw new InitCancelledError();
   return answer;
 }
@@ -255,7 +314,8 @@ async function askSelect(
   options: { value: string; label: string; hint?: string }[],
   initialValue: string,
 ): Promise<string> {
-  const answer = await select({ message: question, options, initialValue });
+  // #718: raced against stdin ending — see stdinEnded()'s own doc comment above.
+  const answer = await Promise.race([select({ message: question, options, initialValue }), stdinEnded()]);
   if (isCancel(answer)) throw new InitCancelledError();
   return answer;
 }
@@ -281,7 +341,18 @@ const BACKEND_HINTS: Record<(typeof BACKEND_NAMES)[number], string> = {
 // drift. The wizard-era design notes (1Password Emergency Kit lineage,
 // plain-text-over-PDF, primary-not-duplicated) live there now.
 
-export async function init(_o: CliOptions): Promise<void> {
+// #731: returns true once a snapshot has actually been created AND pushed — the
+// wizard's own definition of a completed run. Returns false for the two deliberate
+// early-exit branches below (a chosen paid backend's prerequisites are missing) —
+// those print "nothing has been rolled back ... cannot be re-run" and are NOT the
+// same outcome as a completed setup, even though (like a completed run) they neither
+// throw nor roll anything back. Every OTHER outcome still throws exactly as before
+// (an invalid answer, a declined paid-backend consent, InitCancelledError, ...) —
+// this return value only disambiguates the two "returned normally" cases from each
+// other, it does not change what already threw. cli.ts's own `init` dispatch reads
+// this to decide whether the happy mascot/founder's note (and exit code 0) are
+// warranted, instead of assuming every non-throwing return means the same thing.
+export async function init(_o: CliOptions): Promise<boolean> {
   requireTTY();
   if (await exists(IDENTITY)) {
     throw new Error(
@@ -323,6 +394,31 @@ export async function init(_o: CliOptions): Promise<void> {
     try {
       await keygen({ dirs: [], tables: [], recipients: [] });
     } catch (e) {
+      // #720: two `cypher-brain init` (or a concurrent `keygen`) processes racing
+      // against the SAME empty CYPHER_BRAIN_HOME can both pass the exists()-based
+      // refusal above before either has written anything, then both call keygenAt()
+      // (keys.ts), which writes IDENTITY first via an EXCLUSIVE create ('wx' flag) —
+      // the OS itself lets exactly one of the two writes win; the LOSER's write
+      // throws EEXIST. Before this fix, the loser unconditionally deleted IDENTITY
+      // here, which can delete the WINNER's just-written (or about-to-be-written)
+      // identity out from under it, corrupting a concurrent init that would
+      // otherwise have succeeded. keygenAt() writes IDENTITY strictly before
+      // RECIPIENT (keys.ts), so an EEXIST on IDENTITY specifically means THIS
+      // process's own keygenAt() call never got past its very first write — it
+      // created nothing at all, and has nothing of its own to roll back. Back off
+      // cleanly instead: touch neither IDENTITY nor RECIPIENT, and let the operator
+      // re-run once the winning process finishes (it will then either see "an
+      // identity already exists", if the winner succeeded, or a fresh, writable
+      // CYPHER_BRAIN_HOME again, if the winner itself failed later).
+      const raced = (e as NodeJS.ErrnoException)?.code === 'EEXIST' && (e as NodeJS.ErrnoException)?.path === IDENTITY;
+      if (raced) {
+        throw new Error(
+          `another "cypher-brain init" (or "keygen") process just won a race to create the identity at ${IDENTITY} ` +
+            '— this run is backing off WITHOUT touching anything the other process wrote. Re-run "cypher-brain ' +
+            'init" once it finishes: it will refuse with "an identity already exists" if that other run ' +
+            'succeeded, or start cleanly again if it did not.',
+        );
+      }
       await rm(IDENTITY, { force: true });
       if (!recipientPreExisted) await rm(RECIPIENT, { force: true });
       throw e;
@@ -341,15 +437,28 @@ export async function init(_o: CliOptions): Promise<void> {
     // surfaces unchanged.
     let backup: BackupKey | null = null;
     let signing: SigningKey | null = null;
-    // Set the moment snapshot() below actually succeeds — never before. snapshot()'s own
-    // promote step (promoteSnapshot in snapshot.ts) only renames/links its .part onto
-    // o.out on success, so if snapshot() itself throws, o.out (and its sidecars) were
-    // never created and there is nothing here to roll back. If a LATER step fails (push,
-    // the recovery-kit write, ...), the dated snapshot file it did produce — plus its
-    // `.digest` / `.recipients-fingerprint` sidecars — must still be deleted: snapshot()
-    // refuses to overwrite an existing --out (no-clobber), and the wizard's --out is
-    // dated per-day, so leaving them behind would make a same-day retry fail again at
-    // this exact step even though the rollback below already cleared the identity.
+    // #719: true only when THIS run generated a NEW signing keypair (the "Generate a
+    // signing keypair now?" branch below). When `signing` instead came from REUSING an
+    // already-existing signing pair (step 3's own "already exists — reusing it"
+    // branch), this stays false — a signing keypair that predates this run must never
+    // be deleted by rollback (this run neither created it nor has any reason to expect
+    // its own cleanup to touch it), unlike a keypair this run generated itself, which
+    // rollback must remove exactly like the primary identity/backup keypair above.
+    let signingGeneratedThisRun = false;
+    // #733: set to `outPath` BEFORE calling snapshot() below, not only after it
+    // returns. snapshot() can durably PROMOTE o.out (rename its .part onto it,
+    // promoteSnapshot in snapshot.ts) and even finish writing its `.digest`/
+    // `.recipients-fingerprint`/`.minisig` sidecars, then STILL throw afterward (e.g.
+    // the minisign sidecar write itself failing — a pre-existing directory sitting at
+    // that exact path, ENOSPC, ...) — recording this only on a successful RETURN used
+    // to leave that already-durable ciphertext (and whichever sidecars it managed to
+    // write) completely untracked by the rollback below, so a same-day retry then hit
+    // snapshot()'s own no-clobber refusal at this exact --out even after the identity
+    // itself had already been cleaned up. Setting it here instead makes the rollback
+    // below safe for BOTH failure shapes: if snapshot() throws before writing anything
+    // at all, these paths never existed and the `{ force: true }` removes below are
+    // harmless no-ops; if it throws partway through (or after fully succeeding, and a
+    // LATER step then fails), whatever it did manage to write gets cleaned up too.
     let snapshotOutPath: string | null = null;
     // True once push() below actually returns successfully. From that point on the
     // ciphertext already exists, durably, in the chosen backend's store — for
@@ -364,6 +473,60 @@ export async function init(_o: CliOptions): Promise<void> {
     let pushSucceeded = false;
     let pushedBackend: string | null = null;
     let pushedLocatorPath: string | null = null;
+    // #734: a fatal signal (Ctrl-C, launchd/shutdown SIGTERM) during the long
+    // snapshot()/push() phase below is delivered as a real OS signal — unlike Ctrl-C
+    // during a clack prompt (raw mode decodes it as an ordinary keypress instead, see
+    // InitCancelledError's own doc comment above) — and signal-guard.ts's handler
+    // re-raises it directly rather than letting the suspended async stack here ever
+    // unwind, so the catch block below (and its rollback) never runs. Register a
+    // SYNCHRONOUS mirror of that same rollback here — a closure over exactly the same
+    // mutable state the catch block below reads — so signal-guard.ts can run it first
+    // if a fatal signal lands anywhere in the rest of this run, then re-raise the
+    // signal as it already does. `rmSync`, not the async `rm` used everywhere else in
+    // this file, because a signal handler cannot await anything (the process is mid-
+    // signal); `{ force: true }` still makes every one of these a no-op for a path
+    // that never existed, and a wrapping try/catch protects each individually so one
+    // failing removal never blocks the rest.
+    const rollbackKeysAndSnapshotSync = (): void => {
+      if (pushSucceeded) return; // once pushed, never delete — identical rule to the async catch below
+      try {
+        rmSync(IDENTITY, { force: true });
+      } catch {}
+      try {
+        rmSync(RECIPIENT, { force: true });
+      } catch {}
+      if (backup) {
+        try {
+          rmSync(backup.identityPath, { force: true });
+        } catch {}
+        try {
+          rmSync(backup.recipientPath, { force: true });
+        } catch {}
+      }
+      if (signing && signingGeneratedThisRun) {
+        try {
+          rmSync(signing.identityPath, { force: true });
+        } catch {}
+        try {
+          rmSync(signing.recipientPath, { force: true });
+        } catch {}
+      }
+      if (snapshotOutPath) {
+        try {
+          rmSync(snapshotOutPath, { force: true });
+        } catch {}
+        try {
+          rmSync(`${snapshotOutPath}.digest`, { force: true });
+        } catch {}
+        try {
+          rmSync(`${snapshotOutPath}.recipients-fingerprint`, { force: true });
+        } catch {}
+        try {
+          rmSync(`${snapshotOutPath}.minisig`, { force: true });
+        } catch {}
+      }
+    };
+    setActiveInitRollback(rollbackKeysAndSnapshotSync);
     try {
       // ---------- 2. backup key guidance (MANAGEMENT.md Key recovery #1) ----------
       console.log('\n== 2/7: offline backup key (recommended) ==');
@@ -481,12 +644,30 @@ export async function init(_o: CliOptions): Promise<void> {
         // null even though snapshot auto-signs with the pre-existing key
         // regardless of this wizard run, so the recovery kit would falsely omit
         // the signing public key a restore on another machine actually needs.
+        // #736: the two halves above are only checked for PRESENCE, never that they
+        // actually pair up — sign-identity.key and sign-recipient.pub could have
+        // landed there from two unrelated setups (e.g. two independent "keygen --sign"
+        // runs, one of which only replaced one half via --sign-identity/
+        // --sign-recipient overrides pointed at the default path). Reusing a
+        // mismatched pair as-is would bake a public key into the recovery kit that
+        // can never verify anything actually signed with the paired private key —
+        // silently, since snapshot() itself has no reason to notice (it just signs
+        // with whichever private key is at SIGN_IDENTITY). Prove the two halves
+        // belong together with a cheap sign->verify round trip over known data
+        // (signingKeypairMatches, minisign.ts) BEFORE trusting either of them.
+        const pubkeyText = await readFile(SIGN_RECIPIENT, 'utf8');
+        const { privateKey } = await loadSignIdentity(SIGN_IDENTITY);
+        const { publicKey } = parsePubkeyFile(pubkeyText);
+        if (!signingKeypairMatches(privateKey, publicKey)) {
+          throw new Error(
+            `the existing signing keypair does not match: ${SIGN_IDENTITY} cannot produce a signature ` +
+              `${SIGN_RECIPIENT} verifies. This pair likely came from two different setups (e.g. two separate ` +
+              '"keygen --sign" runs) — regenerate a matching pair ("cypher-brain keygen --sign --force") before ' +
+              're-running init, or move the mismatched files aside.',
+          );
+        }
         console.log(`Authenticity signing keypair already exists (${SIGN_RECIPIENT}) — reusing it.`);
-        signing = {
-          identityPath: SIGN_IDENTITY,
-          recipientPath: SIGN_RECIPIENT,
-          pubkeyText: await readFile(SIGN_RECIPIENT, 'utf8'),
-        };
+        signing = { identityPath: SIGN_IDENTITY, recipientPath: SIGN_RECIPIENT, pubkeyText };
       } else if (await askYesNo('Generate a signing keypair now?', true)) {
         // Same partial-write hazard/rollback shape as the backup keypair above: check
         // pre-existence BEFORE calling keygenSignAt (this branch only runs when
@@ -509,6 +690,7 @@ export async function init(_o: CliOptions): Promise<void> {
           throw e;
         }
         signing = { identityPath: SIGN_IDENTITY, recipientPath: SIGN_RECIPIENT, pubkeyText };
+        signingGeneratedThisRun = true; // #719: only THIS flag makes rollback allowed to delete it
         console.log(`signing public key written to: ${SIGN_RECIPIENT}`);
       } else {
         console.log('Skipping authenticity signing. You can add it later at any time: cypher-brain keygen --sign');
@@ -575,8 +757,16 @@ export async function init(_o: CliOptions): Promise<void> {
           'well as your own runs, while one in a shell rc covers the nightly run only if install happened to be\n' +
           'run from a shell that had sourced it. (Added it after "schedule install"? Re-run install to pick it up.)',
       );
+      // #762: "config.env" (the actual filename, matching CONFIG_FILE_PATH's basename
+      // — see configFileIn in config.ts) in place of "the config file" — clack's own
+      // word-wrap (wrapTextWithPrefix, @clack/core) never breaks WITHIN a single
+      // whitespace-free token, so naming the file as one word keeps this question
+      // from ever splitting exactly between "config" and "file?" the way the
+      // two-word phrase could at a narrow terminal width. Keeps the
+      // "Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line" prefix every scripted
+      // selftest QA answer below waits for unchanged.
       let pinRecipientsLine: string | null = null;
-      if (await askYesNo('Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line for the config file?', true)) {
+      if (await askYesNo('Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line for config.env?', true)) {
         const primaryPub = (await readFile(RECIPIENT, 'utf8')).trim();
         const defaultLine = `CYPHER_BRAIN_PIN_RECIPIENTS="${[primaryPub, backup?.recipient].filter(Boolean).join(' ')}"`;
         console.log(`Suggested line (edit or press Enter to accept):\n${defaultLine}`);
@@ -654,7 +844,13 @@ export async function init(_o: CliOptions): Promise<void> {
           dirs = [];
           for (const candidate of candidates) {
             if (await exists(candidate)) dirs.push(candidate);
-            else console.log(`  ${candidate} does not exist — skipping it.`);
+            // #732: warn(), not a plain console.log — dropping a requested backup
+            // source silently changes what actually gets backed up, exactly the class
+            // of thing warn.ts's own chokepoint exists to carry into the end-of-run
+            // "run summary" block (an agent relaying this run is told to show that
+            // block verbatim). A plain console.log line here was easy to lose in the
+            // middle of a long transcript and never made it into that summary at all.
+            else warn(`init: ${candidate} does not exist — skipping it (not included in this backup).`);
           }
           if (dirs.length === 0) console.log('At least one directory is required — please try again.');
         }
@@ -887,11 +1083,23 @@ export async function init(_o: CliOptions): Promise<void> {
           `(see MANAGEMENT.md) — "cypher-brain init" cannot be re-run, since it refuses whenever an identity` +
             ` already exists at ${IDENTITY}.`,
         );
-        return;
+        return false; // #731: never pushed a snapshot — must not share exit 0 with a completed run
       }
-      if (paid && backend !== 'ton-provider' && !(await walletConfigured())) {
+      // #735: mirror wallet.ts's OWN default-path fallback (addressFromWallet/
+      // payerAddressFor: `o.wallet || AR_WALLET || WALLET_DEFAULT_PATH`) instead of
+      // checking CYPHER_BRAIN_AR_WALLET alone. `wallet create`'s own guidance (wallet.ts)
+      // tells users push finds the default wallet.json with NO env var set at all — this
+      // precheck disagreeing with that meant a wallet created via a bare `wallet create`
+      // (no --out) still made this precheck report "no wallet configured" and abandon the
+      // rest of setup, even though push itself would have found and used it just fine.
+      const arWalletPath = AR_WALLET || WALLET_DEFAULT_PATH;
+      if (paid && backend !== 'ton-provider' && !(await walletConfigured(arWalletPath))) {
         console.log(
-          `\n${backend} needs a funded wallet to push, and CYPHER_BRAIN_AR_WALLET is not set to an existing wallet file.`,
+          `\n${backend} needs a funded wallet to push, and none was found at ${arWalletPath}` +
+            (AR_WALLET
+              ? ''
+              : ' (the default path "wallet create" writes to — set CYPHER_BRAIN_AR_WALLET if yours lives elsewhere)') +
+            '.',
         );
         console.log('Set one up first:');
         console.log('  cypher-brain wallet create           # writes a JWK wallet (0600, no-clobber)');
@@ -906,7 +1114,7 @@ export async function init(_o: CliOptions): Promise<void> {
           `(see MANAGEMENT.md) — "cypher-brain init" cannot be re-run, since it refuses whenever an identity` +
             ` already exists at ${IDENTITY}.`,
         );
-        return;
+        return false; // #731: never pushed a snapshot — must not share exit 0 with a completed run
       }
       // #172: build the snapshot BEFORE asking for paid-backend consent, not after.
       // The prompt below ("this spends real funds, confirm?") used to fire with no
@@ -917,11 +1125,15 @@ export async function init(_o: CliOptions): Promise<void> {
       // estimate in the same prompt the consent decision is made against, exactly
       // like push() now does for direct CLI/MCP callers.
       snapshotOpts.recipients = [RECIPIENT, ...(backup ? [backup.recipientPath] : [])];
-      const dateStamp = new Date().toISOString().slice(0, 10);
+      // #761: the operator's own LOCAL calendar day, not toISOString()'s UTC one — see
+      // localDateStamp's own doc comment above for why.
+      const dateStamp = localDateStamp(new Date());
       const outPath = join(HOME, `brain-${dateStamp}.age`);
       snapshotOpts.out = outPath;
+      // #733: recorded BEFORE calling snapshot(), not only after it returns — see this
+      // variable's own declaration above (near `let snapshotOutPath`) for why.
+      snapshotOutPath = outPath;
       await snapshot(snapshotOpts);
-      snapshotOutPath = outPath; // recorded only now — snapshot() has durably written it
 
       if (paid) {
         // Same estimateCost()/formatEstimate() math push() uses (src/lib/estimate.ts,
@@ -1026,10 +1238,41 @@ export async function init(_o: CliOptions): Promise<void> {
 
       // ---------- recovery kit ----------
       const primaryRecipient = (await readFile(RECIPIENT, 'utf8')).trim();
-      const defaultKitPath = join(homedir(), 'recovery-kit.txt');
+      // #717: scoped to THIS run's own CYPHER_BRAIN_HOME, not the OS-level
+      // os.homedir() — consistent with every other path default in this wizard (e.g.
+      // the backup keypair's own default a few steps above, `${CYPHER_BRAIN_HOME}-
+      // backup`). Before this fix, running init for two DIFFERENT identities (two
+      // different CYPHER_BRAIN_HOME values) on the same machine suggested the
+      // IDENTICAL default path both times (~/recovery-kit.txt, unrelated to either
+      // identity) — accepting it the second time silently overwrote the first
+      // identity's kit, with no warning, moments after the wizard had just printed
+      // that this file is meant to be treated as a unique, precious, secret-bearing
+      // artifact.
+      const defaultKitPath = join(HOME, 'recovery-kit.txt');
       console.log('\n⚠  The recovery kit written below will contain secret key material in plaintext — once it');
       console.log('   is written, move it OFF-BOX (encrypted USB, a second location, a trusted person).');
-      const kitPath = expandHome(await askLine(`Path to write the recovery kit [${defaultKitPath}]`, defaultKitPath));
+      // #717: loop until the chosen path either does not exist yet, or the operator
+      // explicitly confirms overwriting whatever is already there — belt-and-
+      // suspenders with the scoped default above, since this prompt still accepts ANY
+      // answer, including a custom path that happens to already hold a kit from a
+      // different setup.
+      let kitPath: string;
+      for (;;) {
+        const candidate = expandHome(
+          await askLine(`Path to write the recovery kit [${defaultKitPath}]`, defaultKitPath),
+        );
+        if (await exists(candidate)) {
+          console.log(`⚠  A file already exists at ${candidate} — writing the new kit here would overwrite it.`);
+          if (await askYesNo('Overwrite it?', false)) {
+            kitPath = candidate;
+            break;
+          }
+          console.log('Choose a different path for the recovery kit.');
+          continue;
+        }
+        kitPath = candidate;
+        break;
+      }
       const kitText = buildRecoveryKit({
         primaryIdentityPath: IDENTITY,
         primaryInline: null, // init never inlines the primary — see recoverykit.ts's design note
@@ -1050,7 +1293,13 @@ export async function init(_o: CliOptions): Promise<void> {
       console.log('\n=== cypher-brain init: complete ===');
       console.log(`primary identity:  ${IDENTITY}`);
       if (backup) console.log(`backup identity:   ${backup.identityPath}  (move this OFF this machine)`);
-      if (signing) console.log(`signing public key: ${signing.recipientPath}`);
+      // #747: "signing public key:" is itself already 19 characters (colon included)
+      // — the same column every OTHER label above pads its OWN (shorter) text out to
+      // — so it needs ZERO extra padding spaces to land its value in the same column
+      // the other six lines already share. A single trailing space here (matching the
+      // "one space, since the two labels differ by one character" idiom keys.ts's own
+      // `keygen --sign` output comment uses) overshot by exactly one column.
+      if (signing) console.log(`signing public key:${signing.recipientPath}`);
       console.log(`snapshot:          ${outPath}`);
       if (snapshotOpts.pg) console.log('postgres:          included (pg_dump)');
       const backendWarning =
@@ -1068,7 +1317,10 @@ export async function init(_o: CliOptions): Promise<void> {
       // The happy mood mascot (issue #194) is printed by cli.ts's `init` dispatch
       // case, right after this function returns (immediately followed by the
       // founder's note, issue #195/#199) — not here, so a successful run only
-      // ever gets ONE happy mascot instead of one from each layer.
+      // ever gets ONE happy mascot instead of one from each layer. #731: `true` here
+      // is what tells that dispatch site it is safe to print — a snapshot was
+      // actually created AND pushed by this point.
+      return true;
     } catch (err) {
       if (pushSucceeded) {
         // Push already happened — see the pushSucceeded declaration above. The
@@ -1126,7 +1378,14 @@ export async function init(_o: CliOptions): Promise<void> {
         await rm(backup.identityPath, { force: true });
         await rm(backup.recipientPath, { force: true });
       }
-      if (signing) {
+      // #719: only a signing keypair THIS RUN generated (step 3's "Generate a signing
+      // keypair now?" branch) is this run's own to delete. `signing` is also populated
+      // when step 3 instead REUSED an already-existing pair (created before this run
+      // started, by an earlier `keygen --sign` or a previous `init`) — deleting that
+      // one here would destroy real, pre-existing key material this run never created
+      // and had no reason to touch, on nothing more than an unrelated failure later in
+      // the SAME run (e.g. a declined paid-backend consent, a typo'd path further down).
+      if (signing && signingGeneratedThisRun) {
         await rm(signing.identityPath, { force: true });
         await rm(signing.recipientPath, { force: true });
       }
@@ -1134,10 +1393,16 @@ export async function init(_o: CliOptions): Promise<void> {
         await rm(snapshotOutPath, { force: true });
         await rm(`${snapshotOutPath}.digest`, { force: true });
         await rm(`${snapshotOutPath}.recipients-fingerprint`, { force: true });
+        await rm(`${snapshotOutPath}.minisig`, { force: true }); // #733: snapshot() can write this sidecar before later throwing
       }
       throw err;
     }
   } finally {
+    // #734: deregister the synchronous signal rollback registered above — this run is
+    // either fully done (success), already rolled back via the async catch above, or
+    // preserved-on-purpose (pushSucceeded) — a fatal signal from THIS point on belongs
+    // to whatever the caller does next, not to this invocation's own key material.
+    setActiveInitRollback(null);
     // No persistent readline Interface to close anymore (issue #230 — @clack/prompts
     // tears down its own per-prompt stdin listeners itself; see askLine/askYesNo
     // above). BUT: Node's own readline.emitKeypressEvents(stdin) — which every clack

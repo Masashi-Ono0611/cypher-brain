@@ -415,6 +415,23 @@ export async function loadSignIdentity(path: string): Promise<LoadedSignIdentity
   return { privateKey, keyId };
 }
 
+// A cheap, self-contained "do these two halves actually belong together?" check
+// (#736): sign a small FIXED buffer with `privateKey` and verify it against
+// `publicKey`, using the SAME raw Ed25519 primitives verifyDetached()/
+// signDetached() use above (crypto.sign/crypto.verify with a null digest
+// algorithm — RFC 8032 PureEdDSA) — no file I/O, no minisign wire framing, just
+// the asymmetric primitive itself. The init wizard calls this before REUSING an
+// existing signing pair (sign-identity.key + sign-recipient.pub that may have
+// been written by two unrelated prior runs — e.g. two separate "keygen --sign"
+// invocations, one of which only partially replaced the pair) so a mismatched
+// pair is caught here instead of silently baking a public key into the recovery
+// kit that can never verify anything signed with the paired private key.
+const KEYPAIR_CONSISTENCY_PROBE = Buffer.from('cypher-brain signing keypair consistency probe (#736)');
+export function signingKeypairMatches(privateKey: KeyObject, publicKey: KeyObject): boolean {
+  const signature = sign(null, KEYPAIR_CONSISTENCY_PROBE, privateKey);
+  return verify(null, KEYPAIR_CONSISTENCY_PROBE, publicKey, signature);
+}
+
 // ---------- the higher-level "does this artifact's signature check out?" call restore/verify make ----------
 
 export type SignatureStatus = 'verified' | 'no_signature' | 'no_pubkey' | 'invalid';
