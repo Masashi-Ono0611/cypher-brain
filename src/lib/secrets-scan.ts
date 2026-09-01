@@ -26,7 +26,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { GITLEAKS_BIN } from './config.js';
 import { run } from './proc.js';
-import { setActiveScanReportDir } from './signal-guard.js';
+import { addActiveScanReportDir, removeActiveScanReportDir } from './signal-guard.js';
 import { errMsg } from './util.js';
 import { warn } from './warn.js';
 
@@ -115,14 +115,14 @@ export async function scanForSecrets(dir: string): Promise<SecretFinding[]> {
   // mkdtempSync (not the async mkdtemp) so dir-creation and the registration happen in ONE
   // tick — the identical reasoning, and identical fix, snapshot() already spells out for
   // its plaintext stage dir. An `await` between them yields to the event loop, and a signal
-  // landing in that gap fires the handler while ACTIVE_SCAN_REPORT_DIR is still null,
+  // landing in that gap fires the handler before this dir is registered at all,
   // leaving the just-created directory behind. Not theoretical: holding a SIGINT inside that
   // window leaked the directory on every one of 5 runs with the async call and none with this
   // one, and unheld it still surfaced about once in 30 unmodified runs locally — which is
   // what took down a CI cell of the SIGINT regression test in scripts/selftest.sh, whose
   // "cypher-brain-*" leftover glob counts this directory too.
   const reportDir = mkdtempSync(join(tmpdir(), 'cypher-brain-gitleaks-'));
-  setActiveScanReportDir(reportDir);
+  addActiveScanReportDir(reportDir);
   const reportPath = join(reportDir, 'report.json');
   try {
     await run(GITLEAKS_BIN, [
@@ -173,23 +173,20 @@ export async function scanForSecrets(dir: string): Promise<SecretFinding[]> {
   } finally {
     // Remove FIRST, deregister only once the directory is actually gone — the mirror image
     // of the create-then-register ordering above, and the same order snapshot()'s own
-    // finally uses (`await rm(stage)` then `setActiveStage(null)`). Clearing the slot
-    // before the await left the second half of the same gap: a signal arriving during the
-    // rm found nothing tracked and left the half-removed directory behind. A signal landing
-    // DURING the rm is now handled rather than missed: the dir is still tracked, and the
-    // handler's forceRmSync is idempotent against a partially-removed tree. Nothing yields
-    // between the rm resolving and this clear, so the "tracked but already gone" state the
-    // old ordering was avoiding lasts no turns at all.
+    // finally uses (`await rm(stage)` then `setActiveStage(null)`). Deregistering before the
+    // await left the second half of the same gap: a signal arriving during the rm found
+    // nothing tracked and left the half-removed directory behind. A signal landing DURING
+    // the rm is now handled rather than missed: the dir is still tracked, and the handler's
+    // forceRmSync is idempotent against a partially-removed tree. Nothing yields between the
+    // rm resolving and this deregistration, so the "tracked but already gone" state the old
+    // ordering was avoiding lasts no turns at all.
     //
-    // What this does NOT fix, because it predates and outlives this function: the guard
-    // holds ONE slot per resource kind, so it is only correct for one scan at a time.
-    // snapshot() satisfies that — it scans its --dir components sequentially — but mcp.ts is
-    // a long-lived server that can have two snapshot_now calls in flight, where the second
-    // scan's registration evicts the first and the first scan's clear pulls the slot out
-    // from under the second. Every other slot in signal-guard.ts has the same shape, so the
-    // fix belongs there (a per-path set) rather than here.
+    // mcp.ts is a long-lived server that can have two snapshot_now calls in flight — this
+    // used to evict/clobber via a single scalar slot (the gap this comment used to describe)
+    // until ACTIVE_SCAN_REPORT_DIR became a per-path set in signal-guard.ts, the same shape
+    // every other MCP-concurrent resource there already uses (#696).
     await rm(reportDir, { recursive: true, force: true });
-    setActiveScanReportDir(null);
+    removeActiveScanReportDir(reportDir);
   }
 }
 
