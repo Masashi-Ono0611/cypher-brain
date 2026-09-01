@@ -37,8 +37,9 @@
   (`CYPHER_BRAIN_HOME/wallet.json`) that `wallet create`'s own guidance documents,
   instead of only recognizing `CYPHER_BRAIN_AR_WALLET` (#735).
 - Reusing an existing signing keypair now verifies the private and public halves
-  actually correspond via a cheap sign→verify round trip, instead of silently baking
-  a mismatched (unverifiable) public key into the recovery kit (#736).
+  actually correspond via a cheap sign→verify round trip AND a key-id comparison,
+  instead of silently baking a mismatched (or key-id-disagreeing) public key into the
+  recovery kit (#736).
 - Completion summary's "signing public key:" line padding now aligns with the other
   six lines (#747).
 - The per-day snapshot filename now uses the operator's own local calendar day
@@ -50,10 +51,24 @@
   double space after the colon (#746).
 
 New/updated scoped tests in `scripts/selftest-init.sh` cover every fix above,
-including two new positive controls: (u2) seeds a REAL, non-empty, previously-
-generated recovery kit and proves declining the new overwrite confirmation leaves it
+including new positive controls: (u2) seeds a REAL, non-empty, previously-generated
+recovery kit and proves declining the new overwrite confirmation leaves it
 byte-for-byte untouched; (v) forces `TZ=Pacific/Kiritimati` (UTC+14) to reproduce the
-exact UTC-vs-local divergence #761 describes. A new `scripts/drive-init-eof.mjs`
-driver (a sibling of `drive-init.mjs`) closes the child's stdin mid-wizard instead of
-answering a prompt, for #718's regression test. Three existing tests ((c2), (n)/(o),
-(o2)) had their exit-code assertions inverted to match #731's fix.
+exact UTC-vs-local divergence #761 describes; (w) proves a pre-existing file at
+today's dated snapshot path survives rollback untouched when `snapshot()`'s own
+no-clobber check refuses; (r2) proves a signing pair whose keys cryptographically
+match but whose recorded key ids disagree is still refused. A new
+`scripts/drive-init-eof.mjs` driver (a sibling of `drive-init.mjs`) closes the
+child's stdin mid-wizard instead of answering a prompt, for #718's regression test.
+Three existing tests ((c2), (n)/(o), (o2)) had their exit-code assertions inverted to
+match #731's fix.
+
+A first-pass multi-model review (`codex exec`) additionally caught and fixed, before
+merge: `snapshotOutPath`/the recovery-kit overwrite confirmation both needed a
+pre-existence guard to avoid deleting/clobbering something this run never created
+(#733, #717); the new `installStageSignalGuard()` call needed to happen as soon as
+the rollback is registered, not left to whenever `snapshot()` gets around to it, so
+steps 2-6 are also covered (#734); an in-flight write tracker was added so a signal
+landing between `keygenAt()`/`keygenSignAt()`'s own two sequential writes is also
+rolled back (#734); and the signing-keypair consistency check needed to also compare
+the minisign key id, not just the cryptographic keys (#736).

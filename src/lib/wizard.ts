@@ -86,7 +86,7 @@ import { warn } from './warn.js';
 import { buildRecoveryKit, writeRecoveryKitFile } from './recoverykit.js';
 import type { BackupKey, SigningKey } from './recoverykit.js';
 import type { CliOptions } from './types.js';
-import { setActiveInitRollback } from './signal-guard.js';
+import { installStageSignalGuard, setActiveInitRollback } from './signal-guard.js';
 
 // Thrown when a clack prompt reports a cancel (Ctrl+C, or Esc on the ones that support
 // it) — turning that into a normal thrown Error routes it through init()'s own
@@ -459,6 +459,11 @@ export async function init(_o: CliOptions): Promise<boolean> {
     // at all, these paths never existed and the `{ force: true }` removes below are
     // harmless no-ops; if it throws partway through (or after fully succeeding, and a
     // LATER step then fails), whatever it did manage to write gets cleaned up too.
+    // Review-hardened: the assignment at the actual call site ALSO checks that
+    // `outPath` did not already exist a moment earlier — the dated `--out` is
+    // once-per-day, so a stray pre-existing file there makes snapshot() refuse
+    // immediately having written nothing, and unconditionally tracking it here would
+    // make rollback delete a file this run never created.
     let snapshotOutPath: string | null = null;
     // True once push() below actually returns successfully. From that point on the
     // ciphertext already exists, durably, in the chosen backend's store — for
@@ -473,6 +478,20 @@ export async function init(_o: CliOptions): Promise<boolean> {
     let pushSucceeded = false;
     let pushedBackend: string | null = null;
     let pushedLocatorPath: string | null = null;
+    // #734 (review-hardened): keygenAt()/keygenSignAt() each do TWO sequential file
+    // writes (identity, then recipient/public key) before their caller ever assigns
+    // `backup`/`signing` below — a signal landing INSIDE that window (between the two
+    // writes, or after both but before this function's own `await` resumes) would
+    // leave a partially-written pair on disk that rollbackKeysAndSnapshotSync (below)
+    // cannot see yet, since it only inspects `backup`/`signing` once they are
+    // assigned. Track the CANDIDATE paths (plus whether each already existed before
+    // this attempt, mirroring identityPreExisted/recipientPreExisted below) the
+    // moment each generation attempt starts, and clear them once it settles either
+    // way — success moves the pair into `backup`/`signing` (rollback no longer needs
+    // this list for it); failure's own local catch already cleans up using these same
+    // preExisted flags, so this list needs to forget it too, or a LATER signal would
+    // try to delete a path some INDEPENDENT, still-in-flight generation now owns.
+    let inFlightSecretWrites: { path: string; preExisted: boolean }[] = [];
     // #734: a fatal signal (Ctrl-C, launchd/shutdown SIGTERM) during the long
     // snapshot()/push() phase below is delivered as a real OS signal — unlike Ctrl-C
     // during a clack prompt (raw mode decodes it as an ordinary keypress instead, see
@@ -525,8 +544,27 @@ export async function init(_o: CliOptions): Promise<boolean> {
           rmSync(`${snapshotOutPath}.minisig`, { force: true });
         } catch {}
       }
+      // #734 (review-hardened): a generation attempt still mid-flight (see
+      // inFlightSecretWrites's own doc comment above) — its target paths are not yet
+      // reflected in `backup`/`signing` above.
+      for (const w of inFlightSecretWrites) {
+        if (w.preExisted) continue; // never delete something this run did not create
+        try {
+          rmSync(w.path, { force: true });
+        } catch {}
+      }
     };
     setActiveInitRollback(rollbackKeysAndSnapshotSync);
+    // #734 (review-hardened): install the signal handler itself HERE, not leave it to
+    // whenever snapshot() below happens to call this (idempotent — see
+    // installStageSignalGuard's own doc comment). snapshot()'s own call site is deep
+    // inside step 7, well after steps 2-6 (backup keypair, signing keypair, passphrase
+    // wrap, recipient pin, profile selection) have already written this run's key
+    // material — without this, a fatal signal during any of those earlier steps found
+    // NO handler installed at all (Node's default SIGINT/SIGTERM/SIGHUP action just
+    // terminates the process outright), so the rollback registered above got no
+    // chance to run for the vast majority of this run's own lifetime.
+    installStageSignalGuard();
     try {
       // ---------- 2. backup key guidance (MANAGEMENT.md Key recovery #1) ----------
       console.log('\n== 2/7: offline backup key (recommended) ==');
@@ -610,6 +648,14 @@ export async function init(_o: CliOptions): Promise<boolean> {
         // whichever ones did NOT already exist beforehand.
         const identityPreExisted = await exists(identityPath);
         const recipientPreExisted = await exists(recipientPath);
+        // #734 (review-hardened): visible to the signal-handler rollback (above) for
+        // the entire window keygenAt() is in flight — see inFlightSecretWrites's own
+        // doc comment for why this matters (keygenAt() itself does two sequential
+        // writes before this call ever returns).
+        inFlightSecretWrites = [
+          { path: identityPath, preExisted: identityPreExisted },
+          { path: recipientPath, preExisted: recipientPreExisted },
+        ];
         let recipient: string;
         try {
           ({ recipient } = await keygenAt({ home: backupHome, identityPath, recipientPath }));
@@ -617,6 +663,8 @@ export async function init(_o: CliOptions): Promise<boolean> {
           if (!identityPreExisted) await rm(identityPath, { force: true });
           if (!recipientPreExisted) await rm(recipientPath, { force: true });
           throw e;
+        } finally {
+          inFlightSecretWrites = [];
         }
         const identityText = await readFile(identityPath, 'utf8');
         backup = { identityPath, recipientPath, recipient, identityText };
@@ -656,9 +704,9 @@ export async function init(_o: CliOptions): Promise<boolean> {
         // belong together with a cheap sign->verify round trip over known data
         // (signingKeypairMatches, minisign.ts) BEFORE trusting either of them.
         const pubkeyText = await readFile(SIGN_RECIPIENT, 'utf8');
-        const { privateKey } = await loadSignIdentity(SIGN_IDENTITY);
-        const { publicKey } = parsePubkeyFile(pubkeyText);
-        if (!signingKeypairMatches(privateKey, publicKey)) {
+        const { privateKey, keyId: privateKeyId } = await loadSignIdentity(SIGN_IDENTITY);
+        const { publicKey, keyId: publicKeyId } = parsePubkeyFile(pubkeyText);
+        if (!signingKeypairMatches(privateKey, publicKey, privateKeyId, publicKeyId)) {
           throw new Error(
             `the existing signing keypair does not match: ${SIGN_IDENTITY} cannot produce a signature ` +
               `${SIGN_RECIPIENT} verifies. This pair likely came from two different setups (e.g. two separate ` +
@@ -677,6 +725,11 @@ export async function init(_o: CliOptions): Promise<boolean> {
         // if it throws partway through.
         const signIdentityPreExisted = await exists(SIGN_IDENTITY);
         const signRecipientPreExisted = await exists(SIGN_RECIPIENT);
+        // #734 (review-hardened): see inFlightSecretWrites's own doc comment above.
+        inFlightSecretWrites = [
+          { path: SIGN_IDENTITY, preExisted: signIdentityPreExisted },
+          { path: SIGN_RECIPIENT, preExisted: signRecipientPreExisted },
+        ];
         let pubkeyText: string;
         try {
           ({ pubkeyText } = await keygenSignAt({
@@ -688,6 +741,8 @@ export async function init(_o: CliOptions): Promise<boolean> {
           if (!signIdentityPreExisted) await rm(SIGN_IDENTITY, { force: true });
           if (!signRecipientPreExisted) await rm(SIGN_RECIPIENT, { force: true });
           throw e;
+        } finally {
+          inFlightSecretWrites = [];
         }
         signing = { identityPath: SIGN_IDENTITY, recipientPath: SIGN_RECIPIENT, pubkeyText };
         signingGeneratedThisRun = true; // #719: only THIS flag makes rollback allowed to delete it
@@ -1130,9 +1185,22 @@ export async function init(_o: CliOptions): Promise<boolean> {
       const dateStamp = localDateStamp(new Date());
       const outPath = join(HOME, `brain-${dateStamp}.age`);
       snapshotOpts.out = outPath;
-      // #733: recorded BEFORE calling snapshot(), not only after it returns — see this
-      // variable's own declaration above (near `let snapshotOutPath`) for why.
-      snapshotOutPath = outPath;
+      // #733 (review-hardened): recorded BEFORE calling snapshot(), not only after it
+      // returns, so rollback also covers a durable artifact snapshot() managed to
+      // PROMOTE before a LATER step inside it throws (e.g. the minisign sidecar write
+      // itself failing) — see this variable's own declaration above (near
+      // `let snapshotOutPath`) for the full reasoning. But outPath is a DATED, once-
+      // per-day path (see the dateStamp comment above): a same-day retry after an
+      // earlier init already produced today's brain-<date>.age (preserved-on-purpose
+      // after a successful push, or simply left over from an unrelated manual
+      // snapshot) could ALREADY be sitting there — snapshot()'s own no-clobber check
+      // then refuses immediately, having written NOTHING, before this run ever
+      // touched it. Recording snapshotOutPath unconditionally in that case would make
+      // rollback delete a file THIS run never created. Check pre-existence first —
+      // same idiom as identityPreExisted/recipientPreExisted above — and only track
+      // it for rollback when it did NOT already exist.
+      const outPathPreExisted = await exists(outPath);
+      if (!outPathPreExisted) snapshotOutPath = outPath;
       await snapshot(snapshotOpts);
 
       if (paid) {
@@ -1257,6 +1325,17 @@ export async function init(_o: CliOptions): Promise<boolean> {
       // answer, including a custom path that happens to already hold a kit from a
       // different setup.
       let kitPath: string;
+      // #717 (review-hardened): tracks whether the operator EXPLICITLY approved
+      // overwriting an existing file — passed through as `clobber` below instead of
+      // an unconditional `true`. Without this, the exists() check just above is
+      // check-then-act: a file that appears at `candidate` in the (small, but real)
+      // window between that check and the write below — this branch is reached
+      // precisely because nothing was there a moment ago — would be silently
+      // overwritten anyway, the exact hazard #717 exists to close. `clobber: false`
+      // instead routes through writeRecoveryKitFile's OWN atomic no-clobber path
+      // (promoteNoClobber, recoverykit.ts), which fails closed on that same race
+      // instead of racing it.
+      let kitClobberApproved = false;
       for (;;) {
         const candidate = expandHome(
           await askLine(`Path to write the recovery kit [${defaultKitPath}]`, defaultKitPath),
@@ -1265,6 +1344,7 @@ export async function init(_o: CliOptions): Promise<boolean> {
           console.log(`⚠  A file already exists at ${candidate} — writing the new kit here would overwrite it.`);
           if (await askYesNo('Overwrite it?', false)) {
             kitPath = candidate;
+            kitClobberApproved = true;
             break;
           }
           console.log('Choose a different path for the recovery kit.');
@@ -1288,7 +1368,10 @@ export async function init(_o: CliOptions): Promise<boolean> {
       });
       // Secret-bearing write: exclusive-create 0600 temp + atomic rename — shared
       // with the standalone command in recoverykit.ts (one write path, #364).
-      await writeRecoveryKitFile(kitPath, kitText, { clobber: true });
+      // #717: `clobber` reflects whether the operator EXPLICITLY approved an
+      // overwrite above, not an unconditional `true` — see kitClobberApproved's own
+      // doc comment for why an unconditional value would reopen the race #717 closes.
+      await writeRecoveryKitFile(kitPath, kitText, { clobber: kitClobberApproved });
 
       console.log('\n=== cypher-brain init: complete ===');
       console.log(`primary identity:  ${IDENTITY}`);

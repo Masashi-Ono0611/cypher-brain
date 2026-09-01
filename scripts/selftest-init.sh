@@ -1624,6 +1624,53 @@ grep -qi "does not match" "$TMP/mismatch.log" || { echo "[FAIL] issue #736: no m
 [ -f "$MISMATCH_CB_HOME/sign-recipient.pub" ] || { echo "[FAIL] issues #736/#719: the pre-existing (mismatched) signing public key was deleted — it must never be touched by this run"; exit 1; }
 echo "[PASS] init refuses to reuse a mismatched signing keypair, rolls back only what this run created, and leaves the pre-existing (mismatched) signing files untouched (issues #736, #719)"
 
+echo "== (r2) init also refuses a signing pair whose CRYPTOGRAPHIC keys match but whose recorded key ids disagree (issue #736, review-hardening) =="
+# The minisign wire format's 8-byte key id is NOT derived from the key material —
+# it is chosen independently at random and both files only happen to agree because
+# keygenSignAt() writes both from the same in-memory value. A hand-edited identity
+# file (or a bad manual merge) could carry the SAME real private key but a stale/
+# wrong "# key id:" comment — signingKeypairMatches()'s sign->verify round trip alone
+# would pass such a pair (the keys genuinely correspond), but restore/verify's own
+# verifyDetached() rejects any signature whose embedded key id does not match the
+# id recorded in the public file, making the "reused" pair unusable regardless. Only
+# the identity file's COMMENT is edited below — the PEM private key body is
+# untouched, so the actual keypair still matches.
+KEYID_HOME="$TMP/keyid-mismatch-home"; mkdir -p "$KEYID_HOME"
+KEYID_CB_HOME="$TMP/keyid-mismatch-cb-home"
+
+CYPHER_BRAIN_HOME="$KEYID_CB_HOME" cb keygen --sign > "$TMP/keyid-mismatch-setup.log" 2>&1 \
+  || { echo "[FAIL] test setup: could not generate a signing keypair"; cat "$TMP/keyid-mismatch-setup.log"; exit 1; }
+python3 - "$KEYID_CB_HOME/sign-identity.key" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+m = re.search(r'^# key id: ([0-9a-f]{16})$', text, re.MULTILINE)
+assert m, "no '# key id:' line found in " + path
+old = m.group(1)
+new = old[:-1] + ('0' if old[-1] != '0' else '1')
+assert new != old
+text = text.replace(f'# key id: {old}\n', f'# key id: {new}\n', 1)
+open(path, 'w').write(text)
+PY
+
+cat > "$TMP/qa-keyid-mismatch.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"]
+]
+JSON
+
+if CYPHER_BRAIN_HOME="$KEYID_CB_HOME" HOME="$KEYID_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 30 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-keyid-mismatch.json" --out "$TMP/keyid-mismatch.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] issue #736: init completed despite a key-id mismatch between the signing identity and its public key"; cat "$TMP/keyid-mismatch.log"; exit 1
+fi
+grep -qi "does not match" "$TMP/keyid-mismatch.log" || { echo "[FAIL] issue #736: no mismatch-related error message found for the key-id-only mismatch"; cat "$TMP/keyid-mismatch.log"; exit 1; }
+[ -f "$KEYID_CB_HOME/sign-identity.key" ] || { echo "[FAIL] the pre-existing signing identity was deleted"; exit 1; }
+[ -f "$KEYID_CB_HOME/sign-recipient.pub" ] || { echo "[FAIL] the pre-existing signing public key was deleted"; exit 1; }
+echo "[PASS] init also refuses a pair whose cryptographic keys match but whose recorded key ids disagree (issue #736, review-hardening)"
+
 echo "== (s) EOF on stdin mid-wizard (a closed pipe / Ctrl-D) triggers the SAME cancel+rollback path as Ctrl-C, not a silent exit 0 with orphaned key material (issue #718) =="
 EOF_HOME="$TMP/eof-home"; mkdir -p "$EOF_HOME"
 EOF_CB_HOME="$TMP/eof-cb-home"
@@ -1780,6 +1827,45 @@ if [ "$TZDATE_LOCAL" != "$TZDATE_UTC" ]; then
 else
   echo "[PASS] snapshot filename uses the LOCAL calendar day (${TZDATE_LOCAL}) — local and UTC coincide at this exact moment, so this run alone can't distinguish the two, but the filename is correct either way"
 fi
+
+echo "== (w) a snapshot already sitting at today's dated --out path is NEVER deleted by rollback — snapshot()'s own no-clobber refusal must not look like something THIS run created (issue #733, review-hardening) =="
+# #733's fix records snapshotOutPath BEFORE calling snapshot(), so rollback also
+# covers a durable artifact snapshot() managed to promote before a LATER step inside
+# it throws. Naively doing that unconditionally would make rollback delete a file
+# THIS run never created whenever snapshot()'s own no-clobber check refuses (the
+# dated --out is once-per-day, so a stray/leftover file already sitting there is a
+# real scenario) — this proves that specific regression does not exist: a
+# pre-existing, non-empty file at today's exact dated path must survive byte-for-byte.
+PREEXIST_HOME="$TMP/preexist-snap-home"; mkdir -p "$PREEXIST_HOME"
+PREEXIST_CB_HOME="$TMP/preexist-snap-cb-home"; mkdir -p "$PREEXIST_CB_HOME"
+PREEXIST_SRC="$TMP/preexist-snap-src"; mkdir -p "$PREEXIST_SRC"
+printf 'preexist-snap-marker\n' > "$PREEXIST_SRC/note.txt"
+PREEXIST_DATESTAMP="$(date '+%Y-%m-%d')"
+PREEXIST_OUT="$PREEXIST_CB_HOME/brain-${PREEXIST_DATESTAMP}.age"
+printf 'a pre-existing snapshot this run did NOT create\n' > "$PREEXIST_OUT"
+PREEXIST_PRE_SHA="$(sha "$PREEXIST_OUT")"
+
+cat > "$TMP/qa-preexist-snap.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$PREEXIST_SRC"],
+  ["Choose a backend", ""]
+]
+JSON
+
+if CYPHER_BRAIN_HOME="$PREEXIST_CB_HOME" CYPHER_BRAIN_FILE_DIR="$TMP/preexist-snap-store" HOME="$PREEXIST_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-preexist-snap.json" --out "$TMP/preexist-snap.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] init completed despite the dated --out path already existing — snapshot()'s own no-clobber refusal should have fired"; cat "$TMP/preexist-snap.log"; exit 1
+fi
+grep -qi "already exists" "$TMP/preexist-snap.log" || { echo "[FAIL] no no-clobber refusal message found in the transcript"; cat "$TMP/preexist-snap.log"; exit 1; }
+[ "$(sha "$PREEXIST_OUT")" = "$PREEXIST_PRE_SHA" ] || { echo "[FAIL] issue #733: the pre-existing file at today's dated snapshot path was modified/deleted by rollback — it was never this run's to touch"; exit 1; }
+[ ! -f "$PREEXIST_CB_HOME/identity.age" ] || { echo "[FAIL] the primary identity this run created was not rolled back"; exit 1; }
+echo "[PASS] a pre-existing file at today's dated snapshot path survives rollback byte-for-byte — snapshot()'s own no-clobber refusal is never mistaken for something this run created (issue #733, review-hardening)"
 
 echo
 echo "INIT SELFTEST PASS"
