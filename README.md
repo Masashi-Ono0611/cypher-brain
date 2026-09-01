@@ -1207,6 +1207,10 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       unattended spender is refused. --no-load writes the artifacts without registering.
       Each run logs to $CYPHER_BRAIN_HOME/schedule/logs/nightly-YYYY-MM-DD.log, ending
       "OK rc=0" or "FAILED rc=N".
+      --index-file <path> overrides where the generated runner appends its index.tsv line
+      (timestamp, locator, sha256 — MANAGEMENT.md "Cadence"); default
+      $CYPHER_BRAIN_HOME/schedule/index.tsv. Like the other install-time settings, the
+      EFFECTIVE path is baked into the runner at install time — re-run install to change it.
       --ping-url <url> adds a healthchecks.io-style dead man's switch: the runner curl's
       <url> (best-effort, 10s timeout, never affects the run's own outcome) on every
       successful run, and <url>/fail on every failed run — so a schedule that silently

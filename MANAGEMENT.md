@@ -277,6 +277,9 @@ printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$LOC" "$SHA" \
   >> "$HOME/.cypher-brain/schedule/index.tsv"
 ```
 
+`schedule install --index-file <path>` overrides where the generated runner appends this
+line, if `$CYPHER_BRAIN_HOME/schedule/index.tsv` (shown above) isn't where you want it.
+
 Snapshotting needs only the **public** key, so the snapshots the always-on box
 writes (and anything storage sees) are ciphertext only. Two caveats: that box also
 runs gbrain, so the live plaintext is on it regardless (keep it full-disk-encrypted);
