@@ -58,36 +58,73 @@ func stateVerdict(status string) string {
 	}
 }
 
-// fetchAccountState is a plain read-only HTTP GET against tonapi's public
-// REST API — deliberately NOT a full liteclient/ton.APIClientWrapped
+// fetchAccountStateAt performs one plain read-only HTTP GET against the
+// given tonapi URL — deliberately NOT a full liteclient/ton.APIClientWrapped
 // integration (that would need a global config + live lite-server
 // connections just to answer "does this address exist on-chain yet"; tonapi
 // answers the same question with a single HTTP GET, exactly as
-// scripts/ton-provider-experiment.mjs already does for the C++ scheme).
-func fetchAccountState(ctx context.Context, addr *address.Address, testnet bool) (*accountState, error) {
-	url := fmt.Sprintf("%s/v2/blockchain/accounts/%s", tonapiBase(testnet), addr.StringRaw())
+// scripts/ton-provider-experiment.mjs already does for the C++ scheme). It
+// also returns the raw HTTP status code (0 if the request never got a
+// response) so fetchAccountState below can react to a specific code (404)
+// without parsing error strings.
+func fetchAccountStateAt(ctx context.Context, url string) (*accountState, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", url, err)
+		return nil, 0, fmt.Errorf("GET %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if readErr != nil {
-		return nil, fmt.Errorf("GET %s: reading response body: %w", url, readErr)
+		return nil, resp.StatusCode, fmt.Errorf("GET %s: reading response body: %w", url, readErr)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s -> HTTP %d: %s", url, resp.StatusCode, truncate(string(body), 200))
+		return nil, resp.StatusCode, fmt.Errorf("GET %s -> HTTP %d: %s", url, resp.StatusCode, truncate(string(body), 200))
 	}
 	var acc accountState
 	if err := json.Unmarshal(body, &acc); err != nil {
-		return nil, fmt.Errorf("GET %s: non-JSON response: %s", url, truncate(string(body), 200))
+		return nil, resp.StatusCode, fmt.Errorf("GET %s: non-JSON response: %s", url, truncate(string(body), 200))
 	}
-	return &acc, nil
+	return &acc, resp.StatusCode, nil
+}
+
+// fetchAccountState looks up addr's on-chain account state via tonapi's
+// blockchain/accounts endpoint, falling back to the plain accounts endpoint
+// on a 404 (see #716 below) — used by status/deploy/notify/update-providers/
+// withdraw alike, so the fallback fixes all five call sites at once.
+func fetchAccountState(ctx context.Context, addr *address.Address, testnet bool) (*accountState, error) {
+	primaryURL := fmt.Sprintf("%s/v2/blockchain/accounts/%s", tonapiBase(testnet), addr.StringRaw())
+	acc, status, err := fetchAccountStateAt(ctx, primaryURL)
+	if err == nil {
+		return acc, nil
+	}
+	if status != http.StatusNotFound {
+		return nil, err
+	}
+	// #716: tonapi answers a genuinely-never-used address on the
+	// blockchain/accounts endpoint with HTTP 404 {"error":"entity not
+	// found"} — NOT an ordinary 200 status=nonexist response the way this
+	// codebase had assumed (confirmed with curl against both mainnet and
+	// testnet tonapi.io, for multiple independently-generated fresh
+	// addresses; see the issue for the exact repro). The plain (non
+	// "blockchain/") /v2/accounts/ endpoint answers the SAME address with an
+	// ordinary 200 {"status":"nonexist",...} every time, so fall back to it
+	// on a 404 instead of hard-failing every caller on what is actually the
+	// completely normal "this address has never received a single nanoTON"
+	// case (the standard state of a brand-new bag/owner pair's very first
+	// deploy). A non-404 failure from the primary endpoint (timeout, 5xx,
+	// malformed body) is NOT retried here — only a confirmed 404 is treated
+	// as potentially just "not yet known to the blockchain-indexed view".
+	fallbackURL := fmt.Sprintf("%s/v2/accounts/%s", tonapiBase(testnet), addr.StringRaw())
+	fallbackAcc, _, fallbackErr := fetchAccountStateAt(ctx, fallbackURL)
+	if fallbackErr != nil {
+		return nil, fmt.Errorf("%w (fallback to %s also failed: %s)", err, fallbackURL, fallbackErr)
+	}
+	return fallbackAcc, nil
 }
 
 // statusParams / parseStatusFlags is the pure (network-free) argument
