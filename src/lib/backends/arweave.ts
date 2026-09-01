@@ -34,6 +34,7 @@ import {
 } from '../util.js';
 import { arUsdRate, usdApprox } from '../estimate.js';
 import { progressReporter } from '../progress.js';
+import { warn } from '../warn.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 // The public gateways to try (in order) for the HTTP read, before the L1 chunk
@@ -573,7 +574,14 @@ export async function arweaveBackend(): Promise<StorageBackend> {
             `arweave: could not verify CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND} (price estimate failed: ${errMsg(e)}) — aborting to protect your wallet`,
           );
         }
-        process.stderr.write(`arweave: could not estimate L1 cost (${errMsg(e)}); proceeding\n`);
+        // #692: warn(), not a raw stderr write — turbo.ts's structurally identical
+        // branch already uses warn() (its own line 145). Per warn.ts's own header
+        // comment (#347), it is THE chokepoint for a runtime warning a human must see:
+        // a raw process.stderr.write bypasses both mcp.ts's captureCall() console.error
+        // interception and the `warnings` array an MCP tool result carries, so an agent
+        // relaying an unattended/MCP-driven push never sees that the spend cap could
+        // not be verified for this run.
+        warn(`arweave: could not estimate L1 cost (${errMsg(e)}); proceeding`);
       }
       if (reward !== undefined && AR_MAX_SPEND > 0n && reward > AR_MAX_SPEND) {
         throw new Error(
