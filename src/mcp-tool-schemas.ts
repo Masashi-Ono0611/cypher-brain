@@ -258,7 +258,12 @@ export const RESTORE_NOW_TOOL: Tool = {
     'files into out_dir, and — when pg is given — that pg_restore --clean --if-exists will ALSO DROP and ' +
     'replace objects in that database, an irreversible operation (the MCP equivalent of the CLI --yes/' +
     'CYPHER_BRAIN_YES guard on restore --pg; the CYPHER_BRAIN_YES env escape hatch is NOT honored here, so ' +
-    'nothing can be restored/clobbered without an explicit confirm_write in the call).',
+    'nothing can be restored/clobbered without an explicit confirm_write in the call). IMPORTANT: arweave/' +
+    'turbo locators are NOT content hashes, so restoring — and, when pg is given, pg_restoring — a bare ' +
+    'locator without a sha256 pin cannot detect a gateway rollback/substitution that still decrypts with ' +
+    'your key: this tool will proceed and DROP/replace live database objects over unverified bytes — pass ' +
+    'sha256 (or use locator_file) to pin the fetched bytes; an unpinned arweave/turbo pull returns a warning ' +
+    'field in the result instead of refusing.',
   inputSchema: {
     type: 'object',
     properties: {
