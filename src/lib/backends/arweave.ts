@@ -336,6 +336,13 @@ interface ArweaveClient {
     post(tx: ArweaveTransaction): Promise<{ status: number; data?: unknown }>;
     getData(id: string, opts?: { decode?: boolean }): Promise<Uint8Array | string>;
   };
+  // #701: the pre-upload balance check needs the signer's address (derived from its own
+  // JWK — no network call) and its native on-chain balance (winston string, per
+  // arweave-js's own Wallets.getBalance() contract).
+  wallets: {
+    jwkToAddress(jwk: unknown): Promise<string>;
+    getBalance(address: string): Promise<string>;
+  };
   createTransaction(attrs: { data: Uint8Array; reward?: string }, jwk: unknown): Promise<ArweaveTransaction>;
 }
 interface ArweaveTransaction {
@@ -375,6 +382,25 @@ function describeArweavePostError(status: number, data: unknown): string {
     /* fall through to the bare status message below */
   }
   return `arweave post failed: HTTP ${status}`;
+}
+
+// The pre-upload insufficient-balance refusal (#701) — arweave.ts's counterpart to
+// turbo.ts's insufficientFundsError() (balance.ts), adapted from Turbo Credits (winc) to
+// native winston/AR, and simpler: there is no payment-service concept of credit share
+// approvals here, just the signer's own on-chain balance. Pure formatting, kept separate
+// from the caller so it can be pinned by a test the way insufficientFundsError() is —
+// the real call site (an actual underfunded L1 upload) cannot be exercised without a
+// funded wallet.
+function arBalanceInsufficientError(uploadWinston: bigint, balanceWinston: bigint, address: string): string {
+  const shortfall = uploadWinston - balanceWinston;
+  const ar = (w: bigint) => `${w} winston (~${(Number(w) / 1e12).toFixed(8)} AR)`;
+  return (
+    `arweave: this upload needs ${ar(uploadWinston)} but wallet ${address} only holds ${ar(balanceWinston)} ` +
+    `(short ${ar(shortfall)}) — aborting BEFORE signing, because the network would refuse the broadcast after it.\n` +
+    `To fund it: send AR directly to ${address} (an exchange withdrawal, or buy AR/ETH/USDC and bridge/swap — ` +
+    `see docs/arweave-upload-runbook.md), then re-run once the balance covers this upload. ` +
+    `'cypher-brain wallet address' reprints this address if you need it again.`
+  );
 }
 
 // arweave-js's HTTP client (`Api.request()`, node_modules/arweave/node/lib/api.js) — used
@@ -587,6 +613,31 @@ export async function arweaveBackend(): Promise<StorageBackend> {
         throw new Error(
           `arweave: L1 upload cost ${reward} winston exceeds CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND} — aborting to protect your wallet`,
         );
+      }
+      // #701: pre-upload wallet-balance check — turbo.ts has had the equivalent since
+      // #342 (getBalance/summarizeBalance/insufficientFundsError); arweave.ts never did,
+      // so an underfunded wallet signed and broadcast a transaction that could only fail
+      // on-chain/at the gateway AFTER the fact. Runs only when the cost estimate above
+      // actually succeeded (reward !== undefined) — a failed estimate has nothing to
+      // compare a balance against, and its own fail-open/fail-closed policy already ran
+      // above. The balance READ itself is advisory-only and must not block a push on its
+      // own (same posture turbo.ts's balance read takes) — only a successfully-read,
+      // genuinely insufficient balance aborts; that comparison is deliberately kept
+      // OUTSIDE the try/catch below so a read failure can never be mistaken for "funded"
+      // (mirrors how the AR_MAX_SPEND cap check above sits outside the estimate's own
+      // try/catch, for the same reason).
+      if (reward !== undefined) {
+        let balanceWinston: bigint | null = null;
+        let balanceAddress: string | null = null;
+        try {
+          balanceAddress = await ar.wallets.jwkToAddress(jwk);
+          balanceWinston = BigInt(await ar.wallets.getBalance(balanceAddress));
+        } catch (e) {
+          warn(`arweave: could not verify wallet balance (${errMsg(e)}); proceeding`);
+        }
+        if (balanceWinston !== null && balanceAddress !== null && balanceWinston < reward) {
+          throw new Error(arBalanceInsufficientError(reward, balanceWinston, balanceAddress));
+        }
       }
       const tx = await ar.createTransaction(reward !== undefined ? { data, reward: String(reward) } : { data }, jwk);
       tx.addTag('App-Name', 'cypher-brain');
