@@ -473,14 +473,40 @@ export const TON_TONVIEWER_URL = readEnv('CYPHER_BRAIN_TON_TONVIEWER_URL') || 'h
 // the provider market itself is a mainnet market (docs/ton-storage-status.md), so unlike
 // arweave/turbo there is no meaningful testnet mode to gate behind a flag.
 export const TON_PROVIDER_OWNER = readEnv('CYPHER_BRAIN_TON_PROVIDER_OWNER') || ''; // TON wallet address that will own the deployed StorageV1 contract (required to push)
-const TON_PROVIDER_MAX_SPEND_RAW = readEnv('CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND');
+// #715: a bare `BigInt(raw)` throws a raw SyntaxError (Node stack trace, .ts source paths
+// and all) for ANY non-integer input — a decimal, a comma-grouped number, plain non-numeric
+// text — and both call sites below run at module-import time, before either entry point's
+// own error formatting (cli.ts's main().catch(), mcp.ts's main().catch()) ever gets a
+// chance to run. That crash took down every command, including --help and doctor, not just
+// push/estimate (the only two that actually spend). Same posture as IDEMPOTENCY_TTL_ERROR
+// below: record the failure as a value here, and let the two entry points' own guards
+// (mirroring their existing CONFIG_FILE_ERROR check) decide when to throw it, so
+// `error: …`, the --json error object, and the CB-E code all stay intact.
+// try/catch (rather than a hand-rolled regex) so this accepts EXACTLY what BigInt()
+// itself accepts — whitespace-trimmed, an optional leading sign, "0x"/"0o"/"0b" literals
+// included — and only ever catches the SyntaxError BigInt() would otherwise throw
+// uncaught. No new restriction is introduced beyond "must not crash".
+function parseMaxSpendBigInt(raw: string | undefined, name: string): { value: bigint; error: Error | null } {
+  if (!raw) return { value: 0n, error: null };
+  try {
+    return { value: BigInt(raw), error: null };
+  } catch {
+    return { value: 0n, error: new Error(`${name} must be an integer (got ${JSON.stringify(raw)})`) };
+  }
+}
+const TON_PROVIDER_MAX_SPEND_LOAD = parseMaxSpendBigInt(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND'),
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND',
+);
 // Unlike AR_MAX_SPEND (0/unset = no cap, the --yes guard alone gates spend), ton-provider.ts's
 // put() deliberately REFUSES to push at all when this is 0/unset — a StorageV1 deploy has no
 // SDK-computed "market price" the way arweave/turbo do, so there is no safe default amount to
 // let through uncapped (Codex review: the prior wording here claimed the opposite of the
 // enforced behavior). Separate variable from AR_MAX_SPEND — different backend, different
 // native unit, so one accidental cap must never silently apply to the other's spend.
-export const TON_PROVIDER_MAX_SPEND = TON_PROVIDER_MAX_SPEND_RAW ? BigInt(TON_PROVIDER_MAX_SPEND_RAW) : 0n;
+export const TON_PROVIDER_MAX_SPEND = TON_PROVIDER_MAX_SPEND_LOAD.value;
+/** Why CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND was refused, if it was (#715) — mirrors CONFIG_FILE_ERROR above. */
+export const TON_PROVIDER_MAX_SPEND_ERROR: Error | null = TON_PROVIDER_MAX_SPEND_LOAD.error;
 // Path to a locally-built scripts/go/storage-v1-client binary (`go build` in that dir) —
 // the ONLY step that needs it: notifying a provider over ADNL/RLDP has no mature
 // TypeScript implementation (checked; even thekiba/tonutils's storage package is
@@ -584,8 +610,12 @@ export const AR_BALANCE_URL = readEnv('CYPHER_BRAIN_AR_BALANCE_URL') || 'https:/
 //     (the --yes guard still fires). Prevents runaway spend without changing behaviour
 //     when the upload is well under budget.
 export const CIPHER_YES = !!readEnv('CYPHER_BRAIN_YES');
-const MAX_SPEND_RAW = readEnv('CYPHER_BRAIN_MAX_SPEND');
-export const AR_MAX_SPEND = MAX_SPEND_RAW ? BigInt(MAX_SPEND_RAW) : 0n;
+// #715: same non-integer-input crash as TON_PROVIDER_MAX_SPEND above, same fix — see
+// parseMaxSpendBigInt's doc comment there for why this records rather than throws.
+const MAX_SPEND_LOAD = parseMaxSpendBigInt(readEnv('CYPHER_BRAIN_MAX_SPEND'), 'CYPHER_BRAIN_MAX_SPEND');
+export const AR_MAX_SPEND = MAX_SPEND_LOAD.value;
+/** Why CYPHER_BRAIN_MAX_SPEND was refused, if it was (#715) — mirrors CONFIG_FILE_ERROR above. */
+export const AR_MAX_SPEND_ERROR: Error | null = MAX_SPEND_LOAD.error;
 // Escape hatch for the turbo pre-upload funds check (#342). The check refuses an upload
 // whose cost exceeds even the upper bound of reachable credit — a spend the payment
 // service would reject anyway — but the balance read can lag a top-up made seconds

@@ -27,7 +27,7 @@
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { IDENTITY, CONFIG_FILE_ERROR } from './lib/config.js';
+import { IDENTITY, CONFIG_FILE_ERROR, AR_MAX_SPEND_ERROR, TON_PROVIDER_MAX_SPEND_ERROR } from './lib/config.js';
 import { keygen } from './lib/keys.js';
 import { snapshot } from './lib/snapshot.js';
 import { restore, verify } from './lib/restore.js';
@@ -1478,6 +1478,13 @@ async function main(): Promise<void> {
   // the CB-E code match. Nothing from the file has been applied, so continuing would run
   // the command with the operator's settings silently absent.
   if (CONFIG_FILE_ERROR) throw CONFIG_FILE_ERROR;
+  // #715: same posture — CYPHER_BRAIN_MAX_SPEND/CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND used to
+  // call BigInt() directly at module-import time, so a non-integer value (e.g. "0.5") threw
+  // a raw SyntaxError before this function — or its --help early-return two lines down —
+  // ever ran, crashing every command. config.ts now records the failure instead; re-enter
+  // the normal error path here.
+  if (AR_MAX_SPEND_ERROR) throw AR_MAX_SPEND_ERROR;
+  if (TON_PROVIDER_MAX_SPEND_ERROR) throw TON_PROVIDER_MAX_SPEND_ERROR;
   const [cmd, ...rest] = process.argv.slice(2);
   // `<subcommand> --help` / `-h` must show help instead of running the
   // subcommand (issue #171) — checked on the raw args, BEFORE parseArgs(),

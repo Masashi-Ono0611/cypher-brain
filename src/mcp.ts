@@ -49,6 +49,8 @@ import {
   IDEMPOTENCY_LOG,
   IDEMPOTENCY_TTL_SECONDS,
   IDEMPOTENCY_TTL_ERROR,
+  AR_MAX_SPEND_ERROR,
+  TON_PROVIDER_MAX_SPEND_ERROR,
   NON_CONTENT_ADDRESSED_BACKENDS,
 } from './lib/config.js';
 import { restoreRunbook } from './lib/runbook.js';
@@ -2138,6 +2140,12 @@ async function main(): Promise<void> {
   // on IDEMPOTENCY_TTL_ERROR). The CLI never reads or writes the idempotency log, so this
   // check lives only here, not in cli.ts's equivalent guard.
   if (IDEMPOTENCY_TTL_ERROR) throw IDEMPOTENCY_TTL_ERROR;
+  // #715: same posture as the two guards above — a non-integer CYPHER_BRAIN_MAX_SPEND/
+  // CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND used to throw a raw SyntaxError straight out of
+  // config.ts's module body, before this server ever got a chance to start (or fail
+  // cleanly). config.ts now records the failure instead of throwing it.
+  if (AR_MAX_SPEND_ERROR) throw AR_MAX_SPEND_ERROR;
+  if (TON_PROVIDER_MAX_SPEND_ERROR) throw TON_PROVIDER_MAX_SPEND_ERROR;
   // Module-load warnings (a deprecated env var, a loose-permissioned config file)
   // already printed to the server's stderr live; drain them here so they are not
   // misattributed to whichever tool call happens to run first — but PRESERVED, not
