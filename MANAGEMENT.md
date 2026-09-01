@@ -512,9 +512,12 @@ pipes to a tool that does, or you wire your own healthcheck around it.)
 
 ## Error codes
 
-Failures print with a stable `[CB-E0xx]` code and this section's anchor, the same shape
+Failures print with a stable `[CB-E0xx]` code and a link to this section, the same shape
 ngrok uses for its own errors (https://ngrok.com/docs/errors): `error: <existing message>
-[CB-E0xx] see MANAGEMENT.md#error-codes`. The code identifies the FAILURE PATTERN, not
+[CB-E0xx] see https://github.com/Masashi-Ono0611/cypher-brain/blob/main/MANAGEMENT.md#error-codes`
+(a full GitHub URL rather than a bare relative filename — issue #727: `MANAGEMENT.md`
+itself isn't part of the published npm package, so a relative pointer resolves to
+nothing for an `npx`/global install). The code identifies the FAILURE PATTERN, not
 the exact wording — it's meant to stay stable across a future rewording of the surrounding
 message (`src/lib/errors.ts`'s registry matches text, so keeping that promise in practice
 means the registry entry is updated in the SAME change that reworks its message — see that

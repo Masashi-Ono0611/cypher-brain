@@ -768,6 +768,20 @@ async function run(tmp) {
       throw new Error(`tools/list mismatch: expected ${expected.join(', ')} got ${names.join(', ')}`);
     }
 
+    // The advertised `backend` enum, read back out of tools/list rather than hardcoded —
+    // BACKENDS conditionally APPENDS "ton-provider" when this environment happens to have
+    // a local TON wallet configured (mcp-tool-schemas.ts's top-level `await
+    // tonWalletConfigured()`), which this test does not control and must not assume away
+    // (Codex review: a hardcoded 3-item expectation would break on a machine that already
+    // has CYPHER_BRAIN_TON_WALLET set, since that leaks into this spawned server's env
+    // via the `...process.env` below). Used by the #753/#755 assertions further down.
+    const backendEnum = (list.result?.tools ?? []).find((t) => t.name === 'estimate_cost')?.inputSchema?.properties
+      ?.backend?.enum;
+    if (!Array.isArray(backendEnum) || backendEnum.length === 0) {
+      throw new Error('could not read estimate_cost.backend.enum out of tools/list');
+    }
+    const quotedBackendList = backendEnum.map((v) => JSON.stringify(v)).join(', ');
+
     // 1b. MCP standard tool annotations (issue #219) — every tool must carry
     // readOnlyHint/destructiveHint/idempotentHint/openWorldHint hints
     // matching its actual behavior, alongside the existing confirm_paid logic.
@@ -1657,7 +1671,7 @@ async function run(tmp) {
       );
     }
     if (
-      !/"file", "arweave", "turbo"/.test(missingBackendSc.message) ||
+      !missingBackendSc.message.includes(quotedBackendList) ||
       /file\|arweave\|turbo/.test(missingBackendSc.message)
     ) {
       throw new Error(
@@ -2294,7 +2308,7 @@ async function run(tmp) {
     // #753: the allowed-value list is quoted (formatAllowedValues), the SAME shape
     // requireBackend's own "missing entirely" refusal renders below — not the bare,
     // unquoted "file, arweave, turbo" the old inline .join(', ') produced.
-    if (!/"file", "arweave", "turbo"/.test(nearEnumSc.message)) {
+    if (!nearEnumSc.message.includes(quotedBackendList)) {
       throw new Error(`verify_restore backend="fille" allowed-value list is not quoted: ${nearEnumSc.message}`);
     }
     // #755: the long design-rationale sentence ("the tool publishes that set for every
@@ -2306,7 +2320,7 @@ async function run(tmp) {
         `verify_restore backend="fille" still carries the long design-rationale sentence: ${nearEnumSc.message}`,
       );
     }
-    if (!/Accepts only: "file", "arweave", "turbo"\.$/.test(nearEnumSc.message)) {
+    if (!nearEnumSc.message.endsWith(`Accepts only: ${quotedBackendList}.`)) {
       throw new Error(
         `verify_restore backend="fille" does not end with the accepted-set list as the final takeaway: ${nearEnumSc.message}`,
       );
