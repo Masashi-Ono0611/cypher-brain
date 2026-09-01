@@ -170,6 +170,18 @@ export interface ReadJsonlLogResult<T> {
   skippedLines: number;
 }
 
+// A human-readable name for whatever a non-regular-file stat() result describes — same
+// duck-typed shape doctor.ts's own statKind() takes, kept as an independent copy rather
+// than an import: this one small helper does not justify doctor.ts and util.ts taking a
+// dependency on each other (util.ts is the lower-level module every doctor.ts check
+// already imports FROM).
+function statKind(st: { isDirectory(): boolean; isFIFO(): boolean; isSocket(): boolean }): string {
+  if (st.isDirectory()) return 'a directory';
+  if (st.isFIFO()) return 'a FIFO/named pipe';
+  if (st.isSocket()) return 'a socket';
+  return 'not a regular file';
+}
+
 // #503: the JSONL-log-reading skeleton receipt.ts's readReceipts() and audit.ts's
 // readAuditLog() each hand-rolled a second time (audit.ts's own comments cite
 // receipt.ts as the precedent it consciously reimplemented rather than shared) —
@@ -182,15 +194,39 @@ export interface ReadJsonlLogResult<T> {
 // (audit.ts's is stricter — exact null-vs-string checks on every nullable field,
 // Codex review, Critical — see its own header comment for why), which stays local to
 // each module rather than being forced into a shared shape here.
+//
+// #695: stat()s the path and refuses to readFile() anything that is not a regular file,
+// mirroring doctor.ts's own checkIdentityRecipientPairing() guard (Codex review, #333)
+// — readFile() below would BLOCK indefinitely on e.g. a FIFO with no writer on the
+// other end, and every caller of this helper (doctor.ts's audit-chain-integrity/
+// receipt-ledger-readability checks, AND the standalone `cypher-brain audit`/`ledger`
+// CLI commands that share this same helper) is exactly the kind of routine, read-only
+// diagnostic that hang would turn into an indefinite freeze instead of a clean FAIL. A
+// missing path (ENOENT/ENOTDIR from stat() itself) is still "empty, not an error" —
+// unchanged from before — so a not-yet-created log continues to mean "nothing has been
+// recorded yet", not "the log is unreadable".
 export async function readJsonlLog<T>(
   path: string,
   label: string,
   validateAndParse: (parsed: unknown) => T | null,
 ): Promise<ReadJsonlLogResult<T>> {
+  let st: Awaited<ReturnType<typeof stat>>;
+  try {
+    st = await stat(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { items: [], skippedLines: 0 };
+    throw new Error(`cannot read ${label} at ${path}: ${errMsg(e)}`);
+  }
+  if (!st.isFile()) {
+    throw new Error(`${path} is not a regular file (${statKind(st)}) — refusing to read it as the ${label}`);
+  }
   let text: string;
   try {
     text = await readFile(path, 'utf8');
   } catch (e) {
+    // TOCTOU: the path could have been removed or replaced between the stat() above and
+    // this readFile() — ENOENT here means the same "nothing to read" as a path that was
+    // never there in the first place.
     if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { items: [], skippedLines: 0 };
     throw new Error(`cannot read ${label} at ${path}: ${errMsg(e)}`);
   }
