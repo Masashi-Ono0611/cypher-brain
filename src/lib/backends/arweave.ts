@@ -432,6 +432,56 @@ function l1ChunkRead(ar: ArweaveClient, locator: string, timeoutMs: number): Pro
   return p;
 }
 
+// The identical fetch-patch technique l1ChunkRead() above uses for the READ-side L1
+// chunk fallback (#116), applied to the WRITE-side paid upload (#691): arweave-js's
+// `ar.transactions.post()` drives `TransactionUploader.uploadChunk()` through the SAME
+// `Api.request()` → plain fetch() call path (node_modules/arweave/node/lib/api.js) —
+// no AbortSignal, and its `ApiConfig.timeout` is stored but never wired in (a dead
+// option in this SDK version, per l1ChunkRead()'s header comment). Without this, a
+// gateway that accepts the connection but never completes a chunk-upload response
+// hangs `push` forever, with the tx already signed. `sign()` itself is local crypto
+// (no network call) when a JWK is supplied, so patching fetch for both calls together
+// is harmless — it simply has nothing to intercept during sign().
+// Deliberately NOT armed before `sign()` runs (unlike l1ChunkRead(), which fetches
+// immediately with no such gap): signing hashes/signs the whole (already-buffered)
+// payload, which is local compute this stall timer must not budget against — arming
+// early would let a slow-but-healthy sign() alone burn through timeoutMs and abort
+// post()'s first request before any network call was ever made (Codex review). The
+// timer starts on the FIRST fetch call instead, which is always post()'s doing.
+// NOT reentrant, same caveat as l1ChunkRead(): mutates the process-global `fetch` for
+// the duration of one call; safe because put() is only ever awaited sequentially (one
+// backend.put() per CLI process).
+function l1SignAndPost(
+  ar: ArweaveClient,
+  tx: ArweaveTransaction,
+  jwk: unknown,
+  timeoutMs: number,
+): Promise<{ status: number; data?: unknown }> {
+  const realFetch = globalThis.fetch;
+  const ctl = new AbortController();
+  let stall: ReturnType<typeof setTimeout> | undefined;
+  const arm = () => {
+    clearTimeout(stall);
+    stall = setTimeout(() => ctl.abort(), timeoutMs);
+  };
+  globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    arm(); // first call arms the timer; each subsequent one (a new chunk) resets it
+    return realFetch(input, { ...init, redirect: 'error', signal: ctl.signal });
+  }) as typeof fetch;
+  const p = (async () => {
+    await ar.transactions.sign(tx, jwk);
+    return ar.transactions.post(tx);
+  })();
+  // Restore the moment `p` settles, mirroring l1ChunkRead(): the caller's own try/catch
+  // (or the bare await in put()) handles `p`'s real rejection — this `.catch` exists only
+  // so this settle-tracking chain doesn't itself surface as an unhandled rejection.
+  p.finally(() => {
+    clearTimeout(stall);
+    globalThis.fetch = realFetch;
+  }).catch(() => {});
+  return p;
+}
+
 // arweave backend: stores the ciphertext as an Arweave transaction. The locator is
 // the tx id — assigned AFTER upload, NOT a content hash — which is exactly the case
 // the StorageBackend interface must handle (vs file's pre-known content id).
@@ -533,8 +583,11 @@ export async function arweaveBackend(): Promise<StorageBackend> {
       const tx = await ar.createTransaction(reward !== undefined ? { data, reward: String(reward) } : { data }, jwk);
       tx.addTag('App-Name', 'cypher-brain');
       tx.addTag('Content-Type', 'application/octet-stream');
-      await ar.transactions.sign(tx, jwk);
-      const res = await ar.transactions.post(tx);
+      // #691: sign+post wrapped in a stall-armed AbortSignal (same technique l1ChunkRead()
+      // uses for the read side, #116) — without it a stalled gateway hangs this paid
+      // upload forever, with no CYPHER_BRAIN_AR_HTTP_TIMEOUT_MS/PIPE_TIMEOUT_MS bound
+      // applying here at all (unlike every read path in this file).
+      const res = await l1SignAndPost(ar, tx, jwk, AR_HTTP_TIMEOUT_MS);
       if (res.status !== 200 && res.status !== 208) throw new Error(describeArweavePostError(res.status, res.data));
       // #232: tx.reward is the AUTHORITATIVE actual cost — set either from the pre-flight
       // `reward` above (passed into createTransaction) or, if that estimate failed,
