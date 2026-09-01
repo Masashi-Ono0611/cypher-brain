@@ -524,7 +524,10 @@ export const KEYGEN_TOOL: Tool = {
     'keypair — every snapshot already encrypted to it becomes permanently unrecoverable. ' +
     'passphrase=true additionally wraps the new identity at rest; since MCP has no interactive TTY this ' +
     'REQUIRES CYPHER_BRAIN_PASSPHRASE to be set in the server environment (fails closed with a clear ' +
-    'error otherwise — never prompts blindly).',
+    'error otherwise — never prompts blindly). NOTE (#690): this server serializes every captured tool ' +
+    'call through one internal queue, so this call can sit WAITING (not failing, not hung) behind an ' +
+    'unrelated in-flight snapshot_now/restore_now/verify_restore call that happens to still be running — ' +
+    'a slow response here does not by itself mean anything is wrong.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -575,7 +578,11 @@ export const WALLET_CREATE_TOOL: Tool = {
     '#439): this tool has no chain parameter and cannot create a TON wallet. To use snapshot_now/' +
     'schedule_install\'s backend="ton-provider", instead run `cypher-brain wallet create --chain ton` ' +
     "from a shell, set CYPHER_BRAIN_TON_WALLET to the printed path in this MCP server's own environment, " +
-    'and restart the server — only then does "ton-provider" appear in those tools\' backend enum.',
+    'and restart the server — only then does "ton-provider" appear in those tools\' backend enum. ' +
+    'NOTE (#690): this server serializes every captured tool call through one internal queue, so this ' +
+    'call can sit WAITING (not failing, not hung) behind an unrelated in-flight snapshot_now/restore_now/' +
+    'verify_restore call that happens to still be running — a slow response here does not by itself mean ' +
+    'anything is wrong.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -616,7 +623,10 @@ export const WALLET_ADDRESS_TOOL: Tool = {
     'writes to) when wallet is omitted. ARWEAVE ONLY (issue #439): there is no TON equivalent of this ' +
     "tool over MCP — a TON wallet's address is printed once by `cypher-brain wallet create --chain ton` " +
     "at creation time (see wallet_create's description for the full CLI-bootstrap-then-restart steps " +
-    'needed to reach backend="ton-provider").',
+    'needed to reach backend="ton-provider"). NOTE (#690): despite being read-only and fast on its own, ' +
+    'this server serializes every captured tool call through one internal queue, so this call can sit ' +
+    'WAITING (not failing, not hung) behind an unrelated in-flight snapshot_now/restore_now/verify_restore ' +
+    'call that happens to still be running — do not mistake a queued call for a hang.',
   inputSchema: {
     type: 'object',
     properties: {
