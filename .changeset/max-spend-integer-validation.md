@@ -14,3 +14,9 @@ re-enter the normal error path with it, so a bad value now prints a clean
 `error: CYPHER_BRAIN_MAX_SPEND must be an integer (got "0.5")` on stderr with a normal
 non-zero exit code — matching every other env-var validation in this CLI — instead of
 crashing.
+
+A negative value (e.g. `-1`) is refused too, with its own `must be a non-negative
+integer` message: `BigInt()` parses a negative string without error, but both spend
+checks gate on `> 0n`, so a negative cap would otherwise parse "successfully" into one
+silently indistinguishable from 0/unset (no cap at all) — the opposite of what setting a
+negative number here could ever sensibly mean (multi-model review).

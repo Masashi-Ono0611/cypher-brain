@@ -74,11 +74,14 @@
 //      (naming the variable) rather than silently defeating replay; unset
 //      still starts normally. runMaxSpendValidationTest() (#715):
 //      CYPHER_BRAIN_MAX_SPEND/CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND set to a
-//      non-integer value (a decimal, a comma-grouped number, plain text, a
-//      negative number) refuses to start the server with a clean "must be an
-//      integer" message naming the variable — never the raw, unhandled
-//      BigInt() SyntaxError this used to throw at module-import time — and
-//      leaving both unset still starts normally. runIdempotencyCorruptedLogTest(): the
+//      non-integer value (a decimal, a comma-grouped number, plain text) refuses
+//      to start the server with a clean "must be an integer" message naming the
+//      variable — never the raw, unhandled BigInt() SyntaxError this used to
+//      throw at module-import time; a NEGATIVE integer (which BigInt() itself
+//      parses without error) is refused too, with its own "must be a
+//      non-negative integer" message — a negative cap would otherwise parse
+//      "successfully" into one silently indistinguishable from 0/unset (no cap
+//      at all). Leaving both unset still starts normally. runIdempotencyCorruptedLogTest(): the
 //      idempotency log corrupted EXTERNALLY between two calls makes a
 //      BRAND NEW key refuse fail-closed (ERR_IDEMPOTENCY_STORE_UNREADABLE)
 //      rather than silently proceeding as "no prior calls". The signature-
@@ -218,39 +221,51 @@ async function runIdempotencyTtlValidationTest(tmp) {
 // stack trace) for each bad value, and that leaving both unset still starts fine.
 async function runMaxSpendValidationTest(tmp) {
   const cases = [
-    { name: 'CYPHER_BRAIN_MAX_SPEND', values: ['0.5', '1,000,000', 'notanumber', 'Infinity'] },
-    { name: 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND', values: ['0.5', 'notanumber'] },
+    {
+      name: 'CYPHER_BRAIN_MAX_SPEND',
+      // non-integer (BigInt() itself throws) vs. negative (BigInt() parses it fine, but
+      // it must still be refused — see parseMaxSpendBigInt's doc comment in config.ts)
+      // are DIFFERENT failure modes with DIFFERENT wording; kept as separate lists so
+      // each is asserted against the wording it actually produces.
+      nonInteger: ['0.5', '1,000,000', 'notanumber', 'Infinity'],
+      negative: ['-1', '-5'],
+    },
+    { name: 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND', nonInteger: ['0.5', 'notanumber'], negative: ['-1'] },
   ];
-  for (const { name, values } of cases) {
-    for (const bad of values) {
-      const home = join(tmp, `home-max-spend-${name}-${bad}`.replace(/[^a-zA-Z0-9_-]/g, '_'));
-      const res = spawnSync(process.execPath, [SERVER_PATH], {
-        env: { ...process.env, CYPHER_BRAIN_HOME: home, [name]: bad },
-        input: '',
-        encoding: 'utf8',
-        timeout: 5000,
-      });
-      if (res.status === 0) {
-        throw new Error(`max-spend validation: ${name}=${bad} started successfully (should refuse)`);
-      }
-      const stderr = res.stderr ?? '';
-      if (!new RegExp(name).test(stderr)) {
-        throw new Error(
-          `max-spend validation: ${name}=${bad} did not name the variable in its refusal: ` +
-            `${JSON.stringify(stderr).slice(0, 400)}`,
-        );
-      }
-      if (!stderr.includes('must be an integer')) {
-        throw new Error(
-          `max-spend validation: ${name}=${bad} did not use the "must be an integer" wording: ` +
-            `${JSON.stringify(stderr).slice(0, 400)}`,
-        );
-      }
-      if (/^\s*at /m.test(stderr)) {
-        throw new Error(
-          `max-spend validation: ${name}=${bad} printed a raw stack trace instead of a clean refusal: ` +
-            `${JSON.stringify(stderr).slice(0, 400)}`,
-        );
+  const wordingFor = { nonInteger: 'must be an integer', negative: 'must be a non-negative integer' };
+  for (const { name, ...groups } of cases) {
+    for (const [kind, values] of Object.entries(groups)) {
+      const wording = wordingFor[kind];
+      for (const bad of values) {
+        const home = join(tmp, `home-max-spend-${name}-${bad}`.replace(/[^a-zA-Z0-9_-]/g, '_'));
+        const res = spawnSync(process.execPath, [SERVER_PATH], {
+          env: { ...process.env, CYPHER_BRAIN_HOME: home, [name]: bad },
+          input: '',
+          encoding: 'utf8',
+          timeout: 5000,
+        });
+        if (res.status === 0) {
+          throw new Error(`max-spend validation: ${name}=${bad} started successfully (should refuse)`);
+        }
+        const stderr = res.stderr ?? '';
+        if (!new RegExp(name).test(stderr)) {
+          throw new Error(
+            `max-spend validation: ${name}=${bad} did not name the variable in its refusal: ` +
+              `${JSON.stringify(stderr).slice(0, 400)}`,
+          );
+        }
+        if (!stderr.includes(wording)) {
+          throw new Error(
+            `max-spend validation: ${name}=${bad} did not use the "${wording}" wording: ` +
+              `${JSON.stringify(stderr).slice(0, 400)}`,
+          );
+        }
+        if (/^\s*at /m.test(stderr)) {
+          throw new Error(
+            `max-spend validation: ${name}=${bad} printed a raw stack trace instead of a clean refusal: ` +
+              `${JSON.stringify(stderr).slice(0, 400)}`,
+          );
+        }
       }
     }
   }

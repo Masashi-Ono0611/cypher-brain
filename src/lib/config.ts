@@ -482,17 +482,32 @@ export const TON_PROVIDER_OWNER = readEnv('CYPHER_BRAIN_TON_PROVIDER_OWNER') || 
 // below: record the failure as a value here, and let the two entry points' own guards
 // (mirroring their existing CONFIG_FILE_ERROR check) decide when to throw it, so
 // `error: …`, the --json error object, and the CB-E code all stay intact.
-// try/catch (rather than a hand-rolled regex) so this accepts EXACTLY what BigInt()
-// itself accepts — whitespace-trimmed, an optional leading sign, "0x"/"0o"/"0b" literals
+// try/catch (rather than a hand-rolled regex) so the SyntaxError branch below accepts
+// EXACTLY what BigInt() itself accepts — whitespace-trimmed, "0x"/"0o"/"0b" literals
 // included — and only ever catches the SyntaxError BigInt() would otherwise throw
-// uncaught. No new restriction is introduced beyond "must not crash".
+// uncaught. A separate, explicit negative check follows: BigInt("-1") does NOT throw (a
+// negative bigint is a perfectly valid one), but both call sites gate their spend check on
+// `> 0n` (arweave.ts, turbo.ts, ton-provider.ts) — so a negative value would otherwise
+// parse "successfully" into a cap that is silently indistinguishable from 0/unset (no cap
+// at all), the opposite of what a negative number here could ever sensibly mean (Codex
+// review, #715).
 function parseMaxSpendBigInt(raw: string | undefined, name: string): { value: bigint; error: Error | null } {
   if (!raw) return { value: 0n, error: null };
+  let value: bigint;
   try {
-    return { value: BigInt(raw), error: null };
+    value = BigInt(raw);
   } catch {
     return { value: 0n, error: new Error(`${name} must be an integer (got ${JSON.stringify(raw)})`) };
   }
+  if (value < 0n) {
+    return {
+      value: 0n,
+      error: new Error(
+        `${name} must be a non-negative integer (got ${JSON.stringify(raw)}) — 0/unset means no spend cap`,
+      ),
+    };
+  }
+  return { value, error: null };
 }
 const TON_PROVIDER_MAX_SPEND_LOAD = parseMaxSpendBigInt(
   readEnv('CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND'),
