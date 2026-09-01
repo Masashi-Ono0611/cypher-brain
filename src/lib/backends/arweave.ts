@@ -575,9 +575,9 @@ export async function arweaveBackend(): Promise<StorageBackend> {
           );
         }
         // #692: warn(), not a raw stderr write — turbo.ts's structurally identical
-        // branch already uses warn() (its own line 145). Per warn.ts's own header
-        // comment (#347), it is THE chokepoint for a runtime warning a human must see:
-        // a raw process.stderr.write bypasses both mcp.ts's captureCall() console.error
+        // estimate-failure branch already uses warn(). Per warn.ts's own header comment
+        // (#347), it is THE chokepoint for a runtime warning a human must see: a raw
+        // process.stderr.write bypasses both mcp.ts's captureCall() console.error
         // interception and the `warnings` array an MCP tool result carries, so an agent
         // relaying an unattended/MCP-driven push never sees that the spend cap could
         // not be verified for this run.
