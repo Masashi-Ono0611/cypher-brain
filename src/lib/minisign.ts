@@ -47,7 +47,7 @@ import { createReadStream } from 'node:fs';
 import { mkdir, chmod, readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { unwrapTextFile, wrapIdentity, askNewPassphrase } from './crypt.js';
-import { writeKeyFile } from './keys.js';
+import { writeKeyFile, backupIdentityFile } from './keys.js';
 import { exists, errMsg, warnIfLooseKeyPerms } from './util.js';
 
 // ---------- wire format constants (src/minisign.c: SIGALG / SIGALG_HASHED / KEYNUMBYTES
@@ -341,15 +341,22 @@ export interface KeygenSignAtOpts {
 export interface KeygenSignAtResult {
   wrapped: boolean;
   pubkeyText: string;
+  // Set only when --force just replaced an EXISTING signing identity — see
+  // KeygenAtResult's own field of the same name (keys.ts) and
+  // backupIdentityFile()'s doc comment for why (#786).
+  backupPath?: string;
 }
 
 // Mirrors keys.ts's keygenAt(): same no-clobber-unless---force precondition (checked
 // BEFORE anything is generated), same 0700 home dir, same writeKeyFile atomic-write
-// discipline for both the private and public outputs.
+// discipline for both the private and public outputs, and — #786 — the SAME
+// backup-before-replace + public-key-first write order keygenAt() uses (see that
+// function's own comments for the full rationale; sibling code, sibling fix).
 export async function keygenSignAt(opts: KeygenSignAtOpts): Promise<KeygenSignAtResult> {
   await mkdir(opts.home, { recursive: true, mode: 0o700 });
   await chmod(opts.home, 0o700);
-  if ((await exists(opts.identityPath)) && !opts.force) {
+  const identityExisted = await exists(opts.identityPath);
+  if (identityExisted && !opts.force) {
     throw new Error(
       `signing identity already exists at ${opts.identityPath} (refusing to overwrite — a new keypair would invalidate ` +
         `restore's ability to verify signatures made with the OLD key; existing *.minisig files stay verifiable against ` +
@@ -375,9 +382,18 @@ export async function keygenSignAt(opts: KeygenSignAtOpts): Promise<KeygenSignAt
     payload = await wrapIdentity(identityText, await askNewPassphrase());
     wrapped = true;
   }
-  await writeKeyFile(opts.identityPath, payload, 0o600, !!opts.force);
+  // #786: back up the OLD signing identity right here — every step that could
+  // still fail before anything is touched has already succeeded, same "prepare
+  // fully, THEN replace" ordering keygenAt() uses (keys.ts) for the age identity.
+  const backupPath = opts.force && identityExisted ? await backupIdentityFile(opts.identityPath) : undefined;
+  // Announced IMMEDIATELY (see keygenAt()'s identical comment, keys.ts): the two
+  // writes below can still fail, and if either does this function throws before its
+  // caller ever gets to print a success message — the backup itself is unaffected
+  // by that later failure, so say where it is now, not only on a full success.
+  if (backupPath) console.log(`old signing identity backed up to: ${backupPath}`);
   await writeKeyFile(opts.recipientPath, pubkeyText, 0o644, !!opts.force);
-  return { wrapped, pubkeyText };
+  await writeKeyFile(opts.identityPath, payload, 0o600, !!opts.force);
+  return { wrapped, pubkeyText, backupPath };
 }
 
 export interface LoadedSignIdentity {

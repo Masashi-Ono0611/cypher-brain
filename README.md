@@ -505,6 +505,10 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       snapshot unrecoverable) — use this if you skipped the passphrase step during "init"
       or a bare keygen and want to add one later. Refuses if the identity is already
       wrapped, or if none exists yet.
+      --force replacing an EXISTING identity first backs up its old bytes to a sibling
+      "identity.age.bak-<timestamp>-<random>" file (mode 0600, printed as "old identity
+      backed up to: ...") — the safety net for forgetting to copy it aside yourself before
+      running --force (#786).
       --sign (#214) generates a SEPARATE minisign-compatible Ed25519 SIGNING keypair
       instead of an age keypair — an independent mode (like --wrap-in-place; the two are
       mutually exclusive), so it can add authenticity to an existing setup without
@@ -515,7 +519,9 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       $CYPHER_BRAIN_HOME/sign-identity.key (PRIVATE) and sign-recipient.pub (PUBLIC, in
       the reference minisign CLI's own wire format — verifiable with a real
       "minisign -V -p sign-recipient.pub"). --passphrase/--force apply to it the same way
-      they do to the age identity above; --wrap-in-place does not (age-only).
+      they do to the age identity above, INCLUDING the --force backup (sign-identity.key
+      backed up to "sign-identity.key.bak-<timestamp>-<random>", #786); --wrap-in-place
+      does not (age-only).
 
   cypher-brain wallet create [--out <path>] [--force] [--chain arweave|ton]
       Generate a fresh signing credential. --chain arweave (default) generates an
