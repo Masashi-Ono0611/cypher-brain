@@ -439,7 +439,7 @@ fi
 echo "[PASS] --skip-unchanged without --save-locator is rejected"
 
 echo "== issue #723: --digest without --save-locator is refused (it would otherwise be silently ignored) =="
-FAKE_DIGEST="abababababababababababababababababababababababababababababab" # 64 hex chars, distinct from any real content digest above
+FAKE_DIGEST="abababababababababababababababababababababababababababababababab" # 64 hex chars, distinct from any real content digest above
 if cb push --in "$TMP/nosidecar.age" --backend file --digest "$FAKE_DIGEST" 2>"$TMP/digest-no-savelocator.err"; then
   echo "[FAIL] push --digest ran without --save-locator"; exit 1
 fi
