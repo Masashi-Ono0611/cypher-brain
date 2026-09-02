@@ -163,10 +163,15 @@ function parseArgs(argv: string[], cmd: string | undefined): CliOptions {
   // "--scan-secret" and never reaching the unknown-flag refusal (#253) that exists to
   // catch exactly that typo. A value that genuinely begins with "--" is pathological
   // enough to be worth an explicit "./--name", which the message suggests.
+  // #779-class: a missing flag value is a malformed COMMAND LINE, the same class as an
+  // unknown flag or a mistyped sub-verb — throw UsageError (exit 2), not a plain Error
+  // (which main().catch() would otherwise flatten to exit 1, indistinguishable from a
+  // failure that happened while doing real work).
   const valueAt = (i: number, flag: string): string => {
-    if (i >= argv.length) throw new Error(`${flag} requires a value (run 'cypher-brain --help' for the expected form)`);
+    if (i >= argv.length)
+      throw new UsageError(`${flag} requires a value (run 'cypher-brain --help' for the expected form)`);
     if (argv[i].startsWith('--'))
-      throw new Error(
+      throw new UsageError(
         `${flag} requires a value, but the next argument looks like another flag (${argv[i]}) — ` +
           `it was NOT consumed as ${flag}'s value. Give ${flag} its value, or write "./${argv[i]}" if you really ` +
           `meant a path by that name.`,
@@ -1122,8 +1127,12 @@ Env: CYPHER_BRAIN_HOME (default ~/.cypher-brain; an existing ~/.cipher-brain is 
      even under --no-load; override to sandbox a --no-load preview run).
      CYPHER_BRAIN_PASSPHRASE (non-interactive passphrase for a wrapped identity — automation/CI; otherwise prompted on the TTY).
      CYPHER_BRAIN_PIN_RECIPIENTS (snapshot: allowlist of age1… pubkeys, inline or a file — refuse to encrypt to any other recipient).
+     CYPHER_BRAIN_MCP_SOURCE_ROOTS (MCP server only — issue #800: JSON array of absolute directory
+     roots a snapshot_now call's 'dirs' must resolve inside, after following symlinks; a pinned
+     'pg'-only call needs no roots. Unset/empty/malformed refuses every 'dirs' call. The CLI 'snapshot'
+     command itself is unaffected — see 'Threat model' in README.md).
      CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 (init: bypass its TTY requirement — automation/CI only, e.g. this repo's own selftest; a human just runs init directly in a terminal).
-Storage: CYPHER_BRAIN_RECEIPT_LEDGER (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl — every arweave/turbo push's actual-cost receipt, #232; see 'ledger' above, and 'doctor's receipt-ledger-readability check, #456. A '<ledger-name>.pending-spends.jsonl' sidecar is kept beside it (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl.pending-spends.jsonl): a ton-provider deploy records its contract address, provider and amount there BEFORE broadcasting and settles it once the receipt is on disk, so a spend confirmed by a run that then died is recovered by the next push instead of vanishing from the ledger — #808; see 'doctor's pending-spend-intents check).
+Storage: CYPHER_BRAIN_RECEIPT_LEDGER (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl — every arweave/turbo/ton-provider push that actually spent and finished recording it writes a RECEIPT here, #232; see 'ledger' above, and 'doctor's receipt-ledger-readability check, #456. A push whose outcome is UNCERTAIN (CB-E027), or that was killed after confirming a ton-provider spend but before the receipt reached disk, may have spent without one yet — see the pending-spends sidecar below for the ton-provider case. A '<ledger-name>.pending-spends.jsonl' sidecar is kept beside it (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl.pending-spends.jsonl): a ton-provider deploy records its contract address, provider and amount there BEFORE broadcasting and settles it once the receipt is on disk, so a spend confirmed by a run that then died is recovered by the next push instead of vanishing from the ledger — #808; see 'doctor's pending-spend-intents check).
          CYPHER_BRAIN_AUDIT_LOG (default $CYPHER_BRAIN_HOME/audit-log.jsonl — hash-chained record of every push/restore/verify run, #226; see 'audit' above, and 'doctor's audit-chain-integrity check, #456).
          CYPHER_BRAIN_FILE_DIR (file);
          CYPHER_BRAIN_AR_{HOST,PORT,PROTOCOL,WALLET,GATEWAY,GATEWAYS,HTTP_TIMEOUT,USD_RATE_URL,TURBO_RATES_URL,BALANCE_URL,L1_MAX} (arweave; CYPHER_BRAIN_AR_WALLET is a path to a JWK key file — 'cypher-brain wallet create' generates one, 'wallet address' shows what to fund; when unset, push/estimate's payer resolution and 'wallet address'/'balance' all fall back to $CYPHER_BRAIN_HOME/wallet.json (the default 'wallet create' path, #472) — only required when the wallet lives somewhere else; the 'arweave' npm package is needed only to PUSH or for the rare L1 chunk fallback — a gateway pull needs none; the approximate-USD lines price each backend in its own truthful unit: the raw arweave L1 backend at AR SPOT (CYPHER_BRAIN_AR_USD_RATE_URL — the spend is real AR at market value), the turbo backend and 'wallet balance' at Turbo's own credit rate, fees included (CYPHER_BRAIN_AR_TURBO_RATES_URL — a turbo upload spends credits, and credits sell at Turbo's price, not AR spot; pricing them at spot understated a real push's cost by ~35%), falling back to labeled AR spot only when that price sheet is unavailable or unusable; a dead rate endpoint just omits the USD line, it never blocks a push; CYPHER_BRAIN_AR_BALANCE_URL overrides the payment-service account endpoint 'wallet balance' queries as '<url>?address=<addr>'; CYPHER_BRAIN_AR_L1_MAX overrides the raw-arweave-L1 backend's max single-tx size in bytes (default 10485760 ≈ 10 MiB — push/estimate refuse a larger raw-L1 tx and suggest --backend turbo instead, unless this is raised); 'schedule install' bakes the value in effect at install time into the generated nightly runner, same as the other AR_* settings);

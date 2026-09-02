@@ -1205,7 +1205,14 @@ async function restoreImpl(o: CliOptions, opened?: OpenedRestoreArtifact): Promi
       // the DEFAULT path missing means "not opted in yet" (see snapshot.ts's --sign-identity
       // for the same distinction on the signing side).
       if (o.sign_recipient && !(await exists(o.sign_recipient))) {
-        throw new Error(`--sign-recipient ${o.sign_recipient} does not exist`);
+        // Interpolate the path AFTER the invariant "does not exist" wording (rather
+        // than sandwiched between "--sign-recipient" and "does not exist") so CB-E023's
+        // pattern in errors.ts can match on the fixed prefix "--sign-recipient does not
+        // exist: " alone — an arbitrary --sign-recipient value can never collide with
+        // that literal, whereas the old "--sign-recipient <path> does not exist" shape
+        // could only be matched via a "--sign-recipient " PREFIX, which also (wrongly)
+        // caught cli.ts's unrelated "--sign-recipient requires a value" parser error.
+        throw new Error(`--sign-recipient does not exist: ${o.sign_recipient}`);
       }
       const sigCheck = await checkArtifactSignature(artifact, signRecipient);
       if (sigCheck.status === 'invalid') {
@@ -1580,7 +1587,9 @@ async function runFileChecksOn(
   // An EXPLICITLY-named --sign-recipient that doesn't exist is a configuration typo,
   // not "authenticity isn't set up yet" (see restoreImpl's identical guard above).
   if (o.sign_recipient && !(await exists(o.sign_recipient))) {
-    throw new Error(`--sign-recipient ${o.sign_recipient} does not exist`);
+    // Same reworded shape as restoreImpl's identical guard above — see its comment for
+    // why the path is interpolated AFTER "does not exist" rather than before it.
+    throw new Error(`--sign-recipient does not exist: ${o.sign_recipient}`);
   }
   const sigCheck = await checkArtifactSignature(artifact, signRecipient);
   let sigOk: boolean | null = sigCheck.status === 'verified' ? true : sigCheck.status === 'invalid' ? false : null;

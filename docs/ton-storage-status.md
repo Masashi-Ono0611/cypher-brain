@@ -238,11 +238,28 @@ full remediation is intentionally left as future work:
   cannot be told apart from a false claim using self-reported bytes alone.
   The operator-facing "safe to stop the local seed" line also now says
   explicitly that this is a self-report, not a verified proof.
-- **Retry-after-timeout can double-fund the same contract (issue #638,
-  tracked separately)**: the StorageV1 contract address is deterministic
-  from bag metadata + owner, but a retry after an ambiguous broadcast or a
-  notify timeout can re-send `amountNano` against the same (already funded)
-  address. Being fixed independently — see that issue.
+- **Retry-after-timeout double-funding the same contract (issue #638): fixed.**
+  The StorageV1 contract address is deterministic from bag metadata + owner, so a
+  retry after an ambiguous broadcast or a notify timeout reproduces the identical
+  address. `push --backend ton-provider` now checks on-chain state before moving
+  funds and skips re-funding when the contract already shows any on-chain activity
+  — and, if that state cannot be READ at all (a tonapi hiccup), refuses to broadcast
+  rather than risking a second payment (a fail-closed refusal, no funds moved; #819).
+  A confirmed spend no longer gets lost to a crash either (`put()` now records a
+  pending-spend intent BEFORE broadcasting, and the already-active branch a later
+  retry takes settles it — writing the missing receipt from that intent — once a
+  receipt is verifiably on disk; #824), and the already-active branch resolves which
+  provider to notify from the contract's own on-chain `providers` dict rather than a
+  possibly-stale local registry pick (#830). One
+  residual risk remains, documented as a known limitation rather than fixed:
+  TonAPI's own indexing can lag a just-broadcast transaction by a moment, during
+  which a retry landing in that window can still read the contract back as
+  `nonexist`. The code's own analysis (`src/lib/backends/ton-provider.ts`, the
+  #805 fail-closed comment) considers that narrower race bounded by the wallet's
+  seqno-replay protection rather than by this check, but does not claim to
+  eliminate it — closing it fully would need a persisted "broadcast in flight"
+  record surviving process restarts, left as a known limitation rather than
+  implemented speculatively.
 
 ## Testnet — third-party providers (C++ lane)
 

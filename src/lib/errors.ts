@@ -298,21 +298,25 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     source:
       'src/lib/snapshot.ts (snapshot, "--sign-identity … does not exist — refusing to write an unsigned snapshot", #601)',
   },
-  // Prefix-only, not "--sign-recipient .*does not exist": the interpolated path sits
-  // between the two invariant halves of this message, and scripts/selftest-error-
-  // codes.mjs's literal-extraction only understands plain substrings — a wildcard
-  // spanning the path makes it fail closed with "cannot extract literals" (verified),
-  // not silently skip. The trade-off (same one CB-E019's "no wallet at " prefix and
-  // CB-E020's "no recipient at " prefix already accept) is a false-positive risk if some
-  // future unrelated throw site's message also happened to contain this literal; today it
-  // does not (grep confirms only restore.ts's two "--sign-recipient … does not exist"
-  // throw sites contain it).
+  // Used to be prefix-only ("--sign-recipient "), which also matched cli.ts's unrelated
+  // "--sign-recipient requires a value (run 'cypher-brain --help' …)" parser error (the
+  // one valueAt() throws for a MISSING flag value) — mislabeling a usage mistake as a
+  // nonexistent-path problem and pointing at the wrong remediation. A wildcard spanning
+  // the interpolated path ("--sign-recipient .*does not exist") would have fixed that,
+  // but scripts/selftest-error-codes.mjs's literal-extraction only understands plain
+  // substrings — a wildcard makes it fail closed with "cannot extract literals"
+  // (verified), not silently skip. Fixed at the throw sites instead (restore.ts's
+  // restoreImpl + runFileChecks): the path is now interpolated AFTER the invariant
+  // wording ("--sign-recipient does not exist: <path>") rather than between its two
+  // halves, so the ENTIRE distinguishing text is one contiguous literal with nothing
+  // dynamic in the middle — no wildcard needed, and it cannot collide with the
+  // "requires a value" message (which never contains "does not exist").
   {
     code: 'CB-E023',
     title: '--sign-recipient path does not exist',
-    pattern: /--sign-recipient /,
+    pattern: /--sign-recipient does not exist: /,
     origin: 'ours',
-    source: 'src/lib/restore.ts (restoreImpl + runFileChecks, "--sign-recipient … does not exist", #601)',
+    source: 'src/lib/restore.ts (restoreImpl + runFileChecks, "--sign-recipient does not exist: …", #601)',
   },
   // #781: split out of CB-E007 above — "ton-provider needs a spend cap configured" is a
   // DIFFERENT condition from "confirm this paid upload with --yes", even though both

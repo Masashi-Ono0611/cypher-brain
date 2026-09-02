@@ -95,7 +95,12 @@ export const SNAPSHOT_NOW_TOOL: Tool = {
     "say) double-spending on arweave/turbo. The key is scoped to THIS call's dirs/pg/recipients/" +
     'out/backend/scan_secrets: reusing it for a call that differs in any of those is refused ' +
     'rather than silently answered with the wrong result. Cached results expire after ' +
-    'CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS (default 24h) — a repeat past that is a fresh call. ' +
+    'CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS (default 24h) — a repeat past that is a fresh call, ' +
+    'with ONE exception that never expires: a paid push whose outcome is UNCERTAIN (the payment ' +
+    'may or may not have happened) records a PERMANENT tombstone (code ERR_PUSH_OUTCOME_UNCERTAIN) ' +
+    "that every later call with that key keeps replaying as an error — see idempotency_key's own " +
+    'description for the full recovery procedure (verify on-chain, then use a NEW key; do not ' +
+    'retry the same one). ' +
     'POLICY (issue #800, enforced before any work and before an idempotency replay, so a stored ' +
     'result cannot be replayed past it): this server refuses every snapshot_now call unless the ' +
     'OPERATOR has set CYPHER_BRAIN_PIN_RECIPIENTS to at least one age1… key AND every recipient this ' +
@@ -438,15 +443,16 @@ export const SCHEDULE_INSTALL_TOOL: Tool = {
     '⚠ WRITES a REAL, PERSISTENT system file (a launchd plist under ~/Library/LaunchAgents on ' +
     'macOS, or a crontab entry on Linux) and, unless no_load is set, REGISTERS it so the nightly ' +
     'snapshot+push runs unattended from now on (issue #174 follow-up — the MCP equivalent of the ' +
-    "CLI's `schedule install`). A PAID backend (arweave/turbo) gets CYPHER_BRAIN_YES=1 baked into " +
-    'the generated runner for unattended consent, so it ALSO REQUIRES max_spend (a positive integer ' +
-    'cap in native units — winston for arweave, winc for turbo): an uncapped unattended spender is ' +
-    'refused, same as the CLI. backend=ton-provider (only listed when a local TON wallet is ' +
-    "configured — see wallet_create's description for how to set one up) is ALSO paid and " +
-    'unattended-capable, but its spend cap is a SEPARATE, env-only ' +
-    'mechanism (CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND, in nanoTON — must already be set in the ' +
-    "environment before this call; this tool's own max_spend argument does not apply to it and is " +
-    'refused if passed for it, matching the CLI). Requires confirm_install=true before ANY work happens — the MCP ' +
+    "CLI's `schedule install`). ALL THREE paid backends (arweave/turbo/ton-provider) get " +
+    'CYPHER_BRAIN_YES=1 baked into the generated runner for unattended consent, but the SPEND CAP ' +
+    'mechanism differs. arweave/turbo REQUIRE max_spend (a positive integer cap in native units — ' +
+    'winston for arweave, winc for turbo): an uncapped unattended spender is refused, same as the ' +
+    'CLI. backend=ton-provider (only listed when a local TON wallet is configured — see ' +
+    "wallet_create's description for how to set one up) is ALSO paid and unattended-capable, but " +
+    'its spend cap is a SEPARATE, env-only mechanism (CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND, in ' +
+    "nanoTON — must already be set in the environment before this call; this tool's own max_spend " +
+    'argument does not apply to it and is refused if passed for it, matching the CLI). Requires ' +
+    'confirm_install=true before ANY work happens — the MCP ' +
     'equivalent of consenting to both the real-system-file write and (for a paid backend) the ' +
     'ongoing capped spend risk every future unattended run carries; there is no environment escape ' +
     'hatch honored here. Only ONE schedule can be installed at a time; re-calling replaces the prior ' +
@@ -550,8 +556,10 @@ export const SCHEDULE_STATUS_TOOL: Tool = {
     'Read-only, spends nothing, mutates nothing. Report the state of the nightly schedule set up ' +
     'by `cypher-brain schedule install`: the configured time + backend, whether the launchd/cron ' +
     'trigger is actually registered, the last run\'s log filename and its final "OK rc=0"/"FAILED ' +
-    'rc=N" line, and the next scheduled run — the SAME report `cypher-brain schedule status` prints ' +
-    'on the CLI, verbatim (one string per line). No arguments. Fails with ERR_NOT_CONFIGURED if no ' +
+    'rc=N" line, and the next scheduled run — as STRUCTURED FIELDS, not the printed lines the CLI ' +
+    'shows: this tool, `cypher-brain schedule status --json`, and the schedule status resource all ' +
+    'return the SAME one object, built by a single function, so they cannot disagree. No arguments. ' +
+    'Fails with ERR_NOT_CONFIGURED if no ' +
     'schedule is installed yet — call schedule_install first.',
   inputSchema: {
     type: 'object',

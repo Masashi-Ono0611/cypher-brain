@@ -758,11 +758,32 @@ function validateInstallInputs(o: CliOptions, backends: Set<string>): string {
     // that case through the generic "unknown backend" message below reads as if
     // the name itself were wrong, which misleads a user who already ran `wallet
     // create --chain ton` but forgot to export the env var that makes it visible
-    // here. Name it specifically instead; every OTHER rejected name (rclone/ton,
-    // which are real but intentionally never scheduleable, or a genuine typo)
-    // still falls through to the generic message unchanged.
+    // here. Name it specifically instead.
     if (backend === 'ton-provider') {
       throw new Error("ton-provider requires CYPHER_BRAIN_TON_WALLET=<path> — see 'wallet create --chain ton'");
+    }
+    // rclone and ton are ALSO recognized, documented `push --backend` names (all six —
+    // file/arweave/turbo/rclone/ton/ton-provider — are valid per config.ts) — they are
+    // just never in `backends` above, deliberately (the file header comment above
+    // scheduleableBackends() explains why: both need operator-side setup a launchd/cron
+    // job can't collect). The generic "unknown backend" message below is worded for a
+    // genuine typo/invalid name and would tell a user who spelled it correctly that it
+    // was one of only "file|arweave|turbo[|ton-provider]" — false, and CB-E013's
+    // "unknown backend:" pattern would then mislabel this as the wrong error code too
+    // (that catalogue entry is specifically about invalid --backend VALUES). Named
+    // distinctly instead, same as ton-provider just above; only a genuine typo (any
+    // other unrecognized string) still falls through to the generic message.
+    if (backend === 'rclone') {
+      throw new Error(
+        'rclone is a valid push backend, but is not schedule-installable: it needs an operator-configured ' +
+          '--remote (rclone config) that an unattended launchd/cron job cannot supply on its own.',
+      );
+    }
+    if (backend === 'ton') {
+      throw new Error(
+        'ton is a valid push backend, but is not schedule-installable: it needs an operator-run seeder box ' +
+          '(CYPHER_BRAIN_TON_SSH_HOST) that an unattended launchd/cron job cannot supply on its own.',
+      );
     }
     throw new Error(`unknown backend: ${backend} (expected one of ${[...backends].join('|')})`);
   }
