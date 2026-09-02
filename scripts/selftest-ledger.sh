@@ -16,6 +16,9 @@
 #       JSON at all — counted as skipped_lines, never crashes the read). Checked across
 #       all three output modes (human/--json/--csv).
 #   (c) --csv wins when both --json and --csv are given (documented mutual exclusivity).
+#   (d) #766: a shape-valid-but-calendrically-impossible timestamp (Feb 31; a month 99)
+#       is excluded from by_day/by_month (counted as undated, not bucketed as if it
+#       were a real day) — the digit-placement-only regex used to accept both.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -171,5 +174,84 @@ LEDGER_BOTH=$(cb ledger --json --csv)
 printf '%s\n' "$LEDGER_BOTH" | head -1 | grep -qF 'timestamp,backend,locator' \
   || { echo "[FAIL] ledger --json --csv did not produce CSV output (--csv should win): $(printf '%s\n' "$LEDGER_BOTH" | head -1)"; exit 1; }
 echo "[PASS] --csv takes precedence over --json when both flags are given"
+
+echo "== (d) shape-valid but calendrically impossible timestamps are undated, not bucketed (#766) =="
+export CYPHER_BRAIN_HOME="$TMP/dates-home"
+mkdir -p "$CYPHER_BRAIN_HOME"
+node --experimental-strip-types --import "$ROOT/scripts/dev-cli-loader.mjs" -e "
+import('$ROOT/src/lib/receipt.ts').then(async (m) => {
+  // A real, valid day — must survive and be bucketed normally.
+  await m.appendReceipt({
+    timestamp: '2026-03-10T00:00:00.000Z',
+    backend: 'arweave',
+    locator: 'ar-loc-real',
+    artifact_sha256: 'e'.repeat(64),
+    size_bytes: 100,
+    payer_address: null,
+    cost: '10',
+    unit: 'winston',
+    raw: {},
+  });
+  // Shape-valid (matches ISO_UTC_PATTERN's digit-placement-only check) but a day that
+  // does not exist in February.
+  await m.appendReceipt({
+    timestamp: '2026-02-31T00:00:00.000Z',
+    backend: 'arweave',
+    locator: 'ar-loc-feb31',
+    artifact_sha256: 'f'.repeat(64),
+    size_bytes: 100,
+    payer_address: null,
+    cost: '20',
+    unit: 'winston',
+    raw: {},
+  });
+  // Shape-valid but a month that does not exist at all.
+  await m.appendReceipt({
+    timestamp: '9999-99-99T00:00:00.000Z',
+    backend: 'arweave',
+    locator: 'ar-loc-badmonth',
+    artifact_sha256: '0'.repeat(64),
+    size_bytes: 100,
+    payer_address: null,
+    cost: '30',
+    unit: 'winston',
+    raw: {},
+  });
+  // Positive control (Codex review): a GENUINELY valid, shape-matching timestamp
+  // whose year happens to fall in 0-99 must NOT be misclassified as undated.
+  // Date.UTC()'s multi-arg form (like the Date constructor) special-cases a 0-99
+  // 'year' argument by adding 1900 to it, which — if used directly instead of via
+  // setUTCFullYear() — would make this exact receipt fail the round-trip check for
+  // the wrong reason and get wrongly excluded from by_day.
+  await m.appendReceipt({
+    timestamp: '0000-01-01T00:00:00.000Z',
+    backend: 'arweave',
+    locator: 'ar-loc-year-zero',
+    artifact_sha256: '1'.repeat(64),
+    size_bytes: 100,
+    payer_address: null,
+    cost: '40',
+    unit: 'winston',
+    raw: {},
+  });
+});
+"
+LEDGER_DATES_JSON=$(cb ledger --json)
+node -e '
+  const j = JSON.parse(process.argv[1]);
+  if (j.total_receipts !== 4) throw new Error("expected total_receipts 4, got " + j.total_receipts);
+  // Before #766, both impossible timestamps passed the digit-placement-only regex and
+  // were treated as real dated receipts — undated_receipts would be 0 here, not 2.
+  if (j.undated_receipts !== 2) throw new Error("expected undated_receipts 2 (the two calendrically impossible timestamps), got " + j.undated_receipts);
+  if (Object.keys(j.by_day).length !== 2) throw new Error("expected exactly 2 by_day buckets (the real day plus the year-0000 receipt), got " + JSON.stringify(j.by_day));
+  if (j.by_day["2026-03-10"]?.winston !== "10") throw new Error("expected the real days by_day bucket to be present and correct, got " + JSON.stringify(j.by_day));
+  if (j.by_day["0000-01-01"]?.winston !== "40") throw new Error("expected the year-0000 receipt to be bucketed normally, not misclassified as undated, got " + JSON.stringify(j.by_day));
+  if ("2026-02-31" in j.by_day) throw new Error("2026-02-31 (not a real calendar day) must NOT appear in by_day, got " + JSON.stringify(j.by_day));
+  if ("9999-99-99" in j.by_day) throw new Error("9999-99-99 (not a real calendar month) must NOT appear in by_day, got " + JSON.stringify(j.by_day));
+  // All 4 receipts ARE priced, so all 4 must still be counted in by_backend (undated
+  // only excludes a receipt from by_day/by_month, never from by_backend).
+  if (j.by_backend.arweave?.count !== 4) throw new Error("expected by_backend.arweave.count 4 (undated-but-priced receipts are still counted here), got " + JSON.stringify(j.by_backend));
+' "$LEDGER_DATES_JSON" || { echo "[FAIL] ledger --json did not treat shape-valid-but-calendrically-impossible timestamps as undated (#766)"; echo "$LEDGER_DATES_JSON"; exit 1; }
+echo "[PASS] ledger --json: Feb 31 and month-99 timestamps are excluded from by_day and counted as undated; a genuinely valid year-0000 timestamp is still bucketed normally (#766)"
 
 echo "[PASS] all ledger selftest checks passed"

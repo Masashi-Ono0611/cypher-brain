@@ -156,6 +156,30 @@ try {
     afterNullFieldTamper.entries.length === 3 && afterNullFieldTamper.skippedLines === 3,
     `entries=${afterNullFieldTamper.entries.length} skipped=${afterNullFieldTamper.skippedLines}`,
   );
+
+  // Positive control (#744): two appendAuditEntry() calls racing the SAME await point
+  // must not fork the chain. Before the cross-process lock this fix adds, both could
+  // read the SAME tail hash (readAuditLog() awaits real file I/O, so two concurrent
+  // calls genuinely interleave) and each append an entry whose prev_hash points at it —
+  // the second becoming a sibling rather than a child of the first, which
+  // verifyAuditChain() then reports as a broken link (a permanent, false "possible
+  // tamper" verdict for what was actually two legitimate concurrent runs). Fired via
+  // Promise.all (not sequential awaits) onto the log's existing state (3 valid entries
+  // plus the malformed/tampered lines appended above, which readAuditLog() already
+  // skips) so the two calls' internal readAuditLog()+append critical sections actually
+  // have the same tail to race over.
+  const beforeConcurrent = await readAuditLog();
+  await Promise.all([
+    appendAuditEntry({ ...base, timestamp: '2026-08-01T00:03:00.000Z', command: 'push', exit_code: 0 }),
+    appendAuditEntry({ ...base, timestamp: '2026-08-01T00:03:00.000Z', command: 'verify', exit_code: 0 }),
+  ]);
+  const afterConcurrent = await readAuditLog();
+  const concurrentVerify = verifyAuditChain(afterConcurrent.entries);
+  check(
+    'positive control: two concurrent appendAuditEntry() calls do not fork the hash chain (#744)',
+    afterConcurrent.entries.length === beforeConcurrent.entries.length + 2 && concurrentVerify.ok === true,
+    `before=${beforeConcurrent.entries.length} after=${afterConcurrent.entries.length} verify=${JSON.stringify(concurrentVerify)}`,
+  );
 } finally {
   delete process.env.CYPHER_BRAIN_HOME;
   await rm(tmpA, { recursive: true, force: true });
