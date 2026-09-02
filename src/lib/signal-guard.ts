@@ -92,6 +92,17 @@ const ACTIVE_TON_TMP_DIRS = new Set<string>();
 // constraint every other branch in the handler below already has, since the process
 // is mid-signal and cannot wait on I/O.
 let ACTIVE_INIT_ROLLBACK: (() => void) | null = null;
+// #738/#740: crypt.ts's promptHidden() and wizard.ts's @clack/prompts calls both put
+// stdin into raw mode (and, for clack, hide the cursor) for the duration of a single
+// prompt, restoring both only from their own normal completion paths (Enter/Ctrl-C
+// data, or clack's own submit/cancel) — a signal mid-prompt tears the process down
+// without ever reaching that restoration, leaving the REAL terminal raw/no-echo (and,
+// for clack, cursor-hidden) behind. A single scalar slot, like ACTIVE_STAGE/
+// ACTIVE_OUT_PART above: exactly one raw-mode prompt is ever pending at a time in this
+// CLI (crypt.ts and wizard.ts never await each other's prompts concurrently), so there
+// is no "two unrelated resources" case here the way ACTIVE_MCP_FETCH_DIRS's Set exists
+// for.
+let ACTIVE_RAW_INPUT_RESTORE: (() => void) | null = null;
 let SIGNAL_GUARD_INSTALLED = false;
 
 // fs.rmSync({force: true}) only swallows ENOENT (already gone) — it does NOT retry past
@@ -228,6 +239,15 @@ export const removeActiveTonTmpDir = (dir: string): void => {
 export const setActiveInitRollback = (v: (() => void) | null): void => {
   ACTIVE_INIT_ROLLBACK = v;
 };
+// crypt.ts's promptHidden() and wizard.ts's clack-call wrapper each register their own
+// restore callback (setRawMode back to cooked, plus a cursor-show write for clack)
+// right before putting stdin into raw mode, and clear it (v=null) the instant their
+// prompt settles the normal way — mirroring every other setActive*/add/remove pair
+// above's "register right before, clear right after" discipline, just for a callback
+// instead of a path.
+export const setActiveRawInputRestore = (fn: (() => void) | null): void => {
+  ACTIVE_RAW_INPUT_RESTORE = fn;
+};
 
 export function installStageSignalGuard(): void {
   if (SIGNAL_GUARD_INSTALLED) return;
@@ -235,6 +255,16 @@ export function installStageSignalGuard(): void {
   const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
   for (const sig of signals) {
     const handler = () => {
+      // Restore the real terminal FIRST (#738/#740) — a raw/no-echo terminal with a
+      // hidden cursor is the most user-visible damage a signal mid-prompt can leave
+      // behind, and doing it before anything else here means it happens even if a
+      // later step in this same handler throws.
+      if (ACTIVE_RAW_INPUT_RESTORE) {
+        try {
+          ACTIVE_RAW_INPUT_RESTORE();
+        } catch {}
+        ACTIVE_RAW_INPUT_RESTORE = null;
+      }
       // Kill the pipeline children FIRST so a still-writing age/tar can't re-create the
       // stage, .part, or out-dir contents after we remove/flag them (the signal may
       // have hit node alone).

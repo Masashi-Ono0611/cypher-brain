@@ -1080,6 +1080,16 @@ for needle in 'CYPHER_BRAIN_TON_WALLET=' 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND=' 
 done
 echo "[PASS] the generated nightly runner carries CYPHER_BRAIN_TON_WALLET/_MAX_SPEND/_NOTIFY_BIN"
 
+# #798: install()'s own required-config checks above (wallet/cap/notify-bin) all pass
+# for --backend ton-provider, but pushCore()'s consent gate (src/lib/pushpull.ts,
+# `o.backend === 'ton-provider' && !yes`) is a SEPARATE check that used to never get
+# CYPHER_BRAIN_YES=1 baked in — schedule.ts's spend-guard block only fired for
+# PAID={'arweave','turbo'}, never for ton-provider — so a schedule that installed
+# cleanly still failed every single scheduled run at the consent gate.
+grep -Fq 'export CYPHER_BRAIN_YES=1' "$RUNNER" \
+  || { echo "[FAIL] #798 regression: generated ton-provider runner is missing 'export CYPHER_BRAIN_YES=1' — every scheduled run would fail the pushCore() consent gate"; cat "$RUNNER"; exit 1; }
+echo "[PASS] #798: the generated ton-provider nightly runner carries CYPHER_BRAIN_YES=1"
+
 # ========================================================================
 # issue #639: a SIGNED push calls put() TWICE (ciphertext, then its ".minisig" sidecar),
 # each deploying its OWN StorageV1 contract — CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND must

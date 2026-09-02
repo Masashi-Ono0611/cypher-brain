@@ -108,6 +108,17 @@ async function scheduleableBackends(): Promise<Set<string>> {
   return new Set(['file', 'arweave', 'turbo', ...((await tonWalletConfigured()) ? ['ton-provider'] : [])]);
 }
 const PAID = new Set(['arweave', 'turbo']);
+// #798: which backends need CYPHER_BRAIN_YES=1 baked into the generated runner for
+// unattended upload consent — broader than PAID above. ton-provider spends real funds
+// through the SAME pushCore() consent gate (`src/lib/pushpull.ts`, `o.backend ===
+// 'ton-provider' && !yes`) arweave/turbo do, but is NOT folded into PAID itself: PAID
+// also governs eligibility for --max-spend/CYPHER_BRAIN_MAX_SPEND (winc/winston units),
+// and ton-provider correctly uses its own separate CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND
+// (nanoTON) instead — see validateSpendCaps()'s ton-provider-specific branch below, which
+// would refuse an install passing --max-spend for it. Before this set existed, `schedule
+// install --backend ton-provider` reported success for a runner that could never
+// complete a single unattended run: it always failed the consent gate above (issue #798).
+const NEEDS_UNATTENDED_CONSENT = new Set(['arweave', 'turbo', 'ton-provider']);
 
 // Every CYPHER_BRAIN_* var a snapshot+push run could need that this runner does NOT
 // already bake unconditionally or separately (see the comment above envLines' loop
@@ -331,18 +342,39 @@ function runnerBody(cfg: ScheduleConfig): string {
     envLines.push(`export ${v}=${shq(val)}`);
   }
   const spendLines: string[] = [];
-  if (PAID.has(cfg.backend)) {
+  if (NEEDS_UNATTENDED_CONSENT.has(cfg.backend)) {
+    // #798: durability wording matches PAID vs NEEDS_UNATTENDED_CONSENT — ton-provider
+    // is paid but NOT "PERMANENT" like arweave/turbo (mcp-tool-schemas.ts's own
+    // PAID_BACKENDS description: "weaker-durability ... depends on a live provider
+    // continuing to renew/serve the contract").
     spendLines.push(
-      `# ${cfg.backend} is a paid, PERMANENT store. CYPHER_BRAIN_YES=1 grants the unattended`,
-      `# upload consent that an interactive run gives with --yes; CYPHER_BRAIN_MAX_SPEND caps`,
-      `# each upload in the native unit of the backend (winc for turbo, winston for arweave L1)`,
-      `# and aborts the push when the cost estimate exceeds it. REVIEW this cap.`,
+      PAID.has(cfg.backend)
+        ? `# ${cfg.backend} is a paid, PERMANENT store. CYPHER_BRAIN_YES=1 grants the unattended`
+        : `# ${cfg.backend} is a paid store (NOT permanent — depends on a live provider renewing ` +
+            `the contract). CYPHER_BRAIN_YES=1 grants the unattended`,
+      `# upload consent that an interactive run gives with --yes.`,
       `export CYPHER_BRAIN_YES=1`,
-      `export CYPHER_BRAIN_MAX_SPEND=${cfg.max_spend}`,
     );
-    if (!readEnv('CYPHER_BRAIN_AR_WALLET')) {
+    if (PAID.has(cfg.backend)) {
       spendLines.push(
-        `# export CYPHER_BRAIN_AR_WALLET="$HOME/.cypher-brain/wallet.json"   # JWK signer — required to push via ${cfg.backend}`,
+        `# CYPHER_BRAIN_MAX_SPEND caps each upload in the native unit of the backend (winc for`,
+        `# turbo, winston for arweave L1) and aborts the push when the cost estimate exceeds it.`,
+        `# REVIEW this cap.`,
+        `export CYPHER_BRAIN_MAX_SPEND=${cfg.max_spend}`,
+      );
+      if (!readEnv('CYPHER_BRAIN_AR_WALLET')) {
+        spendLines.push(
+          `# export CYPHER_BRAIN_AR_WALLET="$HOME/.cypher-brain/wallet.json"   # JWK signer — required to push via ${cfg.backend}`,
+        );
+      }
+    } else {
+      // ton-provider: its own spend cap (CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND, nanoTON —
+      // required by validateSpendCaps() below at install time) is already baked in above
+      // via the ENV_CAPTURE_VARS loop, not here — --max-spend/CYPHER_BRAIN_MAX_SPEND
+      // (winc/winston) does not apply to it.
+      spendLines.push(
+        `# ${cfg.backend} uses its own CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) cap instead —`,
+        `# already captured above. REVIEW that cap.`,
       );
     }
   }
@@ -501,8 +533,46 @@ function plistBody(cfg: ScheduleConfig): string {
 `;
 }
 
-const cronLine = (cfg: ScheduleConfig): string =>
-  `${cfg.minute} ${cfg.hour} * * * /bin/bash "${cfg.runner}" ${CRON_MARKER}`;
+// #801: cfg.runner goes through shq() (single-quote shell escaping), NOT plain double
+// quotes — double-quoted shell strings still expand $(...), backticks, and $VAR, and
+// cfg.runner derives from CYPHER_BRAIN_SCHEDULE_DIR/CYPHER_BRAIN_HOME, both
+// operator-controlled env vars. Every other generated shell fragment in this file (the
+// runner body itself, envLines, snapshotArgs, pingLines) already goes through shq() —
+// this was the one spot that didn't. crontabText()/loadCron() only ever match on
+// `l.includes(CRON_MARKER)`, never reparse cfg.runner back out of the line, so this is a
+// drop-in change.
+//
+// #801 follow-up (Codex review): shq() only protects against the SHELL's own parsing —
+// crontab(5) has a SEPARATE, earlier layer of its own: cron rewrites an unescaped '%' in
+// the command field into a newline (everything after the first one becomes the job's
+// stdin, and any further '%'s start additional lines) BEFORE the line ever reaches a
+// shell, so shell quoting cannot protect against it. `\%` is how crontab(5) spells a
+// literal '%' — applied to the RAW path before shq() so the backslash survives shq()'s
+// single quotes untouched and cron converts it back to a literal '%' for the shell to
+// see, matching the actual on-disk path. A literal newline/CR in the path is rejected
+// outright rather than escaped: crontab is a strictly line-based format, so embedding
+// one would split this single entry across physical lines, corrupting the file's
+// structure however carefully the rest of the line is escaped — no legitimate
+// CYPHER_BRAIN_SCHEDULE_DIR/CYPHER_BRAIN_HOME needs one.
+const cronEscapePercent = (s: string): string => s.replace(/%/g, '\\%');
+// Split out from cronLine() (Codex review, 2nd pass) so writeScheduleArtifacts() below
+// can call it FIRST, before creating any directory or writing any file — cronLine()
+// itself only runs once CRON_ENTRY_FILE is about to be written, by which point
+// SCHEDULE_DIR/LOGS_DIR/SNAPS_DIR/RUNNER already exist; validating only there left a
+// newline-containing runner path throwing AFTER a partial (never-registered) schedule
+// was already on disk for install to fail back out of.
+function assertValidCronRunnerPath(runner: string): void {
+  if (/[\r\n]/.test(runner)) {
+    throw new Error(
+      `cannot generate a crontab entry: the runner path contains a newline/CR, which would corrupt the ` +
+        `single-line crontab format — check CYPHER_BRAIN_SCHEDULE_DIR/CYPHER_BRAIN_HOME (resolved runner path: ${JSON.stringify(runner)})`,
+    );
+  }
+}
+const cronLine = (cfg: ScheduleConfig): string => {
+  assertValidCronRunnerPath(cfg.runner);
+  return `${cfg.minute} ${cfg.hour} * * * /bin/bash ${shq(cronEscapePercent(cfg.runner))} ${CRON_MARKER}`;
+};
 
 // Escape a string for embedding as PLIST XML text content (e.g. inside <string>…</string>).
 // & must go first, or the entities the other replacements introduce would themselves be
@@ -1001,11 +1071,40 @@ async function buildScheduleConfig(
 }
 
 // ---------- (4) writing the runner/plist/cron/config artifacts ----------
+// #803: owner-only (0700 dirs / 0700 runner / 0600 config) — the SCHEDULE_DIR tree
+// holds install-time config (wallet paths, spend caps) baked into nightly.sh and
+// mirrored into schedule.json. Same `mkdir(..., { recursive: true, mode }); await
+// chmod(...)` pattern src/lib/keys.ts, src/lib/minisign.ts, and src/lib/wallet.ts
+// already use for their own key/wallet directories — the explicit follow-up chmod is
+// required because Node's recursive mkdir only guarantees `mode` on the LAST directory
+// it creates, moderated by umask on intermediates (LOGS_DIR/SNAPS_DIR's mkdir below is
+// what implicitly creates SCHEDULE_DIR itself as an intermediate, since both are direct
+// children of it) — an explicit mkdir(SCHEDULE_DIR, ...) + chmod first pins SCHEDULE_DIR
+// itself regardless of that ordering.
 async function writeScheduleArtifacts(cfg: ScheduleConfig): Promise<void> {
-  await mkdir(LOGS_DIR, { recursive: true });
-  await mkdir(SNAPS_DIR, { recursive: true });
-  await writeFile(RUNNER, runnerBody(cfg));
-  await chmod(RUNNER, 0o755);
+  // #801 follow-up (Codex review, 2nd pass): validate BEFORE writing anything, so a
+  // newline-containing runner path (cron trigger only) refuses cleanly with no partial
+  // schedule left on disk, rather than after SCHEDULE_DIR/LOGS_DIR/SNAPS_DIR/RUNNER are
+  // already written.
+  if (cfg.trigger.type !== 'launchd') assertValidCronRunnerPath(cfg.runner);
+  await mkdir(SCHEDULE_DIR, { recursive: true, mode: 0o700 });
+  await chmod(SCHEDULE_DIR, 0o700);
+  await mkdir(LOGS_DIR, { recursive: true, mode: 0o700 });
+  await chmod(LOGS_DIR, 0o700);
+  await mkdir(SNAPS_DIR, { recursive: true, mode: 0o700 });
+  await chmod(SNAPS_DIR, 0o700);
+  // #803 follow-up (Codex review): pass mode at creation time too, not just the
+  // follow-up chmod — writeFile's `mode` closes the (SCHEDULE_DIR is already 0700, so
+  // narrow) window where a NEW file briefly exists at the umask-derived default before
+  // the chmod below runs, or would land there permanently if the chmod itself failed
+  // partway through. nightly.sh bakes install-time secrets (wallet paths,
+  // CYPHER_BRAIN_YES=1, etc.) — only the owner (and launchd/cron, which run as that
+  // same owner) need to execute it. The chmod stays for the same reason CONFIG's does
+  // below: `mode` only governs a file's permissions AT CREATION, so a re-install over a
+  // pre-existing, looser-mode nightly.sh needs the explicit follow-up to actually
+  // tighten it.
+  await writeFile(RUNNER, runnerBody(cfg), { mode: 0o700 });
+  await chmod(RUNNER, 0o700);
   console.error(`runner written -> ${RUNNER}`);
 
   if (cfg.trigger.type === 'launchd') {
@@ -1016,7 +1115,12 @@ async function writeScheduleArtifacts(cfg: ScheduleConfig): Promise<void> {
     await writeFile(CRON_ENTRY_FILE, `${cronLine(cfg)}\n`);
     console.error(`cron entry written -> ${CRON_ENTRY_FILE}`);
   }
-  await writeFile(CONFIG, `${JSON.stringify(cfg, null, 2)}\n`);
+  await writeFile(CONFIG, `${JSON.stringify(cfg, null, 2)}\n`, { mode: 0o600 });
+  // writeFile's `mode` option only governs the permissions a NEW file is created with —
+  // a re-install over a pre-existing schedule.json (from before this fix, or a stray
+  // manual chmod) would keep its OLD, looser mode otherwise. Same reasoning as RUNNER's
+  // explicit chmod above.
+  await chmod(CONFIG, 0o600);
 }
 
 // ---------- (4b) launchd/cron trigger registration + legacy-scheme migration ----------

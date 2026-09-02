@@ -291,4 +291,52 @@ node -e '
 ' "$LEDGER_DATES_JSON" || { echo "[FAIL] ledger --json did not treat shape-valid-but-calendrically-impossible timestamps as undated (#766)"; echo "$LEDGER_DATES_JSON"; exit 1; }
 echo "[PASS] ledger --json: Feb 31 and month-99 timestamps are excluded from by_day and counted as undated; a genuinely valid year-0000 timestamp is still bucketed normally (#766)"
 
+echo "== (e) issue #737: ledger --json survives a downstream reader closing its pipe early (EPIPE on stdout) =="
+# printJson() (src/lib/ui.ts) used to install its no-op EPIPE 'error' listener only on
+# process.stderr — right for every OTHER writer in that file (all stderr-only
+# decoration), but wrong for printJson() itself, which puts its output on STDOUT. A
+# payload comfortably bigger than one pipe buffer's worth (commonly 64 KiB) run
+# through a reader that closes almost immediately (`head -c 1`) reproduces the
+# original bug report's "64 MiB payload piped to head -c 1" repro at a much smaller,
+# selftest-friendly scale — cb was still mid-write when the reader's end closed, and
+# the resulting async EPIPE 'error' event on stdout crashed the process with an
+# uncaught exception before this fix.
+export CYPHER_BRAIN_HOME="$TMP/epipe-home"
+mkdir -p "$CYPHER_BRAIN_HOME"
+# 2500 valid receipts (~780 KB) — comfortably past a typical 64 KiB pipe buffer,
+# empirically confirmed (against the pre-#737-fix code, before this test existed) to
+# reliably reproduce the crash at this size on this machine. cypher_brain_receipt_version
+# must match RECEIPT_VERSION (receipt.ts) or readReceipts() discards the line as
+# wrong-shape, which would make the --json payload tiny again and silently defeat the
+# whole point of this test.
+node -e '
+  const fs = require("fs");
+  const lines = [];
+  for (let i = 0; i < 2500; i++) {
+    lines.push(JSON.stringify({
+      cypher_brain_receipt_version: 1,
+      timestamp: "2026-01-15T00:00:00.000Z",
+      backend: "arweave",
+      locator: "epipe-loc-" + i,
+      artifact_sha256: "a".repeat(64),
+      size_bytes: 1000,
+      payer_address: "0x" + "b".repeat(40),
+      cost: "0.001",
+      unit: "AR",
+    }));
+  }
+  fs.writeFileSync(process.argv[1], lines.join("\n") + "\n");
+' "$CYPHER_BRAIN_HOME/receipt-ledger.jsonl"
+set +e
+set +o pipefail
+cb ledger --json 2> "$TMP/epipe-err.log" | head -c 1 > /dev/null
+EPIPE_PIPE_RC="${PIPESTATUS[0]}"
+set -o pipefail
+set -e
+[ "$EPIPE_PIPE_RC" = "0" ] \
+  || { echo "[FAIL] ledger --json exited $EPIPE_PIPE_RC when piped through 'head -c 1' (uncaught EPIPE?)"; cat "$TMP/epipe-err.log"; exit 1; }
+grep -qi 'epipe' "$TMP/epipe-err.log" \
+  && { echo "[FAIL] ledger --json printed an EPIPE error to stderr when piped through 'head -c 1':"; cat "$TMP/epipe-err.log"; exit 1; }
+echo "[PASS] ledger --json survives a downstream reader closing its pipe early (#737 EPIPE guard now covers stdout)"
+
 echo "[PASS] all ledger selftest checks passed"
