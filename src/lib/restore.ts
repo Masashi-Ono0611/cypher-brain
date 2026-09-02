@@ -1,6 +1,19 @@
 // restore + verify — the decrypt half and its falsifiable proof.
-import { rm, stat, readFile, writeFile, readdir, rename, lstat } from 'node:fs/promises';
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import {
+  stat,
+  readFile,
+  writeFile,
+  readdir,
+  rename,
+  lstat,
+  link,
+  unlink,
+  symlink,
+  readlink,
+  mkdir,
+  chmod,
+} from 'node:fs/promises';
+import { mkdirSync, mkdtempSync, type Dirent } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
@@ -476,18 +489,87 @@ async function refuseIfSymlink(p: string, what: string): Promise<void> {
   }
 }
 
+// Move one entry from `s` to `d` WITHOUT ever replacing something already at `d`, and
+// without a check-then-act window (#784).
+//
+// rename() is the obvious primitive and was what this used to do, but POSIX rename()
+// silently REPLACES an existing destination — so pairing it with an lstat() "is `d`
+// free?" test is check-then-act: anything created at `d` after the lstat and before the
+// rename is destroyed, which is the exact opposite of this function's promise. Same class
+// of bug #103 closed in promoteSnapshot() and #642 closed in the file backend. Node has no
+// renameat2(RENAME_NOREPLACE), so instead each entry kind uses ITS OWN atomic
+// exclusive-create primitive, all of which fail EEXIST rather than replacing:
+//
+//   regular file — link(s, d) + unlink(s). Same inode, so mode/mtime survive exactly as
+//                  they did under rename().
+//   symlink      — symlink(readlink(s), d) + unlink(s). link() must NOT be used here: it
+//                  follows symlinks on macOS/BSD and does not on Linux, so it would
+//                  silently restore a symlink's TARGET on one platform and the link
+//                  itself on the other (and fail outright on a dangling link, which
+//                  snapshot deliberately archives — see validateRestoreEntries).
+//   directory    — mkdir(d) + recurse, then chmod to the source's mode so the result is
+//                  what rename() would have produced. The chmod is LAST: doing it first
+//                  would make a restrictive mode (0500) block the recursion into it.
+//
+// No other entry kind can reach here: validateRestoreEntries() refuses FIFO/device/socket
+// entries before extraction, and a tar hardlink materializes as a regular file. The
+// `rename` fallback below is only for filesystems where link() is impossible at all.
+async function moveNoClobber(s: string, d: string, entry: Dirent): Promise<void> {
+  if (entry.isDirectory()) {
+    // Read the mode BEFORE the recursion, which widens `s` (see mergeNoClobber below),
+    // and apply it to `d` only AFTER the recursion has finished moving entries in —
+    // setting a restrictive mode (0500) first would block the very writes into it.
+    const srcMode = (await lstat(s)).mode & 0o7777;
+    await mkdir(d); // no recursive: true — that would succeed on an existing directory
+    await mergeNoClobber(s, d);
+    await chmod(d, srcMode);
+    return;
+  }
+  if (entry.isSymbolicLink()) {
+    await symlink(await readlink(s), d);
+    await unlink(s);
+    return;
+  }
+  try {
+    await link(s, d);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    // No hard links available (exFAT/FAT and some network/cloud mounts report EPERM/
+    // ENOTSUP; EXDEV if `dest` turns out to be a different filesystem from the sibling
+    // scratch dir, e.g. a mount point). Fall back to rename, which works there — and
+    // which reopens the replace-an-existing-`d` race for those filesystems only. Stated
+    // rather than hidden: closing it would need a copy-and-fsync path with its own
+    // per-kind handling, and this is the same allowlist of codes promoteSnapshot()
+    // already falls back on for the same reason.
+    if (!code || !['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDEV'].includes(code)) throw e;
+    await rename(s, d);
+    return;
+  }
+  await unlink(s);
+}
+
 // Merge every entry of `src` into `dest` WITHOUT ever overwriting something already
 // there — the same no-clobber posture the outer restore extract keeps. Recurses only
 // into subdirectories that already exist on BOTH sides; everything else (a new file, a
-// new subdirectory, a symlink, or any other entry kind tar can produce, e.g. a FIFO) is
-// moved into place with a single rename() rather than a byte-copy — rename works
-// identically for every entry type and needs no per-kind special-casing (unlike a copy,
-// which would need one path per file kind and cannot recreate some special files at
-// all). Used only when re-expanding INTO an out-dir that already holds a prior
+// new subdirectory, a symlink) is moved into place by moveNoClobber() above rather than
+// byte-copied. Used only when re-expanding INTO an out-dir that already holds a prior
 // expansion of this exact component (see expandComponents below); a first-time
 // expansion instead renames the whole freshly-extracted tree into place in one atomic
 // step and never calls this at all.
 async function mergeNoClobber(src: string, dest: string): Promise<void> {
+  // Moving an entry OUT of `src` now means unlink(s), which needs write on `src` itself —
+  // where the old whole-directory rename() needed nothing. tar's --no-same-permissions
+  // only masks bits OFF, so a directory the archive recorded at 0500 arrives in the
+  // scratch tree still at 0500 and would make every unlink under it fail EACCES. `src` is
+  // this run's own throwaway scratch tree (never the user's data — that is `dest`), so
+  // widening it costs nothing; the recorded mode is applied to the DESTINATION instead,
+  // in moveNoClobber() above. Best-effort: if the chmod fails, the operations below
+  // surface the real error themselves.
+  try {
+    await chmod(src, 0o700);
+  } catch {
+    /* not ours to widen — let the per-entry operation below report the real failure */
+  }
   for (const entry of await readdir(src, { withFileTypes: true })) {
     const s = join(src, entry.name);
     const d = join(dest, entry.name);
@@ -497,6 +579,11 @@ async function mergeNoClobber(src: string, dest: string): Promise<void> {
     // points at — writing archive content outside dest entirely. A symlink at `d` is
     // therefore always treated as "already there, do not touch" (the no-clobber
     // fallthrough below), never as a directory to merge into.
+    //
+    // This lstat is now purely an EARLY-OUT (it keeps the "recurse into a directory that
+    // exists on both sides" case, and skips the rest cheaply): it is no longer what makes
+    // the move safe. moveNoClobber() below refuses an occupied `d` on its own, so a `d`
+    // that appears between this lstat and that call is left alone rather than replaced.
     let dStat: Awaited<ReturnType<typeof lstat>> | undefined;
     try {
       dStat = await lstat(d);
@@ -506,7 +593,14 @@ async function mergeNoClobber(src: string, dest: string): Promise<void> {
     if (entry.isDirectory() && dStat?.isDirectory()) {
       await mergeNoClobber(s, d);
     } else if (!dStat) {
-      await rename(s, d);
+      try {
+        await moveNoClobber(s, d, entry);
+      } catch (e) {
+        // `d` was created by someone else after the lstat above — the race this function
+        // now survives. Treat it exactly like a `d` that was already there when the loop
+        // started: leave it, keep merging the rest. Anything else is a real failure.
+        if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') throw e;
+      }
     }
     // else: `d` already exists (a file, a symlink, or any other non-plain-directory
     // entry) — leave it (no-clobber); the finally block in expandComponents() drops
@@ -801,7 +895,11 @@ async function expandComponents(outDir: string, manifestText: string): Promise<b
       hadFailures = true; // #527: this component was ATTEMPTED and failed — the overall restore must not exit 0
       continue;
     } finally {
-      await rm(scratchDir, { recursive: true, force: true }); // no-op once rename() has already moved it away
+      // rmrf, not rm (#782): no-op once rename() has already moved it away, but when
+      // mergeNoClobber() ran instead, whatever it left behind is decrypted plaintext, and
+      // a plain rm() throws EACCES on any directory under it without an owner-write bit
+      // (unlinking an entry needs write on its PARENT) — leaving that plaintext on disk.
+      await rmrf(scratchDir);
     }
     rows.push({
       dir: relative(outDir, targetDir),
@@ -1051,7 +1149,12 @@ async function restoreImpl(o: CliOptions): Promise<void> {
       { timeoutMs: PIPE_TIMEOUT_MS },
     );
   } catch (e) {
-    await rm(scratchDir, { recursive: true, force: true });
+    // rmrf, not rm (#782) — this tree is freshly-decrypted plaintext and a plain rm()
+    // throws EACCES on a directory under it that has no owner-write bit, leaving the
+    // plaintext on disk. setActiveRestoreScratchDir(null) stays after the await
+    // (AGENTS.md rule two): if the removal throws, the registration is deliberately kept
+    // so a later signal's forceRmSync can still clear it.
+    await rmrf(scratchDir);
     setActiveRestoreScratchDir(null);
     throw e;
   }
@@ -1082,7 +1185,7 @@ async function restoreImpl(o: CliOptions): Promise<void> {
     const scratchManifestPath = join(scratchDir, 'manifest.json');
     freshManifestText = (await exists(scratchManifestPath)) ? await readFile(scratchManifestPath, 'utf8') : null;
   } catch (e) {
-    await rm(scratchDir, { recursive: true, force: true });
+    await rmrf(scratchDir); // #782, same reasoning as the extract failure path above
     setActiveRestoreScratchDir(null);
     throw e;
   }
@@ -1128,7 +1231,10 @@ async function restoreImpl(o: CliOptions): Promise<void> {
       await mergeNoClobber(scratchDir, o.out_dir);
     }
   } finally {
-    await rm(scratchDir, { recursive: true, force: true }); // no-op once rename() has already moved it away
+    // rmrf, not rm (#782): no-op once rename() has already moved it away; after
+    // mergeNoClobber() it is whatever plaintext did not move, which a plain rm() cannot
+    // remove through a directory with no owner-write bit.
+    await rmrf(scratchDir);
     // #721: cleared HERE, only once the scratch dir is actually gone — not right after
     // decrypt/extract settled, above. mergeNoClobber() (the `else` branch above) can run
     // for a long time on a large --out-dir, incrementally moving entries out of

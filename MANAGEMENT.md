@@ -402,6 +402,23 @@ has only that. *(A self-resolving stable name — an ArNS pointer updated to the
 newest locator — would let a fresh machine find the latest with no local file at
 all; that is a future option, not yet implemented.)*
 
+### A snapshot output is `--out` **plus its sidecars**, and all of them are no-clobber
+
+`snapshot` writes up to three files alongside `--out`: `<out>.digest`,
+`<out>.recipients-fingerprint`, and — whenever a signing identity is present —
+`<out>.minisig`. Since #783 every one of those paths gets the same refusal `--out`
+itself has always had: if anything is already sitting there, the run refuses
+(`CB-E009`) before staging anything, and it refuses a **symlink** too rather than
+writing through it.
+
+That matters most for `.minisig`. A signature file left over from a *different*
+artifact used to survive a run that did not sign (no signing identity, or
+`--no-sign`), and `restore`/`verify` would then find a present, well-formed
+signature that does not verify against those bytes — refusing the new snapshot as
+tampered or forged (`CB-E016`), permanently. If you reuse an output name, clear the
+old sidecars along with the old `*.age`; the refusal now tells you which one is in
+the way instead of producing a backup that cannot be restored.
+
 ## Restore runbook
 
 On a machine that holds a recipient **identity** (primary or backup):
