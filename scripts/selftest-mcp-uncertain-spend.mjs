@@ -185,6 +185,12 @@ async function main() {
     // 404 anyway so this test makes no outbound request at all.
     CYPHER_BRAIN_AR_USD_RATE_URL: `http://127.0.0.1:${gateway.port}/rates`,
     CYPHER_BRAIN_RECEIPT_LEDGER: join(tmp, 'receipts.jsonl'),
+    // #800: snapshot_now is fail-closed over MCP — it refuses unless the OPERATOR has
+    // pinned the recipients and declared which directories may be snapshot sources. This
+    // test's own recipient and its own scratch tree, so the policy passes and the
+    // uncertain-spend tombstone under test is what the call actually exercises.
+    CYPHER_BRAIN_PIN_RECIPIENTS: recipientPath,
+    CYPHER_BRAIN_MCP_SOURCE_ROOTS: JSON.stringify([tmp]),
   };
   const snapshotArgs = (out, key) => ({
     dirs: [data],
