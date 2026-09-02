@@ -209,8 +209,12 @@ try {
   });
   capFail.status !== 0 &&
   /L1 cost estimate/.test(capFail.stderr) &&
-  /exceeds CYPHER_BRAIN_MAX_SPEND/.test(capFail.stderr)
-    ? pass('spend cap: a 1-winston cap aborts the upload with a real (not skipped) cost estimate')
+  /exceeds CYPHER_BRAIN_MAX_SPEND/.test(capFail.stderr) &&
+  // The over-cap refusal must still carry its error code: errors.ts's CB-E006 entry
+  // matches on the literal "exceeds CYPHER_BRAIN_MAX_SPEND", so any rewording of this
+  // message silently drops the annotation an agent/operator triages on.
+  /\[CB-E006\]/.test(capFail.stderr)
+    ? pass('spend cap: a 1-winston cap aborts the upload with a real (not skipped) cost estimate, annotated [CB-E006]')
     : fail(
         `spend cap did not abort as expected: status=${capFail.status} stderr=${(capFail.stderr || '').slice(0, 200)}`,
       );
@@ -373,6 +377,121 @@ try {
   /\[PASS\] minisign authenticity signature/.test(cb('verify', '--in', l1SigOut))
     ? pass('L1 fallback: the chunk-read sidecar verifies against the signing key')
     : fail('the L1-fetched sidecar did not verify');
+
+  // #797: CYPHER_BRAIN_MAX_SPEND bounds what the PUSH spends, not what one transaction
+  // spends. A signed push posts TWO paid transactions (ciphertext + ".minisig"); before
+  // this fix each was compared against the whole cap on its own, so two that each cleared
+  // it spent twice it. The cap below is chosen from the REAL prices arlocal quotes so it
+  // is strictly larger than either transaction and strictly smaller than their sum: the
+  // ciphertext must go through and the sidecar must then be refused for having no budget
+  // left. Reverting the shared-tracker change makes both pass the cap and the push
+  // succeed, which is exactly what this asserts cannot happen.
+  log('#797: the spend cap bounds the ciphertext AND the .minisig sidecar together');
+  const combinedSnap = join(tmp, 'combined.age');
+  cb('snapshot', '--dir', src, '--out', combinedSnap, '--sign');
+  const cipherPrice = BigInt(await ar.transactions.getPrice((await readFile(combinedSnap)).length));
+  const sigPrice = BigInt(await ar.transactions.getPrice((await readFile(`${combinedSnap}.minisig`)).length));
+  const larger = cipherPrice > sigPrice ? cipherPrice : sigPrice;
+  const smaller = cipherPrice > sigPrice ? sigPrice : cipherPrice;
+  if (smaller <= 1n) {
+    // BLOCKED, not PASS: with a zero/1-winston quote there is no cap value that separates
+    // "either alone" from "both together", so this fixture cannot exercise the property.
+    fail(
+      `BLOCKED: arlocal quoted ${cipherPrice}/${sigPrice} winston, too small to construct a cap between the larger upload and the sum`,
+    );
+  } else {
+    const combinedCap = larger + 1n; // > either alone, < cipherPrice + sigPrice
+    const combined = spawnSync('node', [...DEV_ARGS, BIN, 'push', '--in', combinedSnap, '--backend', 'arweave'], {
+      env: { ...env, CYPHER_BRAIN_MAX_SPEND: String(combinedCap) },
+      encoding: 'utf8',
+    });
+    combined.status !== 0 &&
+    /checked TOGETHER|no budget remains/.test(combined.stderr) &&
+    /already committed|already committed earlier in this push/.test(combined.stderr) &&
+    // The shared-budget branch is an over-cap refusal like any other and must carry the
+    // same code — the branch where a reworded message would most easily lose it.
+    /\[CB-E006\]/.test(combined.stderr)
+      ? pass('#797: the sidecar is refused once the ciphertext has used up the shared budget, annotated [CB-E006]')
+      : fail(
+          `combined-cap push did not refuse the sidecar: status=${combined.status} stderr=${(combined.stderr || '').slice(0, 400)}`,
+        );
+    // The operator must ALSO have been shown the sidecar's own estimate and the combined
+    // total before the consent gate — consenting against the ciphertext figure alone was
+    // the other half of #797.
+    /a ".minisig" signature sidecar will ALSO be uploaded/.test(combined.stderr) &&
+    /combined ciphertext\+signature spend is checked TOGETHER against CYPHER_BRAIN_MAX_SPEND/.test(combined.stderr)
+      ? pass('#797: the pre-consent display shows the sidecar estimate and the combined total')
+      : fail(`the pre-consent display did not show the combined spend: ${(combined.stderr || '').slice(0, 400)}`);
+  }
+
+  // #802: an ambiguous L1 POST — the gateway accepts the signed transaction and the
+  // response is then lost — used to surface as a plain error with tx.id discarded, which
+  // reads exactly like "nothing happened" and invites a retry that pays a second time.
+  // Reproduced for real rather than mocked: a proxy in front of arlocal forwards the POST
+  // (so the transaction genuinely lands) and then destroys the socket instead of
+  // answering, while every other route is forwarded untouched so the backend's own probe
+  // of tx/<id>/status can reach the gateway that has it.
+  // The proxy runs in its OWN process, like the stalled-host stub further down: an
+  // in-process createServer() cannot answer anything while spawnSync() below is blocking
+  // this script's event loop.
+  log('#802: an ambiguous L1 POST is reported as a confirmed spend, not as "nothing happened"');
+  const dropSrvFile = join(tmp, 'drop-post-proxy.mjs');
+  await writeFile(
+    dropSrvFile,
+    "import {createServer,request} from 'node:http';\n" +
+      'const UP=Number(process.argv[2]);\n' +
+      'const s=createServer((q,res)=>{\n' +
+      "  const drop=q.method==='POST'&&/^\\/tx\\/?$/.test(q.url||'');\n" +
+      "  const up=request({host:'127.0.0.1',port:UP,path:q.url,method:q.method,headers:q.headers},(r)=>{\n" +
+      '    // Let arlocal finish accepting the tx, THEN hang up without answering: the\n' +
+      '    // transaction really lands, the response never arrives.\n' +
+      "    if(drop){r.resume();r.on('end',()=>res.socket&&res.socket.destroy());return;}\n" +
+      '    res.writeHead(r.statusCode||502,r.headers);r.pipe(res);\n' +
+      '  });\n' +
+      "  up.on('error',()=>res.socket&&res.socket.destroy());\n" +
+      '  q.pipe(up);\n' +
+      '});\n' +
+      "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
+  );
+  const dropSrv = spawn('node', [dropSrvFile, String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const dropPort = await new Promise((res, rej) => {
+    const to = setTimeout(() => rej(new Error('drop proxy did not start')), 8000);
+    dropSrv.stdout.on('data', (d) => {
+      const m = String(d).match(/READY:(\d+)/);
+      if (m) {
+        clearTimeout(to);
+        res(m[1]);
+      }
+    });
+  });
+  const ambiguousSnap = join(tmp, 'ambiguous.age');
+  cb('snapshot', '--dir', src, '--out', ambiguousSnap);
+  const ledgerPath = join(tmp, 'ambiguous-ledger.jsonl');
+  const ambiguous = spawnSync('node', [...DEV_ARGS, BIN, 'push', '--in', ambiguousSnap, '--backend', 'arweave'], {
+    env: {
+      ...env,
+      CYPHER_BRAIN_AR_HOST: '127.0.0.1',
+      CYPHER_BRAIN_AR_PORT: dropPort,
+      CYPHER_BRAIN_AR_HTTP_TIMEOUT: '4000', // short bound so the lost response is noticed quickly
+      CYPHER_BRAIN_RECEIPT_LEDGER: ledgerPath,
+    },
+    encoding: 'utf8',
+    timeout: 120_000,
+  });
+  dropSrv.kill('SIGKILL');
+  const ambiguousTx = (ambiguous.stderr.match(/Ciphertext locator[^:]*: ([A-Za-z0-9_-]{43})/) || [])[1];
+  ambiguous.status !== 0 && /CONFIRMED accepted by the network/.test(ambiguous.stderr) && TX_RE.test(ambiguousTx ?? '')
+    ? pass('#802: the lost-response push fails with the tx id and a CONFIRMED-spend verdict')
+    : fail(
+        `the ambiguous POST was not reported as a confirmed spend: status=${ambiguous.status} stderr=${(ambiguous.stderr || '').slice(0, 500)}`,
+      );
+  /Do NOT re-push this artifact/.test(ambiguous.stderr)
+    ? pass('#802: the error tells the operator not to retry (a retry pays twice)')
+    : fail('the ambiguous-POST error did not warn against retrying');
+  const ambiguousLedger = existsSync(ledgerPath) ? await readFile(ledgerPath, 'utf8') : '';
+  ambiguousTx && ambiguousLedger.includes(ambiguousTx)
+    ? pass('#802: the confirmed spend reached the receipt ledger despite the lost response')
+    : fail(`the confirmed spend is missing from the receipt ledger: ${ambiguousLedger.slice(0, 300)}`);
 
   // negative control: an unknown (but well-formed) tx id returns no bytes
   const badId = 'A'.repeat(43);

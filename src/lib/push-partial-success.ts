@@ -67,6 +67,51 @@ export class PushLocatorWriteError extends PushPartialSuccessError {
   }
 }
 
+// issue #802: arweave ONLY. The L1 POST threw (a stalled gateway aborted by #691's
+// stall timer, a reset socket, a DNS failure mid-upload) and a bounded probe of the
+// signed tx id afterwards found the transaction ALREADY ACCEPTED — so the winston was
+// spent even though the call that spent it never got an answer. Before this existed, that
+// case surfaced as an ordinary Error with the tx id discarded, which reads exactly like
+// "nothing happened" and invites a retry that signs and pays a second time.
+//
+// A sibling of PushFundingConfirmedButIncompleteError rather than a reuse of it: that one
+// names a ton-provider stage (`provider_notify`) that has no meaning here. What the two
+// share is the property every caller must act on — the spend is confirmed and the work
+// after it is not — which is what living under PushPartialSuccessError already carries.
+// Like that error, the message says the ledger write was ATTEMPTED, not that it landed:
+// pushpull.ts's persistReceipt() swallows and warns on a receipt-write failure, so this
+// error alone cannot promise the entry exists.
+//
+// `sigLocator` is undefined at the backend's own throw site (it fires from inside a
+// single backend.put()). It carries the SIDECAR's confirmed tx id when the error is
+// RE-THROWN from pushpull.ts's ".minisig" catch block, exactly as
+// PushFundingConfirmedButIncompleteError already is — wrapping it in
+// PushSignatureUploadError there would discard the sidecar's confirmed locator and
+// report a spend that DID happen as an ordinary upload failure. In that re-thrown case
+// `locator` is the CIPHERTEXT's, matching every other subclass's convention.
+export class PushUploadConfirmedResponseLostError extends PushPartialSuccessError {
+  readonly stage = 'upload_response' as const;
+  readonly fundingConfirmed = true as const;
+  constructor(locator: string, cause: unknown, sigLocator?: string) {
+    super(
+      `arweave: the upload response was lost (${cause instanceof Error ? cause.message : String(cause)}) but the ` +
+        'transaction is CONFIRMED accepted by the network — the fee was already spent and a receipt-ledger entry ' +
+        'was attempted for it. Do NOT re-push this artifact: a retry signs and pays for a second transaction. ' +
+        // Both ids, each labelled (Codex review): in the re-thrown sidecar case the
+        // confirmed-but-unanswered upload is the SIGNATURE, while the artifact a later
+        // `pull` has to fetch is the CIPHERTEXT — printing one unlabelled "locator" for
+        // both sent the operator to verify with the wrong id.
+        `Ciphertext locator (what \`cypher-brain pull --locator <id>\` needs): ${locator}` +
+        (sigLocator ? `; ".minisig" sidecar locator (the upload whose response was lost): ${sigLocator}` : '') +
+        '. Record them — `--save-locator` did not run — and check `cypher-brain ledger` if you need to confirm the ' +
+        'entry landed.',
+      locator,
+      sigLocator,
+    );
+    this.name = 'PushUploadConfirmedResponseLostError';
+  }
+}
+
 // issue #654: ton-provider ONLY. A StorageV1 deploy's storage-cost transfer is
 // IRREVERSIBLE the moment waitForContractActive() confirms the contract on-chain — but
 // the push as a whole is not "complete" until notifyProviderWithRetry() also succeeds.

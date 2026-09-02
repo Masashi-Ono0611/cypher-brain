@@ -18,6 +18,7 @@ import { printJson } from './ui.js';
 import { buildPlan, writePlanFile, readRecipientsFingerprint } from './plan.js';
 import { didYouMean, nearestName } from './suggest.js';
 import { STORAGE_BACKEND_NAMES, type CliOptions } from './types.js';
+import { signedDataItemSize } from './backends/ans104.js';
 
 // Every field is REQUIRED and nullable rather than optional (#268): a `--json`
 // consumer — the whole point of #211 — gets one stable object shape, so
@@ -269,7 +270,15 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
         const t = setTimeout(() => resolve(null), AR_HTTP_TIMEOUT_MS);
         if (typeof t.unref === 'function') t.unref();
       });
-      const res = await Promise.race([turbo.getUploadCosts({ bytes: [sizeBytes] }), timeout]);
+      // #791: price the ANS-104 SIGNED DATA ITEM Turbo actually bills for, not the raw
+      // artifact — the same number backends/turbo.ts's own pre-flight quote and
+      // CYPHER_BRAIN_MAX_SPEND check now use, so the figure shown before the --yes
+      // consent gate (pushpull.ts) and the figure the cap is enforced against describe
+      // the same bytes. Sized with ArweaveSigner's fixed lengths (the signer turbo.ts
+      // always constructs): estimate runs without loading a wallet, so there is no live
+      // signer here to ask.
+      const billedBytes = signedDataItemSize(sizeBytes);
+      const res = await Promise.race([turbo.getUploadCosts({ bytes: [billedBytes] }), timeout]);
       if (res === null) {
         return {
           backend,
@@ -295,7 +304,9 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
         approx_ar: Number(BigInt(winc)) / 1e12,
         ...(rate !== null ? { usd_estimate: Number(((Number(BigInt(winc)) / 1e12) * rate).toFixed(6)) } : {}),
         note:
-          'Turbo upload cost estimate (uploads <100KB are free). Paid with Turbo Credits (fundable via ETH/USDC/fiat).' +
+          `Turbo upload cost estimate for ${billedBytes} billed bytes (the ${sizeBytes}-byte artifact plus ` +
+          `${billedBytes - sizeBytes} bytes of ANS-104 data-item header Turbo also charges for; uploads <100KB are ` +
+          'free). Paid with Turbo Credits (fundable via ETH/USDC/fiat).' +
           (credit !== null
             ? ` USD at Turbo's credit rate (~$${credit.usdPerGiB.toFixed(2)}/GiB, fees included) — what buying these credits with fiat costs, not the AR market value of the winc.`
             : spot !== null

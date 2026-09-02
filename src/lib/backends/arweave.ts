@@ -36,6 +36,8 @@ import { arUsdRate, usdApprox } from '../estimate.js';
 import { progressReporter } from '../progress.js';
 import { warn } from '../warn.js';
 import { WALLET_DEFAULT_PATH } from '../wallet.js';
+import { remainingSpendBudget, chargeSpendTracker, spentSoFar, budgetExhaustedMessage } from '../spend-tracker.js';
+import { PushUploadConfirmedResponseLostError } from '../push-partial-success.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 // The public gateways to try (in order) for the HTTP read, before the L1 chunk
@@ -336,6 +338,10 @@ interface ArweaveClient {
     sign(tx: ArweaveTransaction, jwk: unknown): Promise<void>;
     post(tx: ArweaveTransaction): Promise<{ status: number; data?: unknown }>;
     getData(id: string, opts?: { decode?: boolean }): Promise<Uint8Array | string>;
+    // #802: `GET tx/<id>/status`, used ONLY to disambiguate a POST that threw. Resolves
+    // with the gateway's status code (200 mined, 202 pending, 404 unknown) rather than
+    // rejecting on a non-200, per arweave-js's own Transactions.getStatus().
+    getStatus(id: string): Promise<{ status: number; confirmed: unknown }>;
   };
   // #701: the pre-upload balance check needs the signer's address (derived from its own
   // JWK — no network call) and its native on-chain balance (winston string, per
@@ -510,6 +516,33 @@ function l1SignAndPost(
   return p;
 }
 
+// #802: was the transaction we just signed actually accepted, despite the POST throwing?
+// `tx/<id>/status` answers 200 (mined) or 202 (accepted, pending) for a transaction the
+// gateway has; anything else — 404, a 5xx, a network error — is INCONCLUSIVE, never
+// "definitely not there": a transaction accepted moments ago is not immediately indexed.
+// So this only ever returns true for a POSITIVE observation, and the caller treats false
+// as "unknown", not as "safe to retry".
+//
+// Bounded by construction: at most CONFIRM_ATTEMPTS reads, spaced by
+// CONFIRM_INTERVAL_MS, each with the gateway's own timeout. This runs after money has
+// already possibly moved, so a few seconds spent establishing WHICH is cheap; hanging
+// here is not, which is why the attempt count is fixed rather than deadline-driven.
+const POST_CONFIRM_ATTEMPTS = 3;
+const POST_CONFIRM_INTERVAL_MS = 2000;
+async function probeArweaveTxAccepted(ar: ArweaveClient, txId: string): Promise<boolean> {
+  for (let attempt = 0; attempt < POST_CONFIRM_ATTEMPTS; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, POST_CONFIRM_INTERVAL_MS));
+    try {
+      const status = await ar.transactions.getStatus(txId);
+      if (status?.status === 200 || status?.status === 202) return true;
+    } catch {
+      // A failed probe is one more inconclusive read, not an answer — keep trying the
+      // remaining attempts, then let the caller report the uncertainty.
+    }
+  }
+  return false;
+}
+
 // arweave backend: stores the ciphertext as an Arweave transaction. The locator is
 // the tx id — assigned AFTER upload, NOT a content hash — which is exactly the case
 // the StorageBackend interface must handle (vs file's pre-known content id).
@@ -621,10 +654,35 @@ export async function arweaveBackend(): Promise<StorageBackend> {
         // not be verified for this run.
         warn(`arweave: could not estimate L1 cost (${errMsg(e)}); proceeding`);
       }
-      if (reward !== undefined && AR_MAX_SPEND > 0n && reward > AR_MAX_SPEND) {
-        throw new Error(
-          `arweave: L1 upload cost ${reward} winston exceeds CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND} — aborting to protect your wallet`,
-        );
+      // #797: the cap bounds what the whole PUSH spends, not what this one transaction
+      // spends. A signed push posts the ciphertext and its ".minisig" sidecar as two
+      // separate paid transactions; checking each against the full cap in isolation let
+      // two that each cleared it spend twice it, against a consent screen showing only
+      // the ciphertext's estimate. Same shared tracker pushpull.ts passes to both put()
+      // calls that #639 introduced for ton-provider.
+      if (reward !== undefined && AR_MAX_SPEND > 0n) {
+        const spent = spentSoFar(opts.spendTracker);
+        const remaining = remainingSpendBudget(AR_MAX_SPEND, opts.spendTracker);
+        if (remaining <= 0n) {
+          throw new Error(budgetExhaustedMessage('arweave', 'CYPHER_BRAIN_MAX_SPEND', AR_MAX_SPEND, spent));
+        }
+        if (reward > remaining) {
+          // The literal "exceeds CYPHER_BRAIN_MAX_SPEND" is load-bearing, not prose:
+          // errors.ts's CB-E006 entry matches on it (and selftest-error-codes.mjs asserts
+          // it still exists under src/), so an over-cap refusal keeps carrying [CB-E006].
+          // The shared-budget detail is appended AFTER it rather than spliced into it.
+          throw new Error(
+            `arweave: L1 upload cost ${reward} winston exceeds CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND}` +
+              (spent > 0n
+                ? ` (${spent} winston of it already committed earlier in this push — the ciphertext and its ` +
+                  `".minisig" signature sidecar are checked TOGETHER, leaving ${remaining} winston)`
+                : '') +
+              ' — aborting to protect your wallet',
+          );
+        }
+        // Charged once it is known to be within budget and about to be spent, so the
+        // sidecar's own put() sees this transaction already counted (#639's ordering).
+        chargeSpendTracker(opts.spendTracker, reward);
       }
       // #701: pre-upload wallet-balance check — turbo.ts has had the equivalent since
       // #342 (getBalance/summarizeBalance/insufficientFundsError); arweave.ts never did,
@@ -658,8 +716,54 @@ export async function arweaveBackend(): Promise<StorageBackend> {
       // uses for the read side, #116) — without it a stalled gateway hangs this paid
       // upload forever, with no CYPHER_BRAIN_AR_HTTP_TIMEOUT_MS/PIPE_TIMEOUT_MS bound
       // applying here at all (unlike every read path in this file).
-      const res = await l1SignAndPost(ar, tx, jwk, AR_HTTP_TIMEOUT_MS);
-      if (res.status !== 200 && res.status !== 208) throw new Error(describeArweavePostError(res.status, res.data));
+      // #802: once the transaction is signed, any outcome OTHER than a clean accept is
+      // ambiguous — the gateway may hold the transaction and simply never say so.
+      // Reported as an ordinary Error that looked identical to "nothing happened", with
+      // `tx.id` discarded, a retry signed and paid for a SECOND transaction for the same
+      // content. Two shapes reach this, and both are probed:
+      //   - an EXCEPTION (the #691 stall-abort, a reset socket, a DNS failure mid-upload)
+      //     — no answer at all;
+      //   - a NON-ACCEPT STATUS. The gateway answered, but a 5xx from a gateway or a
+      //     proxy in front of one can perfectly well follow a transaction it already
+      //     persisted (Codex review — the first version of this fix probed only the
+      //     exception path and left this one discarding the tx id).
+      // A probe that FINDS the transaction is the only thing treated as proof; not
+      // finding it is "unknown", never "nothing happened", because a just-posted
+      // transaction is not immediately indexed.
+      const confirmAmbiguousPost = async (why: string, cause: unknown): Promise<never> => {
+        if (await probeArweaveTxAccepted(ar, tx.id)) {
+          // The spend is real and irreversible: record it at the same checkpoint a
+          // successful post would have (#654's rule — the ledger entry belongs to the
+          // moment the spend becomes irreversible, not to the moment the call returns),
+          // then raise the TYPED partial-success error so an MCP idempotency caller
+          // remembers this key as spent instead of retrying it (mcp.ts's
+          // PushPartialSuccessError branch).
+          await opts.onReceipt?.({
+            locator: tx.id,
+            raw: { tx_id: tx.id, reward: tx.reward, post_status: why },
+            cost: { amount: tx.reward, unit: 'winston' },
+          });
+          throw new PushUploadConfirmedResponseLostError(tx.id, cause);
+        }
+        throw new Error(
+          `arweave: ${why} and the outcome is UNCERTAIN — the transaction was already signed as ${tx.id} for ` +
+            `${tx.reward} winston and may or may not have been accepted (a probe could not find it, which is not ` +
+            `proof it is absent). Check https://arweave.net/tx/${tx.id}/status (or any gateway) BEFORE retrying: ` +
+            'a retry signs and pays for a second transaction.',
+        );
+      };
+      let res: { status: number; data?: unknown };
+      try {
+        res = await l1SignAndPost(ar, tx, jwk, AR_HTTP_TIMEOUT_MS);
+      } catch (e) {
+        await confirmAmbiguousPost(`the upload response never arrived (${errMsg(e)})`, e);
+        throw e; // unreachable — confirmAmbiguousPost always throws; satisfies control-flow analysis
+      }
+      if (res.status !== 200 && res.status !== 208) {
+        const posted = new Error(describeArweavePostError(res.status, res.data));
+        await confirmAmbiguousPost(`the gateway refused the upload (${posted.message})`, posted);
+        throw posted; // unreachable, same as above
+      }
       // #232: tx.reward is the AUTHORITATIVE actual cost — set either from the pre-flight
       // `reward` above (passed into createTransaction) or, if that estimate failed,
       // fetched internally by createTransaction itself (arweave-js always populates it;
