@@ -15,6 +15,7 @@ import { appendReceipt } from './receipt.js';
 import { recordAudit } from './audit.js';
 import { warn } from './warn.js';
 import { UsageError } from './errors.js';
+import { acquirePushLock, saveLocatorLockKey } from './push-lock.js';
 import type { CliOptions, ReceiptEvent } from './types.js';
 import type { SpendTracker } from './spend-tracker.js';
 import {
@@ -288,7 +289,44 @@ function displayLocator(backend: string, locator: string): string {
   return locator.startsWith(prefix) ? locator : `${prefix}${locator}`;
 }
 
+// #806: --save-locator's lookup -> pay -> commit sequence, serialized across processes.
+//
+// Two pushes sharing one --save-locator file used to race in two distinct ways, and one
+// lock closes both: with --skip-unchanged they could each read "nothing recorded yet",
+// each pay for the same content, and each rewrite the file (the second discarding the
+// first's locator); WITHOUT --skip-unchanged the wholesale rewrite at the end of
+// pushCoreLocked is still a lost update on its own — the second writer's line replaces
+// the first's, so one of the two real, paid-for locators is left recorded nowhere except
+// receipt-ledger.jsonl. That is why the lock is taken for EVERY --save-locator push, not
+// only the --skip-unchanged ones.
+//
+// The loser does not have to be told anything special: it waits for the winner inside
+// acquirePushLock, and by the time it gets the lock the winner's pointer is already
+// committed, so its own resolveSkipUnchanged() below reads it and prints the ordinary
+// SKIPPED line. Only a winner still running when that bounded wait expires produces the
+// PushLockHeldError refusal (CB-E028) — which costs nothing, unlike paying twice.
+//
+// Held around the WHOLE of pushCoreLocked rather than started just before the lookup:
+// the sequence being protected ends with the save-locator rewrite, and everything
+// between is what makes the window wide. Argument validation runs inside it too, which
+// is harmless (a UsageError releases the lock on its way out through the `finally`).
+//
+// writeReplayedSavedLocator() further down takes the SAME lock, for the same reason: it
+// is another writer of the same file, and an MCP replay that rewrote it unlocked while a
+// push was committing would discard the locator that push had just paid for.
 async function pushCore(
+  o: CliOptions,
+): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
+  if (!o.save_locator) return pushCoreLocked(o);
+  const release = await acquirePushLock('save-locator', await saveLocatorLockKey(o.save_locator));
+  try {
+    return await pushCoreLocked(o);
+  } finally {
+    await release();
+  }
+}
+
+async function pushCoreLocked(
   o: CliOptions,
 ): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
   // #779: a required flag simply being absent is the same UsageError class as above.
@@ -709,6 +747,39 @@ export async function push(o: CliOptions): Promise<boolean> {
 // the ones the idempotency log already recorded at the time of the original successful
 // push, so there is nothing to re-derive or risk going stale.
 export async function writeReplayedSavedLocator(
+  savedLocatorPath: string,
+  fields: { locator: string; backend: string; sha256: string },
+): Promise<void> {
+  // #806: this rewrites the same file pushCore's own commit does, so it takes the same
+  // lock — a replay that wrote unlocked would be exactly the lost update the lock exists
+  // to stop, and an atomic rename prevents a torn file, not a discarded one. If the lock
+  // cannot be taken, this REFUSES (CB-E028) rather than writing anyway: the replay itself
+  // uploaded and paid nothing, the recorded result stays in the idempotency log, and the
+  // caller can retry the same key once the other push finishes — whereas an unlocked
+  // write can permanently discard the locator that push just paid for.
+  const release = await acquirePushLock('save-locator', await saveLocatorLockKey(savedLocatorPath));
+  try {
+    // Serializing an unconditional overwrite is not enough on its own: a replay that
+    // simply waits its turn and then rewrites the file would still discard a locator a
+    // push committed while it waited — the same lost update, just tidier. So the write is
+    // CONDITIONAL under the lock: absent, or already naming this same locator, it goes
+    // ahead; anything else means this file is now the pointer for a different artifact,
+    // and overwriting it would destroy that record.
+    const existing = await readSavedLocatorLine(savedLocatorPath);
+    if (existing?.locator && existing.locator !== fields.locator) {
+      throw new Error(
+        `${savedLocatorPath} already records a different locator (${existing.locator}) than this replayed call's ` +
+          `(${fields.locator}) — refusing to overwrite it, since nothing about this replay re-uploaded anything. ` +
+          'Point locator_file at a path of its own, or remove that file if the record it holds is no longer wanted.',
+      );
+    }
+    await writeReplayedSavedLocatorLocked(savedLocatorPath, fields);
+  } finally {
+    await release();
+  }
+}
+
+async function writeReplayedSavedLocatorLocked(
   savedLocatorPath: string,
   fields: { locator: string; backend: string; sha256: string },
 ): Promise<void> {

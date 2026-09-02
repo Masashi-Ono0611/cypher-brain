@@ -406,6 +406,25 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
       'src/lib/push-uncertain-spend.ts (PushUncertainSpendError, "… — the outcome is UNCERTAIN: the payment may ' +
       'already have happened. …"), thrown from src/lib/backends/arweave.ts and src/lib/backends/ton-provider.ts',
   },
+  // #806/#807: the one outcome of push's cross-process advisory lock that reaches the
+  // operator. NOT an ordinary "busy, try later": a push refused here is a push that
+  // would otherwise have paid a second time for content another run is already paying
+  // for (#806), or overwritten an rclone object another run is uploading (#807). The
+  // code exists so the next action is unambiguous — wait and re-run, never "add --force"
+  // and never "delete the lock" (an abandoned lock is cleared automatically; only a lock
+  // held by a live non-pushing process needs a human).
+  //
+  // Matched on "another push is in flight for", composed ONCE in src/lib/push-lock.ts
+  // for both keys (the save-locator file and the rclone remote), so there is a single
+  // contiguous literal for this pattern and for scripts/selftest-error-codes.mjs.
+  {
+    code: 'CB-E028',
+    title: 'another push is already running against this locator file / rclone remote',
+    pattern: /another push is in flight for/,
+    origin: 'ours',
+    source:
+      'src/lib/push-lock.ts (PushLockHeldError, "another push is in flight for … — refusing to run both at once …")',
+  },
 ];
 
 /** The first registry entry whose pattern matches `message`, if any. */

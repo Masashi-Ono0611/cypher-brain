@@ -13,6 +13,7 @@ import { RCLONE_BIN, PIPE_TIMEOUT_MS } from '../config.js';
 import { run } from '../proc.js';
 import { errMsg } from '../util.js';
 import { progressReporter, progressIntervalMs, type ProgressReporter } from '../progress.js';
+import { acquirePushLock } from '../push-lock.js';
 import type { StorageBackend, PutOpts } from '../types.js';
 
 // Runs `rclone <args>` (array args via proc.ts's run() — no shell, so a remote name
@@ -232,27 +233,44 @@ export function rcloneBackend(): StorageBackend {
       // below in pushpull.ts: both mean "push despite this safety net", not two
       // unrelated behaviors sharing a name by accident.
       //
-      // Check-then-upload, not atomic: two concurrent pushes to the SAME --remote
-      // could both observe "nothing there" and race to overwrite each other. Same
-      // shape (and same accepted limitation) as every other exists()-then-write
-      // no-clobber check in this CLI (pull --out, restore --out-dir — pushpull.ts) —
-      // this tool has no locking primitive, and a single operator's sequential runs
-      // are its design center, not concurrent multi-writer pushes to one path.
-      if (!opts.force && (await rcloneObjectExists(remote))) {
-        // Wording matches the OTHER refuse-by-default sites this exact "<subject>
-        // already exists — refusing to overwrite it with <description>" shape is
-        // copied from (pull --out / restore --out-dir, pushpull.ts) on purpose: the
-        // subject comes FIRST so this substring stays contiguous and keeps sharing
-        // CB-E009 (errors.ts) with them, rather than reading as a new, uncoded error.
-        throw new Error(
-          `rclone backend: ${remote} already exists — refusing to overwrite it with a different push (pass --force to overwrite it anyway)`,
-        );
+      // #807: the probe and the upload below are check-then-act, so they are held
+      // together under an advisory lock keyed by this exact --remote string — two
+      // concurrent pushes to one absent remote used to both observe "nothing there"
+      // and both `copyto`, leaving whichever finished last and silently destroying
+      // the other snapshot (no warning, and no way to notice afterwards).
+      //
+      // Layer 1 of the two the issue proposed, and the only one that turned out to
+      // fit. Layer 2 was a backend-native conditional create — `rclone copyto
+      // --immutable` — and it does NOT do what the name suggests here: measured on
+      // rclone v1.74.4 against `:local:`, `rclone copyto --immutable <src>
+      // :local:<dst>` where dst already held DIFFERENT bytes exited 0 and replaced
+      // them. (--immutable is a sync/copy-time comparison, not an atomic
+      // if-not-exists; even where it does refuse, it is itself a list-then-write, so
+      // two writers to an ABSENT path — this bug's case — would both still pass it.)
+      // An S3-family `If-None-Match: *` would be the real thing, but rclone exposes
+      // no such flag through `copyto`. So layer 2 is deliberately not shipped, and
+      // the residual risk is stated instead of implied: two DIFFERENT machines
+      // writing one remote are still unserialized, exactly as before.
+      const release = await acquirePushLock('rclone-remote', remote);
+      try {
+        if (!opts.force && (await rcloneObjectExists(remote))) {
+          // Wording matches the OTHER refuse-by-default sites this exact "<subject>
+          // already exists — refusing to overwrite it with <description>" shape is
+          // copied from (pull --out / restore --out-dir, pushpull.ts) on purpose: the
+          // subject comes FIRST so this substring stays contiguous and keeps sharing
+          // CB-E009 (errors.ts) with them, rather than reading as a new, uncoded error.
+          throw new Error(
+            `rclone backend: ${remote} already exists — refusing to overwrite it with a different push (pass --force to overwrite it anyway)`,
+          );
+        }
+        // `--` ends option parsing (rclone's cobra/pflag CLI, same convention as GNU
+        // getopt) so a --remote value that happens to start with `-` (accidentally, or
+        // via a tampered save-locator file feeding pull's locator back in here) is
+        // always treated as the positional source/destination, never as an rclone flag.
+        await runRclone('copyto', [resolve(file), remote], progressReporter('rclone push'));
+      } finally {
+        await release();
       }
-      // `--` ends option parsing (rclone's cobra/pflag CLI, same convention as GNU
-      // getopt) so a --remote value that happens to start with `-` (accidentally, or
-      // via a tampered save-locator file feeding pull's locator back in here) is
-      // always treated as the positional source/destination, never as an rclone flag.
-      await runRclone('copyto', [resolve(file), remote], progressReporter('rclone push'));
       return remote;
     },
     async get(locator: string, out: string): Promise<void> {

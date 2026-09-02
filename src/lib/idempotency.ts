@@ -384,10 +384,7 @@ function claimLockPath(path: string, tool: string, key: string): string {
 export async function claimIdempotencyKey(path: string, tool: string, key: string): Promise<() => Promise<void>> {
   const lockPath = claimLockPath(path, tool, key);
   await mkdir(dirname(resolve(path)), { recursive: true });
-  // Pid+timestamp alone is not a maximally strong ownership token, but a 128-bit random
-  // suffix on top of it makes an accidental collision with any other claim instance —
-  // same pid or not, this process or a different one — astronomically unlikely.
-  const token = `${process.pid}.${Date.now()}.${randomBytes(16).toString('hex')}`;
+  const token = newLockToken();
   try {
     await writeFile(lockPath, token, { flag: 'wx' });
   } catch (e) {
@@ -410,21 +407,57 @@ export async function claimIdempotencyKey(path: string, tool: string, key: strin
         'remove that file manually to unblock a retry with this exact key.',
     );
   }
-  return async () => {
-    try {
-      const owner = await readFile(lockPath, 'utf8');
-      if (owner === token) await rm(lockPath, { force: true });
-      // else: this claim was manually removed and re-claimed by someone else while this
-      // caller was still (thought to be) running — leave THEIR live claim alone, see
-      // this function's own doc comment above.
-    } catch {
-      // ENOENT (already gone — a prior release already ran, or an operator removed it) or
-      // any other read failure: best-effort cleanup only, never throw out of a release
-      // path. Deliberately no "already released" short-circuit — see this function's own
-      // doc comment for why a repeat call must re-run this check rather than being
-      // suppressed.
-    }
-  };
+  return () => releaseLockFileIfOwned(lockPath, token);
+}
+
+/**
+ * A lock file's owner token: pid, acquisition time, and 128 bits of randomness (#636).
+ * Pid+timestamp alone is not a maximally strong ownership token, but the random suffix
+ * makes an accidental collision with any other lock instance — same pid or not, this
+ * process or a different one — astronomically unlikely.
+ *
+ * Shared (#806/#807) rather than re-derived: push's own advisory lock (src/lib/
+ * push-lock.ts) writes the SAME token format, because it also has to READ the pid back
+ * out of a lock file another process wrote (see lockTokenPid below). Producing and
+ * parsing that format from one place is what keeps the two from drifting apart.
+ */
+export function newLockToken(): string {
+  return `${process.pid}.${Date.now()}.${randomBytes(16).toString('hex')}`;
+}
+
+/**
+ * The pid a `newLockToken()` string was minted by, or null when `text` is not one (an
+ * empty or truncated lock file, a hand-written one, a future format). Never throws —
+ * "unparseable" is a state callers must handle, not an error.
+ */
+export function lockTokenPid(text: string): number | null {
+  const first = text.split('\n', 1)[0] ?? '';
+  const head = first.split('.', 1)[0] ?? '';
+  if (!/^[0-9]+$/.test(head)) return null;
+  const pid = Number(head);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+/**
+ * Remove `lockPath` — but ONLY if it still holds exactly the bytes this owner wrote.
+ * Shared by claimIdempotencyKey above and src/lib/push-lock.ts (#806/#807), which is
+ * why the ownership check is here rather than inlined at one of them.
+ *
+ * The check matters for the slow-motion case of a holder whose lock was removed (by an
+ * operator, or by push-lock.ts's own staleness recovery) and re-taken by someone else
+ * while it was still — as far as it knew — running: releasing must not delete that new
+ * holder's live lock. Never throws, and deliberately has NO "already released"
+ * short-circuit: a repeat call re-runs the check rather than being suppressed by a flag,
+ * so a transient I/O error on one attempt does not wedge the lock indefinitely.
+ */
+export async function releaseLockFileIfOwned(lockPath: string, ownerText: string): Promise<void> {
+  try {
+    const owner = await readFile(lockPath, 'utf8');
+    if (owner === ownerText) await rm(lockPath, { force: true });
+  } catch {
+    // ENOENT (already gone — a prior release already ran, or an operator removed it) or
+    // any other read failure: best-effort cleanup only, never throw out of a release path.
+  }
 }
 
 /**

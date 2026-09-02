@@ -179,5 +179,77 @@ printf '%s' "$VERIFY_REMOTE_OUT" | grep -q "rclone" \
   && echo "[PASS] the warning names rclone specifically (not just a generic backend placeholder)" \
   || { echo "[FAIL] the missing-pin warning does not mention rclone"; echo "$VERIFY_REMOTE_OUT"; exit 1; }
 
+echo "== #807: two CONCURRENT pushes to one ABSENT --remote — exactly one uploads, the other refuses =="
+# The no-clobber check of #533 is a probe-then-copyto, so before #807 both pushes saw
+# "nothing there", both ran `rclone copyto`, and the destination silently kept whichever
+# finished last — destroying a distinct snapshot, because an rclone --remote is the one
+# locator here that is NOT content-addressed. Two DIFFERENT snapshots (different
+# ciphertext, so the surviving bytes name the winner unambiguously) to one fresh path.
+RACE_STORE_PATH="$STORE/race/snap.age"
+RACE_REMOTE=":local:$RACE_STORE_PATH"
+cb snapshot --dir "$SRC" --out "$TMP/race-a.age"
+cb snapshot --dir "$SRC" --out "$TMP/race-b.age"
+RACE_A_SHA=$(sha "$TMP/race-a.age"); RACE_B_SHA=$(sha "$TMP/race-b.age")
+[ "$RACE_A_SHA" != "$RACE_B_SHA" ] || { echo "[FAIL] the two race artifacts are byte-identical — an overwrite would be invisible"; exit 1; }
+set +e
+cb push --in "$TMP/race-a.age" --backend rclone --remote "$RACE_REMOTE" >"$TMP/rr-a.out" 2>"$TMP/rr-a.err" &
+RR_A_PID=$!
+cb push --in "$TMP/race-b.age" --backend rclone --remote "$RACE_REMOTE" >"$TMP/rr-b.out" 2>"$TMP/rr-b.err" &
+RR_B_PID=$!
+wait "$RR_A_PID"; RR_A_RC=$?
+wait "$RR_B_PID"; RR_B_RC=$?
+set -e
+# `if`, not `[ … ] && RR_OK=…`: a false test as the last command of a line exits a
+# `set -e` script (scripts/selftest-lib.sh's own hardening notes cover the same trap).
+RR_OK=0
+if [ "$RR_A_RC" = "0" ]; then RR_OK=$((RR_OK + 1)); fi
+if [ "$RR_B_RC" = "0" ]; then RR_OK=$((RR_OK + 1)); fi
+[ "$RR_OK" = "1" ] || {
+  echo "[FAIL] $RR_OK of 2 concurrent pushes to one absent --remote succeeded (want exactly 1) — both uploaded, one snapshot was destroyed"
+  cat "$TMP/rr-a.err" "$TMP/rr-b.err"; exit 1
+}
+if [ "$RR_A_RC" = "0" ]; then RR_WINNER_SHA="$RACE_A_SHA"; RR_LOSER_ERR="$TMP/rr-b.err"; else RR_WINNER_SHA="$RACE_B_SHA"; RR_LOSER_ERR="$TMP/rr-a.err"; fi
+[ "$(sha "$RACE_STORE_PATH")" = "$RR_WINNER_SHA" ] \
+  || { echo "[FAIL] the object at the remote is not the winner's bytes — the loser overwrote it"; exit 1; }
+# The loser must say WHY: either it waited for the lock and then hit the ordinary #533
+# no-clobber refusal, or the winner outlasted the bounded wait and it refused as
+# in-flight. Never a silent success.
+grep -q -e "already exists — refusing to overwrite" -e "another push is in flight for" "$RR_LOSER_ERR" \
+  || { echo "[FAIL] the losing push did not refuse with a no-clobber or in-flight message"; cat "$RR_LOSER_ERR"; exit 1; }
+echo "[PASS] concurrent pushes to one absent --remote: exactly one uploaded, the winner's bytes survive, the loser refused"
+
+echo "== #807: a lock held by a LIVE process refuses the push before it can copyto (CB-E028) =="
+HELD_STORE_PATH="$STORE/held/snap.age"
+HELD_REMOTE=":local:$HELD_STORE_PATH"
+HELD_LOCK=$(push_lock_file "$CYPHER_BRAIN_HOME" rclone-remote "$HELD_REMOTE")
+# An rclone remote is used as the key verbatim (nothing about "r:/a/../b" can be resolved
+# from here) — unlike a --save-locator path, whose directory is canonicalized.
+RACE_LOCK=$(push_lock_file "$CYPHER_BRAIN_HOME" rclone-remote "$RACE_REMOTE")
+[ ! -f "$RACE_LOCK" ] || { echo "[FAIL] the concurrent pushes left their lock file behind: $RACE_LOCK"; exit 1; }
+sleep 120 &
+HOLDER_PID=$!
+hold_push_lock "$HELD_LOCK" "$HOLDER_PID" rclone-remote "$HELD_REMOTE"
+set +e
+HELD_ERR=$(cb push --in "$TMP/race-a.age" --backend rclone --remote "$HELD_REMOTE" 2>&1); HELD_RC=$?
+set -e
+[ "$HELD_RC" != "0" ] || { echo "[FAIL] push ran while another process held the remote's lock"; echo "$HELD_ERR"; exit 1; }
+printf '%s' "$HELD_ERR" | grep -q "another push is in flight for" \
+  || { echo "[FAIL] the in-flight refusal does not say so"; echo "$HELD_ERR"; exit 1; }
+printf '%s' "$HELD_ERR" | grep -q '\[CB-E028\]' || { echo "[FAIL] the in-flight refusal lacks the CB-E028 code"; echo "$HELD_ERR"; exit 1; }
+[ ! -f "$HELD_STORE_PATH" ] || { echo "[FAIL] the refused push still uploaded to the remote"; exit 1; }
+echo "[PASS] a live holder's lock refuses the rclone push (CB-E028) before any copyto"
+
+echo "== #807: a lock left behind by a CRASHED push is cleared by the next run (no wedged schedule) =="
+kill -9 "$HOLDER_PID" 2>/dev/null || true
+wait "$HOLDER_PID" 2>/dev/null || true
+[ -f "$HELD_LOCK" ] || { echo "[FAIL] the stale lock file vanished on its own — this case is not being exercised"; exit 1; }
+cb push --in "$TMP/race-a.age" --backend rclone --remote "$HELD_REMOTE" >/dev/null 2>"$TMP/rclone-stale.err" \
+  || { echo "[FAIL] a push blocked on a lock whose holder is dead — the nightly schedule would be wedged"; cat "$TMP/rclone-stale.err"; exit 1; }
+grep -q "cleared an abandoned push lock" "$TMP/rclone-stale.err" \
+  || { echo "[FAIL] the stale lock was not reported as cleared"; cat "$TMP/rclone-stale.err"; exit 1; }
+[ "$(sha "$HELD_STORE_PATH")" = "$RACE_A_SHA" ] || { echo "[FAIL] the recovering push did not upload the artifact"; exit 1; }
+[ ! -f "$HELD_LOCK" ] || { echo "[FAIL] the lock file survived the push that took it — it was never released"; exit 1; }
+echo "[PASS] a stale rclone-remote lock (dead pid) is cleared, the push proceeds, and the lock is released afterwards"
+
 echo
 echo "STORAGE SELFTEST (rclone backend) PASS"
