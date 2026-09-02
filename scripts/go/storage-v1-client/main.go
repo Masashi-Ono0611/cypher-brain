@@ -169,6 +169,7 @@ Usage:
   storage-v1-client rates --provider-pubkey <64hex> --size-bytes <n> \
       [--mainnet] [--timeout <seconds>]
   storage-v1-client status --contract <raw-addr> [--mainnet]
+  storage-v1-client providers --address <raw-addr> [--mainnet]
   storage-v1-client update-providers --contract <raw-addr> \
       --provider-pubkey <64hex> --rate-nano-per-mb-day <int> --span-days <int> \
       [--gas-ton 0.05] [--mainnet] [--max-spend-ton 0.1]
@@ -332,6 +333,39 @@ on-chain and its balance.
   --mainnet                 opt in to mainnet. Default: testnet.
 `
 
+const providersHelp = `providers: prints the StorageV1 contract's OWN on-chain provider set — the
+ActiveProviders dict inside its account state — as JSON on stdout. Read-only:
+one tonapi HTTP GET, exactly like 'status'. This is the AUTHORITATIVE answer
+to "which provider is this contract registered with", outranking any local
+note about it, because 'update-providers'/'deploy' REPLACE that dict rather
+than merging into it — whatever the chain holds now is the registration.
+
+  --address <raw-addr>      required. The deployed StorageV1 contract address.
+                             (Named --address, not --contract as the acting
+                             subcommands above call it, because this one only
+                             reads the account and prints it back as the JSON
+                             "address" field.)
+  --mainnet                 opt in to mainnet. Default: testnet.
+
+  Output shape:
+    {"address": "0:...", "network": "mainnet", "status": "active",
+     "providers": [{"pubkey": "<64hex>",
+                    "terms": {"max_span_seconds": N,
+                              "rate_nano_per_mb_day": "<decimal>"}}]}
+
+  "pubkey" is the dict KEY: the provider's ProviderKey public key, the same
+  value 'deploy'/'notify'/'update-providers' take as --provider-pubkey.
+  "terms" can be null — see providers.go for exactly which part of the live
+  dict value is decoded and which part is deliberately left alone.
+
+  Exit codes: 0 for a successful read, INCLUDING an empty "providers" list
+  (an active contract that names nobody — a real answer, not a failure). 2 if
+  the address is not 'active' on-chain (nonexist/uninit/frozen hold no dict
+  to read). 1 if the read itself failed (tonapi unreachable, bad response,
+  or an account whose data cell is not a StorageV1 contract at all). A caller
+  must be able to tell "could not read" from "read, and it names nobody".
+`
+
 const updateProvidersHelp = `update-providers: REPAIR path for an ALREADY-DEPLOYED contract whose provider
 list is wrong or needs changing — sends a bare modify_providers message (no
 StateInit, same contract address, existing balance untouched) instead of a
@@ -409,7 +443,7 @@ paid for it the moment this lands.
 // helpText is the full global help — helpIntro plus every subcommand's own
 // section, in usage order — shown by the bare `storage-v1-client --help`/
 // `-h` and the no-args/unknown-subcommand error paths (see run() below).
-const helpText = helpIntro + "\n" + deployHelp + "\n" + notifyHelp + "\n" + ratesHelp + "\n" + statusHelp + "\n" + updateProvidersHelp + "\n" + withdrawHelp
+const helpText = helpIntro + "\n" + deployHelp + "\n" + notifyHelp + "\n" + ratesHelp + "\n" + statusHelp + "\n" + providersHelp + "\n" + updateProvidersHelp + "\n" + withdrawHelp
 
 // subcommandHelp maps each subcommand name to its own focused help section.
 var subcommandHelp = map[string]string{
@@ -417,6 +451,7 @@ var subcommandHelp = map[string]string{
 	"notify":           notifyHelp,
 	"rates":            ratesHelp,
 	"status":           statusHelp,
+	"providers":        providersHelp,
 	"update-providers": updateProvidersHelp,
 	"withdraw":         withdrawHelp,
 }
@@ -474,6 +509,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = runRates(ctx, rest, stdout)
 	case "status":
 		err = runStatus(ctx, rest, stdout)
+	case "providers":
+		err = runProviders(ctx, rest, stdout)
 	case "update-providers":
 		err = runUpdateProviders(ctx, rest, stdout)
 	case "withdraw":
