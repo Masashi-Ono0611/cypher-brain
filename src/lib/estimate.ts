@@ -426,6 +426,20 @@ export async function estimate(o: CliOptions): Promise<void> {
   // the generic-failure 1 (matches this file's own unknown-backend refusal below).
   if (!o.in) throw new UsageError('--in <file.age> required');
   if (!o.backend) throw new UsageError(`--backend <${STORAGE_BACKEND_NAMES.join('|')}> required`);
+  // #781 (multi-model review): an unknown --backend used to only be caught deep
+  // inside estimateCostFor() below, AFTER requireFile()/stat() — so `estimate --in
+  // <missing> --backend bogus` reported the missing file (a real, exit-1 failure)
+  // instead of the unknown-backend usage error (exit 2), even though the command
+  // line itself was already malformed before any I/O ran. Checked here, cheaply and
+  // without touching the filesystem, so the usage error always wins when both are
+  // wrong. estimateCostFor()'s own fallback stays as defensive belt-and-suspenders
+  // for its OTHER callers (MCP's estimate_cost tool calls estimateCost() directly).
+  if (!STORAGE_BACKEND_NAMES.includes(o.backend as (typeof STORAGE_BACKEND_NAMES)[number])) {
+    const suggestion = nearestName(o.backend, STORAGE_BACKEND_NAMES);
+    throw new UsageError(
+      `unknown backend: ${o.backend}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use ${STORAGE_BACKEND_NAMES.join('|')}`,
+    );
+  }
   await requireFile(o.in); // #267: one shared check/wording across every command
   const st = await stat(o.in);
   if (!st.isFile())
