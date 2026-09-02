@@ -214,7 +214,14 @@ wait "$MMPID" 2>/dev/null || true # signal exit is non-zero — expected
 MMLEFTOVER=$(find "$MMTMP" -maxdepth 1 -name 'out.restore-*' 2>/dev/null | wc -l | tr -d ' ')
 [ "$MMLEFTOVER" = "0" ] \
   && echo "[PASS] SIGTERM mid-merge leaves no out.restore-* scratch dir (no plaintext left behind)" \
-  || { echo "[FAIL] SIGTERM mid-merge leaked $MMLEFTOVER scratch dir(s)"; exit 1; }
+  || {
+    echo "[FAIL] SIGTERM mid-merge leaked $MMLEFTOVER scratch dir(s)"
+    # diagnostics for the next occurrence (#826 was undiagnosable from a bare count)
+    for d in "$MMTMP"/out.restore-*; do echo "  leftover: $d ($(find "$d" -mindepth 1 | wc -l | tr -d ' ') entries)"; { ls -la "$d" 2>/dev/null | head -5; } || true; done
+    echo "  out entries: $(count_top_entries "$MMTMP/out") / expected $((MMN + 1)); sentinel: $([ -f "$MMTMP/out/.cypher-brain-restore-INCOMPLETE" ] && echo present || echo absent)"
+    echo "  restore stderr:"; sed 's/^/    /' "$MMTMP/restore.err" 2>/dev/null | tail -20
+    exit 1
+  }
 test -f "$MMTMP/out/.cypher-brain-restore-INCOMPLETE" \
   && echo "[PASS] SIGTERM mid-merge flagged the pre-existing --out-dir as incomplete" \
   || { echo "[FAIL] SIGTERM mid-merge did not drop the INCOMPLETE sentinel into --out-dir"; exit 1; }
