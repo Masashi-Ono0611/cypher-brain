@@ -93,8 +93,10 @@ printf 'gbrain-pglite-selftest\n' > "$CB_SRC/note.txt"
 # answer the backend prompt with a free-text "not-a-real-backend" typo, which threw
 # — select() makes that specific typo structurally unreachable now (askSelect's own
 # doc comment in wizard.ts), so this needed a different, still-cheap early stop.
-# ton-provider's missing-prerequisites guard is a CLEAN, non-throwing exit instead
-# — see below, the wizard invocation is expected to SUCCEED here, not fail.
+# ton-provider's missing-prerequisites guard is a non-throwing but NON-ZERO exit
+# (issue #731: it prints "nothing has been rolled back ... cannot be re-run" and
+# must not share exit 0 with a completed run) — see below, the wizard invocation
+# is expected to exit non-zero here, not succeed.
 # scripts/selftest-init.sh's own (c2) test covers this exact guard in isolation.)
 #
 # config.json also carries a decoy secret in every case. gbrain's real config.json
@@ -157,14 +159,18 @@ JSON
   # BACKEND_NAMES) up one slot to `ton-provider` (third) — see (c2) in
   # scripts/selftest-init.sh for the same technique. No CYPHER_BRAIN_TON_PROVIDER_
   # OWNER/MAX_SPEND is set anywhere in this file, so the wizard's own pre-flight
-  # check (wizard.ts) fires and returns CLEANLY (exit 0) right after printing the
-  # gbrain-detection prose this test wants — the invocation below is expected to
-  # SUCCEED, not fail (the opposite polarity from the old free-text-typo version).
-  CYPHER_BRAIN_HOME="$cbhome" HOME="$home" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  # check (wizard.ts) fires right after printing the gbrain-detection prose this
+  # test wants — but (issue #731) that guard now sets a NON-ZERO exit code (it
+  # never pushed a snapshot, so it must not share exit 0 with a completed run),
+  # so the invocation below is expected to FAIL, not succeed (drive-init.mjs
+  # propagates the child's own exit code — same idiom as (c2) in
+  # scripts/selftest-init.sh).
+  if CYPHER_BRAIN_HOME="$cbhome" HOME="$home" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
     with_timeout 60 env ${extra_env[@]+"${extra_env[@]}"} \
     node "$ROOT/scripts/drive-init.mjs" --qa "$qa" --out "$logfile" \
-    -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
-    || { echo "[FAIL] $label: init did not stop cleanly at the ton-provider prerequisites guard"; cat "$logfile"; exit 1; }
+    -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+    echo "[FAIL] $label: init exited 0 at the ton-provider prerequisites guard (issue #731: this must be a non-zero exit)"; cat "$logfile"; exit 1
+  fi
   grep -qF "CYPHER_BRAIN_TON_PROVIDER_OWNER" "$logfile" || { echo "[FAIL] $label: the run ended for some reason other than the scripted ton-provider-prerequisites stop (a stalled prompt means the wrong engine branch ran)"; cat "$logfile"; exit 1; }
   if grep -qF "$DECOY_SECRET" "$logfile"; then
     echo "[FAIL] $label: a value from ~/.gbrain/config.json reached the transcript — engine detection must read the engine fields and echo nothing"; exit 1
@@ -220,10 +226,13 @@ cat > "$TMP/qa-pg-yes.json" <<JSON
   ["Choose a backend", "\u001b[A"]
 ]
 JSON
-CYPHER_BRAIN_HOME="$PG_YES_CBHOME" HOME="$PG_YES_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+# issue #731: the ton-provider prerequisites guard now sets a non-zero exit code
+# (it never pushed a snapshot), so this invocation is expected to FAIL, not succeed.
+if CYPHER_BRAIN_HOME="$PG_YES_CBHOME" HOME="$PG_YES_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
   with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-pg-yes.json" --out "$TMP/case-pg-yes.log" \
-  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
-  || { echo "[FAIL] pg-yes: init did not stop cleanly at the ton-provider prerequisites guard"; cat "$TMP/case-pg-yes.log"; exit 1; }
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] pg-yes: init exited 0 at the ton-provider prerequisites guard (issue #731: this must be a non-zero exit)"; cat "$TMP/case-pg-yes.log"; exit 1
+fi
 grep -qF "CYPHER_BRAIN_TON_PROVIDER_OWNER" "$TMP/case-pg-yes.log" || { echo "[FAIL] pg-yes: the run ended for some reason other than the scripted stop"; cat "$TMP/case-pg-yes.log"; exit 1; }
 if grep -qF "$DECOY_DB_URL" "$TMP/case-pg-yes.log"; then
   echo "[FAIL] pg-yes: the decoy database_url reached the transcript (as the prefill or otherwise)"; cat "$TMP/case-pg-yes.log"; exit 1
@@ -780,10 +789,13 @@ cat > "$TMP/qa-reloc.json" <<JSON
   ["Choose a backend", "\u001b[A"]
 ]
 JSON
-CYPHER_BRAIN_HOME="$RELOC_CBHOME" HOME="$RELOC_HOME" GBRAIN_HOME="$RELOC_GBRAIN_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+# issue #731: the ton-provider prerequisites guard now sets a non-zero exit code
+# (it never pushed a snapshot), so this invocation is expected to FAIL, not succeed.
+if CYPHER_BRAIN_HOME="$RELOC_CBHOME" HOME="$RELOC_HOME" GBRAIN_HOME="$RELOC_GBRAIN_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
   with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-reloc.json" --out "$TMP/case-reloc.log" \
-  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
-  || { echo "[FAIL] reloc: init did not stop cleanly at the ton-provider prerequisites guard"; cat "$TMP/case-reloc.log"; exit 1; }
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] reloc: init exited 0 at the ton-provider prerequisites guard (issue #731: this must be a non-zero exit)"; cat "$TMP/case-reloc.log"; exit 1
+fi
 grep -qF "CYPHER_BRAIN_TON_PROVIDER_OWNER" "$TMP/case-reloc.log" || { echo "[FAIL] reloc: the run ended for some reason other than the scripted stop"; cat "$TMP/case-reloc.log"; exit 1; }
 grep -qF "$PGLITE_BRANCH_MARK" "$TMP/case-reloc.log" \
   || { echo "[FAIL] reloc: GBRAIN_HOME-relocated config was not detected — looks like the wizard silently skipped the gbrain-detection block against the empty default \$HOME/.gbrain"; cat "$TMP/case-reloc.log"; exit 1; }
@@ -809,10 +821,13 @@ cat > "$TMP/qa-invalid.json" <<JSON
   ["Choose a backend", "\u001b[A"]
 ]
 JSON
-CYPHER_BRAIN_HOME="$INVALID_CBHOME" HOME="$INVALID_HOME" GBRAIN_HOME="not/absolute" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+# issue #731: the ton-provider prerequisites guard now sets a non-zero exit code
+# (it never pushed a snapshot), so this invocation is expected to FAIL, not succeed.
+if CYPHER_BRAIN_HOME="$INVALID_CBHOME" HOME="$INVALID_HOME" GBRAIN_HOME="not/absolute" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
   with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-invalid.json" --out "$TMP/case-invalid.log" \
-  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
-  || { echo "[FAIL] invalid-gbrain-home: init did not stop cleanly at the ton-provider prerequisites guard"; cat "$TMP/case-invalid.log"; exit 1; }
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] invalid-gbrain-home: init exited 0 at the ton-provider prerequisites guard (issue #731: this must be a non-zero exit)"; cat "$TMP/case-invalid.log"; exit 1
+fi
 grep -qF "CYPHER_BRAIN_TON_PROVIDER_OWNER" "$TMP/case-invalid.log" || { echo "[FAIL] invalid-gbrain-home: the run ended for some reason other than the scripted stop"; cat "$TMP/case-invalid.log"; exit 1; }
 grep -qF "$INVALID_GBRAIN_HOME_MARK" "$TMP/case-invalid.log" \
   || { echo "[FAIL] invalid-gbrain-home: the wizard did not warn about the invalid GBRAIN_HOME"; cat "$TMP/case-invalid.log"; exit 1; }

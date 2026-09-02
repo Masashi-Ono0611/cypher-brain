@@ -1051,6 +1051,10 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       just pushes normally: skip is an optimization, never a gate. --force uploads even
       when unchanged. (The digest is plaintext-side by necessity: age's ephemeral file
       key makes identical content encrypt to different ciphertext bytes every run.)
+      --digest only applies with --save-locator — every reader of it (the comparison
+      above, AND the content_digest this push records in --save-locator's file for a
+      LATER --skip-unchanged run) requires --save-locator, so passing --digest without
+      it is refused up front rather than silently doing nothing (#723).
 
   cypher-brain estimate --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--json] [--out <path.json>] [--remote <name>:<path>] [--force]
       Read-only preview: print what pushing --in to --backend would cost WITHOUT

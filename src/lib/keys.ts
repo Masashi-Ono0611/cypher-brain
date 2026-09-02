@@ -200,9 +200,14 @@ async function keygenSign(o: CliOptions): Promise<void> {
     passphrase: o.passphrase,
     force: o.force,
   });
-  // The two labels differ in width (41 vs 42 chars), so the shorter one gets an
-  // extra space to keep both paths starting in the same column (issue #263).
-  console.log(`signing identity (PRIVATE, keep offline):  ${identityPath}${wrapped ? ' (passphrase-wrapped)' : ''}`);
+  // #746: a single space after the colon, matching the exact same label pattern's
+  // three other occurrences (this file's own plain `keygen`, below, plus wallet.ts's
+  // "TON wallet (PRIVATE, keep offline):"/"wallet (PRIVATE, keep offline):" lines) —
+  // none of which line their two labels up column-for-column with an extra space the
+  // way this pair (issue #263) used to. The two labels below now simply start their
+  // values at different columns, same as every other pair of differently-sized
+  // labels in this pattern.
+  console.log(`signing identity (PRIVATE, keep offline): ${identityPath}${wrapped ? ' (passphrase-wrapped)' : ''}`);
   console.log(`signing public key (PUBLIC, safe to copy): ${recipientPath}`);
   console.log(pubkeyText.trimEnd());
   // #532: --force regenerates IN PLACE at recipientPath, so any `verify` resolving TO
