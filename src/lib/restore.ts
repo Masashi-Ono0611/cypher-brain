@@ -12,6 +12,7 @@ import {
   readlink,
   mkdir,
   chmod,
+  utimes,
 } from 'node:fs/promises';
 import { mkdirSync, mkdtempSync, type Dirent } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -514,14 +515,42 @@ async function refuseIfSymlink(p: string, what: string): Promise<void> {
 // No other entry kind can reach here: validateRestoreEntries() refuses FIFO/device/socket
 // entries before extraction, and a tar hardlink materializes as a regular file. The
 // `rename` fallback below is only for filesystems where link() is impossible at all.
+//
+// Residual, stated rather than hidden (multi-model review): every primitive here refuses
+// to follow a symlink at the FINAL path component, but none of them can promise anything
+// about the INTERMEDIATE ones. An attacker who can write inside --out-dir could unlink a
+// directory this function just created and drop a symlink in its place before the
+// recursion writes into it, and the writes would land through that symlink. Closing it
+// needs fd-relative operations (openat/mkdirat/linkat, with O_NOFOLLOW), which Node does
+// not expose at all — no arrangement of the fs API available here fixes it, so it is
+// documented instead of half-mitigated. Note this window is genuinely NEW: the old
+// whole-directory rename() never descended into --out-dir, so it had nothing to traverse.
+// The pre-existing lstat-based refusal to merge INTO a symlink that was already there
+// (see mergeNoClobber below, and the selftest that pins it) is unchanged.
 async function moveNoClobber(s: string, d: string, entry: Dirent): Promise<void> {
   if (entry.isDirectory()) {
-    // Read the mode BEFORE the recursion, which widens `s` (see mergeNoClobber below),
-    // and apply it to `d` only AFTER the recursion has finished moving entries in —
-    // setting a restrictive mode (0500) first would block the very writes into it.
-    const srcMode = (await lstat(s)).mode & 0o7777;
+    // Read mode AND timestamps BEFORE the recursion — it widens `s` (see mergeNoClobber
+    // below) and moving entries in updates `d`'s own mtime. The old whole-directory
+    // rename() carried the archive's mode and times along with the inode for free; mkdir
+    // makes a brand-new directory, so both have to be put back deliberately (multi-model
+    // review: without the utimes, every merged directory silently regressed to "now").
+    // Applied only AFTER the recursion: a restrictive mode (0500) set first would block
+    // the very writes into it.
+    const sStat = await lstat(s);
+    const srcMode = sStat.mode & 0o7777;
     await mkdir(d); // no recursive: true — that would succeed on an existing directory
-    await mergeNoClobber(s, d);
+    try {
+      await mergeNoClobber(s, d);
+    } catch (e) {
+      // Restore the archived mode even when the merge failed part-way (multi-model
+      // review, Critical): mkdir() leaves `d` at the process umask, which for a source
+      // recorded 0500 is strictly more permissive than intended — and a partly-merged
+      // directory holds decrypted plaintext. Best-effort so it cannot mask the real
+      // failure being rethrown; the caller's rmrf() chmods its way in regardless.
+      await chmod(d, srcMode).catch(() => {});
+      throw e;
+    }
+    await utimes(d, sStat.atime, sStat.mtime);
     await chmod(d, srcMode);
     return;
   }
@@ -534,14 +563,20 @@ async function moveNoClobber(s: string, d: string, entry: Dirent): Promise<void>
     await link(s, d);
   } catch (e) {
     const code = (e as NodeJS.ErrnoException)?.code;
-    // No hard links available (exFAT/FAT and some network/cloud mounts report EPERM/
-    // ENOTSUP; EXDEV if `dest` turns out to be a different filesystem from the sibling
-    // scratch dir, e.g. a mount point). Fall back to rename, which works there — and
-    // which reopens the replace-an-existing-`d` race for those filesystems only. Stated
-    // rather than hidden: closing it would need a copy-and-fsync path with its own
-    // per-kind handling, and this is the same allowlist of codes promoteSnapshot()
-    // already falls back on for the same reason.
-    if (!code || !['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDEV'].includes(code)) throw e;
+    // No hard links available AT ALL on this filesystem — exFAT/FAT and some network/
+    // cloud mounts (common backup media) report EPERM/ENOTSUP/EOPNOTSUPP/ENOSYS, the
+    // same allowlist promoteSnapshot() falls back on for the same reason. rename() works
+    // there, at the cost of reopening the replace-an-existing-`d` race on those
+    // filesystems only — stated rather than hidden.
+    //
+    // EXDEV is deliberately NOT in that list (multi-model review): if `dest` is on a
+    // different filesystem from the sibling scratch dir — --out-dir being a mount point
+    // is the way that happens — rename() fails EXDEV for exactly the same reason link()
+    // did, so falling back to it would only swap one error message for another. It
+    // propagates instead, which is precisely what the previous rename()-only code did
+    // there too. If this ever bites in practice, the fix is copyFile(…, COPYFILE_EXCL)
+    // + unlink, which keeps the exclusive-create guarantee across devices.
+    if (!code || !['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS'].includes(code)) throw e;
     await rename(s, d);
     return;
   }

@@ -228,6 +228,10 @@ cb restore --in "$TMP/mc-second.age" --out-dir "$OUT_MC" >/dev/null
 # widening anything, then widen so a failure below cannot also break this script's own
 # EXIT trap (removing entries under a 0500 directory needs write on it).
 MC_MODE=$(node -e 'process.stdout.write((require("node:fs").lstatSync(process.argv[1]).mode & 0o777).toString(8))' "$OUT_MC/newdir")
+# Same for the directory's mtime: the old whole-directory rename() carried the archive's
+# timestamps along with the inode, mkdir() does not. The fixtures record epoch-0 mtimes,
+# so an unrestored timestamp shows up as "now" — decades away, no tolerance needed.
+MC_MTIME=$(node -e 'process.stdout.write(String(Math.round(require("node:fs").lstatSync(process.argv[1]).mtimeMs)))' "$OUT_MC/newdir")
 chmod -R u+rwX "$OUT_MC"
 
 [ "$(cat "$OUT_MC/collide.txt")" = "ORIGINAL-MUST-SURVIVE" ] \
@@ -251,6 +255,10 @@ echo "[PASS] every entry kind still merges (new file, new nested tree, symlink) 
 [ "$MC_MODE" = "500" ] \
   || { echo "[FAIL] the merged directory landed at mode 0$MC_MODE, expected 0500 (the mode the archive recorded)"; exit 1; }
 echo "[PASS] the merged directory's recorded mode is applied to the destination, not left at the process umask"
+
+[ "$MC_MTIME" = "0" ] \
+  || { echo "[FAIL] the merged directory's mtime is $MC_MTIME ms, expected the archive's 0 (mkdir left it at 'now' instead of restoring it)"; exit 1; }
+echo "[PASS] the merged directory keeps the archive's mtime, as the old whole-directory rename() did"
 
 echo
 echo "RESTORE-SECURITY SELFTEST PASS"
