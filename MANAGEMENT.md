@@ -533,6 +533,50 @@ so a verification cron wires its own dead man's switch the same way that runner 
 bakes into the nightly runner — `verify` does not implement it itself, so the cron line
 pipes to a tool that does, or you wire your own healthcheck around it.)
 
+## MCP snapshot policy
+
+> **Upgrading an existing MCP setup?** This is a breaking change, and the only one in
+> its release. A server that worked before will now refuse **every** `snapshot_now` call
+> with `ERR_POLICY_DENIED` / `CB-E025` until you set both variables below and restart it.
+> Nothing else — the CLI, the nightly schedule, every other MCP tool — is affected.
+
+If you run `cypher-brain-mcp` (the stdio MCP server), `snapshot_now` is **fail-closed**
+until you configure two things in that server's own environment (issue #800). The CLI is
+unaffected — this is an MCP-only policy, because over MCP the caller is an AI agent this
+server's threat model treats as untrusted, and `snapshot_now` is the one tool where such a
+caller picks both the plaintext (`dirs`) and the key it is encrypted to (`recipients`).
+See README's "Threat model" for the full argument.
+
+```sh
+# 1. Which keys may ever decrypt. Required for EVERY snapshot_now call.
+#    `cypher-brain init` offers to write this for you; the wizard's suggestion is the
+#    recommended way to get it right, since it pins the keypair it just generated.
+export CYPHER_BRAIN_PIN_RECIPIENTS="$HOME/.cypher-brain/recipient.txt"
+
+# 2. Which directories may be snapshot SOURCES. A JSON array of absolute paths.
+#    Required for any call that names `dirs`; a pg-only call does not need it.
+export CYPHER_BRAIN_MCP_SOURCE_ROOTS='["/Users/me/.gbrain","/Users/me/notes"]'
+```
+
+Both are read once at server start, so change them and restart the server (the same as
+every other environment-backed setting here). Then:
+
+| Situation | Result |
+|---|---|
+| `CYPHER_BRAIN_PIN_RECIPIENTS` unset, unreadable, or resolving to no `age1…` keys | every `snapshot_now` call refused |
+| a call naming a recipient that is not on that allowlist | that call refused (the CLI enforces the same rule; the MCP server checks it again so an `idempotency_key` replay cannot bypass it) |
+| `CYPHER_BRAIN_MCP_SOURCE_ROOTS` unset, empty, or not a JSON array of absolute paths | every call naming `dirs` refused |
+| a `dirs` entry that resolves (after following symlinks) outside every root | that call refused — containment is exact-match-or-separator-bounded, so a `/roots/a` root does **not** cover `/roots/ab` |
+| a pinned call whose only source is `pg` | allowed with no roots configured |
+| a replay (`idempotency_key`) of a call the CURRENT policy would deny | refused — replays are not grandfathered |
+
+A refusal is `ERR_POLICY_DENIED` with `cb_code` `CB-E025` and names the variable to set.
+Nothing is created on the way out: no `out` file, no object in the store, no idempotency
+record. If you would rather not scope sources at all, the honest answer is that there is
+no opt-out for the pin — the pin is what stops a caller choosing who can decrypt — but a
+single broad root (e.g. the home directory the brain lives under) is a legitimate
+configuration if that is genuinely the boundary you mean.
+
 ## MCP idempotency keys
 
 The MCP `snapshot_now` tool takes an optional `idempotency_key` (issue #220, Stripe's
@@ -628,6 +672,7 @@ is still the full story either way. Over MCP,
 | CB-E022 | `snapshot --sign-identity <path>` was given a path that doesn't exist. | Point `--sign-identity` at an existing signing private key (`cypher-brain keygen` writes one to the default path), or drop the flag to use the default. |
 | CB-E023 | `restore`/`verify --sign-recipient <path>` was given a path that doesn't exist. | Point `--sign-recipient` at an existing signing public key, or drop the flag to use the default. |
 | CB-E024 | `schedule install --backend ton-provider`, or `push --backend ton-provider`, ran with `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND` unset (or `<= 0`) — the operator never configured a spend cap for this paid backend. `--yes`/`CYPHER_BRAIN_YES=1` (CB-E007's fix) does nothing here: this is a missing environment/config value, not a missing per-run consent. | Set `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND` (nanoTON) in the environment before installing the schedule or pushing to `ton-provider`. |
+| CB-E025 | The MCP server refused a `snapshot_now` call under its fail-closed snapshot policy (#800): either `CYPHER_BRAIN_PIN_RECIPIENTS` does not resolve to at least one `age1…` key, or the call named `dirs` and `CYPHER_BRAIN_MCP_SOURCE_ROOTS` is unset/empty/malformed or does not cover one of those directories. MCP only — the CLI `snapshot` has no such gate. A caller cannot fix this by retrying with different arguments: both inputs are operator environment settings. | Set both variables in the MCP server's own environment and restart it — see "MCP snapshot policy" above. The refusal message names which of the two was missing. |
 | CB-E027 | A paid push ended with the outcome **UNCERTAIN**: the payment may already have happened and nothing this process can read says whether it did. Either an `arweave` L1 POST that never answered (or was refused) whose follow-up probe of the signed tx id found nothing, or a `ton-provider` deploy whose broadcast failed *after* the signed message had already left this process and whose contract-address probe stayed inconclusive. Not finding it is **not** proof it is absent — a just-posted transaction is not immediately indexed. | Verify on-chain **before** retrying, using the identifier the message names (the Arweave tx id at `https://arweave.net/tx/<id>/status`, or the TON contract address on an explorer). If it landed, do not push again — record the locator/address. If it did not, retry with a **new** idempotency key: over MCP the old key is permanently blocked on purpose (see "MCP idempotency keys" below). |
 
 ## What's proven vs recommended

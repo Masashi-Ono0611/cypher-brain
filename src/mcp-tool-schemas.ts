@@ -95,14 +95,26 @@ export const SNAPSHOT_NOW_TOOL: Tool = {
     "say) double-spending on arweave/turbo. The key is scoped to THIS call's dirs/pg/recipients/" +
     'out/backend/scan_secrets: reusing it for a call that differs in any of those is refused ' +
     'rather than silently answered with the wrong result. Cached results expire after ' +
-    'CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS (default 24h) — a repeat past that is a fresh call.',
+    'CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS (default 24h) — a repeat past that is a fresh call. ' +
+    'POLICY (issue #800, enforced before any work and before an idempotency replay, so a stored ' +
+    'result cannot be replayed past it): this server refuses every snapshot_now call unless the ' +
+    'OPERATOR has set CYPHER_BRAIN_PIN_RECIPIENTS to at least one age1… key AND every recipient this ' +
+    'call names is on that allowlist, and refuses any call ' +
+    'that names dirs unless every entry resolves (after following symlinks) inside one of the ' +
+    'absolute roots in CYPHER_BRAIN_MCP_SOURCE_ROOTS (a JSON array). A call that snapshots only pg ' +
+    'needs no roots. Both are environment settings a CALLER cannot supply — a refusal comes back as ' +
+    'ERR_POLICY_DENIED / CB-E025 and must be taken to the operator, not retried with different ' +
+    'arguments.',
   inputSchema: {
     type: 'object',
     properties: {
       dirs: {
         type: 'array',
         items: { type: 'string' },
-        description: 'Directories to include (tar.gz each). At least one of dirs/pg is required.',
+        description:
+          'Directories to include (tar.gz each). At least one of dirs/pg is required. Each entry must ' +
+          'resolve inside one of the operator-configured CYPHER_BRAIN_MCP_SOURCE_ROOTS roots (#800); ' +
+          'anything else is refused with ERR_POLICY_DENIED before any snapshot work happens.',
       },
       pg: { type: 'string', description: 'Postgres connection string to pg_dump into the snapshot.' },
       recipients: {

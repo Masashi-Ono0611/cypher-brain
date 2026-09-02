@@ -76,6 +76,12 @@ async function main() {
       ...process.env,
       CYPHER_BRAIN_TON_WALLET: TON_WALLET_PATH,
       CYPHER_BRAIN_TON_PROVIDER_OWNER: '',
+      // #800: snapshot_now is fail-closed over MCP — it refuses unless the OPERATOR has
+      // pinned the recipients and declared which directories may be snapshot sources.
+      // This test's own recipient and its own scratch tree, so the policy passes and the
+      // partial-success classification under test is what the call actually exercises.
+      CYPHER_BRAIN_PIN_RECIPIENTS: process.env.MCP_PARTIAL_TEST_RECIPIENT,
+      CYPHER_BRAIN_MCP_SOURCE_ROOTS: JSON.stringify([TMP]),
       // Short retry window so the mocked provider's partial download (forced below)
       // reliably times out well inside this script's own 30s waitFor() budget.
       CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS: '1500',

@@ -73,6 +73,7 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_PULL_RETRY_MS',
   'CYPHER_BRAIN_NO_CONFIG_FILE', // set by the generated nightly runner so a scheduled run uses only baked values (#286)
   'CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS', // #220: snapshot_now MCP idempotency-key cache lifetime
+  'CYPHER_BRAIN_MCP_SOURCE_ROOTS', // #800: MCP-only — the JSON array of absolute roots snapshot_now's `dirs` must resolve under
 ] as const;
 
 export type EnvName = (typeof ENV_NAMES)[number];
@@ -366,6 +367,62 @@ export const AGE_ARMOR_HEADER = '-----BEGIN AGE ENCRYPTED FILE-----';
 // Kept as `string | undefined` so the two cases stay distinguishable at the call site,
 // which must fail closed on the explicit-empty-string case.
 export const PIN_RECIPIENTS: string | undefined = readEnv('CYPHER_BRAIN_PIN_RECIPIENTS');
+
+// #800: the roots an MCP `snapshot_now` call's `dirs` entries must resolve under — the
+// operator-side half of a fail-closed policy the MCP server enforces and the CLI does
+// not. The asymmetry is the same one every other MCP containment check in this codebase
+// rests on: a human at a shell already chooses what to encrypt, while over MCP the
+// caller is untrusted by this server's own contract (see README's Threat model), and
+// `dirs` is the one remaining input where that caller picks the PLAINTEXT while
+// CYPHER_BRAIN_PIN_RECIPIENTS pins the key.
+//
+// A JSON array of ABSOLUTE paths ("["/srv/brain","/home/me/notes"]") rather than a
+// PATH-style separated list: a directory name may legitimately contain ':' or ',', and
+// a separator-joined list has no way to say so. Anything else — not JSON, not an array,
+// an element that is not a non-empty absolute string — is a MISCONFIGURATION, and is
+// recorded here rather than thrown for the reason parseMaxSpendBigInt's own comment
+// gives below: this runs in a module body, before mcp.ts is serving. The consumer
+// (assertSnapshotPolicy in src/mcp.ts) turns it into a per-call refusal, so a malformed
+// value fails exactly the calls it governs — a `dirs` call — instead of taking the whole
+// server down, including the pinned pg-only calls that need no roots at all.
+//
+// Unset and `''` both mean "no roots configured" and yield an EMPTY list, not an error:
+// the outcome is identical either way (every `dirs` call is refused), so there is no
+// fail-open case here for the PIN_RECIPIENTS-style undefined/'' distinction to protect.
+function parseMcpSourceRoots(raw: string | undefined, name: string): { value: string[]; error: Error | null } {
+  if (raw === undefined || raw.trim() === '') return { value: [], error: null };
+  const bad = (why: string): { value: string[]; error: Error | null } => ({
+    value: [],
+    error: new Error(`${name} must be a JSON array of absolute paths (${why})`),
+  });
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return bad(`it is not valid JSON: ${errMsg(e)}`);
+  }
+  if (!Array.isArray(parsed)) return bad(`got ${typeof parsed === 'object' ? 'a JSON object' : typeof parsed}`);
+  const roots: string[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== 'string' || entry.trim() === '') return bad(`element ${JSON.stringify(entry)} is not a path`);
+    // Absolute here means "starts at the filesystem root". A relative root would be
+    // resolved against the SERVER's working directory — which the operator writing this
+    // variable does not choose and cannot predict — so accepting one would silently
+    // scope the policy to somewhere neither party meant.
+    if (!entry.startsWith('/')) return bad(`element ${JSON.stringify(entry)} is not absolute`);
+    roots.push(entry);
+  }
+  return { value: roots, error: null };
+}
+const MCP_SOURCE_ROOTS_LOAD = parseMcpSourceRoots(
+  readEnv('CYPHER_BRAIN_MCP_SOURCE_ROOTS'),
+  'CYPHER_BRAIN_MCP_SOURCE_ROOTS',
+);
+/** #800: absolute roots an MCP snapshot_now `dirs` entry must resolve under. Empty = no `dirs` call is allowed. */
+export const MCP_SOURCE_ROOTS: readonly string[] = MCP_SOURCE_ROOTS_LOAD.value;
+/** Why CYPHER_BRAIN_MCP_SOURCE_ROOTS was refused, if it was (#800) — mirrors CONFIG_FILE_ERROR above. */
+export const MCP_SOURCE_ROOTS_ERROR: Error | null = MCP_SOURCE_ROOTS_LOAD.error;
+
 // An age recipient: X25519 (age1 + bech32, bounded 50-63 so two unseparated keys
 // can't fuse) OR a post-quantum HYBRID recipient (#205: `keygen --pq`, ML-KEM-768 +
 // X25519 via typage's generateHybridIdentity()) — `age1pq1` + a MUCH longer bech32

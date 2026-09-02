@@ -86,6 +86,12 @@ const PARALLEL = [
   npmTest('selftest:arweave'), // ~138s
   npmTest('selftest:ton-provider'), // ~56s
   { name: 'mcp-smoke', cmd: 'node', args: ['scripts/mcp-smoke.mjs'] }, // ~34s
+  // #800. Parallel-safe on the same finding as mcp-smoke: it mkdtemp's its whole world
+  // under the per-test TMPDIR, and every MCP server it spawns gets that tree's own
+  // CYPHER_BRAIN_HOME/CYPHER_BRAIN_FILE_DIR. It binds no port, writes no LaunchAgent, and
+  // only READS dist/. Its cost is ~30 short-lived server processes, one per policy case,
+  // because the policy inputs are env vars a server reads once at start.
+  npmTest('selftest:mcp-snapshot-policy'), // ~33s
   npmTest('selftest'), // ~32s
   npmTest('selftest:schedule'),
   npmTest('selftest:ton-dns'),

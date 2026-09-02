@@ -39,6 +39,16 @@ stderr is load-bearing, not decoration. If you run cypher-brain on a human's beh
 - stdout is machine-readable data (a push prints ONLY the locator; `--json` prints one
   JSON document). Parse stdout; relay stderr's summary. The exit code is the sole
   authority on success.
+- Over MCP, `snapshot_now` is fail-closed by policy (#800) and refuses until the OPERATOR
+  has set two environment variables on the server: `CYPHER_BRAIN_PIN_RECIPIENTS` (which
+  `age1…` keys may decrypt — required for every call, and every recipient you name must be
+  on it) and `CYPHER_BRAIN_MCP_SOURCE_ROOTS`
+  (a JSON array of absolute paths every `dirs` entry must resolve inside — required for any
+  call naming `dirs`; a `pg`-only call does not need it). The refusal is `ERR_POLICY_DENIED`
+  with `cb_code` `CB-E025`, it is checked before any work happens, and it applies to an
+  `idempotency_key` replay too. **Do not retry it with different arguments** — neither input
+  comes from the call. Relay the message to your human; it names the variable to set. The
+  CLI `snapshot` has no such gate.
 
 ## Key concepts
 

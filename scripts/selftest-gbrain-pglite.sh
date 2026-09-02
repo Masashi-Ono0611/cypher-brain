@@ -683,7 +683,14 @@ MCP_OUT="$TMP/mcp-out.jsonl"
     grep -q '"id":2' "$MCP_OUT" 2>/dev/null && break
     sleep 0.5
   done
-} | CYPHER_BRAIN_HOME="$SNAP_CB_HOME" node "${BIN_DEV_ARGS[@]}" "$MCP_BIN" > "$MCP_OUT" 2> "$TMP/mcp-err.log" || true
+# CYPHER_BRAIN_PIN_RECIPIENTS / CYPHER_BRAIN_MCP_SOURCE_ROOTS (#800): snapshot_now is
+# fail-closed over MCP and refuses unless the operator has pinned the recipients and
+# declared the authorized source roots. Set to this test's OWN recipient and its own
+# fixture tree, so the PGLite warning-relay assertion below is what the call exercises.
+} | CYPHER_BRAIN_HOME="$SNAP_CB_HOME" \
+  CYPHER_BRAIN_PIN_RECIPIENTS="$SNAP_CB_HOME/recipient.txt" \
+  CYPHER_BRAIN_MCP_SOURCE_ROOTS="[\"$FIX_PGLITE\"]" \
+  node "${BIN_DEV_ARGS[@]}" "$MCP_BIN" > "$MCP_OUT" 2> "$TMP/mcp-err.log" || true
 grep -q '"id":2' "$MCP_OUT" || { echo "[FAIL] the MCP server never answered the snapshot_now call"; cat "$MCP_OUT"; tail -20 "$TMP/mcp-err.log"; exit 1; }
 if grep -q '"isError":true' "$MCP_OUT"; then echo "[FAIL] snapshot_now on a PGLite store returned an error — this must be a warning, not a refusal"; cat "$MCP_OUT"; exit 1; fi
 # Read the structured field, not the whole line: `log` echoes stderr verbatim, so a
