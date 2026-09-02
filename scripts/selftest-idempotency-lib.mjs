@@ -299,6 +299,132 @@ try {
     );
     await releaseNew();
   }
+
+  // ---------- #818: disposition/retention round-trip ----------
+  {
+    const logPath = join(tmp, 'disposition-log.jsonl');
+    await recordIdempotencyResult(logPath, 'snapshot_now', 'plain-key', 'fp-plain', { pushed: true }, 86400);
+    await recordIdempotencyResult(
+      logPath,
+      'snapshot_now',
+      'uncertain-key',
+      'fp-uncertain',
+      { code: 'ERR_PUSH_OUTCOME_UNCERTAIN', check_identifier: 'tx-abc' },
+      86400,
+      Date.now(),
+      { disposition: 'error', retention: 'permanent' },
+    );
+    const plain = await lookupIdempotencyResult(logPath, 'snapshot_now', 'plain-key', 86400);
+    check(
+      'a record written with no options reads back as success/ttl (the pre-#818 defaults)',
+      plain?.disposition === 'success' && plain?.retention === 'ttl',
+      JSON.stringify(plain),
+    );
+    const tombstone = await lookupIdempotencyResult(logPath, 'snapshot_now', 'uncertain-key', 86400);
+    check(
+      'an error/permanent record round-trips both fields AND its result payload',
+      tombstone?.disposition === 'error' &&
+        tombstone?.retention === 'permanent' &&
+        tombstone?.result?.check_identifier === 'tx-abc',
+      JSON.stringify(tombstone),
+    );
+  }
+
+  // ---------- #818: the TTL does not govern a permanent record, and compaction keeps it ----------
+  {
+    // The whole point of the tombstone: expiry must not be what unblocks a key whose
+    // payment was never settled. Both halves are asserted — the TTL check on LOOKUP, and
+    // the survival of the rewrite that recordIdempotencyResult performs for another key
+    // (which is where an expired record is actually dropped from the file).
+    const logPath = join(tmp, 'permanent-ttl-log.jsonl');
+    const longAgo = Date.now() - 90 * 24 * 3600 * 1000; // 90 days back, against a 1s TTL below
+    await recordIdempotencyResult(logPath, 'snapshot_now', 'ttl-key', 'fp-ttl', { pushed: true }, 86400, longAgo);
+    await recordIdempotencyResult(
+      logPath,
+      'snapshot_now',
+      'permanent-key',
+      'fp-perm',
+      { code: 'ERR_PUSH_OUTCOME_UNCERTAIN' },
+      86400,
+      longAgo,
+      { disposition: 'error', retention: 'permanent' },
+    );
+    const staleTtl = await lookupIdempotencyResult(logPath, 'snapshot_now', 'ttl-key', 1);
+    check(
+      'a 90-day-old ttl record is expired by a 1s TTL (the control)',
+      staleTtl === undefined,
+      JSON.stringify(staleTtl),
+    );
+    const stalePermanent = await lookupIdempotencyResult(logPath, 'snapshot_now', 'permanent-key', 1);
+    check(
+      'a 90-day-old PERMANENT record is still returned under the same 1s TTL',
+      stalePermanent?.disposition === 'error' && stalePermanent?.retention === 'permanent',
+      JSON.stringify(stalePermanent),
+    );
+    // A later write for an UNRELATED key rewrites the whole file — the moment an expired
+    // record is dropped. The permanent one must survive that compaction.
+    await recordIdempotencyResult(logPath, 'snapshot_now', 'other-key', 'fp-other', { pushed: true }, 1);
+    const afterCompaction = await lookupIdempotencyResult(logPath, 'snapshot_now', 'permanent-key', 1);
+    check(
+      'a PERMANENT record survives the compaction that drops the expired ttl record beside it',
+      afterCompaction?.retention === 'permanent',
+      await readFile(logPath, 'utf8'),
+    );
+    const droppedTtl = (await readFile(logPath, 'utf8')).includes('"ttl-key"');
+    check('the expired ttl record beside it WAS dropped by that same compaction (the control)', !droppedTtl);
+  }
+
+  // ---------- #818: a record written before these fields existed still reads ----------
+  {
+    // Backward compatibility on disk, exercised against a line written by hand in the
+    // EXACT pre-#818 shape (no disposition, no retention, no version field — the format
+    // never had one). Every deployed cypher-brain has such lines already.
+    const logPath = join(tmp, 'legacy-format-log.jsonl');
+    const legacy = JSON.stringify({
+      key: 'legacy-key',
+      tool: 'snapshot_now',
+      recordedAt: new Date().toISOString(),
+      fingerprint: 'fp-legacy',
+      result: { pushed: true, locator: 'legacy-locator' },
+    });
+    await writeFile(logPath, `${legacy}\n`, { flag: 'w' });
+    const hit = await lookupIdempotencyResult(logPath, 'snapshot_now', 'legacy-key', 86400);
+    check(
+      'a pre-#818 record (no disposition/retention on disk) still replays, as success/ttl',
+      hit?.fingerprint === 'fp-legacy' &&
+        hit?.result?.locator === 'legacy-locator' &&
+        hit?.disposition === 'success' &&
+        hit?.retention === 'ttl',
+      JSON.stringify(hit),
+    );
+
+    // ...and a line that DOES carry the fields but with a value outside the closed set is
+    // not silently reinterpreted: it fails the shape check, which makes the file read as
+    // corrupted and a lookup for another key fail closed (the same posture a truncated
+    // line already gets). Reading `disposition: "successs"` as a success is how an error
+    // tombstone would quietly come back as a clean replay.
+    const bogus = JSON.stringify({
+      key: 'bogus-key',
+      tool: 'snapshot_now',
+      recordedAt: new Date().toISOString(),
+      fingerprint: 'fp-bogus',
+      result: { pushed: true },
+      disposition: 'successs',
+    });
+    const bogusPath = join(tmp, 'bogus-disposition-log.jsonl');
+    await writeFile(bogusPath, `${bogus}\n`, { flag: 'w' });
+    let bogusThrew;
+    try {
+      await lookupIdempotencyResult(bogusPath, 'snapshot_now', 'some-other-key', 86400);
+    } catch (e) {
+      bogusThrew = e;
+    }
+    check(
+      'a record with an out-of-set disposition is treated as corrupt (fail-closed), not read as a success',
+      bogusThrew instanceof IdempotencyStoreError,
+      bogusThrew ? `${bogusThrew.constructor.name}: ${bogusThrew.message}` : 'lookup returned normally (BUG)',
+    );
+  }
 } finally {
   await rm(tmp, { recursive: true, force: true });
 }

@@ -493,6 +493,99 @@ try {
     ? pass('#802: the confirmed spend reached the receipt ledger despite the lost response')
     : fail(`the confirmed spend is missing from the receipt ledger: ${ambiguousLedger.slice(0, 300)}`);
 
+  // #818: the OTHER half of the same ambiguous POST — the probe runs and comes back
+  // EMPTY. That is not "nothing happened": a just-posted transaction is not immediately
+  // indexed, so an exhausted probe leaves the outcome genuinely unknown. It used to
+  // surface as a plain Error, which mcp.ts could not tell apart from an ordinary failure,
+  // so a retry carrying the same idempotency key signed and paid for a second transaction.
+  // Now it is a typed PushUncertainSpendError carrying the signed tx id, and the CLI
+  // annotates it [CB-E027].
+  //
+  // Same proxy technique as above with one addition: tx/<id>/status is answered 404 so
+  // probeArweaveTxAccepted() can never get its positive observation, while the POST itself
+  // is still forwarded to arlocal — so the transaction REALLY lands and the id named in
+  // the error can be checked against arlocal directly, which is what proves the error
+  // carries the EXACT tx id rather than merely a well-formed one.
+  log('#818: an ambiguous L1 POST whose probe finds nothing is UNCERTAIN, with the exact tx id');
+  const blindSrvFile = join(tmp, 'blind-probe-proxy.mjs');
+  await writeFile(
+    blindSrvFile,
+    "import {createServer,request} from 'node:http';\n" +
+      'const UP=Number(process.argv[2]);\n' +
+      'const s=createServer((q,res)=>{\n' +
+      "  const drop=q.method==='POST'&&/^\\/tx\\/?$/.test(q.url||'');\n" +
+      "  // The probe's own route, blinded: 404 is INCONCLUSIVE to the backend, never proof.\n" +
+      "  if(/^\\/tx\\/[A-Za-z0-9_-]{43}\\/status$/.test(q.url||'')){res.writeHead(404);res.end('Not Found');return;}\n" +
+      "  const up=request({host:'127.0.0.1',port:UP,path:q.url,method:q.method,headers:q.headers},(r)=>{\n" +
+      "    if(drop){r.resume();r.on('end',()=>res.socket&&res.socket.destroy());return;}\n" +
+      '    res.writeHead(r.statusCode||502,r.headers);r.pipe(res);\n' +
+      '  });\n' +
+      "  up.on('error',()=>res.socket&&res.socket.destroy());\n" +
+      '  q.pipe(up);\n' +
+      '});\n' +
+      "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
+  );
+  const blindSrv = spawn('node', [blindSrvFile, String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const blindPort = await new Promise((res, rej) => {
+    const to = setTimeout(() => rej(new Error('blind-probe proxy did not start')), 8000);
+    blindSrv.stdout.on('data', (d) => {
+      const m = String(d).match(/READY:(\d+)/);
+      if (m) {
+        clearTimeout(to);
+        res(m[1]);
+      }
+    });
+  });
+  const uncertainSnap = join(tmp, 'uncertain.age');
+  cb('snapshot', '--dir', src, '--out', uncertainSnap);
+  const uncertainLedgerPath = join(tmp, 'uncertain-ledger.jsonl');
+  const uncertain = spawnSync('node', [...DEV_ARGS, BIN, 'push', '--in', uncertainSnap, '--backend', 'arweave'], {
+    env: {
+      ...env,
+      CYPHER_BRAIN_AR_HOST: '127.0.0.1',
+      CYPHER_BRAIN_AR_PORT: blindPort,
+      CYPHER_BRAIN_AR_HTTP_TIMEOUT: '4000',
+      CYPHER_BRAIN_RECEIPT_LEDGER: uncertainLedgerPath,
+    },
+    encoding: 'utf8',
+    timeout: 120_000,
+  });
+  blindSrv.kill('SIGKILL');
+  const uncertainTx = (uncertain.stderr.match(/Check Arweave transaction ([A-Za-z0-9_-]{43})/) || [])[1];
+  uncertain.status !== 0 && /the outcome is UNCERTAIN/.test(uncertain.stderr) && TX_RE.test(uncertainTx ?? '')
+    ? pass('#818: an exhausted probe reports the outcome as UNCERTAIN and names the signed tx id')
+    : fail(
+        `the blind-probe POST was not reported as uncertain: status=${uncertain.status} stderr=${(uncertain.stderr || '').slice(0, 500)}`,
+      );
+  /\[CB-E027\]/.test(uncertain.stderr)
+    ? pass('#818: the uncertain-spend refusal carries the stable [CB-E027] code')
+    : fail(`the uncertain-spend error carried no CB-E027 code: ${(uncertain.stderr || '').slice(0, 500)}`);
+  // The id in the message is the REAL one: arlocal (asked directly, bypassing the proxy
+  // that 404s the probe) already holds that exact transaction.
+  // 127.0.0.1 explicitly, not "localhost": node's own fetch can resolve localhost to ::1
+  // and get ECONNREFUSED from a v4-bound arlocal (measured here).
+  let arlocalStatus = 0;
+  let arlocalStatusErr = '';
+  if (uncertainTx) {
+    try {
+      arlocalStatus = (await fetch(`http://127.0.0.1:${PORT}/tx/${uncertainTx}/status`)).status;
+    } catch (e) {
+      arlocalStatusErr = e?.message ?? String(e);
+    }
+  }
+  arlocalStatus === 200 || arlocalStatus === 202
+    ? pass('#818: the tx id in the error is the EXACT one arlocal accepted (checked past the blinded probe)')
+    : fail(
+        `arlocal does not know the tx id the error named (${uncertainTx}): status endpoint answered ` +
+          `${arlocalStatus}${arlocalStatusErr ? ` (${arlocalStatusErr})` : ''}`,
+      );
+  // Nothing is claimed to have been paid for, so no receipt is written — the ledger is an
+  // accounting record of CONFIRMED spends, and this outcome is by definition unconfirmed.
+  const uncertainLedger = existsSync(uncertainLedgerPath) ? await readFile(uncertainLedgerPath, 'utf8') : '';
+  uncertainTx && !uncertainLedger.includes(uncertainTx)
+    ? pass('#818: an unconfirmed spend writes no receipt-ledger entry (the control for the #802 case above)')
+    : fail(`an unconfirmed spend was written to the receipt ledger: ${uncertainLedger.slice(0, 300)}`);
+
   // negative control: an unknown (but well-formed) tx id returns no bytes
   const badId = 'A'.repeat(43);
   const r = spawnSync(

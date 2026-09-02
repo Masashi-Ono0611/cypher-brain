@@ -26,19 +26,52 @@ import { errMsg, readJsonlLog } from './util.js';
 // scan_secrets — see mcp.ts's snapshotNowFingerprint) — this module never inspects it,
 // only compares it for equality, so a future second idempotent tool can define its own
 // notion of "same call" without this file changing.
+//
+// #818: `disposition` and `retention` are BOTH optional on disk. A record written before
+// they existed has neither, and must keep replaying exactly as it did — so a missing
+// `disposition` reads as 'success' and a missing `retention` as 'ttl' (the only
+// behaviours that existed then). There is deliberately no schema-version field to bump:
+// the format has always been "a JSON object per line, unknown keys ignored", so a reader
+// that defaults absent keys IS the compatibility mechanism, and adding a version now
+// would make an old file — which every deployed cypher-brain has on disk — look like a
+// format this reader must refuse.
 interface StoredLine {
   key: string;
   tool: string;
   recordedAt: string;
   fingerprint: string;
   result: Record<string, unknown>;
+  disposition?: IdempotencyDisposition;
+  retention?: IdempotencyRetention;
 }
+
+/**
+ * Whether the recorded call ENDED in success or in an error (#810/#818). The replayer
+ * (mcp.ts) must report a replay the same way the first call was reported — an error
+ * outcome replayed through the success-shaped result builder is how a partial failure
+ * came back as `isError`-less success on retry.
+ */
+export type IdempotencyDisposition = 'success' | 'error';
+
+/**
+ * Whether the record expires with CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS ('ttl') or is kept
+ * forever ('permanent', #818). Permanent is for the one outcome an expiry would turn back
+ * into a double-spend: a payment that MAY have happened and that nothing in this process
+ * can settle. Letting such a record age out does not resolve the ambiguity, it only
+ * postpones the retry that pays twice — so a tombstone for it outlives the TTL, and
+ * compaction below keeps it no matter how old it is.
+ */
+export type IdempotencyRetention = 'ttl' | 'permanent';
 
 export interface IdempotencyLookupResult {
   /** The fingerprint the ORIGINAL call was recorded with — compared against the current call's own. */
   readonly fingerprint: string;
   /** The original call's structured result, replayed byte-for-byte on a cache hit — never re-derived. */
   readonly result: Record<string, unknown>;
+  /** 'success' unless the record says otherwise — see IdempotencyDisposition. */
+  readonly disposition: IdempotencyDisposition;
+  /** 'ttl' unless the record says otherwise — see IdempotencyRetention. */
+  readonly retention: IdempotencyRetention;
 }
 
 // Thrown instead of silently degrading to "no prior calls" whenever the log cannot be
@@ -89,7 +122,15 @@ async function readAllRecords(path: string): Promise<ReadResult> {
         typeof p.recordedAt === 'string' &&
         typeof p.fingerprint === 'string' &&
         p.result &&
-        typeof p.result === 'object'
+        typeof p.result === 'object' &&
+        // #818: ABSENT is valid (an older record — defaulted on read below); PRESENT but
+        // outside the closed set is not. A line saying disposition:"successs" is a line
+        // this reader cannot honestly interpret, and interpreting it wrongly would turn an
+        // error tombstone into a replayed success — so it fails the shape check, which
+        // makes readAllRecords report the file as corrupted and every lookup that finds no
+        // match fail closed, exactly as a truncated line already does.
+        (p.disposition === undefined || p.disposition === 'success' || p.disposition === 'error') &&
+        (p.retention === undefined || p.retention === 'ttl' || p.retention === 'permanent')
       ) {
         return p as StoredLine;
       }
@@ -110,6 +151,14 @@ const isFresh = (recordedAt: string, ttlSeconds: number, now: number): boolean =
   const t = Date.parse(recordedAt);
   return Number.isFinite(t) && now - t < ttlSeconds * 1000;
 };
+
+// #818: the single place the TTL is allowed to decide anything. A 'permanent' record is
+// live regardless of age and regardless of what CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS
+// says — both on lookup (so the key keeps replaying its tombstone) and on compaction (so
+// the rewrite below never drops it). Every other record keeps the exact TTL behaviour it
+// had, including one written before these fields existed (retention undefined -> 'ttl').
+const isLive = (r: StoredLine, ttlSeconds: number, now: number): boolean =>
+  r.retention === 'permanent' || isFresh(r.recordedAt, ttlSeconds, now);
 
 /**
  * Look up the still-fresh recorded result for (tool, key), if any. Returns undefined on a
@@ -144,8 +193,16 @@ export async function lookupIdempotencyResult(
   // one worth trusting.
   for (let i = records.length - 1; i >= 0; i--) {
     const r = records[i];
-    if (r.tool === tool && r.key === key && isFresh(r.recordedAt, ttlSeconds, now)) {
-      return { fingerprint: r.fingerprint, result: r.result };
+    if (r.tool === tool && r.key === key && isLive(r, ttlSeconds, now)) {
+      // #818: absent fields default here, in the ONE place every reader goes through, so
+      // a pre-#818 record on disk reads exactly as it always did (a fresh success, TTL-
+      // governed) rather than needing every caller to remember the default.
+      return {
+        fingerprint: r.fingerprint,
+        result: r.result,
+        disposition: r.disposition ?? 'success',
+        retention: r.retention ?? 'ttl',
+      };
     }
   }
   if (corrupted) {
@@ -233,6 +290,18 @@ export class IdempotencyClaimHeldError extends Error {
     super(message, options);
     this.name = 'IdempotencyClaimHeldError';
   }
+}
+
+/**
+ * The claim lock file for (tool, key). Exported (#818) so a caller that deliberately
+ * RETAINS a claim — mcp.ts, when a paid or uncertain call's result could not be recorded
+ * and releasing the key would let a retry spend again — can name the exact file an
+ * operator has to remove to unblock that key. Same path IdempotencyClaimHeldError's own
+ * message already prints; derived here rather than duplicated at the call site so the two
+ * can never disagree.
+ */
+export function idempotencyClaimLockPath(path: string, tool: string, key: string): string {
+  return claimLockPath(path, tool, key);
 }
 
 function claimLockPath(path: string, tool: string, key: string): string {
@@ -359,9 +428,16 @@ export async function claimIdempotencyKey(path: string, tool: string, key: strin
 }
 
 /**
- * Record a successful result for (tool, key), for a future lookupIdempotencyResult to
- * replay. Rewrites the whole file rather than merely appending, DROPPING every entry that
- * is either expired or for the SAME (tool, key) being written now — a superseded write,
+ * Record a result for (tool, key), for a future lookupIdempotencyResult to replay.
+ *
+ * `options.disposition` says how that replay must be REPORTED — 'error' for a call that
+ * ended in a failure the caller was told about (a partial success, an uncertain spend),
+ * so the replay can be returned as an error rather than as a plain success (#810).
+ * `options.retention` says how long it lives: 'permanent' opts the record out of the TTL
+ * entirely (#818). Both default to the pre-#818 behaviour ('success' / 'ttl').
+ *
+ * Rewrites the whole file rather than merely appending, DROPPING every entry that
+ * is either expired (and not permanent) or for the SAME (tool, key) being written now — a superseded write,
  * which only happens after a TTL expiry or the PushPartialSuccessError partial-success
  * path in mcp.ts, never after a bare cache hit (that returns before this is ever called)
  * — so the file stays bounded to roughly one line per still-live key instead of growing
@@ -381,11 +457,32 @@ export async function recordIdempotencyResult(
   result: Record<string, unknown>,
   ttlSeconds: number,
   now: number = Date.now(),
+  options: { disposition?: IdempotencyDisposition; retention?: IdempotencyRetention } = {},
 ): Promise<void> {
+  const disposition = options.disposition ?? 'success';
+  const retention = options.retention ?? 'ttl';
   await withLogLock(path, async () => {
     const { records: existing } = await readAllRecords(path);
-    const kept = existing.filter((r) => !(r.tool === tool && r.key === key) && isFresh(r.recordedAt, ttlSeconds, now));
-    const fresh: StoredLine = { key, tool, recordedAt: new Date(now).toISOString(), fingerprint, result };
+    // #818: OTHER keys' records now survive compaction whenever they are permanent, not
+    // merely fresh — an expiring log must not be the thing that unblocks a key whose
+    // payment was never settled.
+    //
+    // The SAME (tool, key) is still superseded, exactly as before (that is what the
+    // partial-success path needs). Superseding a PERMANENT record is unreachable rather
+    // than allowed: a later call under that key finds the tombstone on lookup — which
+    // isLive() keeps returning regardless of age — and replays it before any work, so no
+    // second record for that key is ever written. Enforcing it here as well would mean a
+    // throw on a path that cannot be taken, with no way to test the guard firing.
+    const kept = existing.filter((r) => !(r.tool === tool && r.key === key) && isLive(r, ttlSeconds, now));
+    const fresh: StoredLine = {
+      key,
+      tool,
+      recordedAt: new Date(now).toISOString(),
+      fingerprint,
+      result,
+      disposition,
+      retention,
+    };
     const lines = [...kept, fresh].map((r) => JSON.stringify(r));
     await mkdir(dirname(resolve(path)), { recursive: true });
     const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;

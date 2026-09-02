@@ -38,6 +38,7 @@ import { warn } from '../warn.js';
 import { WALLET_DEFAULT_PATH } from '../wallet.js';
 import { remainingSpendBudget, chargeSpendTracker, spentSoFar, budgetExhaustedMessage } from '../spend-tracker.js';
 import { PushUploadConfirmedResponseLostError } from '../push-partial-success.js';
+import { PushUncertainSpendError } from '../push-uncertain-spend.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 // The public gateways to try (in order) for the HTTP read, before the L1 chunk
@@ -745,12 +746,24 @@ export async function arweaveBackend(): Promise<StorageBackend> {
           });
           throw new PushUploadConfirmedResponseLostError(tx.id, cause);
         }
-        throw new Error(
-          `arweave: ${why} and the outcome is UNCERTAIN — the transaction was already signed as ${tx.id} for ` +
-            `${tx.reward} winston and may or may not have been accepted (a probe could not find it, which is not ` +
-            `proof it is absent). Check https://arweave.net/tx/${tx.id}/status (or any gateway) BEFORE retrying: ` +
-            'a retry signs and pays for a second transaction.',
-        );
+        // #818: a TYPED error, not a plain one. The prose said "UNCERTAIN" and named the
+        // tx id, but nothing above the backend could branch on it — mcp.ts saw an
+        // ordinary Error, recorded nothing under the idempotency key, and released the
+        // key, so an agent's retry with the same key spent again. PushUncertainSpendError
+        // carries the tx id as structured data (checkIdentifier) so that retry is refused
+        // instead of paid for; see its own doc comment for why it is deliberately NOT a
+        // PushPartialSuccessError (that class promises a CONFIRMED spend and a usable
+        // locator — neither is true here).
+        throw new PushUncertainSpendError({
+          backend: 'arweave',
+          checkKind: 'arweave_tx_id',
+          checkIdentifier: tx.id,
+          detail:
+            `${why} — the transaction was already signed as ${tx.id} for ${tx.reward} winston and may or may not ` +
+            'have been accepted (a probe could not find it, which is not proof it is absent)',
+          verifyHint: `https://arweave.net/tx/${tx.id}/status, or any gateway`,
+          cause,
+        });
       };
       let res: { status: number; data?: unknown };
       try {

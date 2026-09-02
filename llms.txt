@@ -30,6 +30,12 @@ stderr is load-bearing, not decoration. If you run cypher-brain on a human's beh
   these exist precisely to reach a person, and a log file they never read does not count.
 - The MCP tools return the same content structurally: results carry a `warnings` array
   when the call recorded any (alongside `log`). Surface those to your human too.
+- **Never blind-retry a push that reports `[CB-E027]` / `spend_outcome: "uncertain"`.**
+  It means the payment may already have happened and nothing could confirm it either way;
+  the result names a `check_identifier` (an Arweave tx id, or a TON contract address) to
+  verify on-chain first. Over MCP, `snapshot_now` records that outcome permanently against
+  the `idempotency_key`, so reusing that key replays the same error and spends nothing —
+  retrying it is not a way to make progress. Once you know what happened, use a NEW key.
 - stdout is machine-readable data (a push prints ONLY the locator; `--json` prints one
   JSON document). Parse stdout; relay stderr's summary. The exit code is the sole
   authority on success.

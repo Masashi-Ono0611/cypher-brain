@@ -253,6 +253,34 @@ const FIXTURES = [
       'ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND must be set to a positive nanoTON amount (a StorageV1 deploy spends real funds) — see `estimate --backend ton-provider` for a preview first',
     expect: 'CB-E024',
   },
+  // #818: both backends' uncertain-spend refusals must resolve to CB-E027 and to nothing
+  // else. Each message opens with backend prose that other entries also key on ("arweave:"
+  // ... a reward in winston; "ton-provider: ..." a nanoTON transfer), which is exactly the
+  // overlap shape the CB-E007/CB-E024 pairs above were added for — a message resolving to
+  // CB-E006/CB-E007 here would send the operator to a spend cap or a --yes flag when the
+  // only correct next action is an on-chain check.
+  {
+    label: 'CB-E027 positive: arweave ambiguous L1 POST whose probe found nothing',
+    message:
+      'arweave: the upload response never arrived (socket hang up) — the transaction was already signed as ' +
+      'jZ0Zt9d0hh6WcQ0m6Yy0FvJZ9uV1Hj1Yk8bN3pQ2xLc for 41328902 winston and may or may not have been accepted (a ' +
+      'probe could not find it, which is not proof it is absent) — the outcome is UNCERTAIN: the payment may ' +
+      'already have happened. Check Arweave transaction jZ0Zt9d0hh6WcQ0m6Yy0FvJZ9uV1Hj1Yk8bN3pQ2xLc ' +
+      '(https://arweave.net/tx/jZ0Zt9d0hh6WcQ0m6Yy0FvJZ9uV1Hj1Yk8bN3pQ2xLc/status, or any gateway) BEFORE ' +
+      're-running push or retrying with a new idempotency key: if the first attempt did land, a retry pays for a ' +
+      'second one.',
+    expect: 'CB-E027',
+  },
+  {
+    label: 'CB-E027 positive: ton-provider broadcast that could not be confirmed',
+    message:
+      'ton-provider: broadcasting the deploy failed (HTTP 500) — the transfer of 100000000 nanoTON to ' +
+      '0:9a1b may or may not have been accepted (a probe could not find the contract, which is not proof it is ' +
+      'absent) — the outcome is UNCERTAIN: the payment may already have happened. Check TON contract 0:9a1b (the ' +
+      "address's state on a TON explorer) BEFORE re-running push or retrying with a new idempotency key: if the " +
+      'first attempt did land, a retry pays for a second one.',
+    expect: 'CB-E027',
+  },
 ];
 
 for (const { label, message, expect } of FIXTURES) {
@@ -260,10 +288,10 @@ for (const { label, message, expect } of FIXTURES) {
   if (got !== expect) {
     fail(
       `${label}: expected ${expect}, got ${got ?? '(no match)'} for message ${JSON.stringify(message)} — ` +
-        `CB-E007/CB-E024 patterns are overlapping again`,
+        `the CB-E006/CB-E007/CB-E024/CB-E027 patterns are overlapping again`,
     );
   }
 }
-console.log(`[PASS] ${FIXTURES.length} CB-E007/CB-E024 fixtures resolve to the expected code (#781)`);
+console.log(`[PASS] ${FIXTURES.length} code-resolution fixtures resolve to the expected code (#781, #818)`);
 
 console.log('ERROR CODE PATTERNS: PASS');

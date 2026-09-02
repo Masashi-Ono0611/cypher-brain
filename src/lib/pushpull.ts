@@ -24,6 +24,7 @@ import {
   PushFundingConfirmedButIncompleteError,
   PushUploadConfirmedResponseLostError,
 } from './push-partial-success.js';
+import { PushUncertainSpendError } from './push-uncertain-spend.js';
 // Re-exported unchanged so existing `from './pushpull.js'` imports (mcp.ts, wizard.ts)
 // keep working — see push-partial-success.ts's own header comment for why these
 // classes live in a separate, import-cycle-free module in the first place.
@@ -34,6 +35,7 @@ export {
   PushFundingConfirmedButIncompleteError,
   PushUploadConfirmedResponseLostError,
 } from './push-partial-success.js';
+export { PushUncertainSpendError } from './push-uncertain-spend.js';
 
 // The plaintext content digest for the artifact being pushed: an explicit --digest
 // wins, else the "<in>.digest" sidecar snapshot writes next to its output. Returns
@@ -571,6 +573,17 @@ async function pushCore(
       if (e instanceof PushUploadConfirmedResponseLostError) {
         throw new PushUploadConfirmedResponseLostError(locator, e, e.locator);
       }
+      // #818: the SIDECAR's own paid step can end ambiguously too (its L1 POST lost its
+      // response and the follow-up probe found nothing; its ton-provider deploy broadcast
+      // left this process and could not be confirmed). Re-thrown UNCHANGED rather than
+      // re-wrapped: unlike the two branches above there is no confirmed spend and no
+      // sidecar locator to carry, so this error's own `checkIdentifier` — the id an
+      // operator settles the ambiguity with — is the whole payload, and wrapping it as
+      // PushSignatureUploadError would both discard it and report a possible spend as a
+      // plain "the sidecar failed to upload". The ciphertext's own locator is not lost by
+      // rethrowing: push() already printed it above ("pushed <in> -> <locator>"), which is
+      // what mcp.ts captures into the call's log.
+      if (e instanceof PushUncertainSpendError) throw e;
       // The ciphertext (above) already durably uploaded — see PushPartialSuccessError's
       // own doc comment for why this must never be reported the same way as an
       // ordinary push() failure (a caller assuming "nothing happened" here would be

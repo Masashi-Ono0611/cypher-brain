@@ -1023,6 +1023,17 @@ grep -q 'outcome is' "$TMP/issue664b.err" && grep -q 'UNCERTAIN' "$TMP/issue664b
   || { echo "[FAIL] an unconfirmable broadcast failure did not report the outcome as uncertain"; cat "$TMP/issue664b.err"; exit 1; }
 grep -q 'BEFORE re-running push' "$TMP/issue664b.err" || { echo "[FAIL] the uncertain-broadcast error does not tell the operator to check before retrying"; cat "$TMP/issue664b.err"; exit 1; }
 echo "[PASS] issue #664: an unconfirmable broadcast failure names the address and says the outcome is uncertain"
+# issue #818: that refusal is now a TYPED PushUncertainSpendError, not a plain Error --
+# which is what lets the MCP layer persist it against the idempotency key and refuse the
+# retry instead of broadcasting a second transfer. Two observable consequences of the type
+# are asserted here (the CLI's own display boundary is all this script can see): the stable
+# [CB-E027] code the shared message now matches, and the contract address carried as the
+# structured checkIdentifier -- printed as "Check TON contract <raw address>".
+grep -q '\[CB-E027\]' "$TMP/issue664b.err" \
+  || { echo "[FAIL] issue #818: the uncertain-broadcast refusal carries no [CB-E027] code (still a plain Error?)"; cat "$TMP/issue664b.err"; exit 1; }
+grep -q 'Check TON contract 0:' "$TMP/issue664b.err" \
+  || { echo "[FAIL] issue #818: the uncertain-broadcast refusal does not name the contract address to check"; cat "$TMP/issue664b.err"; exit 1; }
+echo "[PASS] issue #818: the unconfirmable broadcast is a typed uncertain-spend refusal ([CB-E027] + the address to check)"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
 echo "== issue #654: a notify failure AFTER funding is confirmed still persists the receipt (PushFundingConfirmedButIncompleteError) =="

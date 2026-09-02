@@ -1862,11 +1862,17 @@ async function run(tmp) {
       });
       const idem7 = await waitFor(22007);
       const idem7Sc = idem7.result?.structuredContent;
-      if (idem7.result?.isError || idem7Sc?.idempotent_replay !== true || idem7Sc?.pushed !== true)
+      // #810: the replay carries isError:true. It used to require `isError` to be ABSENT,
+      // which is the bug that issue reports — the first call surfaced this outcome as an
+      // error and the replay reported the identical state as a clean success with
+      // `pushed: true` at the top level, so a caller keying off isError (the normal MCP
+      // contract) read a locator-write failure as a fully successful push. The recorded
+      // FIELDS are unchanged; only the error shape of the reply is added.
+      if (idem7.result?.isError !== true || idem7Sc?.idempotent_replay !== true || idem7Sc?.pushed !== true)
         throw new Error(
           `a repeat call with the SAME idempotency_key after a partial-success failure should replay the recorded ` +
-            `partial success (idempotent_replay:true, pushed:true), not re-execute or refuse: ` +
-            `${JSON.stringify(idem7.result).slice(0, 500)}`,
+            `partial success as an ERROR (isError:true, idempotent_replay:true, pushed:true), not re-execute, ` +
+            `refuse, or report a clean success (#810): ${JSON.stringify(idem7.result).slice(0, 500)}`,
         );
       if (typeof idem7Sc?.locator !== 'string' || idem7Sc.locator.length === 0)
         throw new Error(`replayed partial-success result is missing its recorded locator: ${JSON.stringify(idem7Sc)}`);
