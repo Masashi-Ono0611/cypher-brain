@@ -74,6 +74,24 @@ const ACTIVE_SCAN_REPORT_DIRS = new Set<string>();
 // tmpRoot in flight in the same process (MCP server, or `schedule install`'s cron
 // running push then immediately pull).
 const ACTIVE_TON_TMP_DIRS = new Set<string>();
+// #734: the init wizard (src/lib/wizard.ts) creates secret key material (the primary
+// identity, an optional offline backup keypair, an optional signing keypair) BEFORE
+// its own long snapshot()/push() phase runs, and its normal rollback (an async
+// try/catch around that whole phase) only fires when a JS error propagates back into
+// it — which a raw OS signal never does: a signal handler runs OUTSIDE the suspended
+// async call stack entirely, and this module's own handler below re-raises the
+// signal directly (`process.kill`) rather than letting anything unwind, so a Ctrl-C
+// while snapshot()/push() is running (as opposed to while a clack prompt has stdin in
+// raw mode, where Ctrl-C is decoded as an ordinary keypress instead of an OS signal —
+// see wizard.ts's own header comment) leaves those freshly-generated keys behind with
+// no snapshot ever pushed. A single synchronous callback slot (not a Set, unlike the
+// dir-tracking fields above): unlike concurrent MCP fetch dirs, there is only ever
+// ONE init() wizard run active in a process at a time (it is a one-shot CLI command,
+// never exposed over MCP — see recoverykit.ts's own doc comment on why this whole
+// area of the tool stays CLI-only). Must be synchronous (no async/await) — same
+// constraint every other branch in the handler below already has, since the process
+// is mid-signal and cannot wait on I/O.
+let ACTIVE_INIT_ROLLBACK: (() => void) | null = null;
 let SIGNAL_GUARD_INSTALLED = false;
 
 // fs.rmSync({force: true}) only swallows ENOENT (already gone) — it does NOT retry past
@@ -199,6 +217,17 @@ export const addActiveTonTmpDir = (dir: string): void => {
 export const removeActiveTonTmpDir = (dir: string): void => {
   ACTIVE_TON_TMP_DIRS.delete(dir);
 };
+// #734: init() (wizard.ts) registers a synchronous rollback callback right after its
+// own primary keygen succeeds, and clears it (v=null) in its own `finally` block —
+// covering steps 2-7 of the wizard, i.e. exactly the window during which this run's
+// own keys exist on disk but nothing has been pushed yet. The callback itself decides
+// whether there is anything left to roll back (e.g. it must still see push() having
+// already succeeded and back off, the same "once pushed, never delete" rule the
+// wizard's own async catch block already applies) — this module only decides WHEN to
+// call it (on a fatal signal, before re-raising).
+export const setActiveInitRollback = (v: (() => void) | null): void => {
+  ACTIVE_INIT_ROLLBACK = v;
+};
 
 export function installStageSignalGuard(): void {
   if (SIGNAL_GUARD_INSTALLED) return;
@@ -303,6 +332,17 @@ export function installStageSignalGuard(): void {
       // so there is no still-writing process left to race with removing its directory.
       for (const dir of ACTIVE_TON_TMP_DIRS) forceRmSync(dir);
       ACTIVE_TON_TMP_DIRS.clear();
+      // #734: run the init wizard's own key rollback (if one is currently registered)
+      // BEFORE re-raising the signal below — this is the only chance it gets, since
+      // re-raising terminates the process without ever unwinding back into wizard.ts's
+      // own async try/catch. Best-effort, same posture as every branch above: a
+      // failure here must never prevent the signal from actually being re-raised.
+      if (ACTIVE_INIT_ROLLBACK) {
+        try {
+          ACTIVE_INIT_ROLLBACK();
+        } catch {}
+        ACTIVE_INIT_ROLLBACK = null;
+      }
       // adding a listener suppressed Node's default auto-terminate — remove only our
       // own handler (not any unrelated listener) and re-raise so the process exits
       // with the correct signal code instead of hanging.

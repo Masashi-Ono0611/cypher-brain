@@ -144,7 +144,13 @@ mkdir -p "$MMTMP/out"; touch "$MMTMP/out/.marker" # pre-existing --out-dir => me
 CYPHER_BRAIN_HOME="$PRIMARY" node "${BIN_DEV_ARGS[@]}" "$BIN" restore --in "$MMTMP/v.age" --out-dir "$MMTMP/out" >/dev/null 2>&1 &
 MMPID=$!
 MMLANDED=0
-for _ in $(seq 1 300); do
+# Wall-clock deadline, not an iteration count: each poll forks a `find`, so 300
+# iterations was only ~3 s on a fast laptop but exhausted itself on a loaded CI runner
+# BEFORE the decrypt+extract phase had produced its first --out-dir entry (macOS cells
+# failed with "never observed in a mid-merge state" while the window itself, measured
+# locally, is ~2.5 s wide). The process-exit check below still ends the loop early.
+MMDEADLINE=$((SECONDS + 120))
+while [ "$SECONDS" -lt "$MMDEADLINE" ]; do
   kill -0 "$MMPID" 2>/dev/null || break
   MMCOUNT=$(find "$MMTMP/out" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
   if [ "$MMCOUNT" -gt 1 ] && [ "$MMCOUNT" -lt "$((MMN + 1))" ]; then
@@ -155,7 +161,7 @@ for _ in $(seq 1 300); do
   sleep 0.01
 done
 if [ "$MMLANDED" != "1" ]; then
-  echo "[FAIL] restore never observed in a mid-merge state (test setup) — try a larger MMN"
+  echo "[FAIL] restore never observed in a mid-merge state within 120 s (test setup) — try a larger MMN"
   kill "$MMPID" 2>/dev/null || true
   exit 1
 fi
@@ -191,7 +197,8 @@ mkfifo "$FTMP/out/.cypher-brain-restore-INCOMPLETE"
 CYPHER_BRAIN_HOME="$PRIMARY" node "${BIN_DEV_ARGS[@]}" "$BIN" restore --in "$FTMP/v.age" --out-dir "$FTMP/out" >/dev/null 2>&1 &
 FPID=$!
 FLANDED=0
-for _ in $(seq 1 300); do
+FDEADLINE=$((SECONDS + 120)) # same wall-clock deadline as the #721 block above
+while [ "$SECONDS" -lt "$FDEADLINE" ]; do
   kill -0 "$FPID" 2>/dev/null || break
   FCOUNT=$(find "$FTMP/out" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
   if [ "$FCOUNT" -gt 1 ] && [ "$FCOUNT" -lt "$((FN + 1))" ]; then
@@ -202,7 +209,7 @@ for _ in $(seq 1 300); do
   sleep 0.01
 done
 if [ "$FLANDED" != "1" ]; then
-  echo "[FAIL] restore never observed in a mid-merge state (test setup) — try a larger FN"
+  echo "[FAIL] restore never observed in a mid-merge state within 120 s (test setup) — try a larger FN"
   kill -9 "$FPID" 2>/dev/null || true
   exit 1
 fi

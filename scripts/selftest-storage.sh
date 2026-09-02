@@ -438,6 +438,22 @@ if cb push --in "$TMP/s2.age" --backend file --skip-unchanged 2>/dev/null; then
 fi
 echo "[PASS] --skip-unchanged without --save-locator is rejected"
 
+echo "== issue #723: --digest without --save-locator is refused (it would otherwise be silently ignored) =="
+FAKE_DIGEST="abababababababababababababababababababababababababababababababab" # 64 hex chars, distinct from any real content digest above
+if cb push --in "$TMP/nosidecar.age" --backend file --digest "$FAKE_DIGEST" 2>"$TMP/digest-no-savelocator.err"; then
+  echo "[FAIL] push --digest ran without --save-locator"; exit 1
+fi
+grep -q -- '--digest <hex> only applies with --save-locator' "$TMP/digest-no-savelocator.err" \
+  || { echo "[FAIL] push --digest without --save-locator was not refused with the expected message"; cat "$TMP/digest-no-savelocator.err"; exit 1; }
+echo "[PASS] --digest without --save-locator is rejected (#723)"
+
+echo "== issue #723 control: --digest WITH --save-locator (but WITHOUT --skip-unchanged) is accepted and recorded =="
+DIGEST_LOC="$TMP/digest-locator.tsv"
+cb push --in "$TMP/nosidecar.age" --backend file --digest "$FAKE_DIGEST" --save-locator "$DIGEST_LOC" >/dev/null
+[ "$(cut -f4 "$DIGEST_LOC")" = "$FAKE_DIGEST" ] \
+  || { echo "[FAIL] --digest --save-locator (no --skip-unchanged) did not record the given digest as the 4th field"; cat "$DIGEST_LOC"; exit 1; }
+echo "[PASS] --digest --save-locator without --skip-unchanged is a real, working invocation — it seeds the recorded content_digest (#723)"
+
 echo "== issue #212: push refuses non-ciphertext with the CB-E008 error code =="
 printf 'plainly not age ciphertext\n' > "$TMP/plaintext.age"
 set +e

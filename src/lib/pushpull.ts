@@ -237,12 +237,42 @@ function assertRemoteRequiresRcloneBackend(o: CliOptions): void {
   );
 }
 
+// #723: --digest <hex> is read by contentDigestFor() above, which has exactly TWO call
+// sites — resolveSkipUnchanged()'s own comparison (already unreachable without
+// --save-locator, since that function throws its own "requires --save-locator" first)
+// and the "if (o.save_locator)" recording block later in this file, which writes
+// contentDigestFor()'s result into the save-locator file's content_digest field for a
+// LATER --skip-unchanged run to compare against. Both readers require --save-locator —
+// given without it, --digest parses fine and is then silently dropped (verified: `push
+// --digest <hex> --yes` with no --save-locator produces byte-identical stdout/output to
+// the same push without --digest). Same "flag accepted, never honored" bug class
+// assertRemoteRequiresRcloneBackend just above already refuses.
+//
+// Deliberately requires --save-locator, NOT --skip-unchanged (the flag issue #723 itself
+// names): `--digest <hex> --save-locator <file>` WITHOUT --skip-unchanged is a real,
+// working invocation — it seeds the save-locator file's content_digest for a future
+// --skip-unchanged run to compare against, on a push that has no previous locator to
+// compare against yet (e.g. the very first push of a foreign, non-cypher-brain-produced
+// artifact with no "<in>.digest" sidecar). Requiring --skip-unchanged too would refuse
+// that working case for no reason — verified by pushing with exactly this combination
+// and reading back the digest --save-locator recorded.
+function assertDigestRequiresSaveLocator(o: CliOptions): void {
+  if (!o.digest) return;
+  if (o.save_locator) return;
+  throw new Error(
+    `--digest <hex> only applies with --save-locator <file> (it becomes the content_digest THIS push records there, read back by a later --skip-unchanged run) — ` +
+      `no --save-locator was given, so --digest would otherwise be silently ignored. ` +
+      `Add --save-locator <file>, or drop --digest if you did not mean to seed a future --skip-unchanged comparison.`,
+  );
+}
+
 async function pushCore(
   o: CliOptions,
 ): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
   if (!o.in) throw new Error('--in <file.age> required');
   if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton> required'); // no silent default
   assertRemoteRequiresRcloneBackend(o); // #655 — see the function's own doc comment (supersedes #658's warn-only version, since a hard refusal here makes that warn path unreachable)
+  assertDigestRequiresSaveLocator(o); // #723 — see the function's own doc comment
   await requireFile(o.in); // #267: one shared check/wording across every command
   // storage must only ever see ciphertext — refuse to push a non-age artifact
   // (e.g. an accidental plaintext path), which would be the last gate before a

@@ -35,6 +35,7 @@ import {
 import { arUsdRate, usdApprox } from '../estimate.js';
 import { progressReporter } from '../progress.js';
 import { warn } from '../warn.js';
+import { WALLET_DEFAULT_PATH } from '../wallet.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 // The public gateways to try (in order) for the HTTP read, before the L1 chunk
@@ -536,11 +537,22 @@ export async function arweaveBackend(): Promise<StorageBackend> {
     _ar = ArweaveCtor.init({ host: AR_HOST, port: AR_PORT, protocol: AR_PROTOCOL });
     return _ar;
   };
-  const loadWallet = async (): Promise<unknown> => {
-    if (!AR_WALLET) throw new Error('arweave put needs CYPHER_BRAIN_AR_WALLET (path to a JWK key file)');
-    await warnIfLooseKeyPerms(AR_WALLET, 'arweave JWK wallet');
+  const loadWallet = async (): Promise<{ jwk: unknown; walletPath: string }> => {
+    // #735 (review-hardening, discovered while fixing the init wizard's own paid-
+    // backend wallet precheck): falls back to WALLET_DEFAULT_PATH exactly like
+    // wallet.ts's own addressFromWallet()/payerAddressFor() already do — matching
+    // `wallet create`'s own completion message (wallet.ts), which tells the operator
+    // push finds a default-path wallet.json with NO env var set at all. Before this,
+    // that claim was false for the actual upload path (only estimate/address/balance
+    // honored the fallback) — confirmed empirically: a bare `wallet create` (no
+    // --out) followed by `push --backend arweave` with CYPHER_BRAIN_AR_WALLET unset
+    // failed here with "needs CYPHER_BRAIN_AR_WALLET" even though a real wallet.json
+    // sat at the exact default path push's own cost-estimate step had just read.
+    const walletPath = AR_WALLET || WALLET_DEFAULT_PATH;
+    if (!walletPath) throw new Error('arweave put needs CYPHER_BRAIN_AR_WALLET (path to a JWK key file)');
+    await warnIfLooseKeyPerms(walletPath, 'arweave JWK wallet');
     try {
-      return JSON.parse(await readFile(AR_WALLET, 'utf8'));
+      return { jwk: JSON.parse(await readFile(walletPath, 'utf8')), walletPath };
     } catch (e) {
       // ENOENT specifically means "not created yet" — give the same friendly nudge
       // wallet.ts's addressFromWallet() already gives `wallet address`/`wallet balance`
@@ -548,9 +560,9 @@ export async function arweaveBackend(): Promise<StorageBackend> {
       // (EACCES, corrupt/non-JSON file, …) is a genuine problem the operator needs the
       // real error to debug, so that keeps the raw errMsg(e) detail untouched.
       if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') {
-        throw new Error(`arweave: no wallet at ${AR_WALLET} — run 'cypher-brain wallet create' first`);
+        throw new Error(`arweave: no wallet at ${walletPath} — run 'cypher-brain wallet create' first`);
       }
-      throw new Error(`arweave: cannot read JWK wallet at ${AR_WALLET}: ${errMsg(e)}`);
+      throw new Error(`arweave: cannot read JWK wallet at ${walletPath}: ${errMsg(e)}`);
     }
   };
   return {
@@ -566,11 +578,11 @@ export async function arweaveBackend(): Promise<StorageBackend> {
         );
       }
       const ar = await getAr(); // uploads genuinely need the SDK (createTransaction/sign/post)
-      const jwk = await loadWallet(); // only uploads need a wallet/signature
+      const { jwk, walletPath } = await loadWallet(); // only uploads need a wallet/signature
       const data = await readFile(file); // small ciphertext fits one tx (guarded above); large blobs go via --backend turbo
       // inform before signing — the --yes guard in push() already confirmed intent;
       // this surfaces the size so the operator knows what they're committing to.
-      process.stderr.write(`arweave: L1 upload — ${data.length} bytes, wallet ${AR_WALLET}\n`);
+      process.stderr.write(`arweave: L1 upload — ${data.length} bytes, wallet ${walletPath}\n`);
       // Cost estimate + cap BEFORE signing (mirrors turbo.ts): `ar.transactions.getPrice()`
       // is the SAME call ar.createTransaction() makes internally when `reward` is omitted
       // (see arweave-js common.js createTransaction), so pre-flighting it here is not an
