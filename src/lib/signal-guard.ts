@@ -13,7 +13,7 @@
 // itself does not have: that scratch dir outlives restoreImpl()'s own out-dir tracking
 // (component auto-expand still runs after restoreImpl() clears ACTIVE_RESTORE_OUT_DIR),
 // so it needs its OWN, longer-lived tracked variable rather than reusing that one.
-import { rmSync, readdirSync, chmodSync, writeFileSync, type Dirent } from 'node:fs';
+import { rmSync, readdirSync, chmodSync, writeFileSync, unlinkSync, rmdirSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { ACTIVE_CHILDREN } from './proc.js';
 
@@ -114,55 +114,135 @@ let SIGNAL_GUARD_INSTALLED = false;
 // mid-signal), so unlike util.ts's rmrf (the async, normal-exit equivalent of this same
 // idea) this chmods synchronously and swallows whatever is still left afterward — the
 // same best-effort posture every other branch in this handler already has.
-// Bounded retry (no await — this runs mid-signal): a tree that is being mutated by an
-// in-flight libuv threadpool op the moment the handler runs (restore's mergeNoClobber()
-// rename()s entries OUT of the scratch dir one at a time) can make a single recursive
-// rmSync fail transiently with ENOENT/ENOTEMPTY on Linux even with `force`, and the
-// tree then survives. Observed once on ubuntu-24 CI (#826); a few immediate re-attempts
-// cost nothing and the last one still swallows whatever is genuinely stuck.
-// Backoff between attempts (25/50/100 ms, ~175 ms total worst case) so an in-flight
-// threadpool rename has actually finished before the next try — immediate retries can
-// all lose the same race (multi-model review). Synchronous sleep via Atomics.wait: the
-// only way to pause without yielding to the event loop, which a signal handler must not.
-const FORCE_RM_ATTEMPTS = 4;
-const FORCE_RM_BACKOFF_MS = [25, 50, 100];
+//
+// #826: the removal itself is NOT fs.rmSync any more. On Linux (Node 22+'s C++ rmSync,
+// std::filesystem::remove_all) a directory whose entries are being renamed out by an
+// in-flight libuv op — exactly restore's mergeNoClobber() the moment a mid-merge signal
+// lands — was left with ~230 of 400 entries three times on ubuntu CI: remove_all's
+// directory iteration skips entries that move under it, the final rmdir fails ENOTEMPTY,
+// the error is swallowed, and the plaintext stays. Retrying rmSync did not help because
+// every pass hit the same iterator behaviour. Walking the tree in JS (readdir → unlink →
+// rmdir, re-read the directory until it is empty, bounded passes with a synchronous
+// backoff) never trusts a single directory listing, so a concurrently mutated directory
+// is simply re-listed. rmSync stays only as the fast first try.
+const FORCE_RM_PASSES = 8;
+const FORCE_RM_BACKOFF_MS = 20;
 const sleepSync = (ms: number): void => {
   try {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   } catch {}
 };
-function forceRmSync(dir: string): void {
-  for (let attempt = 0; attempt < FORCE_RM_ATTEMPTS; attempt++) {
+// One pass over `dir`: walk it iteratively (explicit stack, no recursion — depth is
+// attacker-influenced via the archive), unlink every non-directory, then rmdir the
+// directories deepest-first. Every entry is lstat'ed right before it is acted on, so a
+// symlink is unlinked and never descended into (a directory swapped for a symlink between
+// the listing and the lstat is caught; the lstat→readdir instant itself is the same
+// residual window fs.rmSync has). Never throws; a missing entry is the concurrent-rename
+// case this exists for, any other per-entry error is skipped so the pass still reaches
+// everything else and the caller re-runs it. Returns true once `dir` is verifiably gone.
+function rmTreeOnceSync(root: string): boolean {
+  const dirs: string[] = [];
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop() as string;
+    let st: ReturnType<typeof lstatSync>;
     try {
-      rmSync(dir, { recursive: true, force: true });
-      return;
+      st = lstatSync(dir);
+    } catch {
+      continue; // gone (or unreadable — the final existence check decides)
+    }
+    if (!st.isDirectory()) {
+      try {
+        unlinkSync(dir); // a symlink or file where a directory was listed: remove, never follow
+      } catch {}
+      continue;
+    }
+    dirs.push(dir);
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const p = join(dir, name);
+      let est: ReturnType<typeof lstatSync>;
+      try {
+        est = lstatSync(p);
+      } catch {
+        continue;
+      }
+      if (est.isDirectory()) stack.push(p);
+      else {
+        try {
+          unlinkSync(p);
+        } catch {}
+      }
+    }
+  }
+  for (let i = dirs.length - 1; i >= 0; i--) {
+    try {
+      rmdirSync(dirs[i] as string);
     } catch {}
-    // re-run the unlock on EVERY failed attempt: a traversal that itself tripped over
-    // an entry mid-rename leaves later mode-restricted entries un-chmodded otherwise
+  }
+  return goneSync(root);
+}
+// "Gone" means lstat says ENOENT — nothing else. EACCES/EIO/EMFILE all leave the path in
+// an unknown state and must NOT be reported as a successful removal (multi-model review).
+function goneSync(p: string): boolean {
+  try {
+    lstatSync(p);
+    return false;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+}
+function forceRmSync(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {}
+  if (goneSync(dir)) return;
+  for (let pass = 0; pass < FORCE_RM_PASSES; pass++) {
     try {
       unlockRecursiveSync(dir);
     } catch {}
-    if (attempt < FORCE_RM_ATTEMPTS - 1) sleepSync(FORCE_RM_BACKOFF_MS[attempt] ?? 100);
+    if (rmTreeOnceSync(dir)) return;
+    if (pass < FORCE_RM_PASSES - 1) sleepSync(FORCE_RM_BACKOFF_MS);
   }
 }
 
-function unlockRecursiveSync(dir: string): void {
-  let entries: Dirent[];
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return; // not a directory, or already gone — nothing to unlock
-  }
-  for (const e of entries) {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) unlockRecursiveSync(p);
+// Iterative + lstat-based like rmTreeOnceSync (multi-model review round 2): chmod only
+// what lstat says is a directory or regular file — chmodSync follows symlinks, so a link
+// planted inside the tree must never be chmod'ed through.
+function unlockRecursiveSync(root: string): void {
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop() as string;
+    let names: string[];
     try {
-      chmodSync(p, e.isDirectory() ? 0o700 : 0o600);
+      names = readdirSync(dir);
+    } catch {
+      continue; // not a directory, or already gone — nothing to unlock
+    }
+    try {
+      chmodSync(dir, 0o700);
     } catch {}
+    for (const name of names) {
+      const p = join(dir, name);
+      let st: ReturnType<typeof lstatSync>;
+      try {
+        st = lstatSync(p);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) stack.push(p);
+      else if (st.isFile()) {
+        try {
+          chmodSync(p, 0o600);
+        } catch {}
+      }
+    }
   }
-  try {
-    chmodSync(dir, 0o700);
-  } catch {}
 }
 
 // ESM live bindings are read-only from the importing side, so the module that owns a
