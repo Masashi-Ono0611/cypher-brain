@@ -187,47 +187,47 @@ not 'nonexist' on-chain — re-running deploy after an unconfirmed or lost
 result would otherwise resend the storage cost; use update-providers/status
 instead.
 
-  --bag-id <64hex>          required. The bag's TON Storage torrent hash
-                             (== StorageV1.TorrentHash). This is the same
-                             64-hex value as a cypher-brain "ton:v1:<hex>"
-                             locator's suffix.
-  --provider-pubkey <64hex> required. The provider's ProviderKey (Ed25519)
-                             public key — mytonprovider.org's registry
-                             'pubkey' field (NOT its 'address' field, and NOT
-                             the daemon's separate lower-level ADNLKey — see
-                             main.go field notes: this is the same value
-                             'notify'/'update-providers' below take, not a
-                             TON wallet address, despite ProviderV1.Address's
-                             Go type name).
-  --owner <raw-addr>        required. Raw TON address ("0:<64hex>" or
-                             "-1:<64hex>") that will own the contract
-                             (StorageV1.OwnerAddr) — normally your own wallet.
+  --bag-id <64hex>              required. The bag's TON Storage torrent hash
+                                 (== StorageV1.TorrentHash). This is the same
+                                 64-hex value as a cypher-brain "ton:v1:<hex>"
+                                 locator's suffix.
+  --provider-pubkey <64hex>     required. The provider's ProviderKey (Ed25519)
+                                 public key — mytonprovider.org's registry
+                                 'pubkey' field (NOT its 'address' field, and NOT
+                                 the daemon's separate lower-level ADNLKey — see
+                                 main.go field notes: this is the same value
+                                 'notify'/'update-providers' below take, not a
+                                 TON wallet address, despite ProviderV1.Address's
+                                 Go type name).
+  --owner <raw-addr>            required. Raw TON address ("0:<64hex>" or
+                                 "-1:<64hex>") that will own the contract
+                                 (StorageV1.OwnerAddr) — normally your own wallet.
   --rate-nano-per-mb-day <int>  required. nanoTON/MB/day the provider charges.
-                             NOTE: mytonprovider.org's registry 'price' field
-                             is NOT this value directly — see main.go field
-                             notes for the conversion.
-  --span-days <int>         required. Proof span, in days (converted to
-                             seconds for StorageV1.MaxSpan — must fit uint32).
-  --size-bytes <n>          bag size in bytes (StorageV1.DataSize). Must be
-                             given together with --piece-size and
-                             --merkle-hash, or not at all.
-  --piece-size <n>          bag piece/chunk size in bytes (StorageV1.PieceSize).
-                             Must be given together with --size-bytes and
-                             --merkle-hash, or not at all.
-  --merkle-hash <64hex>     the torrent's merkle root hash
-                             (StorageV1.MerkleHash) — NOT the same value as
-                             --bag-id (see main.go field notes: TorrentHash is
-                             the TorrentInfo cell's own hash; MerkleHash is a
-                             field inside that cell). Must be given together
-                             with --size-bytes and --piece-size, or not at all.
-  --mainnet                 opt in to mainnet (REAL FUNDS). Default: testnet.
-  --max-spend-ton <float>   refuse (exit 2) if the suggested CONTRACT-DEPLOY
-                             TRANSFER amount would exceed this. Default 0.5.
-                             Compared as nanoTON (big.Int), never as a float.
-                             Does NOT include wallet/network gas fees, which
-                             your wallet app adds on top when you sign — the
-                             actual amount your wallet debits will be
-                             somewhat higher than this cap.
+                                 NOTE: mytonprovider.org's registry 'price' field
+                                 is NOT this value directly — see main.go field
+                                 notes for the conversion.
+  --span-days <int>             required. Proof span, in days (converted to
+                                 seconds for StorageV1.MaxSpan — must fit uint32).
+  --size-bytes <n>              bag size in bytes (StorageV1.DataSize). Must be
+                                 given together with --piece-size and
+                                 --merkle-hash, or not at all.
+  --piece-size <n>              bag piece/chunk size in bytes (StorageV1.PieceSize).
+                                 Must be given together with --size-bytes and
+                                 --merkle-hash, or not at all.
+  --merkle-hash <64hex>         the torrent's merkle root hash
+                                 (StorageV1.MerkleHash) — NOT the same value as
+                                 --bag-id (see main.go field notes: TorrentHash is
+                                 the TorrentInfo cell's own hash; MerkleHash is a
+                                 field inside that cell). Must be given together
+                                 with --size-bytes and --piece-size, or not at all.
+  --mainnet                     opt in to mainnet (REAL FUNDS). Default: testnet.
+  --max-spend-ton <float>       refuse (exit 2) if the suggested CONTRACT-DEPLOY
+                                 TRANSFER amount would exceed this. Default 0.5.
+                                 Compared as nanoTON (big.Int), never as a float.
+                                 Does NOT include wallet/network gas fees, which
+                                 your wallet app adds on top when you sign — the
+                                 actual amount your wallet debits will be
+                                 somewhat higher than this cap.
 
   When --size-bytes/--piece-size/--merkle-hash are NOT all three given, this
   program resolves them by asking cypher-brain's own seeder (the same
@@ -356,7 +356,7 @@ retry.
   --rate-nano-per-mb-day <int>  required. See 'deploy' — same conversion note
                                  applies for mytonprovider.org's 'price' field.
   --span-days <int>             required. See 'deploy'.
-  --gas-ton <float>              TON attached for message-processing gas only
+  --gas-ton <float>             TON attached for message-processing gas only
                                  — NOT a re-funding of the storage budget (the
                                  contract keeps its existing balance). Default
                                  0.05.
@@ -384,7 +384,7 @@ paid for it the moment this lands.
   Also REFUSES (exit 2) unless --contract's on-chain status is 'active' —
   withdraw is only meaningful against a deployed, running contract.
 
-  --contract <raw-addr>         required. The EXISTING contract's address.
+  --contract <raw-addr>          required. The EXISTING contract's address.
   --bag-id <64hex>               required. Must match this contract's deploy.
   --merkle-hash <64hex>          required. Must match this contract's deploy.
   --size-bytes <n>               required. Must match this contract's deploy.
@@ -401,9 +401,9 @@ paid for it the moment this lands.
                                  — the contract's existing balance is what
                                  gets returned, this is separate spend on top.
                                  Default 0.05.
-  --max-spend-ton <float>       refuse (exit 2) if --gas-ton would exceed
+  --max-spend-ton <float>        refuse (exit 2) if --gas-ton would exceed
                                  this. Default 0.1.
-  --mainnet                     opt in to mainnet (REAL FUNDS). Default: testnet.
+  --mainnet                      opt in to mainnet (REAL FUNDS). Default: testnet.
 `
 
 // helpText is the full global help — helpIntro plus every subcommand's own
@@ -441,12 +441,20 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		// exit 2 means "treated as an error" — print the help to stderr, not
-		// stdout, so a caller that only reads stdout (e.g. `cmd 2>/dev/null`
-		// to check for real output) doesn't see a success-shaped dump on an
-		// error-shaped exit code.
+		// #750: exit 2 is reserved for guardError (a deliberate, semantic
+		// on-chain-safety refusal — see guardError below and every
+		// subcommand's own --help section, which only ever documents "exit
+		// 2" for that kind of refusal). No-args is a usage mistake, the same
+		// category as an unknown subcommand below or a missing required flag
+		// (checkRequiredFlags' plain error, already exit 1 via the generic
+		// branch at the bottom of this function) — so it exits 1, not 2,
+		// letting a caller branch on exit code alone between "you invoked
+		// this wrong" and "a real refusal happened". Still prints the help
+		// to stderr, not stdout, so a caller that only reads stdout (e.g.
+		// `cmd 2>/dev/null` to check for real output) doesn't see a
+		// success-shaped dump on an error-shaped exit code.
 		fmt.Fprint(stderr, helpText)
-		return 2
+		return 1
 	}
 	sub, rest := args[0], args[1:]
 	if sub == "--help" || sub == "-h" {
@@ -471,9 +479,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "withdraw":
 		err = runWithdraw(ctx, rest, stdout)
 	default:
+		// #750: same usage-mistake category as no-args above — exit 1, not
+		// 2 (reserved for guardError refusals only).
 		fmt.Fprintf(stderr, "storage-v1-client: unknown subcommand %q\n\n", sub)
 		fmt.Fprint(stderr, helpText)
-		return 2
+		return 1
 	}
 
 	if err != nil {
