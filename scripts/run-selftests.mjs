@@ -117,6 +117,13 @@ const PARALLEL = [
   npmTest('selftest:pq'),
   npmTest('selftest:keygen-force'),
   npmTest('selftest:restore-security'),
+  // ~7s measured in the pool. Parallel-safe under this list's own bar (a positive
+  // finding, not the absence of a reason to suspect it): everything it creates lives
+  // under one mkdtemp beneath the per-test TMPDIR — its CYPHER_BRAIN_HOME, its fixtures,
+  // and the stub `tar` it puts on PATH. That PATH override is scoped to the env of the
+  // `restore` children it spawns itself and is never exported, so no other test can pick
+  // it up; it binds no port and writes nothing outside that tree.
+  npmTest('selftest:restore-toctou'),
   npmTest('selftest:config-file'),
   npmTest('selftest:wallet-balance'),
   npmTest('selftest:audit'),

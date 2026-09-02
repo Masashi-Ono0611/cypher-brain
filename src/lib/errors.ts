@@ -372,6 +372,19 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     origin: 'ours',
     source: 'src/mcp.ts (snapshotPolicyDenied, "… — refusing to snapshot over MCP (#800). …")',
   },
+  // #785: restore/verify open --in once and drive every phase off that descriptor, so a
+  // rename onto that path mid-run is invisible. This code is the OTHER half — a writer
+  // who rewrote the SAME inode in place between two of those phases. On restore nothing
+  // was promoted (--out-dir untouched, no database touched, the freshly-decrypted scratch
+  // tree removed); on verify no verdict was printed. Either way the artifact on disk is
+  // simply not the one the checks looked at.
+  {
+    code: 'CB-E026',
+    title: 'the artifact was rewritten in place while restore/verify was reading it',
+    pattern: /changed while it was being read/,
+    origin: 'ours',
+    source: 'src/lib/restore.ts (artifactChangedError, "… changed while it was being read: …", #785)',
+  },
   // #818: the one outcome where "retry the same call" is the WRONG next action and
   // "assume nothing happened" is worse still — the paid step may already have completed
   // and nothing this process can read will say. The code exists so an operator (or an

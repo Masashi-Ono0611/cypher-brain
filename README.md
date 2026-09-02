@@ -114,6 +114,29 @@ extracting a single byte, into an isolated scratch directory only promoted into
 equivalent guard for manifest.json's `name`/`source` fields, not a fix for a known
 exploited vulnerability.
 
+Every one of those checks now refers to **the bytes that actually get restored**.
+`restore` and `verify` open `--in` **once** and drive every phase — the `--sha256`
+pin, the `*.minisig` verification, the size cap, the tar-entry inspection and the
+extraction itself — off that single open file descriptor, instead of re-opening the
+path per phase. A writer who can replace that path for a few seconds (a
+group-writable or synced directory, a network mount, a world-writable `/tmp`, or the
+gap between an unattended `pull` and the `restore` that reads its output back) used to
+be able to pass verification with a genuine, correctly-signed artifact and have a
+different one extracted — and because age is public-key encryption, producing that
+replacement needs no secret of yours at all. Renaming another file onto `--in` is now
+invisible to the run: the descriptor keeps pointing at what was checked. Rewriting the
+**same** file in place is caught instead by a digest comparison — *every* pass that read
+the file, not merely the last one, has to end up with the same sha256, so showing genuine
+bytes to the signature check and attacker bytes to the extraction fails just as loudly as
+the other way round. When they disagree, `restore` refuses with **`CB-E026`**, leaving
+`--out-dir` untouched, no PostgreSQL work done, and its scratch tree removed; `verify`
+refuses rather than print a verdict that would describe two different files, and
+`verify --level drill` hands its own descriptor to the restore it performs instead of
+reopening the path. This is always on; there is no flag. What it does **not** establish is
+provenance: an artifact that was already attacker-chosen when the process opened it is
+bound just as faithfully as a genuine one, which is exactly what `--sha256` and
+`--require-signature` are for.
+
 Permanence adds a fourth caveat: **harvest now, decrypt later.** Ciphertext parked
 on a permanent public network can never be recalled — anyone can copy it today and
 wait for the cryptography to fail. age's plain X25519 recipient scheme is **not

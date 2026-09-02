@@ -65,6 +65,7 @@
     "selftest:recovery": "bash scripts/selftest-recovery.sh",
     "selftest:recovery-kit": "bash scripts/selftest-recovery-kit.sh",
     "selftest:restore-security": "bash scripts/selftest-restore-security.sh",
+    "selftest:restore-toctou": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-restore-toctou.mjs",
     "selftest:pq": "bash scripts/selftest-pq.sh",
     "selftest:minisign": "bash scripts/selftest-minisign.sh",
     "selftest:push-partial-failure": "bash scripts/selftest-push-partial-failure.sh",

@@ -10,7 +10,7 @@
 // a whole-pipeline timeout, SIGTERM→SIGKILL escalation for the tar child, and
 // reject-only-after-the-child-is-dead so a caller's cleanup (rm of .part / stage /
 // out-dir) can never race a still-running process that would recreate the files.
-import { createReadStream, createWriteStream } from 'node:fs';
+import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { spawn, type ChildProcess, type StdioNull, type StdioPipe } from 'node:child_process';
 import { Readable } from 'node:stream';
@@ -23,6 +23,7 @@ import {
   identityToRecipient,
   armor,
 } from 'age-encryption';
+import type { PinnedReadable } from './artifact.js';
 import { AGE_MAGIC, AGE_ARMOR_HEADER, readEnv } from './config.js';
 import { ACTIVE_CHILDREN } from './proc.js';
 import { installEpipeGuard } from './ui.js';
@@ -471,7 +472,31 @@ export function encryptToFile(
   });
 }
 
-// inPath → typage decrypt (WebStream) → child (tar) stdin, all streaming. A wrong
+/**
+ * How a decrypt gets at its ciphertext (#785). A FACTORY, not a path and not a single
+ * stream: the caller decides where the bytes come from, and every call gets its own
+ * fresh stream so a retried or concurrent phase never inherits a half-consumed one.
+ * restore/verify hand over `() => artifact.createReadStream()` from the ONE descriptor
+ * they opened `--in` on, which is what stops a phase from silently reading a different
+ * file than the phase before it did.
+ */
+export type CiphertextSource = () => PinnedReadable;
+
+export interface DecryptToChildResult {
+  /** The consumer's captured stdout TEXT — present only when `consStdout: 'pipe'`. */
+  stdout?: string;
+  /**
+   * sha256 (lowercase hex) of every ciphertext byte this call actually streamed — NOT a
+   * second read, and not a second hash either: the pinned stream keeps a running digest
+   * as it delivers, and this is that value, read once the pipeline has finished with it.
+   * restore.ts compares it against the baseline hash taken before verification, which is
+   * what turns "these bytes were checked" into "these bytes were the ones extracted"
+   * (#785, CB-E026). `undefined` only if the source is not a pinned stream.
+   */
+  ciphertextSha256: string | undefined;
+}
+
+// source() → typage decrypt (WebStream) → child (tar) stdin, all streaming. A wrong
 // key / foreign ciphertext throws at the header, BEFORE the consumer sees a byte; a
 // truncated or corrupt payload errors mid-stream and the whole call rejects even if
 // tar exited 0 on the resulting EOF — a partial extraction must never look like
@@ -479,18 +504,23 @@ export function encryptToFile(
 //
 // Resolves with the consumer's captured stdout TEXT when `consStdout: 'pipe'` — added
 // for restore.ts's pre-extraction inspection phase (#218), which needs `tar -tf`/
-// `tar -tv`'s entry listing back as a string, not merely a "did it succeed" signal.
-// Every existing caller passes 'inherit' (the default) or 'ignore' and simply never
-// reads the resolved value, so this stays source-compatible with them.
+// `tar -tv`'s entry listing back as a string, not merely a "did it succeed" signal —
+// alongside the digest of the ciphertext it just streamed (#785).
 export function decryptToChild(
   decrypter: Decrypter,
-  inPath: string,
+  source: CiphertextSource,
   consCmd: string,
   consArgs: string[],
   { consStdout = 'inherit', timeoutMs }: PipelineOpts & { consStdout?: StdioNull | StdioPipe } = {},
-): Promise<string | undefined> {
+): Promise<DecryptToChildResult> {
   const cons = spawn(consCmd, consArgs, { stdio: ['pipe', consStdout, 'pipe'] });
-  const src = createReadStream(inPath);
+  // The source hashes as it delivers (src/lib/artifact.ts), so `src.digest` below
+  // describes exactly the bytes this decrypt consumed — the claim #785 needs — without
+  // this function making a pass of its own. It used to tap the stream through a
+  // Transform here; that hashed every byte twice and roughly doubled restore's wall
+  // clock on a 1.2 GiB artifact, since the two inspection passes and the extraction all
+  // stream the whole file.
+  const src = source();
   let cOut = '';
   // Only accumulated when the caller actually asked for it ('pipe') — every other
   // mode ('inherit'/'ignore') never attaches a 'data' listener, so cons.stdout (which
@@ -507,19 +537,30 @@ export function decryptToChild(
     pipelineErrorLabel: 'age decrypt',
     onFailCleanup: () => src.destroy(),
     runStreamPipeline: async () => {
-      const pt = await decrypter.decrypt(Readable.toWeb(src) as ReadableStream<Uint8Array>);
-      if (!cons.stdin) throw new Error(`${consCmd}: no stdin stream`);
-      await pipeline(Readable.fromWeb(pt as never), cons.stdin);
+      try {
+        const pt = await decrypter.decrypt(Readable.toWeb(src) as ReadableStream<Uint8Array>);
+        if (!cons.stdin) throw new Error(`${consCmd}: no stdin stream`);
+        await pipeline(Readable.fromWeb(pt as never), cons.stdin);
+      } catch (e) {
+        src.destroy(); // the decrypter may have abandoned its reader without cancelling it
+        throw e;
+      }
     },
-    resolveValue: () => (consStdout === 'pipe' ? cOut : undefined),
+    // Reached only once the plaintext pipeline above resolved, which age cannot do
+    // before the ciphertext source hits EOF (typage rejects trailing bytes outright) —
+    // so the source's running digest is complete and `digest` is set by then.
+    resolveValue: () => ({
+      ...(consStdout === 'pipe' ? { stdout: cOut } : {}),
+      ciphertextSha256: src.digest,
+    }),
   });
 }
 
 // verify's negative control: a freshly generated (wrong) key must NOT open the
 // artifact. The header check needs no payload read, so this is fast on any size.
-export async function wrongKeyRejects(path: string): Promise<boolean> {
+export async function wrongKeyRejects(source: CiphertextSource): Promise<boolean> {
   const d = newDecrypter([await generateIdentity()]);
-  const src = createReadStream(path);
+  const src = source();
   try {
     const pt = await d.decrypt(Readable.toWeb(src) as ReadableStream<Uint8Array>);
     await pt.cancel(); // should be unreachable — but never read a payload we didn't ask for
