@@ -125,9 +125,26 @@ let jsonWritten = false;
 /** True once printJson() has written a command's own JSON document to stdout. */
 export const hasWrittenJson = (): boolean => jsonWritten;
 
+// #737: installEpipeGuard() above only ever listens on process.stderr — right for
+// printMascot/warn.ts/wisdom.ts (all stderr-only decoration), but printJson() is the
+// one writer in this file that puts its output on STDOUT instead. A downstream
+// consumer of `--json` output that closes its end early (e.g. `cypher-brain ledger
+// --json | head -c1`) surfaces the exact same async EPIPE 'error' event this file
+// already guards against, just on process.stdout — its own installed-flag/listener
+// pair, since it is a different stream than installEpipeGuard()'s.
+let stdoutEpipeGuardInstalled = false;
+function installStdoutEpipeGuard(): void {
+  if (stdoutEpipeGuardInstalled) return;
+  stdoutEpipeGuardInstalled = true;
+  process.stdout.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code !== 'EPIPE') throw e;
+  });
+}
+
 /** Print one JSON document to stdout — the single writer, see the note above. */
 export function printJson(value: unknown): void {
   jsonWritten = true;
   installEpipeGuard();
+  installStdoutEpipeGuard();
   console.log(JSON.stringify(value));
 }

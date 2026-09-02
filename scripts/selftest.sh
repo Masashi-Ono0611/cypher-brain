@@ -1115,14 +1115,15 @@ CYPHER_BRAIN_HOME="$FORCE_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen >/dev/nu
 ORIG_IDENTITY_SHA="$(shasum -a 256 "$FORCE_HOME/identity.age" | cut -d' ' -f1)"
 ORIG_RECIPIENT="$(cat "$FORCE_HOME/recipient.txt")"
 # --passphrase with no CYPHER_BRAIN_PASSPHRASE and no TTY (< /dev/null): askNewPassphrase()
-# throws deterministically ("stdin is not a TTY") AFTER the new keypair is generated but
-# BEFORE keygenAt() ever touches identityPath/recipientPath on disk (see keys.ts) — the
-# same "prepare fully, THEN replace" ordering the #122 fix requires.
+# throws deterministically ("a passphrase prompt requires both stdin and stderr to be a
+# TTY", #739) AFTER the new keypair is generated but BEFORE keygenAt() ever touches
+# identityPath/recipientPath on disk (see keys.ts) — the same "prepare fully, THEN
+# replace" ordering the #122 fix requires.
 set +e
 OUT=$(CYPHER_BRAIN_HOME="$FORCE_HOME" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen --force --passphrase < /dev/null 2>&1); RC=$?
 set -e
 if [ "$RC" = "0" ]; then echo "FAIL: keygen --force --passphrase succeeded despite no TTY / no CYPHER_BRAIN_PASSPHRASE"; echo "$OUT"; exit 1; fi
-printf '%s' "$OUT" | grep -qi "not a TTY" || { echo "FAIL: expected the passphrase-requires-a-TTY error"; echo "$OUT"; exit 1; }
+printf '%s' "$OUT" | grep -qi "requires both stdin and stderr to be a TTY" || { echo "FAIL: expected the passphrase-requires-a-TTY error"; echo "$OUT"; exit 1; }
 [ "$(shasum -a 256 "$FORCE_HOME/identity.age" | cut -d' ' -f1)" = "$ORIG_IDENTITY_SHA" ] || { echo "FAIL: the ORIGINAL identity was lost/modified by a failed --force keygen — the #122 regression (delete-before-ready)"; exit 1; }
 [ "$(cat "$FORCE_HOME/recipient.txt")" = "$ORIG_RECIPIENT" ] || { echo "FAIL: the ORIGINAL recipient was lost/modified by a failed --force keygen"; exit 1; }
 TMP_LEFTOVER="$(find "$FORCE_HOME" -maxdepth 1 -name '*.tmp' 2>/dev/null | head -n1)"

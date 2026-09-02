@@ -86,7 +86,7 @@ import { warn } from './warn.js';
 import { buildRecoveryKit, writeRecoveryKitFile } from './recoverykit.js';
 import type { BackupKey, SigningKey } from './recoverykit.js';
 import type { CliOptions } from './types.js';
-import { installStageSignalGuard, setActiveInitRollback } from './signal-guard.js';
+import { installStageSignalGuard, setActiveInitRollback, setActiveRawInputRestore } from './signal-guard.js';
 
 // Thrown when a clack prompt reports a cancel (Ctrl+C, or Esc on the ones that support
 // it) — turning that into a normal thrown Error routes it through init()'s own
@@ -165,6 +165,35 @@ function requireTTY(): void {
   );
 }
 
+// #738/#740: @clack/prompts puts stdin into raw mode AND hides the cursor for the
+// duration of every text()/confirm()/select() call below, restoring both only from
+// its own submit/cancel paths (see setRawMode/`cursor.show` in @clack/core's
+// Prompt.prompt()) — the exact same gap crypt.ts's promptHidden had (#738) before its
+// own fix: a SIGTERM/SIGHUP mid-prompt (or, for `init` specifically, a hidden prompt
+// the user cannot even see because stdout is redirected, #740) tears the process down
+// without ever reaching clack's own cleanup, leaving the real terminal raw/no-echo
+// with its cursor hidden. Reuses the SAME shared SIGINT/SIGTERM/SIGHUP handler
+// crypt.ts's promptHidden and every other signal-guard.ts resource already share
+// (installStageSignalGuard is idempotent) instead of adding a second, parallel
+// signal-handling path — register a restore callback for the exact span each clack
+// call is pending, cleared the instant it settles (resolve OR throw) the normal way.
+async function withRawSignalGuard<T>(run: () => Promise<T>): Promise<T> {
+  installStageSignalGuard();
+  setActiveRawInputRestore(() => {
+    try {
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    } catch {}
+    try {
+      process.stdout.write('\x1B[?25h'); // show cursor — clack hides it while a prompt is active
+    } catch {}
+  });
+  try {
+    return await run();
+  } finally {
+    setActiveRawInputRestore(null);
+  }
+}
+
 async function askLine(question: string, def = ''): Promise<string> {
   // defaultValue: clack itself substitutes this ONLY when the user submits with
   // truly zero characters typed (TextPrompt's own "finalize" handler treats an
@@ -184,10 +213,11 @@ async function askLine(question: string, def = ''): Promise<string> {
   // is typed; pass undefined rather than '' so an empty def does not render a stray
   // placeholder.
   // #718: raced against stdin ending — see stdinEnded()'s own doc comment above.
-  const answer = await Promise.race([
-    text({ message: question, placeholder: def || undefined, defaultValue: def }),
-    stdinEnded(),
-  ]);
+  // #738/#740: wrapped in withRawSignalGuard so a SIGTERM/SIGHUP mid-prompt still
+  // restores raw mode and the cursor — see that helper's own doc comment above.
+  const answer = await withRawSignalGuard(() =>
+    Promise.race([text({ message: question, placeholder: def || undefined, defaultValue: def }), stdinEnded()]),
+  );
   if (isCancel(answer)) throw new InitCancelledError();
   return answer.trim() || def;
 }
@@ -290,7 +320,10 @@ async function askExistingPath(
 // no "unrecognized answer" state left to re-prompt for.
 async function askYesNo(question: string, def: boolean): Promise<boolean> {
   // #718: raced against stdin ending — see stdinEnded()'s own doc comment above.
-  const answer = await Promise.race([confirm({ message: question, initialValue: def }), stdinEnded()]);
+  // #738/#740: wrapped in withRawSignalGuard — see that helper's own doc comment above.
+  const answer = await withRawSignalGuard(() =>
+    Promise.race([confirm({ message: question, initialValue: def }), stdinEnded()]),
+  );
   if (isCancel(answer)) throw new InitCancelledError();
   return answer;
 }
@@ -315,7 +348,10 @@ async function askSelect(
   initialValue: string,
 ): Promise<string> {
   // #718: raced against stdin ending — see stdinEnded()'s own doc comment above.
-  const answer = await Promise.race([select({ message: question, options, initialValue }), stdinEnded()]);
+  // #738/#740: wrapped in withRawSignalGuard — see that helper's own doc comment above.
+  const answer = await withRawSignalGuard(() =>
+    Promise.race([select({ message: question, options, initialValue }), stdinEnded()]),
+  );
   if (isCancel(answer)) throw new InitCancelledError();
   return answer;
 }
