@@ -1086,7 +1086,6 @@ async function restoreImpl(o: CliOptions): Promise<void> {
     setActiveRestoreScratchDir(null);
     throw e;
   }
-  setActiveRestoreScratchDir(null);
 
   // #218 phase 3 — promote atomically, only now that extraction of an ALREADY-VETTED
   // archive fully succeeded: a fresh --out-dir gets the whole scratch tree renamed into
@@ -1130,6 +1129,17 @@ async function restoreImpl(o: CliOptions): Promise<void> {
     }
   } finally {
     await rm(scratchDir, { recursive: true, force: true }); // no-op once rename() has already moved it away
+    // #721: cleared HERE, only once the scratch dir is actually gone — not right after
+    // decrypt/extract settled, above. mergeNoClobber() (the `else` branch above) can run
+    // for a long time on a large --out-dir, incrementally moving entries out of
+    // scratchDir; clearing this registration before that loop starts (as this used to)
+    // left a SIGTERM/SIGINT landing mid-merge with NEITHER guard seeing scratchDir —
+    // the scratch-dir guard already cleared, and the out-dir guard (below) unaware the
+    // sibling scratch dir even exists — so the signal handler dropped the INCOMPLETE
+    // sentinel into --out-dir but left the still-populated plaintext scratchDir sitting
+    // on disk forever. Keeping it registered through the entire promotion (rename() or
+    // mergeNoClobber()) means a signal during either one still finds it and erases it.
+    setActiveRestoreScratchDir(null);
     // the promotion is settled (cleanly, or the above already threw) — a later signal
     // (e.g. during pg_restore below) must not touch out_dir anymore.
     setActiveRestoreOutDir(null);
@@ -1505,6 +1515,14 @@ async function verifyImpl(o: CliOptions): Promise<number> {
           'drill fetch by those instead of taking --in)',
       );
     }
+    // #745: --in's own presence/existence check, duplicated from runFileChecks() below
+    // (the same duplication restoreImpl() already has against its own copy of these two
+    // checks) — deliberately BEFORE the "level: quick" line next, not after: sibling
+    // commands print nothing to stdout on a basic usage/argument error (only the error
+    // line goes to stderr), and quick used to violate that by printing "level: quick"
+    // unconditionally ahead of this exact check.
+    if (!o.in) throw new Error('--in <file.age> required');
+    await requireFile(o.in);
     // #536: remote/drill both print a "level: …" first line and carry a "level" field in
     // --json (below); quick used to have neither, so a caller inspecting only the JSON
     // (or grepping a captured log for "level:") could not tell "quick ran" apart from

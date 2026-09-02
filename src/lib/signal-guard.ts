@@ -241,10 +241,34 @@ export function installStageSignalGuard(): void {
           // touched it — drop a durable sentinel instead (a console.error here could be
           // lost: the process is about to die and stderr writes are not guaranteed to
           // flush before that happens).
+          const sentinelPath = join(ACTIVE_RESTORE_OUT_DIR, '.cypher-brain-restore-INCOMPLETE');
+          // #741: plain writeFileSync() opens with O_CREAT|O_WRONLY|O_TRUNC — if
+          // something (an attacker who predicted this exact name, or an accidental
+          // leftover) already made that name a FIFO, open() blocks synchronously
+          // forever waiting for a reader that will never come, since this IS the
+          // signal handler. That hangs the whole handler: every cleanup after this
+          // point (verify/MCP/gitleaks/TON scratch dirs, the signal re-raise below)
+          // never runs, and the process needs SIGKILL. A symlink is just as unsafe —
+          // it would silently truncate whatever writable file it points at instead of
+          // this sentinel.
+          //
+          // An lstat-then-write check (an earlier draft of this fix) is NOT enough:
+          // it is two syscalls, and anything able to plant a FIFO/symlink at a
+          // predictable path can just as easily re-plant it in the gap between the
+          // lstat and the writeFileSync() that follows (multi-model review finding).
+          // The `wx` flag makes this one atomic syscall instead: O_CREAT|O_EXCL fails
+          // outright — before the kernel ever treats the name as a FIFO/device/symlink
+          // — the instant ANYTHING already exists at this path, hostile or not. The
+          // one case this intentionally no longer refreshes is a LEGITIMATE leftover
+          // sentinel from an earlier interrupted run at the same --out-dir: it is left
+          // untouched rather than overwritten with a newer timestamp, which is an
+          // acceptable trade for closing the race — the directory is already correctly
+          // flagged incomplete either way.
           try {
             writeFileSync(
-              join(ACTIVE_RESTORE_OUT_DIR, '.cypher-brain-restore-INCOMPLETE'),
+              sentinelPath,
               `restore interrupted by ${sig} at ${new Date().toISOString()} — this directory may hold a partially-extracted tree; discard it before trusting the contents\n`,
+              { flag: 'wx' },
             );
           } catch {}
         }

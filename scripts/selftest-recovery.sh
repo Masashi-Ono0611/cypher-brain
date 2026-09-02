@@ -115,5 +115,117 @@ CYPHER_BRAIN_FILE_DIR="$STORE" cb "$PRIMARY" push --in "$TMP/v3.age" --backend f
 [ "$(grep -c . "$LOCFILE")" = "1" ] || { echo "[FAIL] locator file has >1 line (should hold only the latest)"; cat "$LOCFILE"; exit 1; }
 echo "[PASS] --save-locator holds only the latest locator (overwrite, not append)"
 
+echo "== #721: SIGTERM mid-merge (restore into a PRE-EXISTING --out-dir) leaves no scratch dir or plaintext behind =="
+# mergeNoClobber() (restore.ts) incrementally rename()s each of scratchDir's OWN
+# top-level entries into a pre-existing --out-dir, one at a time. restoreImpl() used to
+# clear the scratch dir's signal-guard registration (setActiveRestoreScratchDir(null))
+# the instant its OWN decrypt+extract settled — well BEFORE this merge loop even starts.
+# A SIGTERM landing during the merge therefore found NEITHER guard tracking the sibling
+# scratch dir: the scratch-dir guard already cleared, the out-dir guard (set for the
+# PROMOTION step) unaware a sibling plaintext scratch dir even exists — leaving it, and
+# every entry still inside it, on disk forever (#721).
+#
+# Many small --dir sources (=> many top-level "<name>.tar.gz" entries at scratchDir's own
+# root, each its own separate rename() inside mergeNoClobber's loop) turn what would
+# otherwise be a near-instantaneous merge into a real window this test can reliably land
+# a SIGTERM inside: poll --out-dir's entry count until it is more than the single
+# pre-existing marker file but fewer than the total, proving the merge is IN PROGRESS
+# (not finished) the instant the signal is sent. --scan-secrets off skips a gitleaks scan
+# per source that has nothing to do with what this is testing.
+MMTMP="$TMP/mid-merge"; mkdir -p "$MMTMP/src"
+MMDIRARGS=(); MMN=400
+for i in $(seq 1 "$MMN"); do
+  d="$MMTMP/src/d$i"; mkdir -p "$d"; printf 'x' > "$d/f.txt"
+  MMDIRARGS+=(--dir "$d")
+done
+cb "$PRIMARY" snapshot "${MMDIRARGS[@]}" --recipient "$PRIMARY/recipient.txt" --scan-secrets off \
+  --out "$MMTMP/v.age" >/dev/null
+mkdir -p "$MMTMP/out"; touch "$MMTMP/out/.marker" # pre-existing --out-dir => mergeNoClobber(), not the rename()-whole-tree path
+CYPHER_BRAIN_HOME="$PRIMARY" node "${BIN_DEV_ARGS[@]}" "$BIN" restore --in "$MMTMP/v.age" --out-dir "$MMTMP/out" >/dev/null 2>&1 &
+MMPID=$!
+MMLANDED=0
+for _ in $(seq 1 300); do
+  kill -0 "$MMPID" 2>/dev/null || break
+  MMCOUNT=$(find "$MMTMP/out" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$MMCOUNT" -gt 1 ] && [ "$MMCOUNT" -lt "$((MMN + 1))" ]; then
+    MMLANDED=1
+    kill -TERM "$MMPID"
+    break
+  fi
+  sleep 0.01
+done
+if [ "$MMLANDED" != "1" ]; then
+  echo "[FAIL] restore never observed in a mid-merge state (test setup) — try a larger MMN"
+  kill "$MMPID" 2>/dev/null || true
+  exit 1
+fi
+wait "$MMPID" 2>/dev/null || true # signal exit is non-zero — expected
+MMLEFTOVER=$(find "$MMTMP" -maxdepth 1 -name 'out.restore-*' 2>/dev/null | wc -l | tr -d ' ')
+[ "$MMLEFTOVER" = "0" ] \
+  && echo "[PASS] SIGTERM mid-merge leaves no out.restore-* scratch dir (no plaintext left behind)" \
+  || { echo "[FAIL] SIGTERM mid-merge leaked $MMLEFTOVER scratch dir(s)"; exit 1; }
+test -f "$MMTMP/out/.cypher-brain-restore-INCOMPLETE" \
+  && echo "[PASS] SIGTERM mid-merge flagged the pre-existing --out-dir as incomplete" \
+  || { echo "[FAIL] SIGTERM mid-merge did not drop the INCOMPLETE sentinel into --out-dir"; exit 1; }
+
+echo "== #741: the signal handler must not block forever if the INCOMPLETE-sentinel path is a FIFO =="
+# signal-guard.ts's handler drops a '.cypher-brain-restore-INCOMPLETE' sentinel into a
+# pre-existing --out-dir via writeFileSync() (it cannot safely DELETE a directory the
+# caller already owned). writeFileSync() opens with O_CREAT|O_WRONLY|O_TRUNC — if that
+# exact path is already a FIFO (planted by an attacker who predicted the name, or an
+# accidental leftover), open() blocks synchronously forever waiting for a reader that
+# will never come, since THIS is the signal handler: no later cleanup step ever runs,
+# and the process needs SIGKILL to die at all. Same mid-merge setup as #721 above (a
+# large --out-dir gives a real window to land the signal in), but this time the
+# sentinel path is pre-created as a FIFO before restore ever starts.
+FTMP="$TMP/fifo-sentinel"; mkdir -p "$FTMP/src"
+FDIRARGS=(); FN=400
+for i in $(seq 1 "$FN"); do
+  d="$FTMP/src/d$i"; mkdir -p "$d"; printf 'x' > "$d/f.txt"
+  FDIRARGS+=(--dir "$d")
+done
+cb "$PRIMARY" snapshot "${FDIRARGS[@]}" --recipient "$PRIMARY/recipient.txt" --scan-secrets off \
+  --out "$FTMP/v.age" >/dev/null
+mkdir -p "$FTMP/out"
+mkfifo "$FTMP/out/.cypher-brain-restore-INCOMPLETE"
+CYPHER_BRAIN_HOME="$PRIMARY" node "${BIN_DEV_ARGS[@]}" "$BIN" restore --in "$FTMP/v.age" --out-dir "$FTMP/out" >/dev/null 2>&1 &
+FPID=$!
+FLANDED=0
+for _ in $(seq 1 300); do
+  kill -0 "$FPID" 2>/dev/null || break
+  FCOUNT=$(find "$FTMP/out" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$FCOUNT" -gt 1 ] && [ "$FCOUNT" -lt "$((FN + 1))" ]; then
+    FLANDED=1
+    kill -TERM "$FPID"
+    break
+  fi
+  sleep 0.01
+done
+if [ "$FLANDED" != "1" ]; then
+  echo "[FAIL] restore never observed in a mid-merge state (test setup) — try a larger FN"
+  kill -9 "$FPID" 2>/dev/null || true
+  exit 1
+fi
+# Bounded wait for exit, NOT an unbounded `wait`: the whole point being tested is that
+# the handler must NOT hang, so this loop (not `wait` itself) is what turns "still
+# blocked in open()" into an observable, non-hanging [FAIL] instead of wedging this
+# selftest script itself.
+FDIED=0
+for _ in $(seq 1 300); do
+  if ! kill -0 "$FPID" 2>/dev/null; then FDIED=1; break; fi
+  sleep 0.01
+done
+if [ "$FDIED" != "1" ]; then
+  kill -9 "$FPID" 2>/dev/null || true
+  wait "$FPID" 2>/dev/null || true
+  echo "[FAIL] process did not exit within 3s of SIGTERM — signal handler is blocked writing the sentinel (FIFO not detected)"
+  exit 1
+fi
+wait "$FPID" 2>/dev/null || true # signal exit is non-zero — expected
+echo "[PASS] signal handler exits promptly (does not block) when the sentinel path is a FIFO"
+test -p "$FTMP/out/.cypher-brain-restore-INCOMPLETE" \
+  && echo "[PASS] the pre-existing FIFO itself is left untouched (never opened for writing)" \
+  || { echo "[FAIL] the sentinel path is no longer a FIFO — the handler wrote through/replaced it"; exit 1; }
+
 echo
 echo "RECOVERY SELFTEST PASS"
