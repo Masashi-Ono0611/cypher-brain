@@ -981,7 +981,19 @@ async function runPaidConsentDescriptionTest(tmp) {
 // here does not return until the server has opened it for reading, which is a handshake
 // rather than a guess — at that instant the fetch dir provably exists, so TMPDIR can be
 // made read-only and the identity then fed through.
+//
+// Both prerequisites are checked rather than assumed, and a missing one SKIPS loudly
+// instead of passing: as root the chmod does not block anything, so the cleanup would
+// simply succeed and the assertions would fail for a reason that has nothing to do with
+// #793. GitHub-hosted runners are non-root and have mkfifo, so this runs in CI.
 async function runCleanupFailurePreservesOutcomeTest(tmp) {
+  if (process.getuid?.() === 0) {
+    process.stdout.write(
+      'MCP SMOKE (cleanup failure): SKIP — running as root, where chmod 0555 does not prevent writes, so the ' +
+        '#793 cleanup-failure window cannot be opened (this is BLOCKED, not PASS)\n',
+    );
+    return;
+  }
   const home6 = join(tmp, 'home-cleanup-failure');
   const store6 = join(tmp, 'store-cleanup-failure');
   const data6 = join(tmp, 'data-cleanup-failure');
@@ -1781,73 +1793,86 @@ async function run(tmp) {
     // directory is the honest version of this test: nothing can detect it without
     // attempting the write, so the failure genuinely belongs to the aftermath stage the
     // partial-success path exists for.
-    const idemPartialOut = join(tmp, 'idem-partial.age');
-    const idemPartialKey = 'idem-partial-failure-key';
-    // #789: home-scoped so the containment preflight passes and the EACCES still comes from
-    // push()'s own --save-locator write, which is what this case is testing.
-    const idemBadLocatorDir = join(home, 'idem-unwritable-locator-dir');
-    await mkdir(idemBadLocatorDir, { recursive: true });
-    const idemBadLocatorFile = join(idemBadLocatorDir, 'locator.tsv');
-    await chmod(idemBadLocatorDir, 0o555);
-    send({
-      jsonrpc: '2.0',
-      id: 22006,
-      method: 'tools/call',
-      params: {
-        name: 'snapshot_now',
-        arguments: {
-          dirs: [data],
-          recipients: [recipientPath],
-          out: idemPartialOut,
-          backend: 'file',
-          locator_file: idemBadLocatorFile,
-          idempotency_key: idemPartialKey,
-        },
-      },
-    });
-    const idem6 = await waitFor(22006);
-    const idem6Sc = idem6.result?.structuredContent;
-    await chmod(idemBadLocatorDir, 0o755); // restore, so the tmp tree can be removed at the end
-    if (!idem6.result?.isError || !/upload succeeded/.test(idem6Sc?.message ?? ''))
-      throw new Error(
-        `snapshot_now with a --save-locator write that fails AFTER a successful upload should refuse with a ` +
-          `"upload succeeded" PushLocatorWriteError message, not: ${JSON.stringify(idem6.result).slice(0, 500)}`,
+    //
+    // That trade has one cost, stated rather than left to be discovered: as root, chmod
+    // 0555 prevents nothing, so this case cannot be induced at all and is SKIPPED loudly
+    // rather than failing for an unrelated reason. CI runs non-root (no `container:` in
+    // .github/workflows/ci.yml), so it exercises this there.
+    if (process.getuid?.() === 0) {
+      process.stdout.write(
+        'MCP SMOKE: SKIP — running as root, where chmod 0555 does not prevent writes, so the #220 ' +
+          'partial-success push (a --save-locator write failing AFTER a successful upload) cannot be induced ' +
+          '(this is BLOCKED, not PASS)\n',
       );
+    } else {
+      const idemPartialOut = join(tmp, 'idem-partial.age');
+      const idemPartialKey = 'idem-partial-failure-key';
+      // #789: home-scoped so the containment preflight passes and the EACCES still comes from
+      // push()'s own --save-locator write, which is what this case is testing.
+      const idemBadLocatorDir = join(home, 'idem-unwritable-locator-dir');
+      await mkdir(idemBadLocatorDir, { recursive: true });
+      const idemBadLocatorFile = join(idemBadLocatorDir, 'locator.tsv');
+      await chmod(idemBadLocatorDir, 0o555);
+      send({
+        jsonrpc: '2.0',
+        id: 22006,
+        method: 'tools/call',
+        params: {
+          name: 'snapshot_now',
+          arguments: {
+            dirs: [data],
+            recipients: [recipientPath],
+            out: idemPartialOut,
+            backend: 'file',
+            locator_file: idemBadLocatorFile,
+            idempotency_key: idemPartialKey,
+          },
+        },
+      });
+      const idem6 = await waitFor(22006);
+      const idem6Sc = idem6.result?.structuredContent;
+      await chmod(idemBadLocatorDir, 0o755); // restore, so the tmp tree can be removed at the end
+      if (!idem6.result?.isError || !/upload succeeded/.test(idem6Sc?.message ?? ''))
+        throw new Error(
+          `snapshot_now with a --save-locator write that fails AFTER a successful upload should refuse with a ` +
+            `"upload succeeded" PushLocatorWriteError message, not: ${JSON.stringify(idem6.result).slice(0, 500)}`,
+        );
 
-    // The SAME key, called again with a WORKING locator_file: if the partial success was
-    // correctly recorded above despite the overall call erroring, this replays the cached
-    // result (idempotent_replay:true, pushed:true) instead of re-executing — a real
-    // re-execution would fail closed on `out` already existing (CB-E009), so hitting THAT
-    // instead would prove the record was lost, exactly the bug this fixes.
-    const idemPartialGoodLocatorFile = join(home, 'idem-partial-good-locator.tsv'); // #789: home-scoped, see locatorFile above
-    send({
-      jsonrpc: '2.0',
-      id: 22007,
-      method: 'tools/call',
-      params: {
-        name: 'snapshot_now',
-        arguments: {
-          dirs: [data],
-          recipients: [recipientPath],
-          out: idemPartialOut,
-          backend: 'file',
-          locator_file: idemPartialGoodLocatorFile,
-          idempotency_key: idemPartialKey,
+      // The SAME key, called again with a WORKING locator_file: if the partial success was
+      // correctly recorded above despite the overall call erroring, this replays the cached
+      // result (idempotent_replay:true, pushed:true) instead of re-executing — a real
+      // re-execution would fail closed on `out` already existing (CB-E009), so hitting THAT
+      // instead would prove the record was lost, exactly the bug this fixes.
+      const idemPartialGoodLocatorFile = join(home, 'idem-partial-good-locator.tsv'); // #789: home-scoped, see locatorFile above
+      send({
+        jsonrpc: '2.0',
+        id: 22007,
+        method: 'tools/call',
+        params: {
+          name: 'snapshot_now',
+          arguments: {
+            dirs: [data],
+            recipients: [recipientPath],
+            out: idemPartialOut,
+            backend: 'file',
+            locator_file: idemPartialGoodLocatorFile,
+            idempotency_key: idemPartialKey,
+          },
         },
-      },
-    });
-    const idem7 = await waitFor(22007);
-    const idem7Sc = idem7.result?.structuredContent;
-    if (idem7.result?.isError || idem7Sc?.idempotent_replay !== true || idem7Sc?.pushed !== true)
-      throw new Error(
-        `a repeat call with the SAME idempotency_key after a partial-success failure should replay the recorded ` +
-          `partial success (idempotent_replay:true, pushed:true), not re-execute or refuse: ` +
-          `${JSON.stringify(idem7.result).slice(0, 500)}`,
-      );
-    if (typeof idem7Sc?.locator !== 'string' || idem7Sc.locator.length === 0)
-      throw new Error(`replayed partial-success result is missing its recorded locator: ${JSON.stringify(idem7Sc)}`);
-    if (!existsSync(idemPartialGoodLocatorFile))
-      throw new Error('the replay of a recorded partial-success result did not write the requested locator_file');
+      });
+      const idem7 = await waitFor(22007);
+      const idem7Sc = idem7.result?.structuredContent;
+      if (idem7.result?.isError || idem7Sc?.idempotent_replay !== true || idem7Sc?.pushed !== true)
+        throw new Error(
+          `a repeat call with the SAME idempotency_key after a partial-success failure should replay the recorded ` +
+            `partial success (idempotent_replay:true, pushed:true), not re-execute or refuse: ` +
+            `${JSON.stringify(idem7.result).slice(0, 500)}`,
+        );
+      if (typeof idem7Sc?.locator !== 'string' || idem7Sc.locator.length === 0)
+        throw new Error(`replayed partial-success result is missing its recorded locator: ${JSON.stringify(idem7Sc)}`);
+      if (!existsSync(idemPartialGoodLocatorFile))
+        throw new Error('the replay of a recorded partial-success result did not write the requested locator_file');
+    }
 
     // 2c. last_snapshot_status reads the save-locator file back
     send({
