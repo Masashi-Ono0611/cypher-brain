@@ -163,7 +163,13 @@ export const SNAPSHOT_NOW_TOOL: Tool = {
           'call with the SAME key AND the same dirs/pg/recipients/out/backend/scan_secrets returns the ' +
           "FIRST call's result — no new snapshot, no new spend — instead of re-executing. The same key " +
           'with DIFFERENT values in any of those fields is refused rather than answered with the wrong ' +
-          'result. Cached results expire after CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS (default 24h).',
+          'result. Cached results expire after CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS (default 24h). A replay ' +
+          'reports the outcome the SAME WAY the first call did: a recorded FAILURE replays with isError:true ' +
+          'and its recorded fields, never as a clean success. One outcome never expires — a paid push whose ' +
+          'result is UNCERTAIN (the payment may or may not have happened) records a PERMANENT tombstone ' +
+          '(code ERR_PUSH_OUTCOME_UNCERTAIN, spend_outcome "uncertain", plus check_kind/check_identifier and ' +
+          'no pushed/locator), and every later call with that key replays it as an error and does no paid ' +
+          'work. Do not keep retrying it: verify check_identifier on-chain, then use a NEW key.',
       },
     },
     required: ['recipients', 'out'],

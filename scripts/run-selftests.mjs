@@ -123,6 +123,10 @@ const PARALLEL = [
   npmTest('selftest:properties'),
   npmTest('selftest:ledger'),
   npmTest('selftest:idempotency-lib'),
+  // #818. Parallel-safe by the same findings as mcp-smoke: its own temp
+  // CYPHER_BRAIN_HOME, its mock Arweave gateway on `listen(0, '127.0.0.1')`, and it
+  // only READS dist/.
+  npmTest('selftest:mcp-uncertain-spend'),
   npmTest('selftest:turbo-dep'),
   npmTest('selftest:ans104-sizing'),
   npmTest('selftest:push-partial-failure'),

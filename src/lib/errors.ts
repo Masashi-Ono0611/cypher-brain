@@ -372,6 +372,27 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     origin: 'ours',
     source: 'src/mcp.ts (snapshotPolicyDenied, "… — refusing to snapshot over MCP (#800). …")',
   },
+  // #818: the one outcome where "retry the same call" is the WRONG next action and
+  // "assume nothing happened" is worse still — the paid step may already have completed
+  // and nothing this process can read will say. The code exists so an operator (or an
+  // agent) is sent to the on-chain check named in the message rather than to a retry.
+  // Sibling codes CB-E025/CB-E026 are being added concurrently by other work; this entry
+  // deliberately takes CB-E027 rather than the next free number, so the three never
+  // collide.
+  //
+  // Matched on "the outcome is UNCERTAIN", which src/lib/push-uncertain-spend.ts composes
+  // ONCE for every backend (each caller supplies only the backend-specific detail around
+  // it) — so unlike the two wordings this replaced, there is a single contiguous literal
+  // for this pattern and for scripts/selftest-error-codes.mjs to assert against.
+  {
+    code: 'CB-E027',
+    title: 'push outcome uncertain — payment may have occurred; verify on-chain before retrying with a new key',
+    pattern: /the outcome is UNCERTAIN/,
+    origin: 'ours',
+    source:
+      'src/lib/push-uncertain-spend.ts (PushUncertainSpendError, "… — the outcome is UNCERTAIN: the payment may ' +
+      'already have happened. …"), thrown from src/lib/backends/arweave.ts and src/lib/backends/ton-provider.ts',
+  },
 ];
 
 /** The first registry entry whose pattern matches `message`, if any. */

@@ -59,7 +59,7 @@ import {
   MCP_SOURCE_ROOTS_ERROR,
 } from './lib/config.js';
 import { restoreRunbook } from './lib/runbook.js';
-import { drainWarnings } from './lib/warn.js';
+import { drainWarnings, warn } from './lib/warn.js';
 import { snapshot } from './lib/snapshot.js';
 import { restore, verify } from './lib/restore.js';
 import { withSpan } from './lib/otel.js';
@@ -70,12 +70,14 @@ import {
   redactUserinfo,
   PushPartialSuccessError,
   PushFundingConfirmedButIncompleteError,
+  PushUncertainSpendError,
   writeReplayedSavedLocator,
 } from './lib/pushpull.js';
 import {
   lookupIdempotencyResult,
   recordIdempotencyResult,
   claimIdempotencyKey,
+  idempotencyClaimLockPath,
   IdempotencyStoreError,
   IdempotencyClaimHeldError,
 } from './lib/idempotency.js';
@@ -268,15 +270,31 @@ function reclassify(code: string, message: string, original: Error): ToolError {
 // structured result below (session-scoped facts like a deprecated env var).
 let startupWarnings: string[] = [];
 
-function structuredOk(payload: Record<string, unknown>): CallToolResult {
+// #810/#818: one builder for a structured tool result, with `isError` as an explicit
+// parameter rather than an implicit consequence of which function was called. Two
+// outcomes have to come back error-shaped while still carrying a full structured payload
+// that structuredErr()'s {code, message} shape cannot hold: an uncertain spend (#818) and
+// a REPLAY of any error-disposition record (#810) — the bug there was precisely that
+// replaying a recorded partial failure through the success-shaped builder dropped
+// `isError`, so the same outcome read as an error on the first call and as a clean
+// success on the retry.
+//
+// A non-error result is byte-for-byte what structuredOk() always returned: no `isError`
+// key at all, rather than `isError: false`.
+function structuredOutcome(payload: Record<string, unknown>, opts: { isError?: boolean } = {}): CallToolResult {
   const full = {
     ...payload,
     ...(startupWarnings.length ? { startup_warnings: startupWarnings } : {}),
   };
-  return {
+  const base: CallToolResult = {
     content: [{ type: 'text', text: JSON.stringify(full, null, 2) }],
     structuredContent: full,
   };
+  return opts.isError ? { ...base, isError: true } : base;
+}
+
+function structuredOk(payload: Record<string, unknown>): CallToolResult {
+  return structuredOutcome(payload);
 }
 
 // #293: a caller-supplied path that is not there is bad INPUT, not a server fault —
@@ -1536,6 +1554,40 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
   let fingerprint: string | undefined;
   const lockId = idempotencyKey ? JSON.stringify([SNAPSHOT_NOW_TOOL.name, idempotencyKey]) : undefined;
   let releaseClaim: (() => Promise<void>) | undefined;
+  // #809: set when the result of a call that MAY HAVE SPENT could not be recorded. The
+  // `finally` below then leaves BOTH claims in place instead of releasing them, so the
+  // key stays blocked and a retry carrying it is refused — rather than finding no record
+  // and no claim, and running the whole paid path a second time. Fail closed, the same
+  // posture ERR_IDEMPOTENCY_STORE_UNREADABLE already takes when the log cannot be READ.
+  let retainClaim = false;
+  // Only a paid backend can have spent, so only a paid backend is worth wedging a key
+  // for: on `file` (free) a re-executed retry costs nothing but a no-clobber refusal,
+  // which is a much better outcome than a key an operator has to unblock by hand.
+  const paidSpend = typeof backend === 'string' && PAID_BACKENDS.has(backend);
+  // #809: the exact file an operator removes to unblock a retained key. Derived from the
+  // same helper IdempotencyClaimHeldError's own message uses, so the two cannot drift.
+  const claimLockPathForKey = (): string =>
+    idempotencyKey ? idempotencyClaimLockPath(IDEMPOTENCY_LOG, SNAPSHOT_NOW_TOOL.name, idempotencyKey) : '';
+  // #809: a record-write failure after a possible spend, reported the way AGENTS.md's
+  // relay contract requires (warn(), never a raw console.error — the console.error this
+  // replaced never reached the result's `warnings` array, so the structured payload of an
+  // otherwise-successful paid call said nothing about the replay net being gone). Returned
+  // as well as warned so the caller's own result carries it verbatim: this runs AFTER the
+  // call's captureCall has already drained, so nothing else would splice it in.
+  const warnRecordFailure = (recordErr: unknown, outcome: string): string => {
+    if (paidSpend) retainClaim = true;
+    const message =
+      `snapshot_now: ${outcome} but recording its idempotency-key result failed ` +
+      `(idempotency_key=${JSON.stringify(idempotencyKey)}): ${errMsg(recordErr)}. ` +
+      (retainClaim
+        ? `The idempotency claim is being RETAINED rather than released, so a retry with this key is refused ` +
+          `instead of spending again (#809). Verify the outcome, then remove ${claimLockPathForKey()} by hand to ` +
+          `unblock this key — or simply use a NEW key once you know what happened.`
+        : 'Nothing was spent on this call, so the claim is released normally — a retry with the same key will ' +
+          're-execute rather than replay this result.');
+    warn(message);
+    return message;
+  };
   if (idempotencyKey && lockId) {
     // No `await` between this check and the `.add()` below — see idempotencyInFlight's
     // own comment for why that is what makes it safe against a same-process concurrent
@@ -1639,7 +1691,23 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
           });
           replayedResult = { ...replayedResult, locator_file: savedLocatorFile };
         }
-        return structuredOk({ ...replayedResult, idempotent_replay: true });
+        // #810: a replay must be reported the same way the FIRST call was. A recorded
+        // partial success (the paid upload landed, a later stage failed) was re-thrown on
+        // the first call — an error — but replayed through structuredOk(), which sets no
+        // `isError` at all: an agent retrying after a transport hiccup saw an error once
+        // and a clean success the second time for identical state, with `pushed: true` at
+        // the top level. #818's uncertain-spend tombstone is the same shape and must never
+        // read as a success either. Both are marked `disposition: 'error'` at record time,
+        // which is what this reads — so the two calls agree, and a caller keying off
+        // `isError` (the normal MCP contract) is told the truth on both.
+        //
+        // Records written BEFORE #818 carry no disposition and read as 'success', which is
+        // exactly the pre-#818 behaviour for them: this changes how NEW records replay, it
+        // does not retroactively reinterpret what is already on disk.
+        return structuredOutcome(
+          { ...replayedResult, idempotent_replay: true },
+          { isError: cached.disposition === 'error' },
+        );
       }
     }
 
@@ -1740,6 +1808,74 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
       try {
         pushRes = await captureCall(() => push(pushOpts));
       } catch (e) {
+        // #818: checked BEFORE the PushPartialSuccessError branch below — the two demand
+        // opposite payloads and must never be confused. That branch asserts a CONFIRMED
+        // spend and reports `pushed: true` with a usable locator; here the spend is
+        // UNKNOWN and there is no locator at all, so borrowing its shape would tell the
+        // caller an upload exists that may never have happened. (PushUncertainSpendError
+        // is deliberately not a subclass, so this is belt-and-braces rather than the thing
+        // that makes the ordering safe — but the ordering is what a reader checks first.)
+        //
+        // Recorded as a PERMANENT, error-disposition tombstone: the record is what refuses
+        // the retry that would otherwise pay a second time, and expiring it would not
+        // settle the ambiguity — only postpone that retry until the TTL had passed.
+        if (e instanceof PushUncertainSpendError) {
+          // Folded into the payload BEFORE it is recorded (multi-model review, Warning):
+          // the snapshot's own warnings (a single-recipient snapshot, a secret-scan
+          // finding) and any the failing push recorded must ride the REPLAY too, not only
+          // the immediate response — a replay is meant to be the first call's result, and
+          // #347's relay contract does not stop applying to the second delivery of it.
+          const uncertainWarnings = [
+            ...(Array.isArray(result.warnings) ? (result.warnings as string[]) : []),
+            ...((e as Error & { cbWarnings?: string[] }).cbWarnings ?? []),
+          ];
+          const uncertainResult: Record<string, unknown> = {
+            code: 'ERR_PUSH_OUTCOME_UNCERTAIN',
+            spend_outcome: 'uncertain',
+            backend: e.backend,
+            // What settles it, and what to settle it WITH — the one value that must
+            // survive this failure. No `pushed` and no `locator`, deliberately: an
+            // upload that may not exist has nothing to point at, and a caller reading
+            // either field would act on a fiction.
+            check_kind: e.checkKind,
+            check_identifier: e.checkIdentifier,
+            // Present ONLY when the ambiguous upload was the ".minisig" sidecar and the
+            // ciphertext's own upload had already succeeded (multi-model review,
+            // Critical). Distinctly named rather than `locator`, and never accompanied by
+            // `pushed`, so it cannot be mistaken for "the push succeeded": it is the one
+            // thing here that IS confirmed, and losing it would make the "use a NEW key"
+            // recovery re-pay for bytes that are already stored.
+            ...(e.confirmedCiphertextLocator ? { confirmed_ciphertext_locator: e.confirmedCiphertextLocator } : {}),
+            message: annotateErrorMessage(e.message),
+            idempotency_key: idempotencyKey ?? null,
+            idempotent_replay: false,
+            ...(uncertainWarnings.length ? { warnings: uncertainWarnings } : {}),
+          };
+          if (idempotencyKey && fingerprint) {
+            try {
+              await recordIdempotencyResult(
+                IDEMPOTENCY_LOG,
+                SNAPSHOT_NOW_TOOL.name,
+                idempotencyKey,
+                fingerprint,
+                uncertainResult,
+                IDEMPOTENCY_TTL_SECONDS,
+                Date.now(),
+                { disposition: 'error', retention: 'permanent' },
+              );
+            } catch (recordErr) {
+              // Only this one cannot be in the persisted copy — there is no persisted copy
+              // to put it in. Spliced onto the RESPONSE instead, which is the only place
+              // it can be delivered at all.
+              const recordWarning = warnRecordFailure(recordErr, 'the push outcome is UNCERTAIN');
+              return structuredOutcome(
+                { ...uncertainResult, warnings: [...uncertainWarnings, recordWarning] },
+                { isError: true },
+              );
+            }
+          }
+          return structuredOutcome(uncertainResult, { isError: true });
+        }
         // #220 (multi-model review, P1): a PushPartialSuccessError means the ciphertext
         // upload — the actual paid, permanent spend — already happened even though THIS
         // call is about to report an error. That covers the ".minisig" signature
@@ -1784,6 +1920,12 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
               fingerprint,
               partialResult,
               IDEMPOTENCY_TTL_SECONDS,
+              Date.now(),
+              // #810: the first call re-throws `e` below, so this outcome is an ERROR —
+              // and its replay has to be one too. Still TTL-governed: unlike an uncertain
+              // spend, the outcome here is KNOWN (the upload landed, a later stage did
+              // not), so once the caller has acted on it the record has no further job.
+              { disposition: 'error' },
             );
           } catch (recordErr) {
             // A record-write failure here must NEVER mask `e` (multi-model review, P1):
@@ -1791,12 +1933,18 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
             // unrelated fs error (the ORIGINAL bug this fixes) would hide the one piece
             // of information the operator needs to hand-record the already-paid-for
             // upload. Best-effort only — log a warning and fall through to `throw e`
-            // below unconditionally.
-            console.error(
-              `warning: could not record the idempotency-key result for a partially-succeeded snapshot_now call ` +
-                `(idempotency_key=${JSON.stringify(idempotencyKey)}, locator=${JSON.stringify(e.locator)}): ` +
-                `${errMsg(recordErr)} — the error below (not this warning) is the one to act on.`,
+            // below unconditionally. #809: warn(), not console.error — a raw
+            // console.error here bypasses the relay contract entirely (AGENTS.md), which
+            // is why the structured error result said nothing about the replay net being
+            // gone. Spliced onto `e.cbWarnings` as well, because captureCall bound that
+            // array at the moment push() threw — i.e. before this line ran — so a warning
+            // recorded now would otherwise never reach THIS call's `warnings`.
+            const recordWarning = warnRecordFailure(
+              recordErr,
+              `the ciphertext upload already succeeded (locator=${JSON.stringify(e.locator)})`,
             );
+            const withWarnings = e as Error & { cbWarnings?: string[] };
+            withWarnings.cbWarnings = [...(withWarnings.cbWarnings ?? []), recordWarning];
           }
         }
         throw e;
@@ -1840,11 +1988,15 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
         // failure, which would all but guarantee a double-spend retry AND hide that the
         // work genuinely succeeded (multi-model review, P1: the same "never let
         // idempotency-log bookkeeping outrank the real result" principle as above).
-        console.error(
-          `warning: snapshot_now succeeded but recording its idempotency-key result failed ` +
-            `(idempotency_key=${JSON.stringify(idempotencyKey)}): ${errMsg(recordErr)} — a retry with the SAME key ` +
-            'will not replay this result and may re-execute.',
-        );
+        //
+        // #809: what the old console.error here said — "a retry with the SAME key ... may
+        // re-execute" — understated it twice over. With the record missing AND the
+        // `finally` releasing both claims, a retry WOULD re-execute, and on a paid backend
+        // that is a second charge. warnRecordFailure() both relays the warning properly
+        // (warn(), so it reaches this result's `warnings`) and, on a paid backend, retains
+        // the claim so the retry is refused instead.
+        const recordWarning = warnRecordFailure(recordErr, 'the snapshot (and any push) fully succeeded');
+        result.warnings = [...(Array.isArray(result.warnings) ? (result.warnings as string[]) : []), recordWarning];
       }
     }
     return structuredOk(result);
@@ -1854,8 +2006,27 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
     // The in-process delete is synchronous and cheap; the cross-process release is
     // best-effort I/O (see claimIdempotencyKey's own doc comment for what it does and does
     // not remove — it never touches a claim it did not itself create).
+    //
+    // #809: the CROSS-PROCESS claim is kept when the result of a possibly-paid call could
+    // not be recorded. Releasing it removes the last thing standing between a retry and a
+    // second charge: the log has no record to replay, and a freed claim lets the retry
+    // straight through to the paid path. A wedged key an operator can clear by hand is a
+    // strictly better failure than a silent double-spend, and it is the same fail-closed
+    // trade ERR_IDEMPOTENCY_STORE_UNREADABLE already makes for an unreadable log.
+    //
+    // The IN-PROCESS Set entry is dropped either way (multi-model review, Warning). Keeping
+    // it would make the recovery this call's own warning documents — "remove the lock file
+    // to unblock this key" — not actually work against THIS still-running server, which
+    // would then also need a restart. Dropping it loses nothing: a retry in this process
+    // still has to take the file claim, and that `writeFile(..., 'wx')` fails on the
+    // retained lock exactly as another process's would, so both are refused until the file
+    // is gone — and once an operator removes it, both are unblocked.
+    //
+    // Written as a guarded block rather than an early `return`: a `return` inside a
+    // `finally` DISCARDS whatever the `try` was throwing or returning, which would swallow
+    // the very error this branch exists to report.
     if (lockId) idempotencyInFlight.delete(lockId);
-    if (releaseClaim) await releaseClaim();
+    if (!retainClaim && releaseClaim) await releaseClaim();
   }
 }
 
