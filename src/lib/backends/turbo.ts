@@ -23,6 +23,13 @@ import { arUsdRate, turboUsdRate, usdApprox } from '../estimate.js';
 import { progressReporter } from '../progress.js';
 import { arweaveBackend } from './arweave.js';
 import { WALLET_DEFAULT_PATH } from '../wallet.js';
+import {
+  CYPHER_BRAIN_DATA_ITEM_TAGS,
+  dataItemOverheadBytes,
+  signedDataItemSize,
+  signerLengthsOrDefaults,
+} from './ans104.js';
+import { remainingSpendBudget, chargeSpendTracker, spentSoFar, budgetExhaustedMessage } from '../spend-tracker.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 export function turboBackend(): StorageBackend {
@@ -64,9 +71,23 @@ export function turboBackend(): StorageBackend {
         }
         throw new Error(`turbo: cannot read JWK wallet at ${walletPath}: ${errMsg(e)}`);
       }
-      const turbo = TurboFactory.authenticated({ signer: new ArweaveSigner(jwk) });
+      const signer = new ArweaveSigner(jwk);
+      const turbo = TurboFactory.authenticated({ signer });
       const abs = resolve(file);
       const { size } = await stat(abs); // stream the file (don't buffer an ~850MB brain) and give Turbo its size
+      // #791: what Turbo bills for is the ANS-104 SIGNED DATA ITEM uploadFile() builds
+      // below — signature, owner, tags and length prefixes wrapped around the ciphertext
+      // — not the ciphertext alone. Pricing `size` quoted for ~1.1KB fewer bytes than were
+      // charged, which sailed under CYPHER_BRAIN_MAX_SPEND near a price tier (and, right
+      // at the 100KB free-upload threshold, quoted a paid upload as free) and recorded the
+      // short figure in the receipt ledger. Every number below — the quote, the cap check,
+      // the stderr estimate and the receipt — is now the data item's size. The tags are
+      // built once, HERE, because they are an input to that size; the paidBy validation
+      // that used to sit next to them still happens at its own call site further down.
+      const dataItemTags = [...CYPHER_BRAIN_DATA_ITEM_TAGS];
+      const { ownerLength, signatureLength } = signerLengthsOrDefaults(signer);
+      const billedBytes = signedDataItemSize(size, dataItemTags, ownerLength, signatureLength);
+      const overheadBytes = dataItemOverheadBytes(dataItemTags, ownerLength, signatureLength);
       // cost estimate + balance before committing to an irreversible spend.
       // Uploads <100KB are free (0 winc); larger ones draw from Turbo Credits.
       let uploadWinc: bigint | null = null;
@@ -77,7 +98,7 @@ export function turboBackend(): StorageBackend {
       // early (#342).
       let balForCheck: BalanceSummary | null = null;
       try {
-        const [{ winc: uploadWincStr }] = await turbo.getUploadCosts({ bytes: [size] });
+        const [{ winc: uploadWincStr }] = await turbo.getUploadCosts({ bytes: [billedBytes] });
         // BigInt('') is 0n (no throw) — a malformed-but-non-throwing winc would otherwise
         // read as a free upload and slip past the cap below without ever hitting the catch.
         // Reject anything that isn't a plain non-negative integer string up front instead.
@@ -86,7 +107,8 @@ export function turboBackend(): StorageBackend {
         }
         uploadWinc = BigInt(uploadWincStr);
         process.stderr.write(
-          `turbo: upload cost estimate: ${uploadWinc} winc (~${(Number(uploadWinc) / 1e12).toFixed(8)} AR, ${size} bytes)\n`,
+          `turbo: upload cost estimate: ${uploadWinc} winc (~${(Number(uploadWinc) / 1e12).toFixed(8)} AR, ` +
+            `${billedBytes} billed bytes = ${size} bytes of ciphertext + ${overheadBytes} bytes of ANS-104 data-item header)\n`,
         );
         // Human-readable USD approximation next to the native estimate (#70). arUsdRate
         // never throws (null on any failure), so a dead pricing endpoint can neither
@@ -108,12 +130,12 @@ export function turboBackend(): StorageBackend {
               : null;
         if (turboRate !== null) {
           process.stderr.write(
-            `turbo: approx cost: ${fmtBytes(size)} -> ${usdApprox(uploadWinc, turboRate.ratePer1e12Winc)} ` +
+            `turbo: approx cost: ${fmtBytes(billedBytes)} -> ${usdApprox(uploadWinc, turboRate.ratePer1e12Winc)} ` +
               `(at Turbo's credit rate ~$${turboRate.usdPerGiB.toFixed(2)}/GiB, fees included — what buying these credits with fiat costs; not a quote)\n`,
           );
         } else if (spotRate !== null) {
           process.stderr.write(
-            `turbo: approx cost: ${fmtBytes(size)} -> ${usdApprox(uploadWinc, spotRate)} ` +
+            `turbo: approx cost: ${fmtBytes(billedBytes)} -> ${usdApprox(uploadWinc, spotRate)} ` +
               `(at AR SPOT ~$${spotRate.toFixed(2)}/AR — the credit price sheet was unavailable; buying the credits with fiat typically costs more than this)\n`,
           );
         }
@@ -165,11 +187,30 @@ export function turboBackend(): StorageBackend {
             'turbo: internal error — CYPHER_BRAIN_MAX_SPEND is set but no upload cost estimate is available; refusing to proceed uncapped',
           );
         }
-        if (uploadWinc > AR_MAX_SPEND) {
+        // #797: the cap bounds what the whole PUSH spends, not what this one upload
+        // spends. A signed push uploads the ciphertext and its ".minisig" sidecar as two
+        // separate paid data items; checking each against the full cap in isolation let
+        // two uploads that each cleared it spend twice it (the bug #639 already fixed for
+        // ton-provider, via the same shared tracker pushpull.ts passes to both calls).
+        const spent = spentSoFar(opts.spendTracker);
+        const remaining = remainingSpendBudget(AR_MAX_SPEND, opts.spendTracker);
+        if (remaining <= 0n) {
+          throw new Error(budgetExhaustedMessage('turbo', 'CYPHER_BRAIN_MAX_SPEND', AR_MAX_SPEND, spent));
+        }
+        if (uploadWinc > remaining) {
           throw new Error(
-            `turbo: upload cost ${uploadWinc} winc exceeds CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND} — aborting to protect your wallet`,
+            `turbo: upload cost ${uploadWinc} winc exceeds ${
+              spent > 0n
+                ? `the ${remaining} winc still left under CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND} ` +
+                  `(${spent} winc of it already committed earlier in this push — the ciphertext and its ".minisig" ` +
+                  'signature sidecar are checked TOGETHER)'
+                : `CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND}`
+            } — aborting to protect your wallet`,
           );
         }
+        // Charged once it is known to be within budget and about to be spent, so the
+        // sidecar's own put() below sees this upload already counted (#639's ordering).
+        chargeSpendTracker(opts.spendTracker, uploadWinc);
       }
       // Funds check (#342) — like the cap check above, OUTSIDE the estimate try/catch so
       // no exception path can swallow it (#105's lesson). It runs only when BOTH facts
@@ -241,11 +282,11 @@ export function turboBackend(): StorageBackend {
       // CLI path when credits were bought on a wallet we can't sign with (e.g. MetaMask)
       // and shared to this JWK. Not URL-interpolated (header only), but sanity-check the
       // shape (Arweave/Ethereum/Solana address) to reject header-breaking input.
+      // The SAME `dataItemTags` array the size/price above was computed from (#791) —
+      // building a second, separately-written list here is exactly how the priced item
+      // and the uploaded item drift apart.
       const dataItemOpts: { tags: { name: string; value: string }[]; paidBy?: string[] } = {
-        tags: [
-          { name: 'App-Name', value: 'cypher-brain' },
-          { name: 'Content-Type', value: 'application/octet-stream' },
-        ],
+        tags: dataItemTags,
       };
       if (AR_PAID_BY) {
         if (!isWalletAddress(AR_PAID_BY))

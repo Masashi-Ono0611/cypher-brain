@@ -144,6 +144,9 @@ const broadcastLogPath = process.argv[7]; // every accepted POST /v2/blockchain/
 const neverActiveFlagPath = process.argv[8]; // if present, every NON-owner address (i.e. a just-deployed contract) reports 'uninitialized' forever — issue #480's waitForContractActive() timeout positive control
 const unfundedAddrFlagPath = process.argv[9]; // if present, its CONTENTS name an address to report 'nonexist'/balance:0 for on plain /v2/accounts/<addr>
 const lookupFailAddrFlagPath = process.argv[10]; // issue #640: if present, its CONTENTS name an address for which GET /v2/blockchain/accounts/<addr> (fetchAccountState's own endpoint) answers HTTP 500 -- a TRANSIENT lookup failure, distinct from every 200-with-status response above (which are all real, non-error account states)
+const contractLookupFailFlagPath = process.argv[11]; // issue #805: if present, GET /v2/blockchain/accounts/<addr> answers HTTP 500 for every NON-owner address (i.e. the derived StorageV1 contract) -- the "the already-funded check cannot answer" case, which must fail CLOSED. Address-agnostic (same shape as neverActiveFlagPath) because the contract address is derived inside put() and is not known to the test up front
+const broadcastFailFlagPath = process.argv[12]; // issue #664: if present, POST /v2/blockchain/message still RECORDS the BOC (the transfer lands) but answers HTTP 500 -- the "accepted, response lost" broadcast case
+const contractNeverExistsFlagPath = process.argv[13]; // issue #664: if present, every NON-owner address reports 'nonexist' forever, so the post-broadcast probe stays inconclusive
 
 const seenAddrs = new Set(); // issue #638: first-ever query for an address -> 'nonexist'; every query after that -> 'active' (see header comment above)
 
@@ -159,6 +162,13 @@ createServer((req, res) => {
     req.on('data', (d) => (body += d));
     req.on('end', () => {
       if (broadcastLogPath) appendFileSync(broadcastLogPath, `${body}\n`);
+      // issue #664: the BOC is recorded first either way -- the point of this flag is a
+      // broadcast that really landed and then lost its response, not one that was refused.
+      if (broadcastFailFlagPath && existsSync(broadcastFailFlagPath)) {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'simulated lost broadcast response (issue #664 positive control)' }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({}));
     });
@@ -179,6 +189,13 @@ createServer((req, res) => {
       res.end(JSON.stringify({ error: 'simulated transient tonapi failure (issue #640 positive control)' }));
       return;
     }
+    // issue #805: the same transient failure, but aimed at the DERIVED CONTRACT rather
+    // than a known address -- everything that is not the owner wallet.
+    if (contractLookupFailFlagPath && existsSync(contractLookupFailFlagPath) && blockchainAccountMatch[1] !== ownerAddr) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'simulated transient tonapi failure on the contract (issue #805 positive control)' }));
+      return;
+    }
   }
   const plainAccountMatch = url.pathname.match(/^\/v2\/accounts\/([^/]+)$/);
   if (plainAccountMatch) {
@@ -194,7 +211,12 @@ createServer((req, res) => {
   const lowBalance = lowBalanceFlagPath && existsSync(lowBalanceFlagPath) && url.pathname.includes(ownerAddr);
   const neverActive = neverActiveFlagPath && existsSync(neverActiveFlagPath) && !url.pathname.includes(ownerAddr);
   let status;
-  if (isFrozenTarget) {
+  if (contractNeverExistsFlagPath && existsSync(contractNeverExistsFlagPath)) {
+    // issue #664: nothing ever shows on-chain, so the post-broadcast probe cannot
+    // confirm the transfer landed. (A wallet reading 'nonexist' simply means seqno 0 --
+    // autoSignAndBroadcastDeploy treats that as a never-used wallet, not an error.)
+    status = 'nonexist';
+  } else if (isFrozenTarget) {
     status = 'frozen';
   } else {
     // issue #638: see the "seen" tracking header comment above this mock's source.
@@ -226,8 +248,11 @@ BROADCAST_LOG="$TMP/broadcast-log"
 NEVER_ACTIVE_FLAG="$TMP/never-active-flag"
 UNFUNDED_ADDR_FLAG="$TMP/unfunded-addr-flag"
 LOOKUP_FAIL_ADDR_FLAG="$TMP/lookup-fail-addr-flag"
+CONTRACT_LOOKUP_FAIL_FLAG="$TMP/contract-lookup-fail-flag"
+BROADCAST_FAIL_FLAG="$TMP/broadcast-fail-flag"
+CONTRACT_NEVER_EXISTS_FLAG="$TMP/contract-never-exists-flag"
 TONAPI_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" "$UNFUNDED_ADDR_FLAG" "$LOOKUP_FAIL_ADDR_FLAG" &
+node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" "$UNFUNDED_ADDR_FLAG" "$LOOKUP_FAIL_ADDR_FLAG" "$CONTRACT_LOOKUP_FAIL_FLAG" "$BROADCAST_FAIL_FLAG" "$CONTRACT_NEVER_EXISTS_FLAG" &
 TONAPI_PID=$!
 export CYPHER_BRAIN_TON_TONAPI_URL="http://127.0.0.1:$TONAPI_PORT"
 
@@ -891,6 +916,81 @@ SECOND_BROADCASTS=$(grep -c '"boc"' "$BROADCAST_LOG" || true)
 [ "$SECOND_BROADCASTS" = "1" ] || { echo "[FAIL] issue #638 REGRESSION: the retry sent a SECOND broadcast against an already-active contract (double-funding) — broadcast count is now $SECOND_BROADCASTS, expected still 1"; cat "$BROADCAST_LOG"; exit 1; }
 grep -q 'already shows on-chain activity' "$TMP/issue638-retry.err" || { echo "[FAIL] the retry did not report that the contract was already active/skipped"; cat "$TMP/issue638-retry.err"; exit 1; }
 echo "[PASS] issue #638: retrying an already-active StorageV1 contract skips re-funding (broadcast count stayed at 1, not 2)"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
+
+echo "== issue #805: an already-funded check that cannot ANSWER must fail CLOSED, not fund anyway =="
+# #638's guard is only useful on a RETRY, and a retry after an ambiguous broadcast is
+# exactly when tonapi is most likely to be flaky — so the old "on a lookup failure,
+# proceed as if the contract is fresh" fallback fired precisely when it was most likely
+# to be re-funding an already-funded contract. Driven through the deeplink path
+# (CYPHER_BRAIN_TON_WALLET unset) so "owner" is the configured owner address and the
+# mock's contract-lookup-failure flag hits ONLY the derived contract.
+mkdir -p "$TMP/issue805-src"
+printf 'ton-provider issue #805 fail-closed already-funded check payload\n' > "$TMP/issue805-src/note.txt"
+cb snapshot --dir "$TMP/issue805-src" --out "$TMP/issue805.age"
+I805_SIZE=$(stat -f%z "$TMP/issue805.age" 2>/dev/null || stat -c%s "$TMP/issue805.age")
+echo "$I805_SIZE" > "$TMP/notify-downloaded"
+touch "$CONTRACT_LOOKUP_FAIL_FLAG"
+: > "$BROADCAST_LOG"
+if CYPHER_BRAIN_TON_WALLET= CYPHER_BRAIN_TON_PROVIDER_OWNER="$TON_PROVIDER_OWNER_ADDR" \
+  cb push --in "$TMP/issue805.age" --backend ton-provider 2>"$TMP/issue805.err"; then
+  echo "[FAIL] push proceeded even though the already-funded check could not be answered"; cat "$TMP/issue805.err"; exit 1
+fi
+grep -q 'could not determine whether contract' "$TMP/issue805.err" || { echo "[FAIL] wrong indeterminate-state message"; cat "$TMP/issue805.err"; exit 1; }
+grep -q 'fail-closed refusal: no funds moved' "$TMP/issue805.err" || { echo "[FAIL] the refusal does not state that no funds moved"; cat "$TMP/issue805.err"; exit 1; }
+[ -s "$BROADCAST_LOG" ] && { echo "[FAIL] an indeterminate already-funded check still reached broadcast"; exit 1; }
+grep -q 'sign this to deploy the contract' "$TMP/issue805.err" && { echo "[FAIL] an indeterminate already-funded check still printed a funding deeplink"; exit 1; }
+rm -f "$CONTRACT_LOOKUP_FAIL_FLAG"
+# Control, on the SAME artifact: with the lookup answering again, this push reaches the
+# funding step — so the refusal above is the check firing, not this fixture being unable
+# to push at all.
+CYPHER_BRAIN_TON_WALLET= CYPHER_BRAIN_TON_PROVIDER_OWNER="$TON_PROVIDER_OWNER_ADDR" \
+  cb push --in "$TMP/issue805.age" --backend ton-provider 2>"$TMP/issue805-ok.err" >/dev/null \
+  || { echo "[FAIL] the control push failed even with the account-state lookup answering"; cat "$TMP/issue805-ok.err"; exit 1; }
+grep -q 'sign this to deploy the contract' "$TMP/issue805-ok.err" || { echo "[FAIL] the control push never reached the funding step"; cat "$TMP/issue805-ok.err"; exit 1; }
+echo "[PASS] issue #805: an unanswerable already-funded check refuses before any funds move, and answers again once tonapi recovers"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
+
+echo "== issue #664: a broadcast whose response is LOST but which LANDED is carried through to confirmation, not thrown away =="
+# tonapi can accept the BOC and then lose the response. Rethrowing that error left the
+# spend invisible: put() never reached waitForContractActive(), so #654's receipt
+# checkpoint never fired, and a later retry hit #638's already-active branch which
+# deliberately writes no receipt. The mock records the BOC and THEN answers HTTP 500.
+mkdir -p "$TMP/issue664-src"
+printf 'ton-provider issue #664 lost-broadcast-response payload\n' > "$TMP/issue664-src/note.txt"
+cb snapshot --dir "$TMP/issue664-src" --out "$TMP/issue664.age"
+I664_SIZE=$(stat -f%z "$TMP/issue664.age" 2>/dev/null || stat -c%s "$TMP/issue664.age")
+echo "$I664_SIZE" > "$TMP/notify-downloaded"
+RECEIPT_COUNT_BEFORE_664=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+touch "$BROADCAST_FAIL_FLAG"
+: > "$BROADCAST_LOG"
+CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue664.age" --backend ton-provider 2>"$TMP/issue664.err" >/dev/null \
+  || { echo "[FAIL] a broadcast that actually landed was still reported as a failure"; cat "$TMP/issue664.err"; exit 1; }
+rm -f "$BROADCAST_FAIL_FLAG"
+[ -s "$BROADCAST_LOG" ] || { echo "[FAIL] issue #664 setup: the broadcast never reached the mock"; exit 1; }
+grep -q 'the transfer landed despite the error' "$TMP/issue664.err" || { echo "[FAIL] the lost-response broadcast was not reported as having landed"; cat "$TMP/issue664.err"; exit 1; }
+RECEIPT_COUNT_AFTER_664=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+[ "$RECEIPT_COUNT_AFTER_664" -gt "$RECEIPT_COUNT_BEFORE_664" ] \
+  || { echo "[FAIL] the confirmed spend never reached the receipt ledger ($RECEIPT_COUNT_BEFORE_664 -> $RECEIPT_COUNT_AFTER_664)"; exit 1; }
+echo "[PASS] issue #664: a lost broadcast response whose transfer landed is confirmed and recorded, not discarded"
+
+echo "== issue #664: a broadcast failure that CANNOT be confirmed says so, instead of reading as 'nothing happened' =="
+mkdir -p "$TMP/issue664b-src"
+printf 'ton-provider issue #664 unconfirmable-broadcast payload\n' > "$TMP/issue664b-src/note.txt"
+cb snapshot --dir "$TMP/issue664b-src" --out "$TMP/issue664b.age"
+I664B_SIZE=$(stat -f%z "$TMP/issue664b.age" 2>/dev/null || stat -c%s "$TMP/issue664b.age")
+echo "$I664B_SIZE" > "$TMP/notify-downloaded"
+touch "$BROADCAST_FAIL_FLAG" "$CONTRACT_NEVER_EXISTS_FLAG"
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue664b.age" --backend ton-provider 2>"$TMP/issue664b.err"; then
+  echo "[FAIL] push succeeded even though the broadcast failed and nothing could confirm it"; cat "$TMP/issue664b.err"; exit 1
+fi
+rm -f "$BROADCAST_FAIL_FLAG" "$CONTRACT_NEVER_EXISTS_FLAG"
+grep -q 'outcome is' "$TMP/issue664b.err" && grep -q 'UNCERTAIN' "$TMP/issue664b.err" \
+  || { echo "[FAIL] an unconfirmable broadcast failure did not report the outcome as uncertain"; cat "$TMP/issue664b.err"; exit 1; }
+grep -q 'BEFORE re-running push' "$TMP/issue664b.err" || { echo "[FAIL] the uncertain-broadcast error does not tell the operator to check before retrying"; cat "$TMP/issue664b.err"; exit 1; }
+echo "[PASS] issue #664: an unconfirmable broadcast failure names the address and says the outcome is uncertain"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
 echo "== issue #654: a notify failure AFTER funding is confirmed still persists the receipt (PushFundingConfirmedButIncompleteError) =="

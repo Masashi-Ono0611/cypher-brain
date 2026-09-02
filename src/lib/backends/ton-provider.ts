@@ -107,6 +107,7 @@ import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 // imports this file; if this file imported from pushpull.ts, that would close the loop.
 // See push-partial-success.ts's own header comment.
 import { PushFundingConfirmedButIncompleteError } from '../push-partial-success.js';
+import { spentSoFar, remainingSpendBudget, chargeSpendTracker } from '../spend-tracker.js';
 
 // Lazy loader for @ton/ton's VALUE exports (beginCell/Cell/Dictionary/Address/
 // contractAddress/storeStateInit) — mirrors wallet.ts's getArweave(). Cached after the
@@ -434,6 +435,13 @@ function buildTonkeeperUniversalLink(addr: TonAddress, body: TonCell, stateInit:
 }
 
 // ---------- on-chain status polling (tonapi, same endpoint scripts/go/storage-v1-client's status.go uses) ----------
+// #805: how hard put()'s "has this contract already been funded?" guard tries before it
+// gives up and REFUSES to broadcast. Small and fixed rather than deadline-driven: the
+// failure this absorbs is a transient tonapi blip, and a longer wait would only delay a
+// refusal the operator has to act on anyway. Also reused by the #664 post-broadcast
+// probe, which asks the same endpoint the same way.
+const ALREADY_ACTIVE_CHECK_ATTEMPTS = 3;
+const ALREADY_ACTIVE_CHECK_INTERVAL_MS = 2000;
 interface AccountState {
   status: string;
   balance: number;
@@ -511,10 +519,20 @@ async function fetchWalletSeqno(addr: TonAddress): Promise<number> {
 //   own UI already shows the "Fee" line separately from the transfer amount for the
 //   human-signed path. Pre-existing PR1 semantics (MAX_SPEND was never a hard ceiling on
 //   Tonkeeper's total wallet debit either) — not a gap PR2 introduces or worsens.
+// issue #664: `submitted` is set to true at the exact moment the signed BOC leaves this
+// process, and never before. put()'s catch around this call uses it to tell a failure
+// that CANNOT have moved funds (a frozen wallet, an unreadable seqno, a StateInit
+// mismatch — all of them before the POST) from one that MIGHT have (the POST itself
+// throwing or answering non-2xx, where tonapi may well have accepted the message and
+// only lost the response). Probing the contract's on-chain state after a pre-broadcast
+// failure would be actively wrong: the address can read as non-`nonexist` for reasons
+// that have nothing to do with this run, and the caller would then treat a refusal that
+// spent nothing as a confirmed spend.
 async function autoSignAndBroadcastDeploy(
   wallet: TonWalletContractV4,
   secretKey: Buffer,
   deploy: BuildDeployResult,
+  submitted?: { value: boolean },
 ): Promise<void> {
   const { beginCell, contractAddress, external, internal, loadStateInit, SendMode, storeMessage } = await getTon();
 
@@ -589,6 +607,9 @@ async function autoSignAndBroadcastDeploy(
   const boc = beginCell().store(storeMessage(extMsg)).endCell().toBoc({ idx: false, crc32: true });
 
   const url = `${TON_TONAPI_URL}/v2/blockchain/message`;
+  // Set BEFORE the await, not after it: the whole point is to cover the window where the
+  // request may have reached tonapi while this process never learns the outcome.
+  if (submitted) submitted.value = true;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1139,8 +1160,11 @@ export function tonProviderBackend(): StorageBackend {
       // that, and this is a documented assumption of the contract (types.ts), not an
       // enforced invariant — same posture as the pre-existing cross-process wallet
       // seqno race documented above (autoSignAndBroadcastDeploy's KNOWN LIMITATIONS).
-      const spentSoFarNano = opts.spendTracker?.spentNano ?? 0n;
-      const remainingMaxSpendNano = TON_PROVIDER_MAX_SPEND - spentSoFarNano;
+      // #797 factored this arithmetic into src/lib/spend-tracker.ts so arweave and turbo
+      // can enforce the SAME combined-spend rule against their own caps; the behaviour
+      // here is unchanged.
+      const spentSoFarNano = spentSoFar(opts.spendTracker);
+      const remainingMaxSpendNano = remainingSpendBudget(TON_PROVIDER_MAX_SPEND, opts.spendTracker);
       if (remainingMaxSpendNano <= 0n) {
         throw new Error(
           `ton-provider backend: this push already committed ${spentSoFarNano} nanoTON toward ` +
@@ -1288,21 +1312,48 @@ export function tonProviderBackend(): StorageBackend {
         // fix does not claim to eliminate, left as a known limitation (see this PR's
         // description) rather than implemented speculatively.
         //
-        // A network failure while checking is NOT treated as proof the contract is
-        // fresh: falling back to the PRE-#638 behavior (attempt to fund) on a check
-        // failure means this fix can only make double-funding LESS likely, never
-        // introduce a new way to silently skip a real, first-time deploy.
+        // #805: a check that cannot ANSWER now fails CLOSED. This guard originally fell
+        // back to "proceed as if the contract is fresh" on a lookup failure, reasoning
+        // that doing so could only make double-funding less likely and could never skip
+        // a real first deploy. That reasoning holds for a fresh deploy and is exactly
+        // inverted for the case the guard exists for: a retry after an ambiguous
+        // broadcast, where the very instability that produced the ambiguity is what
+        // makes the lookup fail — so the fail-open branch fired precisely when it was
+        // most likely to be re-funding an already-funded contract.
+        //
+        // Failing closed costs no working path here: waitForContractActive() below polls
+        // this SAME endpoint and put() always reaches it, so a genuinely unreachable
+        // tonapi already fails this push — the only change is that it now fails BEFORE
+        // the transfer instead of after it. Retried a few times first, because the usual
+        // cause is a transient blip rather than an outage.
+        //
+        // `nonexist` must be POSITIVELY observed. An unread state is "unknown", never
+        // "fresh": the only status this backend's own first-ever deploy for a bag/owner
+        // pair should ever see here is `nonexist`, and anything we did not actually read
+        // could equally be `uninit`/`active`/`frozen`.
         let alreadyActive = false;
         let observedStatus = '';
-        try {
-          const contractState = await fetchAccountState(deploy.contractAddress);
-          observedStatus = contractState.status;
-          alreadyActive = observedStatus !== 'nonexist';
-        } catch (e) {
-          warn(
-            `ton-provider: could not check whether contract ${deploy.contractAddress.toRawString()} already has ` +
-              `on-chain history (${errMsg(e)}) — proceeding as if it does not (the pre-#638 behavior for this ` +
-              'specific check failure; the broadcast/signature step below still gives its own unambiguous result)',
+        let lastLookupError: unknown = null;
+        for (let attempt = 0; attempt < ALREADY_ACTIVE_CHECK_ATTEMPTS; attempt++) {
+          if (attempt > 0) await sleep(ALREADY_ACTIVE_CHECK_INTERVAL_MS);
+          try {
+            const contractState = await fetchAccountState(deploy.contractAddress);
+            observedStatus = contractState.status;
+            alreadyActive = observedStatus !== 'nonexist';
+            lastLookupError = null;
+            break;
+          } catch (e) {
+            lastLookupError = e;
+          }
+        }
+        if (lastLookupError !== null) {
+          throw new Error(
+            `ton-provider backend: could not determine whether contract ${deploy.contractAddress.toRawString()} ` +
+              `has already been funded (${ALREADY_ACTIVE_CHECK_ATTEMPTS} tonapi lookups failed, last: ` +
+              `${errMsg(lastLookupError)}) — refusing to broadcast a ${deploy.amountNano} nanoTON transfer that ` +
+              'could be a SECOND payment for the same contract. This is a fail-closed refusal: no funds moved. ' +
+              "Check the address's state on a TON explorer, or re-run push once tonapi is reachable again (the " +
+              'same ciphertext resolves to the same bag id and reuses this bag, so nothing is lost by waiting).',
           );
         }
         if (!alreadyActive) {
@@ -1316,7 +1367,7 @@ export function tonProviderBackend(): StorageBackend {
           // funds at all (see the money-safety comment above), so charging it there
           // would falsely shrink the sidecar's remaining budget for a spend that never
           // happened this run.
-          if (opts.spendTracker) opts.spendTracker.spentNano += deploy.amountNano;
+          chargeSpendTracker(opts.spendTracker, deploy.amountNano);
         }
         if (alreadyActive) {
           // warn() (#347), not a raw console.error: this is a safety-relevant skip
@@ -1375,7 +1426,53 @@ export function tonProviderBackend(): StorageBackend {
             `ton-provider: auto-signing with local wallet ${owner.toString({ bounceable: true })} ` +
               '(CYPHER_BRAIN_TON_WALLET) — no Tonkeeper deeplink needed',
           );
-          await autoSignAndBroadcastDeploy(autoSignWallet.wallet, autoSignWallet.secretKey, deploy);
+          const submitted = { value: false };
+          try {
+            await autoSignAndBroadcastDeploy(autoSignWallet.wallet, autoSignWallet.secretKey, deploy, submitted);
+          } catch (e) {
+            // Nothing left this process: a frozen wallet, an unreadable seqno, a
+            // StateInit mismatch. No funds can have moved, so this is an ordinary
+            // failure and must stay one — probing the contract here would let an
+            // unrelated on-chain state turn a refusal into a "confirmed spend".
+            if (!submitted.value) throw e;
+            // issue #664: a broadcast POST that FAILS can still have landed — tonapi can
+            // accept the BOC and then lose the response. Rethrown as-is, the transfer is
+            // invisible: put() never reaches waitForContractActive(), so #654's receipt
+            // checkpoint never fires, and a later retry hits #638's already-active branch
+            // which deliberately writes no receipt (it moved no funds). The spend is then
+            // absent from the ledger forever.
+            //
+            // Probe the derived contract address before letting the error out, the same
+            // bounded way the pre-broadcast guard above asks. If it is no longer
+            // `nonexist` the transfer DID land: fall through to waitForContractActive()
+            // and the normal confirmation/receipt path, which is exactly what would have
+            // happened had the response arrived. If the probe cannot say, the outcome is
+            // genuinely ambiguous — say so and name the address, rather than let it read
+            // as "nothing happened".
+            let landed = false;
+            for (let attempt = 0; attempt < ALREADY_ACTIVE_CHECK_ATTEMPTS && !landed; attempt++) {
+              if (attempt > 0) await sleep(ALREADY_ACTIVE_CHECK_INTERVAL_MS);
+              try {
+                landed = (await fetchAccountState(deploy.contractAddress)).status !== 'nonexist';
+              } catch {
+                // one more inconclusive read; keep the remaining attempts
+              }
+            }
+            if (!landed) {
+              throw new Error(
+                `ton-provider backend: broadcasting the deploy failed (${errMsg(e)}) and the outcome is ` +
+                  `UNCERTAIN — the transfer of ${deploy.amountNano} nanoTON to ` +
+                  `${deploy.contractAddress.toRawString()} may or may not have been accepted (a probe could not ` +
+                  "find the contract, which is not proof it is absent). Check the address's state on a TON " +
+                  'explorer BEFORE re-running push.',
+              );
+            }
+            warn(
+              `ton-provider: the deploy broadcast reported a failure (${errMsg(e)}) but contract ` +
+                `${deploy.contractAddress.toRawString()} shows on-chain activity — the transfer landed despite the ` +
+                'error. Continuing with confirmation and the receipt for the spend that already happened (#664).',
+            );
+          }
         } else {
           console.error(`ton-provider: sign this to deploy the contract (bag stays seeded locally while you do):`);
           console.error(`  ${deploy.deeplink}`);

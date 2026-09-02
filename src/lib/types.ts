@@ -2,6 +2,7 @@
 // bag every command function takes, and the storage-backend contract every
 // src/lib/backends/*.ts implements. Kept in one place so cli.ts, mcp.ts and every
 // lib/*.ts consumer import the SAME type instead of each hand-rolling its own.
+import type { SpendTracker } from './spend-tracker.js';
 
 // The full canonical set of storage backend names, shared by backends/index.ts (its
 // BACKEND_FACTORIES key set, and the "unknown backend" usage text) and estimate.ts
@@ -148,19 +149,22 @@ export interface PutOpts {
   // the backend moves on to whatever might still fail (e.g. ton-provider's notify) —
   // a synchronous callback would let the receipt live only in memory across that gap.
   onReceipt?: (event: ReceiptEvent) => Promise<void>;
-  // #639: ton-provider only. A signed push calls put() TWICE — once for the ciphertext,
-  // once for its ".minisig" sidecar — and each deploys its OWN StorageV1 contract.
-  // pushpull.ts's push() creates ONE mutable box and passes the SAME reference to both
-  // calls; ton-provider.ts's put() checks the REMAINING CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND
-  // budget (the cap minus spentNano so far) before building each deploy, then adds that
-  // deploy's own amountNano to spentNano once it is known to be within budget — so the
-  // cap bounds what the WHOLE push spends, not what either deploy spends in isolation.
-  // Every other backend ignores this field entirely, same as `remote`/`force` above.
+  // #639, extended to arweave/turbo by #797: EVERY paid backend. A signed push calls
+  // put() TWICE — once for the ciphertext, once for its ".minisig" sidecar — and each of
+  // those is its own real charge (a StorageV1 contract deploy, an L1 transaction, a
+  // Turbo data item). pushpull.ts's push() creates ONE mutable box and passes the SAME
+  // reference to both calls; each paid backend's put() checks the REMAINING budget (its
+  // cap minus `spent` so far) before committing, then adds its own amount to `spent`
+  // once that amount is known to be within budget — so the cap bounds what the WHOLE
+  // push spends, not what either upload spends in isolation. The unit is whatever the
+  // spending backend's cap is denominated in (nanoTON / winston / winc); a tracker is
+  // only ever seen by one backend, so it is never ambiguous. Free backends (file,
+  // rclone) ignore this field entirely, same as `remote`/`force` above.
   // CONTRACT: the check-then-charge against this box is not atomic — callers must
   // never run two put() calls against the SAME spendTracker concurrently (await each
   // to completion before starting the next), or the cap can be bypassed. pushpull.ts's
-  // push() already does this correctly.
-  spendTracker?: { spentNano: bigint };
+  // push() already does this correctly. See src/lib/spend-tracker.ts for the helpers.
+  spendTracker?: SpendTracker;
 }
 
 export interface StorageBackend {

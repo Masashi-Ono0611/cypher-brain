@@ -15,11 +15,13 @@ import { appendReceipt } from './receipt.js';
 import { recordAudit } from './audit.js';
 import { warn } from './warn.js';
 import type { CliOptions, ReceiptEvent } from './types.js';
+import type { SpendTracker } from './spend-tracker.js';
 import {
   PushPartialSuccessError,
   PushSignatureUploadError,
   PushLocatorWriteError,
   PushFundingConfirmedButIncompleteError,
+  PushUploadConfirmedResponseLostError,
 } from './push-partial-success.js';
 // Re-exported unchanged so existing `from './pushpull.js'` imports (mcp.ts, wizard.ts)
 // keep working — see push-partial-success.ts's own header comment for why these
@@ -29,6 +31,7 @@ export {
   PushSignatureUploadError,
   PushLocatorWriteError,
   PushFundingConfirmedButIncompleteError,
+  PushUploadConfirmedResponseLostError,
 } from './push-partial-success.js';
 
 // The plaintext content digest for the artifact being pushed: an explicit --digest
@@ -360,25 +363,28 @@ async function pushCore(
     // header must never produce a false match of that check.
     console.error(`${o.backend}: cost estimate (shown before the upload-consent check below):`);
     for (const line of formatEstimate(est)) console.error(`  ${line}`);
-    // #639: ton-provider is the ONLY backend where CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND
-    // must bound the ciphertext deploy AND (if a signed artifact) the ".minisig" sidecar
-    // deploy TOGETHER (ton-provider.ts's put() enforces this via a shared spendTracker
-    // passed below) — so a signed push's pre-consent display must also show the
-    // sidecar's own estimate and the combined total, or an operator could consent
-    // against a number the actual combined spend goes on to exceed. Best-effort only,
-    // same staleness caveat as the ciphertext estimate above: a real, independent
-    // provider-search query, not a shared computation with put()'s own.
-    if (o.backend === 'ton-provider' && (await exists(`${o.in}.minisig`))) {
+    // #639 (ton-provider), extended to arweave/turbo by #797: on EVERY paid backend a
+    // signed push spends twice — once for the ciphertext, once for the ".minisig"
+    // sidecar — and the per-run cap bounds their SUM (each backend's put() enforces this
+    // via the shared spendTracker passed below). So a signed push's pre-consent display
+    // must also show the sidecar's own estimate and the combined total, or an operator
+    // could consent against a number the actual combined spend goes on to exceed.
+    // Best-effort only, same staleness caveat as the ciphertext estimate above: a real,
+    // independent price query, not a shared computation with put()'s own.
+    if (await exists(`${o.in}.minisig`)) {
       const { size: sigSizeBytes } = await stat(`${o.in}.minisig`);
       const sigEst = await estimateCost(o.backend, sigSizeBytes);
+      const secondUnit =
+        o.backend === 'ton-provider' ? 'as a SECOND contract' : 'as a SECOND, separately-priced paid upload';
       console.error(
-        `${o.backend}: a ".minisig" signature sidecar will ALSO be deployed, as a SECOND contract — its own cost estimate:`,
+        `${o.backend}: a ".minisig" signature sidecar will ALSO be uploaded, ${secondUnit} — its own cost estimate:`,
       );
       for (const line of formatEstimate(sigEst)) console.error(`  ${line}`);
       if (est.cost !== null && sigEst.cost !== null) {
+        const capVar = o.backend === 'ton-provider' ? 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND' : 'CYPHER_BRAIN_MAX_SPEND';
         console.error(
           `${o.backend}: combined ciphertext+signature spend is checked TOGETHER against ` +
-            `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (≈${BigInt(est.cost) + BigInt(sigEst.cost)} nanoTON total)`,
+            `${capVar} (≈${BigInt(est.cost) + BigInt(sigEst.cost)} ${sigEst.unit ?? est.unit ?? 'units'} total)`,
         );
       }
     }
@@ -464,11 +470,13 @@ async function pushCore(
   // deliberately the SAME o.force that opted resolveSkipUnchanged() past the digest
   // check above, not a second flag.
   //
-  // `spendTracker` (#639) is ton-provider-only — a mutable box passed BY REFERENCE to
-  // this call and the ".minisig" sidecar's put() call further down, so ton-provider.ts
-  // can enforce CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND against their COMBINED spend rather
-  // than checking each deploy in isolation. Every other backend ignores it.
-  const spendTracker = { spentNano: 0n };
+  // `spendTracker` (#639, extended to arweave/turbo by #797) — a mutable box passed BY
+  // REFERENCE to this call and the ".minisig" sidecar's put() call further down, so each
+  // paid backend can enforce its own per-run cap against their COMBINED spend rather than
+  // checking each upload in isolation. Free backends ignore it. The two put() calls are
+  // strictly sequential (the sidecar's only starts once this one has resolved), which is
+  // what the tracker's non-atomic check-then-charge contract requires.
+  const spendTracker: SpendTracker = { spent: 0n };
   const locator = await backend.put(o.in, {
     yes,
     remote: o.remote,
@@ -506,9 +514,9 @@ async function pushCore(
         yes,
         remote: o.remote ? `${o.remote}.minisig` : undefined,
         force: o.force,
-        // #639: the SAME spendTracker reference the ciphertext upload above used — this
-        // is what lets ton-provider.ts see the ciphertext deploy's already-committed
-        // spend and enforce the cap against the combined total.
+        // #639/#797: the SAME spendTracker reference the ciphertext upload above used —
+        // this is what lets the backend see the ciphertext upload's already-committed
+        // spend and enforce its cap against the combined total.
         spendTracker,
         onReceipt: (event) => persistReceipt(sigPath, event),
       });
@@ -527,6 +535,14 @@ async function pushCore(
       // subclass's convention) and the sidecar's confirmed locator as sigLocator.
       if (e instanceof PushFundingConfirmedButIncompleteError) {
         throw new PushFundingConfirmedButIncompleteError(locator, e, e.locator);
+      }
+      // #802: the arweave equivalent, and the same reasoning verbatim — the sidecar's own
+      // L1 POST can lose its response after the transaction was accepted, so the sidecar
+      // ALSO already spent. Wrapping it as PushSignatureUploadError would report a
+      // confirmed spend as a plain "the sidecar failed to upload", discard the sidecar's
+      // confirmed tx id, and lose the identity mcp.ts classifies on.
+      if (e instanceof PushUploadConfirmedResponseLostError) {
+        throw new PushUploadConfirmedResponseLostError(locator, e, e.locator);
       }
       // The ciphertext (above) already durably uploaded — see PushPartialSuccessError's
       // own doc comment for why this must never be reported the same way as an
