@@ -150,7 +150,7 @@ count_top_entries() {
 # "try again", not as a product failure. The macOS CI cell missed it once in ~13 s while
 # the same script passed locally and on ubuntu.
 land_sigterm_mid_merge() {
-  local age="$1" out="$2" seeded="$3" total="$4" errlog="$5" attempt deadline n rc
+  local age="$1" out="$2" seeded="$3" total="$4" errlog="$5" attempt deadline settle n rc
   LANDED=0
   for attempt in 1 2 3 4 5; do
     "$RESEED"
@@ -163,8 +163,23 @@ land_sigterm_mid_merge() {
       if [ "$n" -gt "$seeded" ] && [ "$n" -lt "$total" ]; then
         # kill can lose the race against a natural exit between the count and here —
         # under set -e that must read as a missed window (retry), not a script abort
-        if kill -TERM "$MMPID" 2>/dev/null; then LANDED=1; return 0; fi
-        break
+        kill -TERM "$MMPID" 2>/dev/null || break
+        # The signal can still arrive AFTER the last rename (the count above is already
+        # stale by the time the kernel delivers it): the restore then completes normally
+        # and the handler, correctly, drops no INCOMPLETE sentinel — the macOS CI cell hit
+        # exactly this ("did not drop the INCOMPLETE sentinel"). Wait (bounded, so a
+        # handler that blocks — #741's regression case — is still left for the caller to
+        # diagnose) and treat "every entry present" as a miss to retry, not as a verdict.
+        settle=$((SECONDS + 10))
+        while [ "$SECONDS" -lt "$settle" ] && kill -0 "$MMPID" 2>/dev/null; do sleep 0.05; done
+        if kill -0 "$MMPID" 2>/dev/null; then LANDED=1; return 0; fi # still alive: caller decides
+        n=$(count_top_entries "$out")
+        if [ "$n" -ge "$total" ]; then
+          wait "$MMPID" 2>/dev/null || true
+          echo "  (attempt $attempt: SIGTERM landed after the merge had completed — retrying)"
+          continue 2
+        fi
+        LANDED=1; return 0
       fi
     done
     if kill -0 "$MMPID" 2>/dev/null; then
