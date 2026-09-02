@@ -45,6 +45,7 @@ import {
 import type { KeyObject } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, chmod, readFile } from 'node:fs/promises';
+import type { Readable } from 'node:stream';
 import { basename } from 'node:path';
 import { unwrapTextFile, wrapIdentity, askNewPassphrase } from './crypt.js';
 import { writeKeyFile, backupIdentityFile } from './keys.js';
@@ -147,19 +148,26 @@ function b64decode(line: string, what: string): Buffer {
 
 // ---------- sign / verify ----------
 
-// Streamed BLAKE2b-512 (unkeyed, 64-byte digest) of a file — matches minisign's own
+// Streamed BLAKE2b-512 (unkeyed, 64-byte digest) — matches minisign's own
 // message_load_hashed() (crypto_generichash init/update/final at
 // crypto_generichash_BYTES_MAX = 64) byte-for-byte; confirmed by cross-verifying with
 // the real `minisign` binary both ways. Streamed (not readFile'd whole) so signing/
 // verifying a multi-GB snapshot stays bounded-memory, mirroring util.ts's sha256().
-function blake2b512(path: string): Promise<Buffer> {
+function blake2b512Stream(stream: Readable): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const h = createHash('blake2b512');
-    createReadStream(path)
+    stream
       .on('data', (d) => h.update(d))
       .on('end', () => resolve(h.digest()))
       .on('error', reject);
   });
+}
+
+// By path — the SIGNING side only: snapshot.ts signs a *.age it has just finished
+// writing, so there is no second reader to disagree with. The VERIFYING side never
+// opens a path (see SignedArtifact below).
+function blake2b512(path: string): Promise<Buffer> {
+  return blake2b512Stream(createReadStream(path));
 }
 
 export interface SignOpts {
@@ -258,18 +266,24 @@ export interface VerifyResult {
   trustedComment?: string; // present when valid === true
 }
 
-// Verify a *.minisig against `filePath`, using `publicKey`/`expectedKeyId` (from
-// parsePubkeyFile). Cheapest/most-tamper-revealing checks first — malformed framing,
-// then the key id pin, then the GLOBAL signature (authenticates the trusted comment
-// text itself) — before the file's own BLAKE2b-512 hash is computed, mirroring
-// restore.ts's own "check cheap things first" discipline for its header/negative-
-// control checks. Never throws for an ordinary verification failure (tampered/wrong
-// key/wrong file) — those come back as `{ valid: false, reason }`; only a caller-side
-// problem (the file itself unreadable) rejects.
+// Verify a *.minisig against the bytes `hashSignedBytes` digests, using
+// `publicKey`/`expectedKeyId` (from parsePubkeyFile). Cheapest/most-tamper-revealing
+// checks first — malformed framing, then the key id pin, then the GLOBAL signature
+// (authenticates the trusted comment text itself) — before the message's own
+// BLAKE2b-512 hash is computed, mirroring restore.ts's own "check cheap things first"
+// discipline for its header/negative-control checks. Never throws for an ordinary
+// verification failure (tampered/wrong key/wrong file) — those come back as
+// `{ valid: false, reason }`; only a caller-side problem (the bytes unreadable) rejects.
+//
+// #785: a DIGEST THUNK, never a path. What this call authenticates is now decided by
+// the caller's already-open descriptor, so "the signature verified" and "these are the
+// bytes that got extracted" can no longer refer to two different files. Kept lazy (a
+// thunk, not a precomputed Buffer) purely to preserve the ordering above — a caller
+// with no valid sidecar must not pay a full pass over a multi-GB artifact to be told so.
 export async function verifyDetached(
   publicKey: KeyObject,
   expectedKeyId: Buffer,
-  filePath: string,
+  hashSignedBytes: () => Promise<Buffer>,
   minisigText: string,
 ): Promise<VerifyResult> {
   let parsed: ParsedMinisig;
@@ -298,7 +312,7 @@ export async function verifyDetached(
       valid: false,
       reason: 'global signature (over the trusted comment) does not verify — the .minisig may be tampered or forged',
     };
-  const hash = await blake2b512(filePath);
+  const hash = await hashSignedBytes();
   const sigOk = verify(null, hash, publicKey, parsed.signature);
   if (!sigOk)
     return {
@@ -475,21 +489,50 @@ export interface SignatureCheck {
   reason?: string; // human-readable detail — always present except for 'verified'
 }
 
-// The one call restore.ts/pushpull.ts actually need: given the ciphertext path and the
-// configured signing public key path, report whether `<inPath>.minisig` (if any)
-// checks out. Distinguishes "no signature to check" / "no public key to check it with"
-// (both non-fatal — an unsigned/legacy artifact, or a public-key-only box that hasn't
-// been given the signing public key) from "invalid" (a tampered/forged signature —
-// the ONLY status callers should treat as fatal). Never throws for a file-shape
-// problem — that becomes 'invalid' with a reason, same as a bad signature; only a
-// missing/unreadable pubkey path itself is reported as 'no_pubkey', not raised.
-export async function checkArtifactSignature(inPath: string, signRecipientPath: string): Promise<SignatureCheck> {
-  const sigPath = `${inPath}.minisig`;
-  if (!(await exists(sigPath))) {
-    return {
-      status: 'no_signature',
-      reason: `no ${sigPath} found — unsigned (legacy) artifact, authenticity not checked`,
-    };
+/**
+ * The artifact whose authenticity is being checked, as its owner exposes it (#785):
+ * a name to build the sidecar path and print messages from, and a way to read the
+ * PINNED bytes — never the path itself. src/lib/artifact.ts's OpenedRestoreArtifact
+ * satisfies this structurally, which is how restore/verify guarantee the signature was
+ * checked against the same descriptor everything else in the run reads through.
+ */
+export interface SignedArtifact {
+  readonly path: string;
+  createReadStream(): Readable;
+}
+
+// The one call restore.ts actually needs: given the opened artifact and the configured
+// signing public key path, report whether `<artifact.path>.minisig` (if any) checks
+// out. Distinguishes "no signature to check" / "no public key to check it with" (both
+// non-fatal — an unsigned/legacy artifact, or a public-key-only box that hasn't been
+// given the signing public key) from "invalid" (a tampered/forged signature — the ONLY
+// status callers should treat as fatal). Never throws for a file-shape problem — that
+// becomes 'invalid' with a reason, same as a bad signature; only a missing/unreadable
+// pubkey path itself is reported as 'no_pubkey', not raised.
+//
+// The sidecar is read ONCE, and its bytes are the only ones this check ever considers —
+// a swap of the *.minisig after this point changes nothing about what was verified, and
+// a sidecar swapped in BEFORE it still has to authenticate the pinned artifact bytes,
+// which is exactly what it cannot do without the signing private key.
+export async function checkArtifactSignature(
+  artifact: SignedArtifact,
+  signRecipientPath: string,
+): Promise<SignatureCheck> {
+  const sigPath = `${artifact.path}.minisig`;
+  // One read, no preceding exists() probe: the sidecar's own absence IS the 'no
+  // signature' answer, and re-reading a path this function already decided about is the
+  // shape #785 is about.
+  let sigText: string;
+  try {
+    sigText = await readFile(sigPath, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return {
+        status: 'no_signature',
+        reason: `no ${sigPath} found — unsigned (legacy) artifact, authenticity not checked`,
+      };
+    }
+    return { status: 'invalid', reason: `could not read ${sigPath}: ${errMsg(e)}` };
   }
   if (!(await exists(signRecipientPath))) {
     return {
@@ -503,13 +546,12 @@ export async function checkArtifactSignature(inPath: string, signRecipientPath: 
   } catch (e) {
     return { status: 'invalid', reason: `could not read signing public key at ${signRecipientPath}: ${errMsg(e)}` };
   }
-  let sigText: string;
-  try {
-    sigText = await readFile(sigPath, 'utf8');
-  } catch (e) {
-    return { status: 'invalid', reason: `could not read ${sigPath}: ${errMsg(e)}` };
-  }
-  const result = await verifyDetached(parsedPub.publicKey, parsedPub.keyId, inPath, sigText);
+  const result = await verifyDetached(
+    parsedPub.publicKey,
+    parsedPub.keyId,
+    () => blake2b512Stream(artifact.createReadStream()),
+    sigText,
+  );
   if (!result.valid) return { status: 'invalid', reason: `signature verification failed: ${result.reason}` };
   return { status: 'verified' };
 }

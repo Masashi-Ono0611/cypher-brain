@@ -32,7 +32,8 @@ import {
 import { run } from './proc.js';
 import { loadIdentities, newDecrypter, decryptToChild, wrongKeyRejects } from './crypt.js';
 import { checkArtifactSignature } from './minisign.js';
-import { exists, requireFile, sha256, readHead, fmtBytes, redactPgConn, errMsg, rmrf } from './util.js';
+import { openRestoreArtifact, type OpenedRestoreArtifact } from './artifact.js';
+import { exists, requireFile, sha256, fmtBytes, redactPgConn, errMsg, rmrf } from './util.js';
 import {
   installStageSignalGuard,
   setActiveRestoreOutDir,
@@ -254,21 +255,97 @@ const splitEntryLines = (s: string): string[] => s.split('\n').filter((l) => l.l
 // exposed as a CYPHER_BRAIN_* tunable, since #218 asks for a cap, not a configurable one.
 const MAX_RESTORE_INPUT_BYTES = 20 * 1024 * 1024 * 1024; // 20 GiB
 
+// #785 — the check that makes every [PASS] line above it refer to the same bytes.
+//
+// The descriptor already makes a rename-swap invisible, but a writer who truncates and
+// rewrites the SAME inode is still seen through it, and comparing only the extraction
+// pass against the baseline is not enough (Codex review): an attacker who leaves
+// malicious bytes in place for the baseline, swaps genuine signed bytes in for the
+// signature check and the entry inspection, then swaps back before extraction would get
+// a matching pair of digests around two phases that never examined what was extracted.
+// So every stream the owner handed out that ran to EOF has to agree — the signature
+// pass, both inspection passes, the baseline and the extraction.
+//
+// Whole-file digests do not cover every reader, though (Codex review round 3): verify's
+// age-header sniff is a 64-byte positional read, and its negative control aborts at that
+// header, so neither completes a stream. On a public-key-only box with an unsigned
+// artifact and no --sha256 those are the ONLY reads verify makes. So the front of the
+// file, which every reader necessarily touches, is compared too — that is what
+// observedHeads() collects.
+//
+// `reference` defaults to the FIRST completed stream, which is what verify needs: it has
+// no baseline pass of its own (adding one would be a whole extra read of a possibly
+// multi-GB artifact just to report on it), and mutual agreement between its phases is
+// exactly as strong. restore passes its baseline explicitly — the same value, since the
+// baseline is its first read, but stated rather than inferred. Returns the first read
+// that disagrees, if any, along with what it was compared against.
+//
+// Exported for scripts/selftest-restore-toctou.mjs, which exercises both directions of
+// it directly — the same reason shortSourceLabel()/sourceDigest()/isSafeComponentName()
+// above are exported. Staging the divergence it detects through the CLI would need a
+// barrier between two of restore's own read passes, and there is no external command
+// there to stub (see that script's header).
+export interface ArtifactChange {
+  scope: 'first bytes' | 'contents';
+  reference: string;
+  observed: string;
+}
+export function artifactChangedDigest(artifact: OpenedRestoreArtifact, reference?: string): ArtifactChange | undefined {
+  // Cheapest and broadest first: every reader, whole or partial, is in here.
+  const heads = artifact.observedHeads();
+  const headRef = heads[0];
+  if (headRef !== undefined) {
+    const observed = heads.find((h) => h !== headRef);
+    if (observed !== undefined) return { scope: 'first bytes', reference: headRef, observed };
+  }
+  const digests = artifact.completedDigests();
+  const ref = reference ?? digests[0];
+  if (ref === undefined) return undefined; // nothing read to EOF yet — nothing to compare
+  const observed = digests.find((d) => d !== ref);
+  return observed === undefined ? undefined : { scope: 'contents', reference: ref, observed };
+}
+
+// The refusal itself. `detail` says what the caller was about to do with bytes it can no
+// longer vouch for. Callers that have already extracted into a scratch tree remove it
+// BEFORE throwing this, so no freshly-decrypted plaintext outlives the refusal.
+function artifactChangedError(path: string, change: ArtifactChange, detail: string): Error {
+  return new Error(
+    `${path} changed while it was being read: its ${change.scope} hashed ${change.reference} on one read during ` +
+      `this run and ${change.observed} on another, so the checks that passed above did not all look at the same ` +
+      `file. ${detail}`,
+  );
+}
+
+const RESTORE_CHANGED_DETAIL = (outDir: string) =>
+  `Refusing to restore bytes that nothing checked — nothing was written to ${outDir}, no database was touched, and the freshly-decrypted scratch tree was removed.`;
+const VERIFY_CHANGED_DETAIL =
+  'Refusing to report a verdict that would describe two different files — re-run against a path only you can write to.';
+
 // List an age-encrypted restore archive's tar entries WITHOUT writing a single byte to
 // disk (`tar -t` / `tar -tv` read only the archive's headers) and validate them. The two
-// listing passes run CONCURRENTLY (two independent decrypt streams over the same input
-// file) rather than one after another — nothing here is a "cheaper approximation" of what
-// actually gets extracted; it reads exactly what extraction will read, twice, for its
-// metadata instead of once for its bytes.
-async function inspectRestoreArchive(decrypter: Decrypter, inPath: string): Promise<void> {
-  const [bareOut, verboseOut] = await Promise.all([
-    decryptToChild(decrypter, inPath, 'tar', ['-tf', '-'], { consStdout: 'pipe', timeoutMs: PIPE_TIMEOUT_MS }),
-    decryptToChild(decrypter, inPath, 'tar', ['-tvf', '-'], { consStdout: 'pipe', timeoutMs: PIPE_TIMEOUT_MS }),
+// listing passes run CONCURRENTLY (two independent decrypt streams over the same OPEN
+// DESCRIPTOR — #785, not two opens of the same path) rather than one after another —
+// nothing here is a "cheaper approximation" of what actually gets extracted; it reads
+// exactly what extraction will read, twice, for its metadata instead of once for its
+// bytes.
+async function inspectRestoreArchive(decrypter: Decrypter, artifact: OpenedRestoreArtifact): Promise<void> {
+  const src = () => artifact.createReadStream();
+  // allSettled, not all (Codex review): Promise.all rejects the moment ONE listing
+  // fails, and the caller's `finally` would then close the shared descriptor while the
+  // other decrypt (and its tar child) are still reading through it — an avoidable
+  // use-after-close on the way out of an already-failing restore. Wait for both, then
+  // raise the first failure, which is the same error the caller saw before.
+  const settled = await Promise.allSettled([
+    decryptToChild(decrypter, src, 'tar', ['-tf', '-'], { consStdout: 'pipe', timeoutMs: PIPE_TIMEOUT_MS }),
+    decryptToChild(decrypter, src, 'tar', ['-tvf', '-'], { consStdout: 'pipe', timeoutMs: PIPE_TIMEOUT_MS }),
   ]);
-  // decryptToChild() always resolves with a string (never undefined) when consStdout is
-  // 'pipe' — the `| undefined` in its return type only covers the OTHER callers
-  // ('inherit'/'ignore'). The `?? ''` below is a type-level formality, not a runtime path.
-  validateRestoreEntries(zipRestoreEntries(splitEntryLines(bareOut ?? ''), splitEntryLines(verboseOut ?? '')));
+  const rejected = settled.find((s) => s.status === 'rejected');
+  if (rejected) throw rejected.reason;
+  const [bare, verbose] = settled.map((s) => (s as PromiseFulfilledResult<{ stdout?: string }>).value);
+  // decryptToChild() always populates `stdout` (never undefined) when consStdout is
+  // 'pipe' — the optional field only covers the OTHER callers ('inherit'/'ignore'). The
+  // `?? ''` below is a type-level formality, not a runtime path.
+  validateRestoreEntries(zipRestoreEntries(splitEntryLines(bare.stdout ?? ''), splitEntryLines(verbose.stdout ?? '')));
 }
 
 // Plain-file counterpart of inspectRestoreArchive() above, for expandComponents()'s inner
@@ -1005,7 +1082,14 @@ export async function restore(o: CliOptions): Promise<void> {
   await recordAudit({ command: 'restore', o, backend: null, locator: null, exitCode: 0, startedAt });
 }
 
-async function restoreImpl(o: CliOptions): Promise<void> {
+// `opened` (#785, Codex review): --level drill hands over the SAME descriptor its own
+// checks ran against, instead of letting this function re-open the pulled artifact by
+// path. Without it there was a gap between verify's signature check and drill's restore
+// — and drill deliberately does not repeat that check (#530), so a swap landing in the
+// gap would have been extracted with the earlier PASS still on screen. When it is
+// passed, the caller owns the descriptor and closes it; every other caller (the CLI's
+// `restore`) opens and closes its own here.
+async function restoreImpl(o: CliOptions, opened?: OpenedRestoreArtifact): Promise<void> {
   // #779: a required flag simply being absent is the same "command line itself was
   // malformed" class as an unrecognized command/enum value — UsageError, exit 2, not
   // the generic-failure 1.
@@ -1039,297 +1123,341 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   // [CB-E002]", a code MANAGEMENT.md documents as "wrong identity, or a corrupt/
   // truncated artifact" — a key audit in answer to a typo.
   await requireFile(o.in);
-  // #645: --sha256 <hex> pins --in to a hash known out-of-band, the exact same shape
-  // pull() already fail-closes on (pushpull.ts) and verify() already reports as
-  // sha256_match — but until now restoreImpl() never read o.sha256 back at all. The
-  // CLI parser accepts the flag (it is a real value flag, VALUE_FLAGS above) and
-  // restore's own deny-list only names --out as unread, so a caller who explicitly
-  // pinned the expected hash (the rollback/substitution protection the flag exists
-  // for) got no error AND no check — a differently-hashed, still-validly-encrypted,
-  // still-correctly-signed ciphertext at the same --in path restored anyway. Checked
-  // HERE: right after the file is confirmed to exist, and before the authenticity
-  // check below — a byte-hash comparison needs no keys, so it fails closed on the
-  // cheapest possible proof first, same ordering principle as the signature check's
-  // own "before any decryption" comment just below.
-  if (o.sha256) {
-    const gotHash = await sha256(o.in);
-    if (gotHash.toLowerCase() !== String(o.sha256).toLowerCase()) {
-      throw new Error(
-        `sha256 mismatch: ${o.in} is ${gotHash}, expected ${o.sha256} (refusing to restore — the artifact at this path ` +
-          `does not match the pinned hash)`,
-      );
-    }
-    console.log(`[PASS] sha256 matches the expected hash`);
-  }
-  // What this proves and what it does not (Codex review): this hashes --in once, here.
-  // The signature check and the decrypt below each independently re-open --in by path,
-  // same as they always have — a local attacker with WRITE access to --in's path DURING
-  // this single restore invocation could in principle swap the bytes between these reads
-  // (a TOCTOU race, not something --sha256 or the signature check close). That is a
-  // materially different threat from the one --sha256 targets: a compromised STORAGE
-  // backend serving a rolled-back/substituted artifact under an otherwise-trusted
-  // locator (the same threat pull()'s own --sha256 check defends against, pushpull.ts).
-  // Closing the local race would mean hashing and decrypting from one already-open file
-  // descriptor rather than re-reading --in by path three times, which the streaming
-  // decrypt-then-tar pipeline below is not structured for — out of scope for #645.
-  // Authenticity check next (#214), still before any decryption or even the age identity
-  // check below: age proves confidentiality + tamper detection, but NOT authenticity
-  // (a recipient's public key is not secret — anyone holding it can forge ciphertext
-  // that decrypts cleanly). A tampered/forged *.minisig always refuses outright. An
-  // ABSENT signature (unsigned/legacy artifact) or an absent signing public key on this
-  // box are non-fatal (warn and continue) BY DEFAULT — so this never breaks a pre-#214
-  // backup or an existing setup that hasn't run `keygen --sign` — UNLESS --require-
-  // signature opts into strict mode, in which case an attacker who simply deletes the
-  // .minisig sidecar (rather than forging one) no longer silently succeeds either.
-  // #530: verify --level drill sets skip_signature_check on the internal restoreImpl()
-  // call it makes below — its own runFileChecks() already ran this EXACT check against
-  // this EXACT fetched artifact, and already printed the PASS/FAIL/SKIP line for it.
-  // Without this, drill's output showed the same signature-check result twice (once at
-  // verify's own top level, once again — independently — from here), reading as if two
-  // checks ran rather than one. verifyImpl() only ever reaches this call once its own
-  // check already came back non-FAIL (a FAIL verdict short-circuits before restoreImpl()
-  // is ever called, per the comment above drill's restoreOpts below), so there is nothing
-  // left here to decide OR report — every other caller of restoreImpl() (the CLI's
-  // `restore` command) never sets this, and runs the check exactly as before.
-  if (!o.skip_signature_check) {
-    const signRecipient = o.sign_recipient || SIGN_RECIPIENT;
-    // An EXPLICITLY-named --sign-recipient that doesn't exist is a configuration typo,
-    // not "authenticity isn't set up yet" — silently falling back to no_pubkey/SKIP here
-    // would make a mistyped path look identical to a deliberately unconfigured one. Only
-    // the DEFAULT path missing means "not opted in yet" (see snapshot.ts's --sign-identity
-    // for the same distinction on the signing side).
-    if (o.sign_recipient && !(await exists(o.sign_recipient))) {
-      throw new Error(`--sign-recipient ${o.sign_recipient} does not exist`);
-    }
-    const sigCheck = await checkArtifactSignature(o.in, signRecipient);
-    if (sigCheck.status === 'invalid') {
-      throw new Error(`refusing to restore ${o.in}: ${sigCheck.reason}`);
-    }
-    if (sigCheck.status === 'verified') {
-      console.log(`[PASS] minisign authenticity signature verified (${o.in}.minisig)`);
-    } else if (o.require_signature) {
-      throw new Error(`refusing to restore ${o.in}: --require-signature was given but ${sigCheck.reason}`);
-    } else {
-      console.error(`warning: ${sigCheck.reason}`);
-    }
-  }
-  const identity = o.identity || IDENTITY;
-  if (!(await exists(identity))) throw new Error(`no identity at ${identity} — cannot decrypt without the private key`);
-  // Load the identity FIRST (this prompts for the passphrase if the file is wrapped)
-  // so a wrong passphrase / unreadable identity fails before out_dir is even created.
-  const decrypter = newDecrypter(await loadIdentities(identity));
-  // The tar child spawned below lands in the same ACTIVE_CHILDREN set snapshot's tar
-  // does (see proc.ts), but until now nothing ever installed a signal guard for
-  // restore() — a SIGINT/SIGTERM/SIGHUP mid-extract hit Node's default handler, the
-  // tar child was never killed, and out_dir was left with a silently partial tree
-  // with no cleanup and no warning (#95). installStageSignalGuard() is idempotent, so
-  // calling it here is safe whether or not a snapshot() in the same process already did.
-  installStageSignalGuard();
-  // #218 size cap: see MAX_RESTORE_INPUT_BYTES above for why the ciphertext's own size
-  // is already a tight (not merely approximate) bound on this pipeline's extraction
-  // footprint — before any inspection or decrypt work happens.
-  const inSize = (await stat(o.in)).size;
-  if (inSize > MAX_RESTORE_INPUT_BYTES) {
-    throw new Error(
-      `${o.in} is ${fmtBytes(inSize)}, over the ${fmtBytes(MAX_RESTORE_INPUT_BYTES)} restore cap — refusing to extract`,
-    );
-  }
-  // #218 phase 1 — inspect every tar entry before a single byte is written to disk. See
-  // the big comment above inspectRestoreArchive()/validateRestoreEntries().
-  await inspectRestoreArchive(decrypter, o.in);
-
-  const outDirPreExisted = await exists(o.out_dir);
-  // The old mkdirSync(o.out_dir, {recursive:true}) this replaced would itself throw
-  // (ENOTDIR/EEXIST) if --out-dir already existed as a non-directory — keep that same
-  // fail-fast behavior explicitly now that nothing mkdir's --out-dir up front anymore
-  // (phase 3 below either rename()s onto it directly or merges into it, neither of
-  // which gives as clear an error against a plain file).
-  if (outDirPreExisted && !(await stat(o.out_dir)).isDirectory()) {
-    throw new Error(`--out-dir ${o.out_dir} exists and is not a directory`);
-  }
-  // #218 phase 2 — extract into an ISOLATED scratch directory, never straight into
-  // --out-dir. Same reasoning expandComponents() below already applies per component: a
-  // tar that dies mid-stream then leaves nothing behind under out-dir's real name
-  // (nothing has been promoted into it yet), instead of a half-written tree that a later
-  // run could only ever partially repair (no-clobber can SKIP an existing name, it has no
-  // way to tell a complete extraction from a truncated one). Named the same way
-  // expandComponents()'s own per-component scratch dir is (a sibling path, not a nested
-  // one — mkdtemp under os.tmpdir() would risk landing on a different filesystem than
-  // --out-dir, turning the atomic rename() below into a cross-device copy).
-  const scratchDir = `${o.out_dir}.restore-${process.pid}-${randomBytes(4).toString('hex')}`;
-  await refuseIfSymlink(scratchDir, 'restore scratch directory'); // defense in depth: this name should never pre-exist
-  mkdirSync(scratchDir, { recursive: true });
-  // Register the scratch dir BEFORE the tar child starts (mkdirSync + this call, no
-  // await in between — same no-event-loop-yield discipline the removed outDirPreExisted
-  // comment used to describe): a signal landing mid-extract now erases the scratch dir
-  // outright (see setActiveRestoreScratchDir in signal-guard.ts) rather than leaving a
-  // partial tree with no cleanup and no warning.
-  setActiveRestoreScratchDir(scratchDir);
-  // decrypt(in) | tar -xf - -C scratchDir
-  // --no-same-owner/--no-same-permissions: a substituted/forged archive must not be
-  // able to set hostile ownership or modes on extraction (defense-in-depth — the
-  // bytes can be attacker-chosen if storage is compromised; see verify --sha256). The
-  // no-clobber flag (see tarNoClobberFlag above) still matters here even though
-  // scratchDir starts empty: it is what keeps this call's OWN behavior identical
-  // (skip a colliding name, exit 0) on both tar flavors, rather than a flavor-specific
-  // fatal-vs-skip split showing up as a mysterious extraction failure.
-  const noClobberFlag = await tarNoClobberFlag();
+  // #785: ONE open descriptor for this whole restore. Every phase below — the size
+  // cap, the baseline hash, the minisign check, the entry inspection and the extraction
+  // itself — reads through it instead of re-opening --in by path, so a rename onto that
+  // path mid-run is invisible to all of them and an in-place rewrite is caught by the
+  // digest comparison before promotion. Closed in the finally below, on every path.
+  const artifact = opened ?? (await openRestoreArtifact(o.in));
   try {
-    await decryptToChild(
-      decrypter,
-      o.in,
-      'tar',
-      ['-xf', '-', '--no-same-owner', '--no-same-permissions', noClobberFlag, '-C', scratchDir],
-      { timeoutMs: PIPE_TIMEOUT_MS },
-    );
-  } catch (e) {
-    // rmrf, not rm (#782) — this tree is freshly-decrypted plaintext and a plain rm()
-    // throws EACCES on a directory under it that has no owner-write bit, leaving the
-    // plaintext on disk. setActiveRestoreScratchDir(null) stays after the await
-    // (AGENTS.md rule two): if the removal throws, the registration is deliberately kept
-    // so a later signal's forceRmSync can still clear it.
-    await rmrf(scratchDir);
-    setActiveRestoreScratchDir(null);
-    throw e;
-  }
-
-  // #527 (multi-model review finding): capture the manifest THIS restore itself just
-  // decrypted, straight out of `scratchDir`, before promotion/merge can leave --out-dir's
-  // OWN manifest.json untouched-and-stale (the same plain no-clobber posture as any other
-  // non-component file — see mergeNoClobber()'s doc comment / the "#112 regression" test).
-  // Re-reading manifest.json from --out-dir AFTER promotion (as this used to) would let a
-  // stale, pre-existing manifest.json — left behind by no-clobber exactly like that test
-  // exercises — drive BOTH the schema check below AND expandComponents()'s own component
-  // list, silently re-attributing whatever happens to already be on disk to THAT stale
-  // manifest's recorded sources instead of refusing (or correctly reporting) anything —
-  // precisely the class of bug findStaleComponentArchives() above exists to close, just
-  // one step further downstream. Captured once, in memory, and used for every step below
-  // instead of ever re-reading manifest.json off disk post-promotion.
-  //
-  // Deliberately done BEFORE setActiveRestoreScratchDir(null) below, not after (multi-
-  // model review finding on an earlier draft of this fix): releasing the scratch-dir
-  // signal-guard registration first, then awaiting this read, would open a real — if
-  // narrow — window where a SIGINT/SIGTERM landing mid-read left the just-decrypted
-  // scratchDir on disk, tracked by NEITHER the scratch guard (already cleared) nor the
-  // out-dir guard (not set until promotion below begins). A normal (non-signal) failure
-  // here gets the exact same scratchDir cleanup the decrypt/extract failure above does,
-  // for the same reason.
-  let freshManifestText: string | null;
-  try {
-    const scratchManifestPath = join(scratchDir, 'manifest.json');
-    freshManifestText = (await exists(scratchManifestPath)) ? await readFile(scratchManifestPath, 'utf8') : null;
-  } catch (e) {
-    await rmrf(scratchDir); // #782, same reasoning as the extract failure path above
-    setActiveRestoreScratchDir(null);
-    throw e;
-  }
-
-  // #218 phase 3 — promote atomically, only now that extraction of an ALREADY-VETTED
-  // archive fully succeeded: a fresh --out-dir gets the whole scratch tree renamed into
-  // place in one step (rename() onto a non-existent destination path both creates it and
-  // is atomic); an --out-dir that already held content merges into it without ever
-  // clobbering an existing name — the SAME no-clobber/atomic-rename policy
-  // expandComponents()'s mergeNoClobber()/rename() split already keeps for each inner
-  // component below, converged here for the outer extract too.
-  setActiveRestoreOutDir(o.out_dir, outDirPreExisted);
-  try {
-    if (!outDirPreExisted) {
-      await rename(scratchDir, o.out_dir);
-    } else {
-      // #527: scan for a component archive whose pre-existing --out-dir content does NOT
-      // match what this restore just decrypted, BEFORE mergeNoClobber() is allowed to
-      // touch anything — see findStaleComponentArchives()'s own doc comment above for why
-      // this is scoped to component archives specifically, not every file in --out-dir.
-      // Refusing the WHOLE restore here (rather than merging what doesn't collide and only
-      // warning about what does) means a failed run leaves --out-dir exactly as it was
-      // found, and never reaches expandComponents() below on ambiguous ground.
-      //
-      // Gated on `!o.no_expand_components` (multi-model review finding): the entire
-      // danger this check exists for is a stale archive later being auto-expanded AND
-      // mis-attributed to the manifest's recorded source — with --no-expand-components,
-      // that step never runs at all, so a stale collision here is just the plain,
-      // documented, general no-clobber case (same as manifest.json/db.dump) restore has
-      // always allowed. Without this gate, --no-expand-components would stop being "exactly
-      // the pre-#181 behavior" it is documented as (see the flag's own help text above) —
-      // it would ALSO start refusing restores that used to succeed under it.
-      const stale = o.no_expand_components ? [] : await findStaleComponentArchives(scratchDir, o.out_dir);
-      if (stale.length > 0) {
-        const names = stale.map((c) => sanitizeForDisplay(c.name)).join(', ');
+    // #218 size cap: see MAX_RESTORE_INPUT_BYTES above for why the ciphertext's own size
+    // is already a tight (not merely approximate) bound on this pipeline's extraction
+    // footprint. Enforced by the owner (src/lib/artifact.ts) rather than by a stat() here,
+    // in two places: this descriptor's fstat — so an over-cap artifact is refused before it
+    // is read at all, let alone extracted — and again on the bytes every stream goes on to
+    // deliver, since a writer can enlarge the inode after that fstat and every stream reads
+    // to its CURRENT end (Codex review).
+    artifact.limitBytes(MAX_RESTORE_INPUT_BYTES);
+    // #785: the baseline digest of the bytes this descriptor is pinned to, taken ONCE and
+    // always — not only when --sha256 asks for it. --sha256 compares it against a hash
+    // known out-of-band; the extraction pass below re-derives the same digest from the
+    // ciphertext it actually streams and refuses to promote anything if the two disagree
+    // (CB-E026). Computing it unconditionally is what makes that second comparison — the
+    // one that catches an in-place overwrite mid-restore — available on every restore
+    // rather than only on pinned ones. It costs one extra read pass over --in.
+    const baselineSha256 = await artifact.sha256();
+    // #645: --sha256 <hex> pins --in to a hash known out-of-band, the exact same shape
+    // pull() already fail-closes on (pushpull.ts) and verify() already reports as
+    // sha256_match — but until #645 restoreImpl() never read o.sha256 back at all. The
+    // CLI parser accepts the flag (it is a real value flag, VALUE_FLAGS above) and
+    // restore's own deny-list only names --out as unread, so a caller who explicitly
+    // pinned the expected hash (the rollback/substitution protection the flag exists
+    // for) got no error AND no check — a differently-hashed, still-validly-encrypted,
+    // still-correctly-signed ciphertext at the same --in path restored anyway. Checked
+    // HERE: right after the file is opened, and before the authenticity check below — a
+    // byte-hash comparison needs no keys, so it fails closed on the cheapest possible
+    // proof first, same ordering principle as the signature check's own "before any
+    // decryption" comment just below.
+    if (o.sha256) {
+      if (baselineSha256.toLowerCase() !== String(o.sha256).toLowerCase()) {
         throw new Error(
-          `refusing to restore into ${o.out_dir}: it already contains ${stale.length} component archive(s) whose on-disk content does not match this snapshot (${names}). ` +
-            "restore's no-clobber promise means these existing files would be left untouched rather than overwritten with the freshly-decrypted bytes — " +
-            'continuing would let the component auto-expand step silently treat that stale/unrelated on-disk content as if it belonged to this restore. ' +
-            `Clear the listed path(s) from ${o.out_dir}, or restore into an empty/different --out-dir.`,
+          `sha256 mismatch: ${o.in} is ${baselineSha256}, expected ${o.sha256} (refusing to restore — the artifact at this path ` +
+            `does not match the pinned hash)`,
         );
       }
-      await mergeNoClobber(scratchDir, o.out_dir);
+      console.log(`[PASS] sha256 matches the expected hash`);
+    }
+    // What this proves, and what it still does not (#645, tightened by #785): every phase
+    // of this restore — this hash, the signature check below, the entry inspection, and
+    // the extraction itself — reads through the ONE descriptor opened above, so a local
+    // writer who renames a different artifact onto --in's path mid-run is simply not seen
+    // by any of them, and one who overwrites the same inode in place is caught by the
+    // digest comparison after extraction. What that does NOT establish is PROVENANCE: an
+    // artifact that was already attacker-chosen when this process opened it is bound
+    // exactly as faithfully as a genuine one. That is what --sha256 and a minisign
+    // signature are for — a compromised STORAGE backend serving a rolled-back/substituted
+    // artifact under an otherwise-trusted locator (the same threat pull()'s own --sha256
+    // check defends against, pushpull.ts).
+    // Authenticity check next (#214), still before any decryption or even the age identity
+    // check below: age proves confidentiality + tamper detection, but NOT authenticity
+    // (a recipient's public key is not secret — anyone holding it can forge ciphertext
+    // that decrypts cleanly). A tampered/forged *.minisig always refuses outright. An
+    // ABSENT signature (unsigned/legacy artifact) or an absent signing public key on this
+    // box are non-fatal (warn and continue) BY DEFAULT — so this never breaks a pre-#214
+    // backup or an existing setup that hasn't run `keygen --sign` — UNLESS --require-
+    // signature opts into strict mode, in which case an attacker who simply deletes the
+    // .minisig sidecar (rather than forging one) no longer silently succeeds either.
+    // #530: verify --level drill sets skip_signature_check on the internal restoreImpl()
+    // call it makes below — its own runFileChecks() already ran this EXACT check against
+    // this EXACT fetched artifact, and already printed the PASS/FAIL/SKIP line for it.
+    // Without this, drill's output showed the same signature-check result twice (once at
+    // verify's own top level, once again — independently — from here), reading as if two
+    // checks ran rather than one. verifyImpl() only ever reaches this call once its own
+    // check already came back non-FAIL (a FAIL verdict short-circuits before restoreImpl()
+    // is ever called, per the comment above drill's restoreOpts below), so there is nothing
+    // left here to decide OR report — every other caller of restoreImpl() (the CLI's
+    // `restore` command) never sets this, and runs the check exactly as before.
+    if (!o.skip_signature_check) {
+      const signRecipient = o.sign_recipient || SIGN_RECIPIENT;
+      // An EXPLICITLY-named --sign-recipient that doesn't exist is a configuration typo,
+      // not "authenticity isn't set up yet" — silently falling back to no_pubkey/SKIP here
+      // would make a mistyped path look identical to a deliberately unconfigured one. Only
+      // the DEFAULT path missing means "not opted in yet" (see snapshot.ts's --sign-identity
+      // for the same distinction on the signing side).
+      if (o.sign_recipient && !(await exists(o.sign_recipient))) {
+        throw new Error(`--sign-recipient ${o.sign_recipient} does not exist`);
+      }
+      const sigCheck = await checkArtifactSignature(artifact, signRecipient);
+      if (sigCheck.status === 'invalid') {
+        throw new Error(`refusing to restore ${o.in}: ${sigCheck.reason}`);
+      }
+      if (sigCheck.status === 'verified') {
+        console.log(`[PASS] minisign authenticity signature verified (${o.in}.minisig)`);
+      } else if (o.require_signature) {
+        throw new Error(`refusing to restore ${o.in}: --require-signature was given but ${sigCheck.reason}`);
+      } else {
+        console.error(`warning: ${sigCheck.reason}`);
+      }
+    }
+    const identity = o.identity || IDENTITY;
+    if (!(await exists(identity)))
+      throw new Error(`no identity at ${identity} — cannot decrypt without the private key`);
+    // Load the identity FIRST (this prompts for the passphrase if the file is wrapped)
+    // so a wrong passphrase / unreadable identity fails before out_dir is even created.
+    const decrypter = newDecrypter(await loadIdentities(identity));
+    // The tar child spawned below lands in the same ACTIVE_CHILDREN set snapshot's tar
+    // does (see proc.ts), but until now nothing ever installed a signal guard for
+    // restore() — a SIGINT/SIGTERM/SIGHUP mid-extract hit Node's default handler, the
+    // tar child was never killed, and out_dir was left with a silently partial tree
+    // with no cleanup and no warning (#95). installStageSignalGuard() is idempotent, so
+    // calling it here is safe whether or not a snapshot() in the same process already did.
+    installStageSignalGuard();
+    // #218 phase 1 — inspect every tar entry before a single byte is written to disk. See
+    // the big comment above inspectRestoreArchive()/validateRestoreEntries(). The size cap
+    // this used to sit behind now runs right after the open, above (#785).
+    await inspectRestoreArchive(decrypter, artifact);
+    // #785 checkpoint: everything that reads --in has now run except the extraction, so
+    // this catches a mid-run rewrite BEFORE any plaintext is decrypted to disk. Nothing
+    // has been created yet at this point, so there is nothing to clean up.
+    {
+      const changed = artifactChangedDigest(artifact, baselineSha256);
+      if (changed) throw artifactChangedError(o.in, changed, RESTORE_CHANGED_DETAIL(o.out_dir));
+    }
+
+    const outDirPreExisted = await exists(o.out_dir);
+    // The old mkdirSync(o.out_dir, {recursive:true}) this replaced would itself throw
+    // (ENOTDIR/EEXIST) if --out-dir already existed as a non-directory — keep that same
+    // fail-fast behavior explicitly now that nothing mkdir's --out-dir up front anymore
+    // (phase 3 below either rename()s onto it directly or merges into it, neither of
+    // which gives as clear an error against a plain file).
+    if (outDirPreExisted && !(await stat(o.out_dir)).isDirectory()) {
+      throw new Error(`--out-dir ${o.out_dir} exists and is not a directory`);
+    }
+    // #218 phase 2 — extract into an ISOLATED scratch directory, never straight into
+    // --out-dir. Same reasoning expandComponents() below already applies per component: a
+    // tar that dies mid-stream then leaves nothing behind under out-dir's real name
+    // (nothing has been promoted into it yet), instead of a half-written tree that a later
+    // run could only ever partially repair (no-clobber can SKIP an existing name, it has no
+    // way to tell a complete extraction from a truncated one). Named the same way
+    // expandComponents()'s own per-component scratch dir is (a sibling path, not a nested
+    // one — mkdtemp under os.tmpdir() would risk landing on a different filesystem than
+    // --out-dir, turning the atomic rename() below into a cross-device copy).
+    //
+    // The tar-flavor probe runs HERE, before the directory exists, not between its
+    // registration and the try/catch that cleans it up (Codex review): a probe that threw
+    // or timed out there would leave the scratch directory on disk AND still registered
+    // with the signal guard, since nothing on that path removes it. Nothing between the
+    // mkdirSync below and the catch may await anything that can fail.
+    const noClobberFlag = await tarNoClobberFlag();
+    const scratchDir = `${o.out_dir}.restore-${process.pid}-${randomBytes(4).toString('hex')}`;
+    await refuseIfSymlink(scratchDir, 'restore scratch directory'); // defense in depth: this name should never pre-exist
+    mkdirSync(scratchDir, { recursive: true });
+    // Register the scratch dir BEFORE the tar child starts (mkdirSync + this call, no
+    // await in between — same no-event-loop-yield discipline the removed outDirPreExisted
+    // comment used to describe): a signal landing mid-extract now erases the scratch dir
+    // outright (see setActiveRestoreScratchDir in signal-guard.ts) rather than leaving a
+    // partial tree with no cleanup and no warning.
+    setActiveRestoreScratchDir(scratchDir);
+    // decrypt(in) | tar -xf - -C scratchDir
+    // --no-same-owner/--no-same-permissions: a substituted/forged archive must not be
+    // able to set hostile ownership or modes on extraction (defense-in-depth — the
+    // bytes can be attacker-chosen if storage is compromised; see verify --sha256). The
+    // no-clobber flag (see tarNoClobberFlag above) still matters here even though
+    // scratchDir starts empty: it is what keeps this call's OWN behavior identical
+    // (skip a colliding name, exit 0) on both tar flavors, rather than a flavor-specific
+    // fatal-vs-skip split showing up as a mysterious extraction failure.
+    try {
+      await decryptToChild(
+        decrypter,
+        () => artifact.createReadStream(),
+        'tar',
+        ['-xf', '-', '--no-same-owner', '--no-same-permissions', noClobberFlag, '-C', scratchDir],
+        { timeoutMs: PIPE_TIMEOUT_MS },
+      );
+    } catch (e) {
+      // rmrf, not rm (#782) — this tree is freshly-decrypted plaintext and a plain rm()
+      // throws EACCES on a directory under it that has no owner-write bit, leaving the
+      // plaintext on disk. setActiveRestoreScratchDir(null) stays after the await
+      // (AGENTS.md rule two): if the removal throws, the registration is deliberately kept
+      // so a later signal's forceRmSync can still clear it.
+      await rmrf(scratchDir);
+      setActiveRestoreScratchDir(null);
+      throw e;
+    }
+
+    // #785 — the binding, now that the extraction pass has hashed what it decrypted (see
+    // artifactChangedDigest above for why this covers every phase and not just this one).
+    // A mismatch means the input changed underneath this run: refuse BEFORE promotion, so
+    // --out-dir is never touched, no PostgreSQL work is reached, and the freshly-decrypted
+    // plaintext is removed. rmrf + the setter ordering are the same as the extract-failure
+    // path just above (AGENTS.md's signal-guard rule two).
+    const changedDuringExtract = artifactChangedDigest(artifact, baselineSha256);
+    if (changedDuringExtract) {
+      await rmrf(scratchDir);
+      setActiveRestoreScratchDir(null);
+      throw artifactChangedError(o.in, changedDuringExtract, RESTORE_CHANGED_DETAIL(o.out_dir));
+    }
+
+    // #527 (multi-model review finding): capture the manifest THIS restore itself just
+    // decrypted, straight out of `scratchDir`, before promotion/merge can leave --out-dir's
+    // OWN manifest.json untouched-and-stale (the same plain no-clobber posture as any other
+    // non-component file — see mergeNoClobber()'s doc comment / the "#112 regression" test).
+    // Re-reading manifest.json from --out-dir AFTER promotion (as this used to) would let a
+    // stale, pre-existing manifest.json — left behind by no-clobber exactly like that test
+    // exercises — drive BOTH the schema check below AND expandComponents()'s own component
+    // list, silently re-attributing whatever happens to already be on disk to THAT stale
+    // manifest's recorded sources instead of refusing (or correctly reporting) anything —
+    // precisely the class of bug findStaleComponentArchives() above exists to close, just
+    // one step further downstream. Captured once, in memory, and used for every step below
+    // instead of ever re-reading manifest.json off disk post-promotion.
+    //
+    // Deliberately done BEFORE setActiveRestoreScratchDir(null) below, not after (multi-
+    // model review finding on an earlier draft of this fix): releasing the scratch-dir
+    // signal-guard registration first, then awaiting this read, would open a real — if
+    // narrow — window where a SIGINT/SIGTERM landing mid-read left the just-decrypted
+    // scratchDir on disk, tracked by NEITHER the scratch guard (already cleared) nor the
+    // out-dir guard (not set until promotion below begins). A normal (non-signal) failure
+    // here gets the exact same scratchDir cleanup the decrypt/extract failure above does,
+    // for the same reason.
+    let freshManifestText: string | null;
+    try {
+      const scratchManifestPath = join(scratchDir, 'manifest.json');
+      freshManifestText = (await exists(scratchManifestPath)) ? await readFile(scratchManifestPath, 'utf8') : null;
+    } catch (e) {
+      await rmrf(scratchDir); // #782, same reasoning as the extract failure path above
+      setActiveRestoreScratchDir(null);
+      throw e;
+    }
+
+    // #218 phase 3 — promote atomically, only now that extraction of an ALREADY-VETTED
+    // archive fully succeeded: a fresh --out-dir gets the whole scratch tree renamed into
+    // place in one step (rename() onto a non-existent destination path both creates it and
+    // is atomic); an --out-dir that already held content merges into it without ever
+    // clobbering an existing name — the SAME no-clobber/atomic-rename policy
+    // expandComponents()'s mergeNoClobber()/rename() split already keeps for each inner
+    // component below, converged here for the outer extract too.
+    setActiveRestoreOutDir(o.out_dir, outDirPreExisted);
+    try {
+      if (!outDirPreExisted) {
+        await rename(scratchDir, o.out_dir);
+      } else {
+        // #527: scan for a component archive whose pre-existing --out-dir content does NOT
+        // match what this restore just decrypted, BEFORE mergeNoClobber() is allowed to
+        // touch anything — see findStaleComponentArchives()'s own doc comment above for why
+        // this is scoped to component archives specifically, not every file in --out-dir.
+        // Refusing the WHOLE restore here (rather than merging what doesn't collide and only
+        // warning about what does) means a failed run leaves --out-dir exactly as it was
+        // found, and never reaches expandComponents() below on ambiguous ground.
+        //
+        // Gated on `!o.no_expand_components` (multi-model review finding): the entire
+        // danger this check exists for is a stale archive later being auto-expanded AND
+        // mis-attributed to the manifest's recorded source — with --no-expand-components,
+        // that step never runs at all, so a stale collision here is just the plain,
+        // documented, general no-clobber case (same as manifest.json/db.dump) restore has
+        // always allowed. Without this gate, --no-expand-components would stop being "exactly
+        // the pre-#181 behavior" it is documented as (see the flag's own help text above) —
+        // it would ALSO start refusing restores that used to succeed under it.
+        const stale = o.no_expand_components ? [] : await findStaleComponentArchives(scratchDir, o.out_dir);
+        if (stale.length > 0) {
+          const names = stale.map((c) => sanitizeForDisplay(c.name)).join(', ');
+          throw new Error(
+            `refusing to restore into ${o.out_dir}: it already contains ${stale.length} component archive(s) whose on-disk content does not match this snapshot (${names}). ` +
+              "restore's no-clobber promise means these existing files would be left untouched rather than overwritten with the freshly-decrypted bytes — " +
+              'continuing would let the component auto-expand step silently treat that stale/unrelated on-disk content as if it belonged to this restore. ' +
+              `Clear the listed path(s) from ${o.out_dir}, or restore into an empty/different --out-dir.`,
+          );
+        }
+        await mergeNoClobber(scratchDir, o.out_dir);
+      }
+    } finally {
+      // rmrf, not rm (#782): no-op once rename() has already moved it away; after
+      // mergeNoClobber() it is whatever plaintext did not move, which a plain rm() cannot
+      // remove through a directory with no owner-write bit.
+      await rmrf(scratchDir);
+      // #721: cleared HERE, only once the scratch dir is actually gone — not right after
+      // decrypt/extract settled, above. mergeNoClobber() (the `else` branch above) can run
+      // for a long time on a large --out-dir, incrementally moving entries out of
+      // scratchDir; clearing this registration before that loop starts (as this used to)
+      // left a SIGTERM/SIGINT landing mid-merge with NEITHER guard seeing scratchDir —
+      // the scratch-dir guard already cleared, and the out-dir guard (below) unaware the
+      // sibling scratch dir even exists — so the signal handler dropped the INCOMPLETE
+      // sentinel into --out-dir but left the still-populated plaintext scratchDir sitting
+      // on disk forever. Keeping it registered through the entire promotion (rename() or
+      // mergeNoClobber()) means a signal during either one still finds it and erases it.
+      setActiveRestoreScratchDir(null);
+      // the promotion is settled (cleanly, or the above already threw) — a later signal
+      // (e.g. during pg_restore below) must not touch out_dir anymore.
+      setActiveRestoreOutDir(null);
+    }
+    console.log(`restored components into ${o.out_dir}`);
+    if (freshManifestText !== null) {
+      // #436: the raw manifest.json (tool/schema/host/created_at, every component's
+      // original absolute SOURCE path, digests) used to print here UNCONDITIONALLY,
+      // ahead of the actually-useful "expanded N component(s) into …" summary and (for
+      // verify --level drill, which replays this function's captured stdout) the
+      // VERDICT below it — a wall of JSON a human had to scroll past, and an incidental
+      // stdout leak of two fields worth gating: `host` (the hostname of whatever machine
+      // ran `snapshot` — see snapshot.ts's `hostname()` call — not necessarily this one)
+      // and each component's original absolute source path ON that machine. --verbose
+      // opts back into seeing it; assertSupportedManifestSchema still runs either way —
+      // that guard's job (refuse a manifest schema this build can't safely read) has
+      // nothing to do with whether its text gets printed. Uses freshManifestText (captured
+      // above, straight from scratchDir) rather than re-reading --out-dir — see #527 note
+      // above.
+      if (o.verbose) console.log(freshManifestText);
+      assertSupportedManifestSchema(freshManifestText, join(o.out_dir, 'manifest.json'));
+    }
+    // Auto-expand --dir/--profile components (#181) — independent of --pg below: it only
+    // ever touches components that carry a `source`, which pg_dump's never does, so the two
+    // flows never race or duplicate work, and neither has to run before the other. --no-
+    // expand-components is the opt-out for anyone who wants exactly the pre-#181 behavior
+    // (raw *.tar.gz files only, manual untar).
+    let expandedCleanly = true;
+    if (!o.no_expand_components && freshManifestText !== null) {
+      expandedCleanly = await expandComponents(o.out_dir, freshManifestText);
+    }
+    if (o.pg) {
+      const dump = join(o.out_dir, 'db.dump');
+      if (!(await exists(dump))) throw new Error(`--pg given but no db.dump in snapshot`);
+      await run(pgTool('pg_restore'), ['--no-owner', '--no-privileges', '--clean', '--if-exists', '-d', o.pg, dump], {
+        timeoutMs: PIPE_TIMEOUT_MS,
+      });
+      console.log(`pg_restore -> ${redactPgConn(o.pg)} done`);
+    }
+    // #527 "Related finding": run this LAST, after --pg above (still best-effort — every
+    // other step above already ran to completion, including any component whose expand did
+    // NOT fail) so the overall exit code reflects a partial expand failure instead of the
+    // 0 a scripted caller's `$?` check used to see identically on a fully clean run. The
+    // "warning:" line(s) expandComponents() already printed say which component(s) failed
+    // and why; the raw *.tar.gz archives remain in --out-dir either way.
+    if (!expandedCleanly) {
+      throw new Error(
+        `restore completed, but auto-expanding one or more components failed (see the "warning:" line(s) above) — ` +
+          `the raw *.tar.gz archive(s) remain in ${o.out_dir} for you to inspect or expand manually`,
+      );
     }
   } finally {
-    // rmrf, not rm (#782): no-op once rename() has already moved it away; after
-    // mergeNoClobber() it is whatever plaintext did not move, which a plain rm() cannot
-    // remove through a directory with no owner-write bit.
-    await rmrf(scratchDir);
-    // #721: cleared HERE, only once the scratch dir is actually gone — not right after
-    // decrypt/extract settled, above. mergeNoClobber() (the `else` branch above) can run
-    // for a long time on a large --out-dir, incrementally moving entries out of
-    // scratchDir; clearing this registration before that loop starts (as this used to)
-    // left a SIGTERM/SIGINT landing mid-merge with NEITHER guard seeing scratchDir —
-    // the scratch-dir guard already cleared, and the out-dir guard (below) unaware the
-    // sibling scratch dir even exists — so the signal handler dropped the INCOMPLETE
-    // sentinel into --out-dir but left the still-populated plaintext scratchDir sitting
-    // on disk forever. Keeping it registered through the entire promotion (rename() or
-    // mergeNoClobber()) means a signal during either one still finds it and erases it.
-    setActiveRestoreScratchDir(null);
-    // the promotion is settled (cleanly, or the above already threw) — a later signal
-    // (e.g. during pg_restore below) must not touch out_dir anymore.
-    setActiveRestoreOutDir(null);
-  }
-  console.log(`restored components into ${o.out_dir}`);
-  if (freshManifestText !== null) {
-    // #436: the raw manifest.json (tool/schema/host/created_at, every component's
-    // original absolute SOURCE path, digests) used to print here UNCONDITIONALLY,
-    // ahead of the actually-useful "expanded N component(s) into …" summary and (for
-    // verify --level drill, which replays this function's captured stdout) the
-    // VERDICT below it — a wall of JSON a human had to scroll past, and an incidental
-    // stdout leak of two fields worth gating: `host` (the hostname of whatever machine
-    // ran `snapshot` — see snapshot.ts's `hostname()` call — not necessarily this one)
-    // and each component's original absolute source path ON that machine. --verbose
-    // opts back into seeing it; assertSupportedManifestSchema still runs either way —
-    // that guard's job (refuse a manifest schema this build can't safely read) has
-    // nothing to do with whether its text gets printed. Uses freshManifestText (captured
-    // above, straight from scratchDir) rather than re-reading --out-dir — see #527 note
-    // above.
-    if (o.verbose) console.log(freshManifestText);
-    assertSupportedManifestSchema(freshManifestText, join(o.out_dir, 'manifest.json'));
-  }
-  // Auto-expand --dir/--profile components (#181) — independent of --pg below: it only
-  // ever touches components that carry a `source`, which pg_dump's never does, so the two
-  // flows never race or duplicate work, and neither has to run before the other. --no-
-  // expand-components is the opt-out for anyone who wants exactly the pre-#181 behavior
-  // (raw *.tar.gz files only, manual untar).
-  let expandedCleanly = true;
-  if (!o.no_expand_components && freshManifestText !== null) {
-    expandedCleanly = await expandComponents(o.out_dir, freshManifestText);
-  }
-  if (o.pg) {
-    const dump = join(o.out_dir, 'db.dump');
-    if (!(await exists(dump))) throw new Error(`--pg given but no db.dump in snapshot`);
-    await run(pgTool('pg_restore'), ['--no-owner', '--no-privileges', '--clean', '--if-exists', '-d', o.pg, dump], {
-      timeoutMs: PIPE_TIMEOUT_MS,
-    });
-    console.log(`pg_restore -> ${redactPgConn(o.pg)} done`);
-  }
-  // #527 "Related finding": run this LAST, after --pg above (still best-effort — every
-  // other step above already ran to completion, including any component whose expand did
-  // NOT fail) so the overall exit code reflects a partial expand failure instead of the
-  // 0 a scripted caller's `$?` check used to see identically on a fully clean run. The
-  // "warning:" line(s) expandComponents() already printed say which component(s) failed
-  // and why; the raw *.tar.gz archives remain in --out-dir either way.
-  if (!expandedCleanly) {
-    throw new Error(
-      `restore completed, but auto-expanding one or more components failed (see the "warning:" line(s) above) — ` +
-        `the raw *.tar.gz archive(s) remain in ${o.out_dir} for you to inspect or expand manually`,
-    );
+    if (!opened) await artifact.close();
   }
 }
 
@@ -1387,15 +1515,42 @@ function printFileCheckVerdict(verdict: 'PASS' | 'FAIL' | 'PARTIAL'): void {
 // either way) — --level drill passes false here because ITS verdict depends on a step
 // that hasn't run yet when this returns, and printing an interim one would be read as
 // final.
-async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<FileCheckResult> {
+//
+// `opened` (#785): --level remote/drill pass the descriptor they already hold for the
+// artifact they just pulled, so the checks here and (for drill) the restore that follows
+// all read the same pinned bytes. --level quick opens and closes its own.
+async function runFileChecks(
+  o: CliOptions,
+  printVerdictLine: boolean,
+  opened?: OpenedRestoreArtifact,
+): Promise<FileCheckResult> {
   // #779: same UsageError treatment as restoreImpl()'s own --in/--out-dir checks above.
   if (!o.in) throw new UsageError('--in <file.age> required');
-  await requireFile(o.in); // #267: before stat(), so a typo is not a raw ENOENT
-  const sz = (await stat(o.in)).size;
-  const head = await readHead(o.in, 64);
+  await requireFile(o.in); // #267: before opening it, so a typo is not a raw ENOENT
+  // #785: one descriptor for every phase below — the size, the header sniff, the
+  // --sha256 pin, the signature check, the negative control and the positive control
+  // all read the same pinned bytes, so verify's report cannot end up describing a
+  // file that was swapped out between two of its own checks. Deliberately NOT capped
+  // with MAX_RESTORE_INPUT_BYTES: verify reports on an artifact of any size, and only
+  // the restore step (drill) has to refuse an over-cap one.
+  const artifact = opened ?? (await openRestoreArtifact(o.in));
+  try {
+    return await runFileChecksOn(o, artifact, printVerdictLine);
+  } finally {
+    if (!opened) await artifact.close();
+  }
+}
+
+async function runFileChecksOn(
+  o: CliOptions,
+  artifact: OpenedRestoreArtifact,
+  printVerdictLine: boolean,
+): Promise<FileCheckResult> {
+  const sz = artifact.size;
+  const head = await artifact.readHead(64);
   const isAge = head.startsWith(AGE_MAGIC);
   if (!o.json) {
-    console.log(`file: ${o.in} (${fmtBytes(sz)})`);
+    console.log(`file: ${artifact.path} (${fmtBytes(sz)})`);
     console.log(`[${isAge ? 'PASS' : 'FAIL'}] age ciphertext header present`);
   }
 
@@ -1406,7 +1561,7 @@ async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<
   let hashOk: boolean | null = null;
   let gotHash: string | undefined;
   if (o.sha256) {
-    gotHash = await sha256(o.in);
+    gotHash = await artifact.sha256();
     hashOk = gotHash.toLowerCase() === String(o.sha256).toLowerCase();
     if (!o.json) {
       console.log(
@@ -1427,7 +1582,7 @@ async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<
   if (o.sign_recipient && !(await exists(o.sign_recipient))) {
     throw new Error(`--sign-recipient ${o.sign_recipient} does not exist`);
   }
-  const sigCheck = await checkArtifactSignature(o.in, signRecipient);
+  const sigCheck = await checkArtifactSignature(artifact, signRecipient);
   let sigOk: boolean | null = sigCheck.status === 'verified' ? true : sigCheck.status === 'invalid' ? false : null;
   // --require-signature (#214): an absent signature or absent signing public key is a
   // SKIP by default (backward compatible with unsigned/pre-#214 artifacts) — this
@@ -1453,7 +1608,7 @@ async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<
     wrongKeyCheckSkipped = true;
     if (!o.json) console.log('[SKIP] a wrong key is rejected — skipped (the authenticity signature above failed)');
   } else {
-    wrongKeyRejected = await wrongKeyRejects(o.in);
+    wrongKeyRejected = await wrongKeyRejects(() => artifact.createReadStream());
     if (!o.json) console.log(`[${wrongKeyRejected ? 'PASS' : 'FAIL'}] a wrong key is rejected`);
   }
 
@@ -1485,7 +1640,10 @@ async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<
   } else if (await exists(identity)) {
     try {
       const decrypter = newDecrypter(await loadIdentities(identity)); // prompts if passphrase-wrapped
-      await decryptToChild(decrypter, o.in, 'tar', ['-tf', '-'], { consStdout: 'ignore', timeoutMs: PIPE_TIMEOUT_MS });
+      await decryptToChild(decrypter, () => artifact.createReadStream(), 'tar', ['-tf', '-'], {
+        consStdout: 'ignore',
+        timeoutMs: PIPE_TIMEOUT_MS,
+      });
       if (!o.json) console.log('[PASS] your identity decrypts the artifact into a well-formed bundle');
     } catch {
       positiveOk = false;
@@ -1496,6 +1654,20 @@ async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<
     positiveSkipped = true;
     if (!o.json) console.log('[SKIP] positive control — no private identity on this machine (public-key-only box)');
   }
+
+  // #785 (Codex review): verify needs the same binding restore has, for the same reason.
+  // Every check above read through one descriptor, but a writer who rewrites the inode
+  // between two of them could otherwise have the signature verified against one file and
+  // the positive control decrypt another, with both reported PASS. Every stream that ran
+  // to EOF has to agree; unlike restore this needs no baseline pass of its own, since
+  // "all of my phases saw the same bytes" is the whole claim. Checked BEFORE the verdict
+  // below, so a changed artifact can never produce one.
+  //
+  // The negative control is deliberately not part of this: it aborts at the age header,
+  // so its stream never completes and is never recorded — and what it proves (a wrong
+  // key is refused) does not depend on which bytes it saw.
+  const changedDuringChecks = artifactChangedDigest(artifact);
+  if (changedDuringChecks) throw artifactChangedError(artifact.path, changedDuringChecks, VERIFY_CHANGED_DETAIL);
 
   // Three verdicts, not two. The header + wrong-key checks alone do NOT prove the
   // artifact is restorable BY YOU, so on a public-key-only box (positive control
@@ -1516,7 +1688,7 @@ async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<
   }
 
   return {
-    file: o.in,
+    file: artifact.path,
     sizeBytes: sz,
     checks: {
       age_header: isAge,
@@ -1705,6 +1877,7 @@ async function verifyImpl(o: CliOptions): Promise<number> {
   // signal during the fetch/checks below would hit no handler at all.
   installStageSignalGuard();
   let scratchRoot: string | null = null;
+  let pulledArtifact: OpenedRestoreArtifact | null = null;
   try {
     // mkdtempSync (not async mkdtemp), and setActiveVerifyScratchDir called immediately
     // after with no await between them — same one-tick discipline snapshot.ts's own
@@ -1816,10 +1989,15 @@ async function verifyImpl(o: CliOptions): Promise<number> {
       }
     }
 
+    // #785: ONE descriptor for the pulled artifact, opened here and handed to both the
+    // checks below and (for drill) the restore after them, rather than each re-opening
+    // `target` by path. Closed in this function's own finally, alongside the scratch tree
+    // it lives in.
+    pulledArtifact = await openRestoreArtifact(target);
     // Same checks as --level quick, run against the just-pulled file. --level remote's
     // own verdict line prints normally here (drill's does not — its overall verdict still
     // depends on the restore step below, so printing one now would read as final).
-    const r = await runFileChecks({ ...o, in: target, sha256: pullOpts.sha256 }, level === 'remote');
+    const r = await runFileChecks({ ...o, in: target, sha256: pullOpts.sha256 }, level === 'remote', pulledArtifact);
 
     if (level === 'remote') {
       return finishVerify(o, r, { level, pulled: pulledInfo });
@@ -1878,7 +2056,11 @@ async function verifyImpl(o: CliOptions): Promise<number> {
     let restoreOk = true;
     let restoreErr: string | undefined;
     try {
-      await restoreImpl(restoreOpts);
+      // The SAME descriptor runFileChecks just used (#785): drill skips the signature
+      // check (#530, because those checks already ran it), so re-opening `target` by path
+      // here would leave a window in which a swap lands between the check and the restore
+      // and gets extracted with the earlier PASS still on screen.
+      await restoreImpl(restoreOpts, pulledArtifact);
     } catch (e) {
       restoreOk = false;
       restoreErr = errMsg(e);
@@ -1924,6 +2106,10 @@ async function verifyImpl(o: CliOptions): Promise<number> {
     // --no-same-permissions, and force:true alone does not retry past the EACCES that
     // causes (#209 review). Only cleared from the signal guard AFTER removal actually
     // finishes — a signal arriving mid-rmrf must still find scratchRoot tracked.
+    //
+    // The descriptor goes first, and its failure is swallowed on purpose: a close() that
+    // throws must not skip the removal below and leave decrypted plaintext on disk.
+    if (pulledArtifact) await pulledArtifact.close().catch(() => {});
     if (scratchRoot) {
       await rmrf(scratchRoot);
       setActiveVerifyScratchDir(null);
