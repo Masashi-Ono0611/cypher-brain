@@ -538,6 +538,44 @@ printf '%s' "$HELD_ERR" | grep -q '\[CB-E028\]' || { echo "[FAIL] the in-flight 
 [ "$(sha "$RACE_LOC")" = "$HELD_LOC_BEFORE" ] || { echo "[FAIL] the refused push still rewrote the save-locator file"; exit 1; }
 echo "[PASS] a live holder's lock refuses the second push (CB-E028), nothing uploaded, locator file untouched"
 
+echo "== #806 alias fix: a lock held for the REAL --save-locator path also refuses a push naming a SYMLINK to it =="
+# saveLocatorLockKey() (src/lib/push-lock.ts) now realpath()s the WHOLE --save-locator
+# path (not just its directory) when the file already exists -- so a symlink and its
+# target collapse onto the SAME lock key instead of being treated as two unrelated
+# files. Plant a held lock under the key the REAL path resolves to (exactly what push
+# itself computes for it -- same `pwd -P` shell equivalent as the RACE_LOC_KEY case
+# above), then push naming the SYMLINK: on main this used to compute an independent
+# key (only the symlink's OWN directory was resolved, not the symlink itself) and see
+# no conflict, so it would run and pay; fixed, it resolves to the SAME key and is
+# refused (CB-E028), exactly as if it had named the real path.
+ALIAS_TARGET="$TMP/alias-target.tsv"
+ALIAS_LINK="$TMP/alias-link.tsv"
+: > "$ALIAS_TARGET"
+ln -s "$ALIAS_TARGET" "$ALIAS_LINK"
+ALIAS_KEY="$(cd "$(dirname "$ALIAS_TARGET")" && pwd -P)/$(basename "$ALIAS_TARGET")"
+ALIAS_LOCK=$(push_lock_file "$CYPHER_BRAIN_HOME" save-locator "$ALIAS_KEY")
+sleep 120 &
+ALIAS_HOLDER_PID=$!
+hold_push_lock "$ALIAS_LOCK" "$ALIAS_HOLDER_PID" save-locator "$ALIAS_KEY"
+cb snapshot --dir "$SRC2" --out "$TMP/alias-c.age"
+ALIAS_BEFORE=$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')
+set +e
+ALIAS_ERR=$(cb push --in "$TMP/alias-c.age" --backend file --save-locator "$ALIAS_LINK" 2>&1); ALIAS_RC=$?
+set -e
+kill -9 "$ALIAS_HOLDER_PID" 2>/dev/null || true
+wait "$ALIAS_HOLDER_PID" 2>/dev/null || true
+rm -f "$ALIAS_LOCK"
+[ "$ALIAS_RC" != "0" ] || {
+  echo "[FAIL] a push naming a symlink to a locked --save-locator ran instead of being refused -- the alias was not recognized as the same lock"
+  echo "$ALIAS_ERR"; exit 1
+}
+printf '%s' "$ALIAS_ERR" | grep -q "another push is in flight for" \
+  || { echo "[FAIL] the in-flight refusal does not say so"; echo "$ALIAS_ERR"; exit 1; }
+printf '%s' "$ALIAS_ERR" | grep -q '\[CB-E028\]' || { echo "[FAIL] the in-flight refusal lacks the CB-E028 code"; echo "$ALIAS_ERR"; exit 1; }
+[ "$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')" = "$ALIAS_BEFORE" ] \
+  || { echo "[FAIL] the refused push still uploaded an object"; exit 1; }
+echo "[PASS] a symlinked --save-locator path is refused by a lock held for its real target (CB-E028)"
+
 echo "== #806: a lock left behind by a CRASHED push is cleared by the next run (no wedged schedule) =="
 # The crash: kill the holder WITHOUT removing its lock file — exactly what a SIGKILL,
 # an OOM or a machine restart leaves between claim and release. An unattended `schedule`

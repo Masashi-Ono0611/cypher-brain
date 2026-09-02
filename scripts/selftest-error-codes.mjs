@@ -307,6 +307,48 @@ const FIXTURES = [
       'first attempt did land, a retry pays for a second one.',
     expect: 'CB-E027',
   },
+  // CB-E023's pattern used to be prefix-only ("--sign-recipient "), which ALSO matched
+  // cli.ts's unrelated "--sign-recipient requires a value …" parser error (valueAt(),
+  // thrown for a MISSING flag value) — mislabeling a usage mistake as a nonexistent-path
+  // problem. Fixed by moving the interpolated path to the end of the throw-site message
+  // ("--sign-recipient does not exist: <path>"), which the pattern now matches as one
+  // contiguous literal. These two fixtures pin both halves of that fix directly.
+  {
+    label: 'CB-E023 positive: restore.ts --sign-recipient path does not exist',
+    message: '--sign-recipient does not exist: /tmp/no-such-recipient.pub',
+    expect: 'CB-E023',
+  },
+  {
+    label: 'CB-E023 negative (was misclassified as CB-E023): cli.ts valueAt() missing-value error for --sign-recipient',
+    message: "--sign-recipient requires a value (run 'cypher-brain --help' for the expected form)",
+    expect: undefined,
+  },
+  // CB-E013's `unknown backend:` pattern used to ALSO match `schedule install --backend
+  // rclone|ton`, even though both are real, documented `push --backend` names — schedule
+  // install just deliberately never lists them as schedule-installable (operator-side
+  // setup a launchd/cron job cannot supply). validateInstallInputs() (schedule.ts) now
+  // gives that case its own distinct wording, which does not contain "unknown backend:".
+  {
+    label:
+      'CB-E013 negative (was misclassified as CB-E013): schedule install --backend rclone is real, just not schedule-installable',
+    message:
+      'rclone is a valid push backend, but is not schedule-installable: it needs an operator-configured ' +
+      '--remote (rclone config) that an unattended launchd/cron job cannot supply on its own.',
+    expect: undefined,
+  },
+  {
+    label:
+      'CB-E013 negative (was misclassified as CB-E013): schedule install --backend ton is real, just not schedule-installable',
+    message:
+      'ton is a valid push backend, but is not schedule-installable: it needs an operator-run seeder box ' +
+      '(CYPHER_BRAIN_TON_SSH_HOST) that an unattended launchd/cron job cannot supply on its own.',
+    expect: undefined,
+  },
+  {
+    label: 'CB-E013 positive control: a genuine --backend typo still resolves to CB-E013',
+    message: 'unknown backend: bogus (expected one of file|arweave|turbo)',
+    expect: 'CB-E013',
+  },
 ];
 
 for (const { label, message, expect } of FIXTURES) {

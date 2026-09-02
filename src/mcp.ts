@@ -2697,7 +2697,10 @@ async function handleScheduleInstall(args: ToolArgs): Promise<CallToolResult> {
       'ERR_CONFIRM_REQUIRED',
       'schedule_install writes a real, persistent system file (a launchd plist or crontab entry)' +
         (PAID_BACKENDS.has(backend)
-          ? ` and, since backend "${backend}" is paid, commits to an ongoing spend capped at max_spend on every future unattended run`
+          ? ` and, since backend "${backend}" is paid, commits to an ongoing spend on every future unattended run, ` +
+            (backend === 'ton-provider'
+              ? 'capped by the CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND environment variable (must already be set — max_spend does not apply to it)'
+              : 'capped at max_spend')
           : '') +
         ' — re-call schedule_install with confirm_install=true to consent. There is no environment escape hatch honored over MCP.',
     );

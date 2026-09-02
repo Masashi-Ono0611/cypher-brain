@@ -28,8 +28,15 @@ whether the funds moved. That is the same state an UNCERTAIN paid-push refusal
 produced it.
 
 Retrying a push against a contract that is already funded also notifies the provider the
-contract was actually deployed with — read back from that record, or from the receipt —
-instead of whichever provider this run's registry lookup happened to return. Registering
-a provider replaces rather than adds to the contract's on-chain list, so a retry after the
-registry changed could otherwise notify a provider that never held the bag. If nothing
-recorded names the deployed provider, the warning about it is now explicit.
+contract was actually deployed with, rather than whichever provider this run's registry
+lookup happened to return — this pending-spend record and the receipt name a candidate,
+but only as a fallback/disambiguation input: the contract's OWN on-chain `providers` dict
+is the authority whenever it can be read (see #830), because `modify_providers` replaces
+that dict rather than merging into it, so what the chain holds now is the registration and
+a local record is only ever a claim about it. If the on-chain read cannot answer at all
+(unconfigured/unreachable/not yet active), this pending-spend record (or the receipt)
+decides instead, and a warning says why. A dict that CAN be read but is empty, or names
+several providers none of which this pending-spend record or the receipt recorded, is not
+a case where a local record steps in either — the push refuses to guess and notifies
+nobody. If nothing recorded names the deployed provider at all, the warning about it is
+now explicit.

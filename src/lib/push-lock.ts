@@ -141,21 +141,29 @@ export function pushLockPath(kind: PushLockKind, key: string): string {
 }
 
 /**
- * The lock key for a `--save-locator` path: absolute, with its DIRECTORY resolved through
- * symlinks. Two invocations naming one file by different routes — `/tmp/x/ptr.tsv` and
- * `/private/tmp/x/ptr.tsv` on macOS, a symlinked backup directory, `./ptr.tsv` from
- * another cwd — must land on the same lock, or the lock silently guards nothing.
+ * The lock key for a `--save-locator` path: absolute, and resolved through symlinks as
+ * far as the filesystem lets us resolve it. Two invocations naming one file by different
+ * routes — `/tmp/x/ptr.tsv` and `/private/tmp/x/ptr.tsv` on macOS, a symlinked backup
+ * directory, `./ptr.tsv` from another cwd, or the locator path itself being a symlink to
+ * another name — must land on the same lock, or the lock silently guards nothing.
  *
- * Only the directory is resolved: the locator file itself often does not exist yet on a
- * first push, and `realpath` on a missing path fails. What that leaves — say so rather
- * than let the guarantee sound wider than it is: two pushes are serialized only when this
- * returns the SAME string for both, so a locator file that is itself a symlink or a hard
- * link to another name, two spellings that differ only in case on a case-insensitive
- * filesystem, and a path under a directory that does not exist yet (where realpath falls
- * back to the unresolved form) each still yield two independent locks.
+ * The WHOLE path is realpath'd first, which also resolves a final-component symlink
+ * (`ptr.tsv -> /real/target.tsv` now collapses onto the same key as `/real/target.tsv`).
+ * That only works once the locator file EXISTS, though: `realpath` on a missing path
+ * fails, and a first push's locator file often does not exist yet. For that case this
+ * falls back to resolving just the DIRECTORY and keeping the given basename — the same
+ * thing this function always did — which is why the guarantee still has real edges left,
+ * stated rather than implied: two pushes are serialized only when this returns the SAME
+ * string for both, so (a) a locator path that does not exist yet and is ALSO a symlink to
+ * a different name, (b) a hard link to another name (realpath cannot tell two inodes
+ * share content — that needs a separate inode/device comparison this function does not
+ * do), and (c) two spellings that differ only in case on a case-insensitive filesystem,
+ * each still yield two independent locks.
  */
 export async function saveLocatorLockKey(path: string): Promise<string> {
   const full = resolve(path);
+  const resolved = await realpath(full).catch(() => null);
+  if (resolved !== null) return resolved;
   const dir = await realpath(dirname(full)).catch(() => dirname(full));
   return join(dir, basename(full));
 }

@@ -1460,6 +1460,46 @@ async function run(tmp) {
       }
     }
 
+    // 1c-iii. Docs-audit fixes: three prose claims that had drifted from the code they
+    // describe (Codex read-only docs audit, 2026-09-02) — asserted here so a future
+    // rewording that reintroduces the same drift fails loudly instead of shipping quietly.
+    {
+      const snapshotDesc = (list.result?.tools ?? []).find((t) => t.name === 'snapshot_now')?.description ?? '';
+      // idempotency_key's own description already documents the ERR_PUSH_OUTCOME_UNCERTAIN
+      // permanent-tombstone exception in full; this only checks the tool's TOP-LEVEL TTL
+      // sentence stops implying every cached result expires.
+      if (!/never expires/i.test(snapshotDesc) || !/ERR_PUSH_OUTCOME_UNCERTAIN/.test(snapshotDesc)) {
+        throw new Error(
+          `snapshot_now's description states the idempotency TTL without the permanent ` +
+            `ERR_PUSH_OUTCOME_UNCERTAIN tombstone exception: ${snapshotDesc.slice(0, 400)}`,
+        );
+      }
+
+      const scheduleInstallDesc =
+        (list.result?.tools ?? []).find((t) => t.name === 'schedule_install')?.description ?? '';
+      if (!/ALL THREE paid backends.*CYPHER_BRAIN_YES=1/is.test(scheduleInstallDesc)) {
+        throw new Error(
+          `schedule_install's description no longer says all three paid backends (arweave/turbo/ton-provider) ` +
+            `bake CYPHER_BRAIN_YES=1 — code (schedule.ts's NEEDS_UNATTENDED_CONSENT) includes ton-provider too: ` +
+            `${scheduleInstallDesc.slice(0, 400)}`,
+        );
+      }
+
+      const scheduleStatusDesc =
+        (list.result?.tools ?? []).find((t) => t.name === 'schedule_status')?.description ?? '';
+      if (/verbatim/i.test(scheduleStatusDesc)) {
+        throw new Error(
+          `schedule_status's description still claims a "verbatim" CLI-line report — it returns the SAME ` +
+            `structured object schedule status --json does: ${scheduleStatusDesc.slice(0, 400)}`,
+        );
+      }
+      if (!/structured/i.test(scheduleStatusDesc)) {
+        throw new Error(
+          `schedule_status's description does not say its result is structured fields: ${scheduleStatusDesc.slice(0, 400)}`,
+        );
+      }
+    }
+
     // 1d. #728: an unknown tool name must offer the SAME "did you mean" suggestion an
     // undeclared argument name / an out-of-enum value already get (src/lib/suggest.ts) —
     // TOOLS_BY_NAME's own keys are the candidate set, so the reproduction that was filed
