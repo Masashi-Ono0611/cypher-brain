@@ -114,17 +114,36 @@ let SIGNAL_GUARD_INSTALLED = false;
 // mid-signal), so unlike util.ts's rmrf (the async, normal-exit equivalent of this same
 // idea) this chmods synchronously and swallows whatever is still left afterward — the
 // same best-effort posture every other branch in this handler already has.
+// Bounded retry (no await — this runs mid-signal): a tree that is being mutated by an
+// in-flight libuv threadpool op the moment the handler runs (restore's mergeNoClobber()
+// rename()s entries OUT of the scratch dir one at a time) can make a single recursive
+// rmSync fail transiently with ENOENT/ENOTEMPTY on Linux even with `force`, and the
+// tree then survives. Observed once on ubuntu-24 CI (#826); a few immediate re-attempts
+// cost nothing and the last one still swallows whatever is genuinely stuck.
+// Backoff between attempts (25/50/100 ms, ~175 ms total worst case) so an in-flight
+// threadpool rename has actually finished before the next try — immediate retries can
+// all lose the same race (multi-model review). Synchronous sleep via Atomics.wait: the
+// only way to pause without yielding to the event loop, which a signal handler must not.
+const FORCE_RM_ATTEMPTS = 4;
+const FORCE_RM_BACKOFF_MS = [25, 50, 100];
+const sleepSync = (ms: number): void => {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {}
+};
 function forceRmSync(dir: string): void {
-  try {
-    rmSync(dir, { recursive: true, force: true });
-    return;
-  } catch {}
-  try {
-    unlockRecursiveSync(dir);
-  } catch {}
-  try {
-    rmSync(dir, { recursive: true, force: true });
-  } catch {}
+  for (let attempt = 0; attempt < FORCE_RM_ATTEMPTS; attempt++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch {}
+    // re-run the unlock on EVERY failed attempt: a traversal that itself tripped over
+    // an entry mid-rename leaves later mode-restricted entries un-chmodded otherwise
+    try {
+      unlockRecursiveSync(dir);
+    } catch {}
+    if (attempt < FORCE_RM_ATTEMPTS - 1) sleepSync(FORCE_RM_BACKOFF_MS[attempt] ?? 100);
+  }
 }
 
 function unlockRecursiveSync(dir: string): void {
@@ -287,9 +306,10 @@ export function installStageSignalGuard(): void {
       if (ACTIVE_RESTORE_SCRATCH_DIR) {
         // Always safe to erase outright — restore's scratch dir is never anything
         // other than a directory restore just mkdirSync'd itself moments earlier.
-        try {
-          rmSync(ACTIVE_RESTORE_SCRATCH_DIR, { recursive: true, force: true });
-        } catch {}
+        // forceRmSync, not a bare rmSync (#826): the tree holds freshly-decrypted
+        // plaintext, can contain a mode-restricted directory (#782), and is being
+        // drained by mergeNoClobber() at the very moment a mid-merge signal lands.
+        forceRmSync(ACTIVE_RESTORE_SCRATCH_DIR);
         ACTIVE_RESTORE_SCRATCH_DIR = null;
       }
       if (ACTIVE_RESTORE_OUT_DIR) {
