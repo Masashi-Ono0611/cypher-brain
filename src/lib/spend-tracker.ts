@@ -49,9 +49,13 @@ export function chargeSpendTracker(tracker: SpendTracker | undefined, amount: bi
 // even starts". Shared so all three backends explain the combined-spend rule the same
 // way — the operator's confusion here is always "but my file is smaller than the cap".
 export function budgetExhaustedMessage(backend: string, capEnvVar: string, cap: bigint, spent: bigint): string {
+  // Worded so the runtime string still reads "... exceeds <CAP ENV VAR>=<n> ...", the
+  // shape errors.ts's CB-E006 pattern matches — this branch is an over-cap refusal like
+  // any other, and must carry the same code. (The literal the selftest greps for lives in
+  // arweave.ts/turbo.ts, which name the variable directly; here it is a parameter.)
   return (
-    `${backend}: this push already committed ${spent} toward ${capEnvVar}=${cap} ` +
-    '(the ciphertext and its ".minisig" signature sidecar are two separate paid uploads, checked TOGETHER) ' +
-    '— no budget remains for this upload'
+    `${backend}: this upload exceeds ${capEnvVar}=${cap} — the push already committed ${spent} toward it ` +
+    '(the ciphertext and its ".minisig" signature sidecar are two separate paid uploads, checked TOGETHER), ' +
+    'so no budget remains'
   );
 }

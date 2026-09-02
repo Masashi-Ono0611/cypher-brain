@@ -667,14 +667,17 @@ export async function arweaveBackend(): Promise<StorageBackend> {
           throw new Error(budgetExhaustedMessage('arweave', 'CYPHER_BRAIN_MAX_SPEND', AR_MAX_SPEND, spent));
         }
         if (reward > remaining) {
+          // The literal "exceeds CYPHER_BRAIN_MAX_SPEND" is load-bearing, not prose:
+          // errors.ts's CB-E006 entry matches on it (and selftest-error-codes.mjs asserts
+          // it still exists under src/), so an over-cap refusal keeps carrying [CB-E006].
+          // The shared-budget detail is appended AFTER it rather than spliced into it.
           throw new Error(
-            `arweave: L1 upload cost ${reward} winston exceeds ${
-              spent > 0n
-                ? `the ${remaining} winston still left under CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND} ` +
-                  `(${spent} winston of it already committed earlier in this push — the ciphertext and its ` +
-                  '".minisig" signature sidecar are checked TOGETHER)'
-                : `CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND}`
-            } — aborting to protect your wallet`,
+            `arweave: L1 upload cost ${reward} winston exceeds CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND}` +
+              (spent > 0n
+                ? ` (${spent} winston of it already committed earlier in this push — the ciphertext and its ` +
+                  `".minisig" signature sidecar are checked TOGETHER, leaving ${remaining} winston)`
+                : '') +
+              ' — aborting to protect your wallet',
           );
         }
         // Charged once it is known to be within budget and about to be spent, so the

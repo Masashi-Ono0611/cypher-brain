@@ -198,14 +198,16 @@ export function turboBackend(): StorageBackend {
           throw new Error(budgetExhaustedMessage('turbo', 'CYPHER_BRAIN_MAX_SPEND', AR_MAX_SPEND, spent));
         }
         if (uploadWinc > remaining) {
+          // Same load-bearing literal as arweave.ts's own over-cap refusal: errors.ts's
+          // CB-E006 entry matches on "exceeds CYPHER_BRAIN_MAX_SPEND", so the
+          // shared-budget detail is appended after it, never spliced through it.
           throw new Error(
-            `turbo: upload cost ${uploadWinc} winc exceeds ${
-              spent > 0n
-                ? `the ${remaining} winc still left under CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND} ` +
-                  `(${spent} winc of it already committed earlier in this push — the ciphertext and its ".minisig" ` +
-                  'signature sidecar are checked TOGETHER)'
-                : `CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND}`
-            } — aborting to protect your wallet`,
+            `turbo: upload cost ${uploadWinc} winc exceeds CYPHER_BRAIN_MAX_SPEND=${AR_MAX_SPEND}` +
+              (spent > 0n
+                ? ` (${spent} winc of it already committed earlier in this push — the ciphertext and its ` +
+                  `".minisig" signature sidecar are checked TOGETHER, leaving ${remaining} winc)`
+                : '') +
+              ' — aborting to protect your wallet',
           );
         }
         // Charged once it is known to be within budget and about to be spent, so the

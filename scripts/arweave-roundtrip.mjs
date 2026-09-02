@@ -209,8 +209,12 @@ try {
   });
   capFail.status !== 0 &&
   /L1 cost estimate/.test(capFail.stderr) &&
-  /exceeds CYPHER_BRAIN_MAX_SPEND/.test(capFail.stderr)
-    ? pass('spend cap: a 1-winston cap aborts the upload with a real (not skipped) cost estimate')
+  /exceeds CYPHER_BRAIN_MAX_SPEND/.test(capFail.stderr) &&
+  // The over-cap refusal must still carry its error code: errors.ts's CB-E006 entry
+  // matches on the literal "exceeds CYPHER_BRAIN_MAX_SPEND", so any rewording of this
+  // message silently drops the annotation an agent/operator triages on.
+  /\[CB-E006\]/.test(capFail.stderr)
+    ? pass('spend cap: a 1-winston cap aborts the upload with a real (not skipped) cost estimate, annotated [CB-E006]')
     : fail(
         `spend cap did not abort as expected: status=${capFail.status} stderr=${(capFail.stderr || '').slice(0, 200)}`,
       );
@@ -403,8 +407,11 @@ try {
     });
     combined.status !== 0 &&
     /checked TOGETHER|no budget remains/.test(combined.stderr) &&
-    /already committed|already committed earlier in this push/.test(combined.stderr)
-      ? pass('#797: the sidecar is refused once the ciphertext has used up the shared budget')
+    /already committed|already committed earlier in this push/.test(combined.stderr) &&
+    // The shared-budget branch is an over-cap refusal like any other and must carry the
+    // same code — the branch where a reworded message would most easily lose it.
+    /\[CB-E006\]/.test(combined.stderr)
+      ? pass('#797: the sidecar is refused once the ciphertext has used up the shared budget, annotated [CB-E006]')
       : fail(
           `combined-cap push did not refuse the sidecar: status=${combined.status} stderr=${(combined.stderr || '').slice(0, 400)}`,
         );
