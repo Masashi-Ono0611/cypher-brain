@@ -1179,7 +1179,10 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       --out <path.json> (#231): ALSO write a "plan" pinning this exact estimate to the
       artifact (sha256 of --in), --backend, --remote (rclone only, null otherwise), the
       configured payer address (if any wallet is set up for this backend — null
-      otherwise), and an expiry 15 minutes from now. Additive to the normal report
+      otherwise; --wallet <path> picks which key file that address is derived from,
+      exactly as it does for "wallet address", and push reads it the same way when
+      re-checking a plan and when recording a receipt), and an expiry 15 minutes from
+      now. Additive to the normal report
       above (stdout/exit code unchanged either way). Refuses if --out already exists
       (same no-clobber posture as "snapshot --out", #470) — pass --force to overwrite
       it anyway. Feed the path to
