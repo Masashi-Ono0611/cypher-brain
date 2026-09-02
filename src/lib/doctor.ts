@@ -526,12 +526,12 @@ async function checkMcpSnapshotPolicy(): Promise<DoctorCheck> {
     };
   }
   // Both configured and syntactically valid (MCP_SOURCE_ROOTS_ERROR === null): also check
-  // each root actually exists on disk. assertSnapshotPolicy() resolves each configured
-  // root via realpathOfNearestAncestor() before comparing — a root that does not exist
-  // still "resolves" to its nearest existing ancestor, so a typo'd root does not crash the
-  // server, but it silently authorizes the WRONG directory (the ancestor) rather than the
-  // one the operator meant. Surfacing that here, rather than leaving it to be discovered
-  // the first time a legitimate `dirs` call is unexpectedly refused or mis-scoped.
+  // each root actually exists on disk. Since #838 (#841) assertSnapshotPolicy() requires
+  // every configured root to exist as a directory and refuses EVERY `dirs` call otherwise
+  // (fail closed — it no longer falls back to the nearest existing ancestor), so a typo'd
+  // root means every snapshot_now call with `dirs` is refused (pg-only calls still run).
+  // Surfacing that here, rather than
+  // leaving it to be discovered the first time a legitimate `dirs` call is refused.
   const missing: string[] = [];
   for (const root of MCP_SOURCE_ROOTS) {
     if (!(await exists(root))) missing.push(root);
@@ -542,9 +542,8 @@ async function checkMcpSnapshotPolicy(): Promise<DoctorCheck> {
       status: 'warn',
       message:
         `CYPHER_BRAIN_MCP_SOURCE_ROOTS names ${missing.length} of ${MCP_SOURCE_ROOTS.length} root(s) that do not ` +
-        `exist on disk (${missing.join(', ')}) — snapshot_now resolves each configured root to its nearest ` +
-        'existing ancestor before checking containment, so a typo here silently authorizes a broader directory ' +
-        'than intended rather than failing loudly.',
+        `exist on disk (${missing.join(', ')}) — snapshot_now refuses every dirs call while any configured root ` +
+        'is missing (fail closed, #838); pg-only calls are unaffected. Fix the path before relying on MCP snapshots.',
       remediation: `Fix the missing path(s) in CYPHER_BRAIN_MCP_SOURCE_ROOTS, or create the directory/directories.`,
     };
   }
