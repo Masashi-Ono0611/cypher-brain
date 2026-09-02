@@ -43,6 +43,7 @@ import { didYouMean, nearestName } from './suggest.js';
 import { moodForVerdict, printMascot, printJson } from './ui.js';
 import { pull, signatureGap } from './pushpull.js';
 import { recordAudit } from './audit.js';
+import { UsageError } from './errors.js';
 import type { CliOptions } from './types.js';
 
 // #228: this file's StrykerJS mutation run (`npm run mutation-test`) is deliberately
@@ -1006,21 +1007,16 @@ export async function restore(o: CliOptions): Promise<void> {
 
 async function restoreImpl(o: CliOptions): Promise<void> {
   if (!o.in) throw new Error('--in <file.age> required');
-  // #277: `--out` is what names the destination on snapshot/pull/wallet create, so
-  // typing it here is the natural mistake — and parseArgs accepts it (it is a valid
-  // flag SOMEWHERE) and then nothing reads it, leaving a bare "--out-dir required"
-  // that reads as if no destination had been given at all. Name what was ignored.
-  // #300: the "did you mean" wording itself comes from src/lib/suggest.ts, the one
-  // place that phrases it — the MCP server refuses unknown tool arguments with the
-  // same idiom, and two hand-written copies would drift. Only the PHRASING is shared:
-  // which flag was meant is known outright here, so this message never depends on a
-  // fuzzy match firing.
+  // #277 named this branch's "did you mean --out-dir" diagnosis for a mistyped
+  // `--out` — that message now lives at the CLI layer instead: src/cli.ts's
+  // FLAG_IRRELEVANT['restore'] entry refuses `restore --out` in assertFlagsRelevant()
+  // BEFORE dispatch ever reaches restoreImpl(), with the same "did you mean
+  // --out-dir" phrasing via didYouMean(). MCP's restore_now (src/mcp.ts) only ever
+  // builds `out_dir`, never `out`, on the CliOptions it hands to restore(). So o.out
+  // can no longer be set by the time this function runs; this stays a plain,
+  // unconditional message.
   if (!o.out_dir) {
-    throw new Error(
-      o.out
-        ? `--out-dir <dir> required (restore extracts into a directory; you passed --out, which restore does not read — ${didYouMean('--out-dir')})`
-        : '--out-dir <dir> required',
-    );
+    throw new Error('--out-dir <dir> required');
   }
   // pg_restore --clean --if-exists below DROPS and replaces objects in the target
   // database — an irreversible operation. Same consent gate as push's paid-backend
@@ -1637,8 +1633,10 @@ async function verifyImpl(o: CliOptions): Promise<number> {
   if (level !== 'quick' && level !== 'remote' && level !== 'drill') {
     // #435: --level is an enum-valued flag, same "did you mean" class #425 already
     // covers for top-level commands/flags — nearestName() is the same matcher.
+    // #779: UsageError — an enum-valued flag's bad value is a parser-level refusal
+    // (exit 2), not the generic-failure 1.
     const suggestion = nearestName(level, ['quick', 'remote', 'drill']);
-    throw new Error(
+    throw new UsageError(
       `--level must be quick, remote or drill (got "${o.level}")${suggestion ? ` (${didYouMean(`--level ${suggestion}`)})` : ''}`,
     );
   }

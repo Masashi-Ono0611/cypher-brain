@@ -17,6 +17,7 @@ import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists, sha256, importQ
 import { printJson } from './ui.js';
 import { buildPlan, writePlanFile, readRecipientsFingerprint } from './plan.js';
 import { didYouMean, nearestName } from './suggest.js';
+import { UsageError } from './errors.js';
 import { STORAGE_BACKEND_NAMES, type CliOptions } from './types.js';
 import { signedDataItemSize } from './backends/ans104.js';
 
@@ -376,8 +377,10 @@ async function estimateCostFor(backend: string, sizeBytes: number): Promise<Part
   // #501: STORAGE_BACKEND_NAMES (types.ts) is the shared list, not a second hand-kept
   // copy — see that const's own comment for why this file can't just import
   // backends/index.ts's BACKEND_FACTORIES instead.
+  // #779: UsageError — an enum-valued flag's bad value is a parser-level refusal
+  // (exit 2), not the generic-failure 1.
   const suggestion = nearestName(backend, STORAGE_BACKEND_NAMES);
-  throw new Error(
+  throw new UsageError(
     `unknown backend: ${backend}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use ${STORAGE_BACKEND_NAMES.join('|')}`,
   );
 }

@@ -42,7 +42,7 @@ import { audit } from './lib/audit.js';
 import { withSpan } from './lib/otel.js';
 import { init } from './lib/wizard.js';
 import { errMsg } from './lib/util.js';
-import { annotateErrorMessage, matchErrorCode } from './lib/errors.js';
+import { annotateErrorMessage, matchErrorCode, exitCodeFor, UsageError } from './lib/errors.js';
 import { didYouMean, nearestName } from './lib/suggest.js';
 import { hasWrittenJson, printMascot, installEpipeGuard } from './lib/ui.js';
 import { recoveryKit } from './lib/recoverykit.js';
@@ -208,12 +208,14 @@ function parseArgs(argv: string[], cmd: string | undefined): CliOptions {
           const spaceForm = BOOL_FLAGS.has(eqFlagName.replace(/-/g, '_'))
             ? `'--${eqFlagName}' (it takes no value — drop the '=')`
             : `'--${eqFlagName} ${eqValue.length > 0 ? eqValue : '<value>'}' (space-separated, not '=')`;
-          throw new Error(
+          // #779: UsageError — a parser-level refusal, same class as the unknown-command
+          // replies below (exit 2, not the generic-failure 1).
+          throw new UsageError(
             `unknown flag: --${a.slice(2)} (${didYouMean(spaceForm)} — run 'cypher-brain --help' or '<command> --help' to see valid flags)`,
           );
         }
         const suggestion = nearestName(a.slice(2), KNOWN_FLAG_NAMES);
-        throw new Error(
+        throw new UsageError(
           `unknown flag: --${a.slice(2)} (${suggestion ? `${didYouMean(`--${suggestion}`)} — ` : ''}run 'cypher-brain --help' or '<command> --help' to see valid flags)`,
         );
       }
@@ -1322,15 +1324,23 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
     { flag: 'json', because: 'snapshot has no JSON success output — only the failure path is JSON-shaped' },
   ],
   // init's implementation is `init(_o)` — it ignores the options bag entirely and asks
-  // interactively instead, so every flag is unread. The four here are the ones a user is
-  // most likely to reach for; the rest are left undeclared on purpose (see the deny-list
-  // reasoning above: a missing entry preserves today's behaviour, a wrong one breaks a
-  // valid call).
+  // interactively instead, so every flag is unread. Four of the five here are the ones a
+  // user is most likely to reach for; the rest are left undeclared on purpose (see the
+  // deny-list reasoning above: a missing entry preserves today's behaviour, a wrong one
+  // breaks a valid call).
+  //
+  // #781: --json is the fifth, named for a different reason than the other four —
+  // init() has no JSON success output (it is an interactive wizard; #195's completion
+  // summary and #731's early-exit note are both prose), so `init --json` used to be
+  // format-by-outcome exactly like recovery-kit below: prose on success, a JSON error
+  // object on failure (main().catch()'s --json branch fires on ANY throw, unconditional
+  // on the command declaring output support).
   init: [
     { flag: 'out', because: 'init is an interactive wizard — it asks for paths rather than taking them as flags' },
     { flag: 'backend', because: 'init is an interactive wizard — it asks which backend to configure' },
     { flag: 'yes', because: 'init is interactive by definition; there is no unattended path to consent to' },
     { flag: 'force', because: 'init never overwrites — it detects what already exists and asks' },
+    { flag: 'json', because: 'init has no JSON success output — it is an interactive wizard, prose only' },
   ],
   // #647: --json is a real, globally-recognized flag (BOOL_FLAGS above) and neither
   // push() nor pull() had a deny-list entry for it, so both silently accepted it
@@ -1347,6 +1357,10 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   // it never pushes/pulls ciphertext or writes a local file, so the flags a user reaching
   // for push/pull's shape would naturally try are named here rather than silently kept.
   'publish-latest': [
+    {
+      flag: 'json',
+      because: 'publish-latest has no JSON success output — it only prints prose (a domain, NFT address, bag id)',
+    },
     {
       flag: 'backend',
       because:
@@ -1378,6 +1392,17 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
       flag: 'identity',
       because:
         'recovery-kit reads the standard layout under CYPHER_BRAIN_HOME so the identity and recipient.txt cannot be mismatched — relocate with the env var, not per-file flags',
+    },
+    // #781: recoverykit.ts's recoveryKit() never reads o.json — its success path is
+    // two console.log() calls (a confirmation line, then the kit's own prose text), so
+    // `recovery-kit --json` used to be format-by-outcome exactly like init above:
+    // prose on success, but a JSON error object on failure (reproduced with
+    // `recovery-kit --from-locator-file <missing> --json`) — the same #647/#722 gap
+    // this table already closed for push/pull/restore/keygen/snapshot/wallet, just
+    // never extended to this sibling command.
+    {
+      flag: 'json',
+      because: 'recovery-kit has no JSON success output — only the failure path is JSON-shaped',
     },
   ],
   // #672: `schedule` covers three sub-verbs (install|status|uninstall,
@@ -1503,7 +1528,10 @@ function assertFlagsRelevant(cmd: string | undefined, o: CliOptions): void {
   const named = ignored
     .map((r) => `--${r.flag.replace(/_/g, '-')} (${r.because}${r.instead ? ` — ${didYouMean(r.instead)}` : ''})`)
     .join('; ');
-  throw new Error(
+  // #779: UsageError — the command line itself named a flag that command does not
+  // read, the same "malformed invocation" class as an unknown command/flag or an
+  // enum-valued flag's bad value, not a failure that happened while doing the work.
+  throw new UsageError(
     `${key} does not read ${ignored.map((r) => `--${r.flag.replace(/_/g, '-')}`).join(', ')}: ${named}. ` +
       `Refused rather than ignored: a flag that is silently dropped looks exactly like one that was honored.`,
   );
@@ -1658,15 +1686,22 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
     // exit and the whole reference captured instead. Treated as the same usage error as
     // an unknown command below — exit 2, short reply, stdout empty — just with its own
     // first line, since there is no offending token to name.
+    // #779: throws UsageError rather than setting process.exitCode = 2 and returning
+    // directly, so this reply funnels through main().catch()'s single generic handler
+    // like every other error — which is what makes `cypher-brain --json` (no command)
+    // print a {error, code, exit_code: 2} object on stdout instead of nothing. The
+    // three lines below become ONE thrown message joined with '\n': console.error(str)
+    // on a string containing embedded newlines prints byte-identical stderr to three
+    // separate console.error() calls (each terminates with exactly one '\n', same as
+    // the embedded ones plus the trailing one from a single call).
     case undefined: {
       const names = commandNames();
-      console.error('error: no command given');
-      if (names.length > 0) console.error(`valid commands: ${names.join(', ')}`);
-      console.error(
+      const lines = ['no command given'];
+      if (names.length > 0) lines.push(`valid commands: ${names.join(', ')}`);
+      lines.push(
         `run 'cypher-brain --help' for the full reference, or 'cypher-brain <command> --help' for one command`,
       );
-      process.exitCode = 2;
-      return;
+      throw new UsageError(lines.join('\n'));
     }
     // issue #269: this is an ERROR path, so all of it goes to stderr and stdout stays
     // empty — the HELP-on-stdout rule two cases up exists so `cypher-brain --help |
@@ -1677,6 +1712,9 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
     // `<command> --help` prints one section, so the useful reply to a typo is the
     // list of real commands plus where to read more — not 300 lines to scroll back
     // through with no indication of which one was meant.
+    // #779: same UsageError treatment as the `case undefined:` arm above, for the
+    // same reason — this used to be the OTHER hand-rolled exit-2 reply that never
+    // reached main().catch()'s --json branch.
     default: {
       // Guard the derived list: if a future HELP edit ever changed the section-header
       // shape enough that nothing matches, "valid commands: " with nothing after it
@@ -1690,13 +1728,12 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
       // `cmd ? ... : undefined` guard exists for the type checker, not because this
       // path can actually see undefined.
       const suggestion = cmd ? nearestName(cmd, names) : undefined;
-      console.error(`error: unknown command: ${cmd}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`);
-      if (names.length > 0) console.error(`valid commands: ${names.join(', ')}`);
-      console.error(
+      const lines = [`unknown command: ${cmd}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`];
+      if (names.length > 0) lines.push(`valid commands: ${names.join(', ')}`);
+      lines.push(
         `run 'cypher-brain --help' for the full reference, or 'cypher-brain <command> --help' for one command`,
       );
-      process.exitCode = 2;
-      return;
+      throw new UsageError(lines.join('\n'));
     }
   }
 }
@@ -1745,10 +1782,17 @@ main()
     // --json command can currently throw after printing (each prints last and returns),
     // so this is a structural guarantee for future ones rather than a live fix
     //.
+    //
+    // #779: exitCode is 2 for a parser-level refusal (errors.ts's UsageError — a
+    // mistyped sub-verb, an enum-valued flag's bad value, an unknown command/flag, a
+    // flag a command does not read) and 1 for everything else, the same distinction
+    // process.exitCode gets below — so a caller parsing this field never disagrees
+    // with the real exit status ($?).
+    const exitCode = exitCodeFor(e);
     if (process.argv.slice(2).includes('--json') && !hasWrittenJson()) {
-      console.log(JSON.stringify({ error: message, code: matchErrorCode(message)?.code ?? null, exit_code: 1 }));
+      console.log(JSON.stringify({ error: message, code: matchErrorCode(message)?.code ?? null, exit_code: exitCode }));
     }
-    process.exitCode = 1;
+    process.exitCode = exitCode;
   })
   // The summary is genuinely LAST — after the error line and the --json error object
   // (multi-model review: printing it before the error handler made "end-of-run" a

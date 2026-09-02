@@ -10,6 +10,7 @@ import { rcloneBackend } from './rclone.js';
 import { tonBackend } from './ton.js';
 import { tonProviderBackend } from './ton-provider.js';
 import { didYouMean, nearestName } from '../suggest.js';
+import { UsageError } from '../errors.js';
 import { STORAGE_BACKEND_NAMES, type StorageBackend } from '../types.js';
 
 // #435 (Codex review): backendFor()'s dispatch used to be an if-chain naming each
@@ -79,8 +80,10 @@ export async function backendFor(name: string | undefined): Promise<StorageBacke
     ? (BACKEND_FACTORIES as Record<string, () => StorageBackend | Promise<StorageBackend>>)[name]
     : undefined;
   if (factory) return factory();
+  // #779: UsageError — an enum-valued flag's bad value is a parser-level refusal
+  // (exit 2), not the generic-failure 1.
   const suggestion = name ? nearestName(name, Object.keys(BACKEND_FACTORIES)) : undefined;
-  throw new Error(
+  throw new UsageError(
     `unknown backend: ${name || '(none)'}${suggestion ? ` (${didYouMean(suggestion)})` : ''} — use --backend ${STORAGE_BACKEND_NAMES.join('|')}`,
   );
 }

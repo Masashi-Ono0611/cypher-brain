@@ -144,12 +144,30 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
       'src/lib/backends/arweave.ts + src/lib/backends/turbo.ts ("… exceeds CYPHER_BRAIN_MAX_SPEND=…"); ' +
       '"insufficient balance/funds" also matches the arweave/turbo-sdk packages’ own thrown wording',
   },
+  // #781: was `/spends real funds/` — too broad. That substring also appears in TWO
+  // "the spend cap env var isn't set" refusals (src/lib/schedule.ts's ton-provider
+  // schedule-install check, src/lib/backends/ton-provider.ts's push-time check) that
+  // --yes cannot fix — the fix there is setting CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND, a
+  // one-time operator/environment change, not a per-run consent flag. An agent (or
+  // human) reading `code: CB-E007` off either of those got this entry's title ("…
+  // needs explicit spend consent (--yes)") and retried with --yes, which does nothing
+  // for a cap that was never configured. Anchored instead to "re-run push with --yes
+  // or set CYPHER_BRAIN_YES=1 in the environment to confirm" — the tail wording ONLY
+  // the two genuine --yes-fixable consent refusals share — so it no longer shadows
+  // CB-E024 below. Deliberately does NOT include the "spends real funds — " prefix:
+  // in pushpull.ts's source that prefix and this tail are two SEPARATE template-
+  // literal string pieces (concatenated with `+` across a line break), so a pattern
+  // spanning both would not appear as one contiguous substring in the .ts file text
+  // that scripts/selftest-error-codes.mjs's literal check greps against, even though
+  // the two evaluate to one string at runtime.
   {
     code: 'CB-E007',
     title: 'paid backend upload needs explicit spend consent (--yes)',
-    pattern: /spends real funds/,
+    pattern: /re-run push with --yes or set CYPHER_BRAIN_YES=1 in the environment to confirm/,
     origin: 'ours',
-    source: 'src/lib/pushpull.ts (push, "… uploading to a permanent Arweave store spends real funds — …")',
+    source:
+      'src/lib/pushpull.ts (push, "… spends real funds — re-run push with --yes or set CYPHER_BRAIN_YES=1 in the ' +
+      'environment to confirm…" — shared verbatim by the arweave/turbo and ton-provider consent refusals)',
   },
   {
     code: 'CB-E008',
@@ -291,11 +309,76 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     origin: 'ours',
     source: 'src/lib/restore.ts (restoreImpl + runFileChecks, "--sign-recipient … does not exist", #601)',
   },
+  // #781: split out of CB-E007 above — "ton-provider needs a spend cap configured" is a
+  // DIFFERENT condition from "confirm this paid upload with --yes", even though both
+  // throw sites' prose happens to contain the substring "spends real funds" (CB-E007's
+  // OLD, too-broad pattern). The fix for THIS one is setting
+  // CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND in the environment — a one-time operator/config
+  // change --yes cannot substitute for, unlike CB-E007's genuinely per-run consent gate.
+  // Two independent throw sites, two different exact wordings (neither a substring of
+  // the other, and neither prefixed by the env var name close enough to the OTHER
+  // half's distinguishing text to share it — see each alternative's own comment).
+  //
+  // First alternative: "(nanoTON) must be set in the" rather than continuing through
+  // "environment before install" — in schedule.ts's source, "in the " and "environment
+  // before install" are two separate template-literal pieces joined with `+` across a
+  // line break, so the longer phrase never appears as ONE contiguous substring in the
+  // .ts file text scripts/selftest-error-codes.mjs greps against, even though they
+  // concatenate to one string at runtime. Dropped the "CYPHER_BRAIN_TON_PROVIDER_MAX_
+  // SPEND " prefix (present right before it in the real message) only to fit this line
+  // under biome's 120-column limit — "(nanoTON) must be set in the" alone is already
+  // unique to this one throw site (grep confirms).
+  //
+  // Second alternative: "must be set to a positive nanoTON amount" — no line-break
+  // split in backends/ton-provider.ts's source, but shortened the same way and for the
+  // same reason (also grep-confirmed unique).
+  {
+    code: 'CB-E024',
+    title: 'ton-provider spend cap not configured (CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND) — --yes will not fix this',
+    pattern: /\(nanoTON\) must be set in the|must be set to a positive nanoTON amount/,
+    origin: 'ours',
+    source:
+      'src/lib/schedule.ts (installSchedule, "ton-provider is a paid store: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND ' +
+      '(nanoTON) must be set in the environment before install — …") + ' +
+      'src/lib/backends/ton-provider.ts (put, "ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND must be ' +
+      'set to a positive nanoTON amount …")',
+  },
 ];
 
 /** The first registry entry whose pattern matches `message`, if any. */
 export function matchErrorCode(message: string): ErrorCodeEntry | undefined {
   return ERROR_CODES.find((e) => e.pattern.test(message));
+}
+
+// #779: a PARSER-LEVEL refusal — a mistyped sub-verb (`wallet adress`), an
+// enum-valued flag given a value it does not accept (`--level remtoe`, `--chain
+// tona`, `--backend fille`), an unrecognized top-level command or flag, or a flag a
+// command declares it does not read (FLAG_IRRELEVANT in src/cli.ts) — is "the
+// command line itself was malformed", the same class getopt/most POSIX CLIs exit 2
+// for, as distinct from a failure that happened while doing the work (a decrypt
+// failure, a network error, a spend cap exceeded) which exits 1. cli.ts's two
+// hand-rolled replies for "no command"/"unknown command" already followed that
+// convention directly (their own `process.exitCode = 2`), but every OTHER
+// parser-level refusal threw a plain Error and fell into main().catch()'s single
+// generic handler below, which unconditionally set exit 1 — an agent scripting
+// against this CLI could not tell "cypher-brain restore" (forgot --in, --out-dir:
+// malformed invocation) from "cypher-brain restore --in x --out-dir y" (right
+// shape, decrypt failed: a real failure) by exit code alone. Throwing UsageError
+// from a parser-level refusal lets the generic handler answer both classes
+// correctly, and — since the two hand-rolled arms now throw it too instead of
+// setting process.exitCode directly and returning — routes them through the SAME
+// path, which is what makes `cypher-brain bogus --json` print a JSON error object
+// (previously: nothing, since that reply never reached the --json branch below).
+export class UsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UsageError';
+  }
+}
+
+/** The process exit code an error should produce: 2 for a UsageError, 1 otherwise. */
+export function exitCodeFor(e: unknown): 1 | 2 {
+  return e instanceof UsageError ? 2 : 1;
 }
 
 // Append "[CB-E0xx] see MANAGEMENT.md#error-codes" to an already-formatted error message

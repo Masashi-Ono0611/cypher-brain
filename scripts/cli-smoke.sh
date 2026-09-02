@@ -391,18 +391,27 @@ echo "[PASS] dist zero arguments: exit 2, stdout empty, a ${NOARGS_LINES}-line s
 # covering a NESTED subcommand typo (schedule/wallet's own sub-verb) and an
 # ENUM-VALUED flag typo (--level/--backend/--chain) — neither got a suggestion
 # before #435, only the generic "expected X | Y | Z" listing.
-# Each typo below must REFUSE (non-zero), not just print a suggestion and carry on. The
-# exact code is deliberately not pinned: today a top-level unknown command exits 2 while
-# these nested/enum typos exit 1 (#779) — asserting either value here would freeze that
-# inconsistency into the test.
+# Each typo below must REFUSE (non-zero), not just print a suggestion and carry on.
+# #779/#781: a top-level unknown command and these nested/enum typos both exit 2 now
+# (errors.ts's UsageError) — 'wallet adress' and the three enum typos below assert the
+# exact code. 'schedule statuz' is schedule.ts's own separate sub-verb check, out of
+# scope for this change (untouched, still exits 1) — its non-zero-only check stays as is.
 node "$DIST" schedule statuz > /dev/null 2> "$TMP/nested-schedule.err"; RC=$?
 [ "$RC" != "0" ] || { echo "[FAIL] 'schedule statuz' exited 0 — the typo was suggested but not refused"; cat "$TMP/nested-schedule.err"; exit 1; }
 grep -Fq 'schedule: expected install | uninstall | status, got: statuz (did you mean status?)' "$TMP/nested-schedule.err" \
   || { echo "[FAIL] 'schedule statuz' did not suggest 'status'"; cat "$TMP/nested-schedule.err"; exit 1; }
-node "$DIST" wallet adress > /dev/null 2> "$TMP/nested-wallet.err"; RC=$?
-[ "$RC" != "0" ] || { echo "[FAIL] 'wallet adress' exited 0 — the typo was suggested but not refused"; cat "$TMP/nested-wallet.err"; exit 1; }
+node "$DIST" wallet adress > /dev/null 2> "$TMP/nested-wallet.err"
+WALLET_ADRESS_RC=$?
 grep -Fq 'wallet: expected create | address | balance, got: adress (did you mean address?)' "$TMP/nested-wallet.err" \
   || { echo "[FAIL] 'wallet adress' did not suggest 'address'"; cat "$TMP/nested-wallet.err"; exit 1; }
+# #781: a mistyped sub-verb is a PARSER-LEVEL refusal (the command line itself was
+# malformed), the same class the unknown-command/no-command replies above already
+# exit 2 for — errors.ts's UsageError now routes this one through main().catch() the
+# same way, so it exits 2 too instead of the generic-failure 1. Pinned only for
+# 'wallet adress' here: 'schedule statuz' above is schedule.ts's own separate
+# sub-verb check, out of scope for this change (untouched, still exits 1).
+[ "$WALLET_ADRESS_RC" = "2" ] \
+  || { echo "[FAIL] 'wallet adress' exited $WALLET_ADRESS_RC, expected 2 (a parser-level refusal, #781)"; exit 1; }
 # a genuinely unrelated nested sub-verb still gets no suggestion (same #425 asymmetry
 # the top-level unknown-command test above already covers).
 node "$DIST" wallet xyz > /dev/null 2> "$TMP/nested-wallet-unrelated.err"
@@ -411,18 +420,26 @@ if grep -qi "did you mean" "$TMP/nested-wallet-unrelated.err"; then
 fi
 echo "[PASS] dist nested subcommand typos: 'schedule statuz'/'wallet adress' suggest their real sub-verb, 'wallet xyz' correctly gets no spurious suggestion"
 
-node "$DIST" verify --level remtoe --in "$TMP/does-not-exist.age" > /dev/null 2> "$TMP/enum-level.err"; RC=$?
-[ "$RC" != "0" ] || { echo "[FAIL] '--level remtoe' exited 0 — the typo was suggested but not refused"; cat "$TMP/enum-level.err"; exit 1; }
+node "$DIST" verify --level remtoe --in "$TMP/does-not-exist.age" > /dev/null 2> "$TMP/enum-level.err"
+ENUM_LEVEL_RC=$?
 grep -Fq 'did you mean --level remote?' "$TMP/enum-level.err" \
   || { echo "[FAIL] '--level remtoe' did not suggest '--level remote'"; cat "$TMP/enum-level.err"; exit 1; }
-node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend fille > /dev/null 2> "$TMP/enum-backend.err"; RC=$?
-[ "$RC" != "0" ] || { echo "[FAIL] '--backend fille' exited 0 — the typo was suggested but not refused"; cat "$TMP/enum-backend.err"; exit 1; }
+node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend fille > /dev/null 2> "$TMP/enum-backend.err"
+ENUM_BACKEND_RC=$?
 grep -Fq 'did you mean file?' "$TMP/enum-backend.err" \
   || { echo "[FAIL] '--backend fille' did not suggest 'file'"; cat "$TMP/enum-backend.err"; exit 1; }
-node "$DIST" wallet create --chain tona > /dev/null 2> "$TMP/enum-chain.err"; RC=$?
-[ "$RC" != "0" ] || { echo "[FAIL] '--chain tona' exited 0 — the typo was suggested but not refused"; cat "$TMP/enum-chain.err"; exit 1; }
+node "$DIST" wallet create --chain tona > /dev/null 2> "$TMP/enum-chain.err"
+ENUM_CHAIN_RC=$?
 grep -Fq 'did you mean ton?' "$TMP/enum-chain.err" \
   || { echo "[FAIL] '--chain tona' did not suggest 'ton'"; cat "$TMP/enum-chain.err"; exit 1; }
+# #781: an enum-valued flag's bad value is a parser-level refusal too — same UsageError
+# treatment as 'wallet adress' above, exit 2 instead of the generic-failure 1.
+[ "$ENUM_LEVEL_RC" = "2" ] \
+  || { echo "[FAIL] '--level remtoe' exited $ENUM_LEVEL_RC, expected 2 (a parser-level refusal, #781)"; exit 1; }
+[ "$ENUM_BACKEND_RC" = "2" ] \
+  || { echo "[FAIL] '--backend fille' exited $ENUM_BACKEND_RC, expected 2 (a parser-level refusal, #781)"; exit 1; }
+[ "$ENUM_CHAIN_RC" = "2" ] \
+  || { echo "[FAIL] '--chain tona' exited $ENUM_CHAIN_RC, expected 2 (a parser-level refusal, #781)"; exit 1; }
 # a genuinely unrelated enum value still gets no suggestion.
 node "$DIST" verify --level bogus --in "$TMP/does-not-exist.age" > /dev/null 2> "$TMP/enum-level-unrelated.err"
 if grep -qi "did you mean" "$TMP/enum-level-unrelated.err"; then
@@ -487,6 +504,29 @@ node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend nosuchba
 [ ! -s "$TMP/err-nojson.out" ] \
   || { echo "[FAIL] the error path writes to stdout even without --json"; cat "$TMP/err-nojson.out"; exit 1; }
 echo "[PASS] dist --json error path: {error, code: CB-E013, exit_code} on stdout, stderr unchanged, no stdout without --json"
+
+# (l cont.) #781: an unknown COMMAND used to be one of two hand-rolled replies
+# (cli.ts's `case undefined:`/`default:` arms) that set process.exitCode = 2 and
+# returned directly — never reaching main().catch()'s --json branch above, so
+# `cypher-brain bogus --json` printed NOTHING on stdout despite asking for --json.
+# Both arms now throw errors.ts's UsageError instead, routing through the SAME
+# generic handler as every other error.
+node "$DIST" bogus --json > "$TMP/unknown-cmd.json" 2> "$TMP/unknown-cmd.txt"
+UNKNOWN_CMD_RC=$?
+[ "$UNKNOWN_CMD_RC" = "2" ] \
+  || { echo "[FAIL] 'bogus --json' exited $UNKNOWN_CMD_RC, expected 2"; cat "$TMP/unknown-cmd.txt"; exit 1; }
+UNKNOWN_CMD_LINES=$(wc -l < "$TMP/unknown-cmd.json" | tr -d ' ')
+[ "$UNKNOWN_CMD_LINES" = "1" ] \
+  || { echo "[FAIL] 'bogus --json' wrote $UNKNOWN_CMD_LINES lines to stdout, expected exactly 1 (a JSON error object)"; cat "$TMP/unknown-cmd.json"; exit 1; }
+node -e '
+  const fs = require("node:fs");
+  const o = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  if (typeof o.error !== "string" || !o.error.includes("unknown command: bogus")) throw new Error("unexpected error text: " + o.error);
+  if (o.code !== null) throw new Error("expected code: null (no CB-E0xx pattern matches this message), got " + o.code);
+  if (o.exit_code !== 2) throw new Error("expected exit_code: 2, got " + o.exit_code);
+' "$TMP/unknown-cmd.json" \
+  || { echo "[FAIL] 'bogus --json' stdout is not the expected {error, code: null, exit_code: 2} object"; cat "$TMP/unknown-cmd.json"; exit 1; }
+echo "[PASS] dist unknown command --json: {error, code: null, exit_code: 2} on stdout (#781 — previously nothing)"
 
 ### (m) restore REFUSES the --out it does not read, naming the flag and the near miss (#277)
 # --out is the destination flag on snapshot/pull/wallet create, so typing it on restore
@@ -576,5 +616,29 @@ M2_RC=$?
 grep -qx -- 'error: --out-dir <dir> required' "$TMP/m2.err" \
   || { echo "[FAIL] restore without a destination no longer emits exactly 'error: --out-dir <dir> required'"; cat "$TMP/m2.err"; exit 1; }
 echo "[PASS] dist restore: --out is named as ignored with a --out-dir hint; the plain error is unchanged without it"
+
+### (m4) #781: recovery-kit/init/publish-latest --json used to be FORMAT-BY-OUTCOME —
+# prose on success, but main().catch()'s --json branch fired on ANY throw regardless
+# of whether the command itself ever implements a JSON success document, so a genuine
+# FAILURE on one of these three commands with --json set printed a JSON error object
+# even though a SUCCESSFUL run of the same command would have printed plain prose. A
+# caller parsing --json output uniformly could not tell which shape to expect until
+# after the fact. All three now have a FLAG_IRRELEVANT['json'] entry (the same #647
+# treatment push/pull/wallet-address/wallet-create/restore/keygen/snapshot already
+# had), so --json is refused upfront instead — reproduced here on recovery-kit's
+# error path specifically, since that's the one this issue's audit demonstrated.
+node "$DIST" recovery-kit --from-locator-file "$TMP/does-not-exist-locator" --json > /dev/null 2> "$TMP/m4-recovery-kit.err"
+M4_RK_RC=$?
+[ "$M4_RK_RC" = "2" ] \
+  || { echo "[FAIL] 'recovery-kit --json' exited $M4_RK_RC, expected 2 (refused upfront as a flag it does not read)"; cat "$TMP/m4-recovery-kit.err"; exit 1; }
+grep -Fq -- 'does not read --json' "$TMP/m4-recovery-kit.err" \
+  || { echo "[FAIL] 'recovery-kit --json' was not refused as unread — it is still format-by-outcome"; cat "$TMP/m4-recovery-kit.err"; exit 1; }
+node "$DIST" init --json > /dev/null 2> "$TMP/m4-init.err" < /dev/null
+grep -Fq -- 'does not read --json' "$TMP/m4-init.err" \
+  || { echo "[FAIL] 'init --json' was not refused as unread — it is still format-by-outcome"; cat "$TMP/m4-init.err"; exit 1; }
+node "$DIST" publish-latest --domain example.ton --from-locator-file "$TMP/does-not-exist-locator" --json > /dev/null 2> "$TMP/m4-publish-latest.err"
+grep -Fq -- 'does not read --json' "$TMP/m4-publish-latest.err" \
+  || { echo "[FAIL] 'publish-latest --json' was not refused as unread — it is still format-by-outcome"; cat "$TMP/m4-publish-latest.err"; exit 1; }
+echo "[PASS] dist recovery-kit/init/publish-latest --json: refused upfront (not format-by-outcome) (#781)"
 
 echo "CLI SMOKE: PASS"
