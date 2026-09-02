@@ -647,6 +647,16 @@ echo "[PASS] pin=yes suggests a config.env KEY=value line (no export prefix), na
 grep -qF 'SOURCES this line as literal shell code on every new shell' "$TMP/wizard-pass.log" || { echo "[FAIL] the shell-rc alternative does not caveat that it executes the line as shell code (issue #622)"; cat "$TMP/wizard-pass.log"; exit 1; }
 echo "[PASS] the shell-rc alternative now caveats that it sources the suggested line as literal shell code, unlike config.env (issue #622 fixed)"
 
+echo "== (g3) the init wizard also suggests CYPHER_BRAIN_MCP_SOURCE_ROOTS, naming the directories just chosen (#800/#820) =="
+# Test (f)'s run picked profile 'none' with a single directory ($F_SRC) — the wizard
+# must suggest a JSON-array CYPHER_BRAIN_MCP_SOURCE_ROOTS line naming exactly that
+# directory, clearly labelled as MCP-only (the CLI itself has no such gate).
+grep -qF "CYPHER_BRAIN_MCP_SOURCE_ROOTS='[\"$F_SRC\"]'" "$TMP/wizard-pass.log" \
+  || { echo "[FAIL] the wizard did not suggest a CYPHER_BRAIN_MCP_SOURCE_ROOTS line naming the chosen directory"; cat "$TMP/wizard-pass.log"; exit 1; }
+grep -qF 'Only needed if you will drive snapshots through the MCP server' "$TMP/wizard-pass.log" \
+  || { echo "[FAIL] the CYPHER_BRAIN_MCP_SOURCE_ROOTS suggestion is not labelled MCP-only"; cat "$TMP/wizard-pass.log"; exit 1; }
+echo "[PASS] init also suggests a CYPHER_BRAIN_MCP_SOURCE_ROOTS line naming the chosen directory, labelled MCP-only"
+
 echo "== (h) rollback + clean retry: a failure AFTER identity creation must not brick a retry (P2 fix) =="
 # The primary identity is created in step 1/6, well before later prompts that can
 # fail/abort (declining the paid-backend spend consent, a cancelled prompt, ...) —

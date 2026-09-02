@@ -260,14 +260,22 @@ function parseArgs(argv: string[], cmd: string | undefined): CliOptions {
       // positional — it is still a plain, non-"--" token either way and would be
       // rejected identically on retry. Only naming the flag it should be attached to
       // is an actual fix here.
-      throw new Error(
+      //
+      // UsageError, not a plain Error (dogfooding gap in #814's own UsageError sweep):
+      // this is a parser-level refusal exactly like the unknown-flag/unknown-command
+      // replies above and below, so it must exit 2, not the generic-failure 1 — an
+      // agent scripting against this CLI cannot otherwise tell "cypher-brain doctor foo"
+      // (malformed invocation) from a real doctor failure by exit code alone.
+      throw new UsageError(
         `${cmd} does not take a bare argument: ${positionals.map((p) => JSON.stringify(p)).join(', ')}. ` +
           `Every value must be attached to a flag (e.g. "--dir ${positionals[0]}"). Refused rather than ignored: ` +
           `an argument that is silently dropped looks exactly like one that was honored.`,
       );
     }
     if (knownCommand && positionals.length > 1) {
-      throw new Error(
+      // Same UsageError treatment as the sibling refusal just above — this is the
+      // "schedule install status" shape (#814's gap): more than one sub-command word.
+      throw new UsageError(
         `${cmd} takes exactly one sub-command word, got ${positionals.length}: ${positionals.join(' ')}. ` +
           `Refused rather than silently dispatching the last one ("${positionals[positionals.length - 1]}").`,
       );

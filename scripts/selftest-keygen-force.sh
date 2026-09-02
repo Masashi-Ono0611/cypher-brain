@@ -32,6 +32,9 @@
 #   (e) a FRESH `keygen` (no pre-existing identity) never creates a backup file —
 #       the unconditional-whenever-force-replaces-an-EXISTING-identity gate must
 #       not fire when there is nothing to protect yet.
+#   (g) `doctor`'s identity-backup-accumulation check (#811 follow-up): SKIP with
+#       none, WARN once one exists (naming the count, the oldest date, and the
+#       exact "safe to delete" condition), and the count keeps up as more pile up.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -174,6 +177,43 @@ printf '%s\n' "$OUT_E" | grep -q 'backed up to' && { echo "[FAIL] a fresh keygen
 BAK_COUNT="$(find "$CYPHER_BRAIN_HOME" -maxdepth 1 -name '*.bak-*' 2>/dev/null | wc -l | tr -d ' ')"
 [ "$BAK_COUNT" = "0" ] || { echo "[FAIL] a fresh keygen left $BAK_COUNT unexpected .bak-* file(s)"; exit 1; }
 echo "[PASS] a fresh keygen (nothing pre-existing) creates no backup file"
+
+echo "== (g) doctor's identity-backup-accumulation check (#811 follow-up): SKIP with none, WARN naming the count/oldest-date/safe-deletion-condition once backups pile up =="
+export CYPHER_BRAIN_HOME="$TMP/home-g"
+cb keygen >/dev/null
+NONE_JSON="$(cb doctor --json || true)"
+node -e "
+const j = JSON.parse(process.argv[1]);
+const c = j.checks.find((x) => x.id === 'identity-backup-accumulation');
+if (!c || c.status !== 'skip') throw new Error('expected identity-backup-accumulation skip with no backups yet, got ' + JSON.stringify(c));
+" "$NONE_JSON"
+echo "[PASS] no backups yet: identity-backup-accumulation SKIPs"
+
+cb keygen --force >/dev/null
+ONE_JSON="$(cb doctor --json || true)"
+node -e "
+const j = JSON.parse(process.argv[1]);
+const c = j.checks.find((x) => x.id === 'identity-backup-accumulation');
+if (!c || c.status !== 'warn') throw new Error('expected identity-backup-accumulation warn after one --force, got ' + JSON.stringify(c));
+if (!/^1 identity backup file\(s\)/.test(c.message)) throw new Error('expected the message to lead with the count 1: ' + c.message);
+if (!c.message.includes('safe to delete once every snapshot encrypted to the OLD recipient')) {
+  throw new Error('expected the exact safe-deletion condition in the message: ' + c.message);
+}
+if (!/oldest: \d{4}-\d{2}-\d{2}/.test(c.message)) throw new Error('expected an oldest: YYYY-MM-DD date in the message: ' + c.message);
+" "$ONE_JSON"
+echo "[PASS] one backup: identity-backup-accumulation WARNs naming the count (1), the oldest date, and the exact safe-deletion condition"
+
+cb keygen --force >/dev/null
+TWO_JSON="$(cb doctor --json || true)"
+node -e "
+const j = JSON.parse(process.argv[1]);
+const c = j.checks.find((x) => x.id === 'identity-backup-accumulation');
+if (!c || c.status !== 'warn') throw new Error('expected identity-backup-accumulation warn after two --force runs, got ' + JSON.stringify(c));
+if (!/^2 identity backup file\(s\)/.test(c.message)) throw new Error('expected the message to lead with the count 2: ' + c.message);
+" "$TWO_JSON"
+BAK_COUNT_G="$(find "$CYPHER_BRAIN_HOME" -maxdepth 1 -name '*.bak-*' 2>/dev/null | wc -l | tr -d ' ')"
+[ "$BAK_COUNT_G" = "2" ] || { echo "[FAIL] test setup: expected exactly 2 .bak-* files on disk, found $BAK_COUNT_G"; exit 1; }
+echo "[PASS] a second --force: identity-backup-accumulation's count tracks it (2), matching the 2 .bak-* files actually on disk"
 
 echo
 echo "KEYGEN --FORCE ORDERING/BACKUP SELFTEST PASS"

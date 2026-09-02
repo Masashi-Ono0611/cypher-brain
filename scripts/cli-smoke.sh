@@ -447,6 +447,35 @@ if grep -qi "did you mean" "$TMP/enum-level-unrelated.err"; then
 fi
 echo "[PASS] dist enum-valued flag typos: '--level remtoe'/'--backend fille'/'--chain tona' suggest the real value, '--level bogus' correctly gets no spurious suggestion"
 
+# (j cont. 4) dogfooding gap in #814's own UsageError sweep: the TWO bare/multi-
+# positional refusals in parseArgs() (a command that takes no positional at all, e.g.
+# 'doctor foo'; a POSITIONAL_COMMANDS command given more than one sub-command word,
+# e.g. 'schedule install status') still threw a plain Error and exited 1 — the same
+# "an agent cannot tell malformed-invocation from a real failure by exit code alone"
+# gap #814/#781 closed for every OTHER parser-level refusal. Both must now exit 2, and
+# --json must print exit_code: 2 (not silently omit it, like the pre-#788 gap did for
+# the top-level unknown-command reply).
+node "$DIST" doctor foo --json > "$TMP/bare-positional.log" 2> "$TMP/bare-positional.err"
+BARE_POSITIONAL_RC=$?
+[ "$BARE_POSITIONAL_RC" = "2" ] \
+  || { echo "[FAIL] 'doctor foo --json' exited $BARE_POSITIONAL_RC, expected 2 (a parser-level refusal)"; cat "$TMP/bare-positional.log" "$TMP/bare-positional.err"; exit 1; }
+grep -Fq 'doctor does not take a bare argument' "$TMP/bare-positional.log" \
+  || { echo "[FAIL] 'doctor foo --json' did not report the bare-argument refusal"; cat "$TMP/bare-positional.log"; exit 1; }
+node -e '
+  const o = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+  if (o.exit_code !== 2) throw new Error("exit_code " + o.exit_code + " != 2");
+' "$TMP/bare-positional.log" \
+  || { echo "[FAIL] 'doctor foo --json' stdout is not {exit_code: 2}"; cat "$TMP/bare-positional.log"; exit 1; }
+echo "[PASS] dist 'doctor foo --json' (a command that takes no bare positional): exit 2, --json reports exit_code: 2"
+
+node "$DIST" schedule install status > /dev/null 2> "$TMP/multi-positional.err"
+MULTI_POSITIONAL_RC=$?
+[ "$MULTI_POSITIONAL_RC" = "2" ] \
+  || { echo "[FAIL] 'schedule install status' exited $MULTI_POSITIONAL_RC, expected 2 (a parser-level refusal)"; cat "$TMP/multi-positional.err"; exit 1; }
+grep -Fq 'schedule takes exactly one sub-command word' "$TMP/multi-positional.err" \
+  || { echo "[FAIL] 'schedule install status' did not report the multi-positional refusal"; cat "$TMP/multi-positional.err"; exit 1; }
+echo "[PASS] dist 'schedule install status' (more than one sub-command word): exit 2"
+
 # #537: nearestName()'s editDistance() moved from plain to (restricted)
 # Damerau-Levenshtein so an adjacent-letter TRANSPOSITION (not just a
 # substitution like 'remtoe' above) also gets a suggestion — 'quikc' (the

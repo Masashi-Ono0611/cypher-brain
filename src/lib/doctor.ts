@@ -36,7 +36,7 @@
 // exists: doctor's whole premise is inspecting an EXISTING setup, so it must never
 // create that directory just to leave its own bookkeeping file on a machine that has
 // nothing set up yet (that would also stop being a purely read-only diagnostic).
-import { stat, readFile, writeFile, rename, rm } from 'node:fs/promises';
+import { stat, readdir, readFile, writeFile, rename, rm } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -49,6 +49,8 @@ import {
   AR_WALLET,
   TON_WALLET,
   PIN_RECIPIENTS,
+  MCP_SOURCE_ROOTS,
+  MCP_SOURCE_ROOTS_ERROR,
   CONFIG_FILE_PATH,
   AGE_MAGIC,
   AGE_ARMOR_HEADER,
@@ -451,6 +453,108 @@ async function checkPinRecipients(): Promise<DoctorCheck[]> {
   return results;
 }
 
+// #820: the MCP server's `snapshot_now` tool is fail-closed on two OPERATOR-set
+// environment variables (assertSnapshotPolicy() in src/mcp.ts) — CYPHER_BRAIN_PIN_RECIPIENTS
+// (mandatory for every call) and CYPHER_BRAIN_MCP_SOURCE_ROOTS (mandatory for any call
+// naming `dirs`; a pg-only call needs no roots). Neither of doctor's existing checks said
+// so: pin-recipients-config (#101) only covers the CLI's own snapshot() allowlist gate,
+// never mentions MCP at all, and nothing here ever read CYPHER_BRAIN_MCP_SOURCE_ROOTS —
+// so an operator running `cypher-brain-mcp` for the first time could see a clean doctor
+// report and still have every snapshot_now call refused with CB-E025 the moment they tried
+// it. This is WARN, not FAIL: a CLI-only setup is a completely normal, healthy state.
+//
+// SKIP, not WARN, on a machine with no identity yet at all — doctor's whole premise is
+// inspecting an EXISTING setup (module doc comment above), and test (a)'s own invariant
+// ("a not-yet-set-up home: every check SKIPs") is exactly that: a fresh checkout that has
+// never run `keygen`/`init` has nothing to protect over MCP yet either, and nagging about
+// an MCP policy before there is even a key to pin would be noise, not signal, on top of
+// every OTHER check already reporting SKIP for the identical reason. Once an identity
+// exists, this repo has something worth protecting, and that is when an unconfigured MCP
+// policy becomes worth a WARN — "doctor has no way to tell whether this machine runs
+// cypher-brain-mcp at all" only holds AFTER that point; before it, there is nothing to run
+// the server against regardless.
+async function checkMcpSnapshotPolicy(): Promise<DoctorCheck> {
+  const id = 'mcp-snapshot-policy';
+  if (!(await exists(IDENTITY))) {
+    return { id, status: 'skip', message: 'no identity yet — nothing to protect over MCP yet' };
+  }
+  // Multi-model review: checking CYPHER_BRAIN_PIN_RECIPIENTS for non-emptiness alone
+  // would PASS a value that resolves to zero usable age1… keys (a typo, a file that
+  // exists but is empty/fully commented out) — exactly the case assertSnapshotPolicy()
+  // in src/mcp.ts itself refuses on ("resolves to no age1… pubkeys"). Reuse the SAME
+  // resolvePinnedRecipients() that check (and pin-recipients-config, above) already use,
+  // so this cannot disagree with either about what counts as "usable".
+  let pinMissing: boolean;
+  if (PIN_RECIPIENTS === undefined || PIN_RECIPIENTS.trim() === '') {
+    pinMissing = true;
+  } else {
+    try {
+      pinMissing = (await resolvePinnedRecipients(PIN_RECIPIENTS)).size === 0;
+    } catch {
+      // Unreadable/unparsable — the dedicated pin-recipients-config check above already
+      // reports the specific reason; here it is enough to know MCP would refuse too.
+      pinMissing = true;
+    }
+  }
+  const rootsMissing = MCP_SOURCE_ROOTS_ERROR !== null || MCP_SOURCE_ROOTS.length === 0;
+  if (pinMissing || rootsMissing) {
+    const reasons: string[] = [];
+    if (pinMissing) reasons.push('CYPHER_BRAIN_PIN_RECIPIENTS is not set (or resolves to no usable age1… key)');
+    if (MCP_SOURCE_ROOTS_ERROR)
+      reasons.push(`CYPHER_BRAIN_MCP_SOURCE_ROOTS is malformed: ${MCP_SOURCE_ROOTS_ERROR.message}`);
+    else if (MCP_SOURCE_ROOTS.length === 0) reasons.push('CYPHER_BRAIN_MCP_SOURCE_ROOTS is not set');
+    // Multi-model review: CYPHER_BRAIN_PIN_RECIPIENTS gates EVERY snapshot_now call, but
+    // CYPHER_BRAIN_MCP_SOURCE_ROOTS only gates a call that names `dirs` — a pinned,
+    // pg-only MCP setup needs no roots at all (assertSnapshotPolicy()'s own "## 2." doc
+    // comment). The lead sentence below (kept verbatim — selftest-doctor.sh asserts it)
+    // would otherwise overstate the roots half for that legitimate configuration; this
+    // trailing clause corrects it without changing which case WARNs.
+    const rootsCaveat =
+      !pinMissing && rootsMissing
+        ? ' A pinned, pg-only snapshot_now call needs no roots at all and is unaffected by this.'
+        : '';
+    return {
+      id,
+      status: 'warn',
+      message:
+        'MCP snapshot_now will refuse until CYPHER_BRAIN_PIN_RECIPIENTS and CYPHER_BRAIN_MCP_SOURCE_ROOTS are ' +
+        `set (#800) — ${reasons.join('; ')}. CLI-only users (never running cypher-brain-mcp) are unaffected.` +
+        rootsCaveat,
+      remediation:
+        'If you run the MCP server: set both variables in its environment and restart it — see MANAGEMENT.md ' +
+        '("MCP snapshot policy"). If you never run the MCP server, this is safe to ignore.',
+    };
+  }
+  // Both configured and syntactically valid (MCP_SOURCE_ROOTS_ERROR === null): also check
+  // each root actually exists on disk. assertSnapshotPolicy() resolves each configured
+  // root via realpathOfNearestAncestor() before comparing — a root that does not exist
+  // still "resolves" to its nearest existing ancestor, so a typo'd root does not crash the
+  // server, but it silently authorizes the WRONG directory (the ancestor) rather than the
+  // one the operator meant. Surfacing that here, rather than leaving it to be discovered
+  // the first time a legitimate `dirs` call is unexpectedly refused or mis-scoped.
+  const missing: string[] = [];
+  for (const root of MCP_SOURCE_ROOTS) {
+    if (!(await exists(root))) missing.push(root);
+  }
+  if (missing.length > 0) {
+    return {
+      id,
+      status: 'warn',
+      message:
+        `CYPHER_BRAIN_MCP_SOURCE_ROOTS names ${missing.length} of ${MCP_SOURCE_ROOTS.length} root(s) that do not ` +
+        `exist on disk (${missing.join(', ')}) — snapshot_now resolves each configured root to its nearest ` +
+        'existing ancestor before checking containment, so a typo here silently authorizes a broader directory ' +
+        'than intended rather than failing loudly.',
+      remediation: `Fix the missing path(s) in CYPHER_BRAIN_MCP_SOURCE_ROOTS, or create the directory/directories.`,
+    };
+  }
+  return {
+    id,
+    status: 'pass',
+    message: `CYPHER_BRAIN_PIN_RECIPIENTS is set and CYPHER_BRAIN_MCP_SOURCE_ROOTS resolves to ${MCP_SOURCE_ROOTS.length} existing root(s) — MCP snapshot_now is configured (#800)`,
+  };
+}
+
 // #99's fix was UX-only (the `init` wizard warns "same disk unless you change this" and
 // suggests a default path) — there is no enforced separation, so this can only ever
 // check the wizard's OWN suggested default (`${HOME}-backup`, wizard.ts's
@@ -711,6 +815,88 @@ async function checkPendingSpends(): Promise<DoctorCheck> {
 // ScheduleStatusReport entirely — see that type's own "names only, never values" posture
 // on `config_file.variables` — so reaching in for it here would be new, privileged
 // plumbing this check does not need to do its job.
+// #811: a `keygen --force`/`keygen --sign --force` run about to replace an EXISTING
+// identity now backs it up first, unconditionally, as a sibling `<path>.bak-<timestamp>-
+// <random>` file (backupIdentityFile() in keys.ts, shared by keygenAt() for the age
+// identity and keygenSignAt() in minisign.ts for the signing identity — same mechanism,
+// same file-naming convention, so this check scans for both). That backup is exactly
+// what makes a --force run non-destructive, but nothing ever tells the operator these
+// files pile up on disk, one per --force run, forever — this surfaces the count so they
+// do not go unnoticed indefinitely.
+//
+// WARN, not FAIL: an accumulating backup is a housekeeping note, not a security problem
+// (each one is written at mode 0600, same posture as the identity it copies) — the
+// remediation is "clean these up when you no longer need them", not "fix this now".
+// The oldest mtime (epoch ms) among `names` under `dir`, or Infinity if none stat'd
+// successfully (an unreadable/vanished file between readdir() and stat() is skipped
+// rather than failing the whole check — the count from readdir() already reflects it).
+async function oldestMtimeMs(dir: string, names: readonly string[]): Promise<number> {
+  let oldestMs = Infinity;
+  for (const name of names) {
+    const st = await stat(join(dir, name)).catch(() => null);
+    if (st && st.mtimeMs < oldestMs) oldestMs = st.mtimeMs;
+  }
+  return oldestMs;
+}
+
+async function checkIdentityBackups(): Promise<DoctorCheck> {
+  const id = 'identity-backup-accumulation';
+  const dir = HOME;
+  const agePrefix = `${IDENTITY.slice(dir.length + 1)}.bak-`;
+  const signPrefix = `${SIGN_IDENTITY.slice(dir.length + 1)}.bak-`;
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR')
+      return { id, status: 'skip', message: 'no identity backup files (no CYPHER_BRAIN_HOME yet)' };
+    return { id, status: 'fail', message: `could not list ${dir} to check for identity backup files: ${errMsg(e)}` };
+  }
+  const ageBackups = entries.filter((name) => name.startsWith(agePrefix));
+  const signBackups = entries.filter((name) => name.startsWith(signPrefix));
+  const total = ageBackups.length + signBackups.length;
+  if (total === 0) {
+    return {
+      id,
+      status: 'skip',
+      message: 'no identity backup files (identity.age.bak-*/sign-identity.key.bak-*) found',
+    };
+  }
+  const oldestMs = Math.min(await oldestMtimeMs(dir, ageBackups), await oldestMtimeMs(dir, signBackups));
+  const oldest = Number.isFinite(oldestMs) ? new Date(oldestMs).toISOString().slice(0, 10) : 'unknown date';
+  // Multi-model review: age-identity and signing-identity backups preserve DIFFERENT
+  // things — an identity.age backup is a decryption key (safe to delete once every
+  // snapshot it could decrypt has been re-encrypted), a sign-identity.key backup is an
+  // AUTHENTICITY key (safe to delete once no .minisig made with it still needs
+  // verifying) — reporting a single count with only the age-identity condition, as an
+  // earlier version of this check did, would misstate the reason for a sign-identity
+  // backup whenever one exists.
+  const conditions: string[] = [];
+  if (ageBackups.length > 0) {
+    conditions.push(
+      `the ${ageBackups.length} age identity backup(s) (identity.age.bak-*) are safe to delete once every ` +
+        'snapshot encrypted to the OLD recipient each preserves has been re-encrypted to the current identity, ' +
+        'or is no longer needed',
+    );
+  }
+  if (signBackups.length > 0) {
+    conditions.push(
+      `the ${signBackups.length} signing identity backup(s) (sign-identity.key.bak-*) are safe to delete once ` +
+        'no .minisig signature made with that OLD signing key still needs verifying (everything has been ' +
+        're-signed with the current one, or is no longer needed)',
+    );
+  }
+  return {
+    id,
+    status: 'warn',
+    message:
+      `${total} identity backup file(s) from past 'keygen --force'/'keygen --sign --force' runs are sitting in ` +
+      `${dir} (oldest: ${oldest}) — ${conditions.join('; ')} (MANAGEMENT.md "Cleaning up identity backups", #811).`,
+    remediation: `review and 'rm' the ones you no longer need — each is named <original>.bak-<timestamp>-<random> under ${dir}`,
+  };
+}
+
 async function checkGbrainEngine(): Promise<DoctorCheck> {
   const id = 'gbrain-engine-detection';
   const { path: gbrainConfigPath, invalidOverride } = resolveGbrainConfigPath();
@@ -1083,12 +1269,14 @@ const CHECK_DEFS: ReadonlyArray<{
   },
   { id: 'identity-recipient-pairing', run: () => checkIdentityRecipientPairing() },
   { id: 'pin-recipients-config', run: () => checkPinRecipients() },
+  { id: 'mcp-snapshot-policy', run: () => checkMcpSnapshotPolicy() },
   { id: 'offline-backup-different-disk', run: () => checkOfflineBackupDisk() },
   { id: 'schedule-last-run', run: () => checkSchedule() },
   { id: 'audit-chain-integrity', run: () => checkAuditChain() },
   { id: 'receipt-ledger-readability', run: () => checkReceiptLedger() },
   { id: 'pending-spend-intents', run: () => checkPendingSpends() },
   { id: 'gbrain-engine-detection', run: () => checkGbrainEngine() },
+  { id: 'identity-backup-accumulation', run: () => checkIdentityBackups() },
 ];
 
 export async function computeDoctorReport(): Promise<DoctorReport> {
