@@ -457,6 +457,141 @@ if cb push --in "$TMP/s2.age" --backend file --skip-unchanged 2>/dev/null; then
 fi
 echo "[PASS] --skip-unchanged without --save-locator is rejected"
 
+echo "== #806: two CONCURRENT pushes sharing one --save-locator must not both upload =="
+# The race artifacts are two snapshots of the SAME source: their plaintext digest and
+# recipients-fingerprint sidecars (what --skip-unchanged compares) are identical, while
+# their ciphertexts differ — age's ephemeral file key makes every encryption unique — so
+# the content-addressed file backend gives each its OWN <sha256>.age object. That is what
+# makes a double upload COUNTABLE: pushing one .age file twice would land on a single
+# object and the race would leave no trace in the store.
+#
+# The file backend is free, so nothing here spends; the object count stands in for the
+# duplicate spend the same sequence causes on arweave/turbo.
+RACE_LOC="$TMP/race-locator.tsv"
+cb snapshot --dir "$SRC2" --out "$TMP/race-a.age"
+cb snapshot --dir "$SRC2" --out "$TMP/race-b.age"
+[ "$(cat "$TMP/race-a.age.digest")" = "$(cat "$TMP/race-b.age.digest")" ] \
+  || { echo "[FAIL] the two race artifacts do not share a content digest — --skip-unchanged could never fire for the loser"; exit 1; }
+[ "$(sha "$TMP/race-a.age")" != "$(sha "$TMP/race-b.age")" ] \
+  || { echo "[FAIL] the two race artifacts are byte-identical — a double upload would be invisible in a content-addressed store"; exit 1; }
+RACE_BEFORE=$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')
+set +e
+cb push --in "$TMP/race-a.age" --backend file --save-locator "$RACE_LOC" --skip-unchanged >"$TMP/race-a.out" 2>"$TMP/race-a.err" &
+RACE_A_PID=$!
+cb push --in "$TMP/race-b.age" --backend file --save-locator "$RACE_LOC" --skip-unchanged >"$TMP/race-b.out" 2>"$TMP/race-b.err" &
+RACE_B_PID=$!
+wait "$RACE_A_PID"; RACE_A_RC=$?
+wait "$RACE_B_PID"; RACE_B_RC=$?
+set -e
+RACE_AFTER=$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')
+[ "$RACE_AFTER" = "$((RACE_BEFORE + 1))" ] || {
+  echo "[FAIL] two concurrent pushes to one --save-locator added $((RACE_AFTER - RACE_BEFORE)) store objects (want exactly 1) — both paid"
+  cat "$TMP/race-a.err" "$TMP/race-b.err"; exit 1
+}
+# The loser must have SKIPPED (it waited for the lock, then observed the winner's
+# pointer) or refused as in-flight — never quietly uploaded a second copy. Exactly one
+# of the two, so a run where BOTH somehow skipped (nothing uploaded) fails too.
+RACE_LOSERS=$(grep -l -e "SKIPPED" -e "another push is in flight for" "$TMP/race-a.err" "$TMP/race-b.err" | wc -l | tr -d ' ')
+[ "$RACE_LOSERS" = "1" ] || {
+  echo "[FAIL] want exactly 1 of the two concurrent pushes to skip/refuse, got $RACE_LOSERS"
+  cat "$TMP/race-a.err" "$TMP/race-b.err"; exit 1
+}
+[ "$RACE_A_RC" = "0" ] || grep -q "another push is in flight for" "$TMP/race-a.err" \
+  || { echo "[FAIL] push A failed for an unexpected reason"; cat "$TMP/race-a.err"; exit 1; }
+[ "$RACE_B_RC" = "0" ] || grep -q "another push is in flight for" "$TMP/race-b.err" \
+  || { echo "[FAIL] push B failed for an unexpected reason"; cat "$TMP/race-b.err"; exit 1; }
+# The locator file must hold exactly ONE line, naming the object that actually survived —
+# the lost-update half of #806 (the second writer's wholesale rewrite discarding the
+# first's record) is what this pins.
+RACE_LINES=$(grep -c . "$RACE_LOC" | tr -d ' ')
+[ "$RACE_LINES" = "1" ] || { echo "[FAIL] save-locator holds $RACE_LINES lines, want exactly 1"; cat "$RACE_LOC"; exit 1; }
+RACE_SURVIVOR=$(cut -f1 "$RACE_LOC")
+[ -f "$RACE_SURVIVOR" ] || { echo "[FAIL] the recorded locator names no object: $RACE_SURVIVOR"; exit 1; }
+[ "$(sha "$RACE_SURVIVOR")" = "$(cut -f3 "$RACE_LOC")" ] \
+  || { echo "[FAIL] the recorded sha256 does not match the object the recorded locator names"; exit 1; }
+echo "[PASS] concurrent --save-locator pushes: exactly one object uploaded, one SKIPPED/refused, one surviving locator line"
+
+echo "== #806: a lock held by a LIVE process refuses the push instead of paying (CB-E028) =="
+# The save-locator lock key is the path with its DIRECTORY resolved through symlinks
+# (src/lib/push-lock.ts's saveLocatorLockKey) — `pwd -P` is the shell's equivalent, and it
+# matters here: on macOS $TMPDIR lives under /var, itself a symlink to /private/var.
+RACE_LOC_KEY="$(cd "$(dirname "$RACE_LOC")" && pwd -P)/$(basename "$RACE_LOC")"
+RACE_LOCK=$(push_lock_file "$CYPHER_BRAIN_HOME" save-locator "$RACE_LOC_KEY")
+# Before planting a stub holder, prove the concurrent pushes above RELEASED their locks —
+# otherwise the stub would overwrite a leaked lock and this test would pass while hiding
+# exactly the wedge it is here to rule out.
+[ ! -f "$RACE_LOCK" ] || { echo "[FAIL] the concurrent pushes left their lock file behind: $RACE_LOCK"; exit 1; }
+sleep 120 &
+HOLDER_PID=$!
+hold_push_lock "$RACE_LOCK" "$HOLDER_PID" save-locator "$RACE_LOC_KEY"
+HELD_BEFORE=$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')
+HELD_LOC_BEFORE=$(sha "$RACE_LOC")
+set +e
+HELD_ERR=$(cb push --in "$TMP/race-b.age" --backend file --save-locator "$RACE_LOC" 2>&1); HELD_RC=$?
+set -e
+[ "$HELD_RC" != "0" ] || { echo "[FAIL] push ran while another process held the lock"; echo "$HELD_ERR"; exit 1; }
+printf '%s' "$HELD_ERR" | grep -q "another push is in flight for" \
+  || { echo "[FAIL] the in-flight refusal does not say so"; echo "$HELD_ERR"; exit 1; }
+printf '%s' "$HELD_ERR" | grep -q '\[CB-E028\]' || { echo "[FAIL] the in-flight refusal lacks the CB-E028 code"; echo "$HELD_ERR"; exit 1; }
+[ "$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')" = "$HELD_BEFORE" ] \
+  || { echo "[FAIL] the refused push still uploaded an object"; exit 1; }
+[ "$(sha "$RACE_LOC")" = "$HELD_LOC_BEFORE" ] || { echo "[FAIL] the refused push still rewrote the save-locator file"; exit 1; }
+echo "[PASS] a live holder's lock refuses the second push (CB-E028), nothing uploaded, locator file untouched"
+
+echo "== #806: a lock left behind by a CRASHED push is cleared by the next run (no wedged schedule) =="
+# The crash: kill the holder WITHOUT removing its lock file — exactly what a SIGKILL,
+# an OOM or a machine restart leaves between claim and release. An unattended `schedule`
+# must recover from this by itself, so the next run has to clear it and proceed.
+kill -9 "$HOLDER_PID" 2>/dev/null || true
+wait "$HOLDER_PID" 2>/dev/null || true
+[ -f "$RACE_LOCK" ] || { echo "[FAIL] the stale lock file vanished on its own — this case is not being exercised"; exit 1; }
+# A THIRD snapshot, never pushed before: the file backend is content-addressed, so
+# re-pushing race-a/race-b would land on the object the race already created and the
+# store count could not tell "uploaded" from "did nothing".
+cb snapshot --dir "$SRC2" --out "$TMP/race-c.age"
+STALE_BEFORE=$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')
+cb push --in "$TMP/race-c.age" --backend file --save-locator "$RACE_LOC" >"$TMP/stale.out" 2>"$TMP/stale.err" \
+  || { echo "[FAIL] a push blocked on a lock whose holder is dead — the nightly schedule would be wedged"; cat "$TMP/stale.err"; exit 1; }
+grep -q "cleared an abandoned push lock" "$TMP/stale.err" \
+  || { echo "[FAIL] the stale lock was not reported as cleared"; cat "$TMP/stale.err"; exit 1; }
+[ "$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')" = "$((STALE_BEFORE + 1))" ] \
+  || { echo "[FAIL] the recovering push did not upload"; exit 1; }
+[ ! -f "$RACE_LOCK" ] || { echo "[FAIL] the lock file survived the push that took it — it was never released"; exit 1; }
+echo "[PASS] a stale lock (dead pid) is cleared, the push proceeds, and the lock is released afterwards"
+
+echo "== #806: a day-old lock is cleared even though its pid is alive (the anti-wedge backstop) =="
+# The case the pid check alone answers wrongly: a crashed owner's pid can be REUSED by an
+# unrelated long-lived process (certainly so after a reboot), and a lock that is only ever
+# cleared on a dead pid would then be held forever by nobody — silently stopping every
+# future scheduled backup. MAX_AGE_MS is the last-resort backstop for exactly that: a live
+# pid (this shell) on a lock back-dated well past a day is still cleared.
+cb snapshot --dir "$SRC2" --out "$TMP/race-d.age"
+hold_push_lock "$RACE_LOCK" "$$" save-locator "$RACE_LOC_KEY"
+touch -t 202001010101 "$RACE_LOCK"
+BOOT_BEFORE=$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')
+cb push --in "$TMP/race-d.age" --backend file --save-locator "$RACE_LOC" >/dev/null 2>"$TMP/boot.err" \
+  || { echo "[FAIL] a push blocked on a day-old lock whose pid was reused — the nightly schedule would be wedged forever"; cat "$TMP/boot.err"; exit 1; }
+grep -q "cleared an abandoned push lock" "$TMP/boot.err" || { echo "[FAIL] the day-old lock was not reported as cleared"; cat "$TMP/boot.err"; exit 1; }
+[ "$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')" = "$((BOOT_BEFORE + 1))" ] || { echo "[FAIL] the recovering push did not upload"; exit 1; }
+echo "[PASS] a lock older than the backstop is cleared even though its pid is currently alive (no permanent wedge)"
+
+echo "== #806: an UNREADABLE lock fails with what is actually wrong, not with 'another push is in flight' =="
+# A directory where the lock file belongs: readFile reports EISDIR, not ENOENT. Treating
+# every read failure as "nothing there" would make this poll for the full wait and then
+# blame a concurrent push — a diagnosis an unattended operator cannot act on.
+mkdir -p "$RACE_LOCK"
+set +e
+UNREADABLE_ERR=$(cb push --in "$TMP/race-a.age" --backend file --save-locator "$RACE_LOC" 2>&1); UNREADABLE_RC=$?
+set -e
+rmdir "$RACE_LOCK"
+[ "$UNREADABLE_RC" != "0" ] || { echo "[FAIL] push ran with an unreadable lock file"; exit 1; }
+printf '%s' "$UNREADABLE_ERR" | grep -q "cannot read the push lock" \
+  || { echo "[FAIL] an unreadable lock was not reported as such"; echo "$UNREADABLE_ERR"; exit 1; }
+if printf '%s' "$UNREADABLE_ERR" | grep -q "another push is in flight for"; then
+  echo "[FAIL] an unreadable lock was misreported as a concurrent push"; echo "$UNREADABLE_ERR"; exit 1
+fi
+echo "[PASS] an unreadable lock file fails fast with its real cause"
+
 echo "== issue #723: --digest without --save-locator is refused (it would otherwise be silently ignored) =="
 FAKE_DIGEST="abababababababababababababababababababababababababababababababab" # 64 hex chars, distinct from any real content digest above
 if cb push --in "$TMP/nosidecar.age" --backend file --digest "$FAKE_DIGEST" 2>"$TMP/digest-no-savelocator.err"; then

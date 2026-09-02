@@ -29,6 +29,41 @@ sha() {
   shasum -a 256 "$1" | cut -d' ' -f1
 }
 
+# push_lock_file <home> <kind> <key>: the advisory lock file push takes for (kind, key)
+# — the same path src/lib/push-lock.ts's pushLockPath() derives (#806, #807), under the
+# given CYPHER_BRAIN_HOME. Mirrored here rather than imported so a test can put a HELD or
+# a STALE lock in place deterministically, instead of trying to time a real second push.
+#
+# The id is sha256 of JSON.stringify([kind, key]), exactly as that function computes it.
+# Every key these tests pass is a plain temp path or a `:local:` remote, with no character
+# JSON would escape — a key containing `"` or `\` would need real JSON encoding here.
+push_lock_file() {
+  local id
+  id=$(printf '["%s","%s"]' "$2" "$3" | shasum -a 256 | cut -d' ' -f1)
+  printf '%s/push-locks/%s.lock\n' "$1" "$id"
+}
+
+# hold_push_lock <lockfile> <pid> <kind> <key> [boot-ms]: write a lock file in the shape
+# acquirePushLock() writes one — first line is the owner token, whose leading
+# dot-separated field is the holding pid (idempotency.ts's newLockToken/lockTokenPid).
+# Pass a LIVE pid to simulate a push still running, a dead one to simulate a crash that
+# never released it.
+#
+# The optional 5th argument writes the `boot=<epoch-ms>` SECOND line a real lock carries
+# (the only line push-lock.ts parses it from): a value from a different boot than the
+# current one is how a lock whose pid has since been REUSED by an unrelated live process
+# is simulated — back-date the file's mtime to match, since both signals must agree.
+# Omitted (the default), the file has no boot line at all, which is the shape a lock
+# written before that field existed has and must still be judged by its pid alone.
+hold_push_lock() {
+  mkdir -p "$(dirname "$1")"
+  if [ -n "${5:-}" ]; then
+    printf '%s.%s.stub\nboot=%s\n%s\t"%s"\n' "$2" "$(date +%s)000" "$5" "$3" "$4" > "$1"
+  else
+    printf '%s.%s.stub\n%s\t"%s"\n' "$2" "$(date +%s)000" "$3" "$4" > "$1"
+  fi
+}
+
 # _with_timeout_core: shared body for with_timeout/with_stdin_timeout (#569).
 #
 # Hardened per this machine's own shell-ops reflex doc (11 review rounds, kept
