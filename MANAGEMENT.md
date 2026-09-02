@@ -65,8 +65,14 @@ defenses, ideally both:
   with a scrypt passphrase (you enter it on `restore`/`verify`). An exfiltrated identity
   file is then useless without the passphrase. **Do not** use `keygen --passphrase
   --force` to add a passphrase to an existing identity — `--force` always generates a
-  brand-new keypair (it does not wrap the old one), so every snapshot already encrypted
-  to the old identity becomes unrecoverable; `--wrap-in-place` keeps the same keypair.
+  brand-new keypair (it does not wrap the old one), so `recipient.txt` no longer names
+  the old identity and every snapshot already encrypted to it stops being reachable
+  through the normal `restore`/default-identity path; `--wrap-in-place` keeps the same
+  keypair instead. (`--force` does back up the OLD identity it is about to replace to a
+  sibling `identity.age.bak-<timestamp>-<random>` file, #786 — so the old snapshots stay
+  recoverable via `restore --identity <that backup>` if you ever need them, but
+  `--wrap-in-place` is still the right tool for "add a passphrase", not a recovery plan
+  to lean on.)
 - **Full-disk-encrypt the identity host.** The machine that holds the identity is
   secret-bearing (it can read every snapshot); FileVault / LUKS protects it (and any
   off-box copies) if the disk or USB is lost or stolen.
@@ -401,6 +407,23 @@ line of `index.tsv`, or the one-line `--save-locator` file (Key recovery #3) if 
 has only that. *(A self-resolving stable name — an ArNS pointer updated to the
 newest locator — would let a fresh machine find the latest with no local file at
 all; that is a future option, not yet implemented.)*
+
+### A snapshot output is `--out` **plus its sidecars**, and all of them are no-clobber
+
+`snapshot` writes up to three files alongside `--out`: `<out>.digest`,
+`<out>.recipients-fingerprint`, and — whenever a signing identity is present —
+`<out>.minisig`. Since #783 every one of those paths gets the same refusal `--out`
+itself has always had: if anything is already sitting there, the run refuses
+(`CB-E009`) before staging anything, and it refuses a **symlink** too rather than
+writing through it.
+
+That matters most for `.minisig`. A signature file left over from a *different*
+artifact used to survive a run that did not sign (no signing identity, or
+`--no-sign`), and `restore`/`verify` would then find a present, well-formed
+signature that does not verify against those bytes — refusing the new snapshot as
+tampered or forged (`CB-E016`), permanently. If you reuse an output name, clear the
+old sidecars along with the old `*.age`; the refusal now tells you which one is in
+the way instead of producing a backup that cannot be restored.
 
 ## Restore runbook
 

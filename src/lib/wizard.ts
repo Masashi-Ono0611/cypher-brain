@@ -428,8 +428,8 @@ export async function init(_o: CliOptions): Promise<boolean> {
     // backup-key rollback below applies.
     const recipientPreExisted = await exists(RECIPIENT);
     // Known, accepted limitation (out of scope for #734 here): keygen()'s own
-    // keygenAt() does TWO sequential file writes (identity, then recipient) before
-    // this call resolves either way. The catch below handles a THROWN error in that
+    // keygenAt() does TWO sequential file writes (recipient, then identity — #786)
+    // before this call resolves either way. The catch below handles a THROWN error in that
     // window (a genuine JS exception unwinds into it normally), but #734's own
     // signal-based rollback (setActiveInitRollback below) is not registered until
     // AFTER this whole try/catch already completed successfully — a fatal OS signal
@@ -559,7 +559,7 @@ export async function init(_o: CliOptions): Promise<boolean> {
     // block).
     let pushAttemptStarted = false;
     // #734 (review-hardened): keygenAt()/keygenSignAt() each do TWO sequential file
-    // writes (identity, then recipient/public key) before their caller ever assigns
+    // writes (recipient/public key, then identity — #786) before their caller ever assigns
     // `backup`/`signing` below — a signal landing INSIDE that window (between the two
     // writes, or after both but before this function's own `await` resumes) would
     // leave a partially-written pair on disk that rollbackKeysAndSnapshotSync (below)
@@ -717,8 +717,8 @@ export async function init(_o: CliOptions): Promise<boolean> {
         }
         const identityPath = join(backupHome, 'identity.age');
         const recipientPath = join(backupHome, 'recipient.txt');
-        // Same partial-write hazard as the primary keygen above (identity.age written,
-        // then recipient.txt's write throws) — but here it CANNOT rely on the outer
+        // Same partial-write hazard as the primary keygen above (recipient.txt written,
+        // then identity.age's write throws — #786) — but here it CANNOT rely on the outer
         // catch's `if (backup) { rm(...) }` rollback, because `backup` itself is only
         // assigned a few lines below, AFTER this call returns successfully. If
         // keygenAt() throws here, `backup` is still null when that catch runs, so its

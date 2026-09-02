@@ -624,7 +624,13 @@ export const AR_BALANCE_URL = readEnv('CYPHER_BRAIN_AR_BALANCE_URL') || 'https:/
 //     unit: winston for arweave L1, winc for turbo) exceeds this value; 0/unset = no cap
 //     (the --yes guard still fires). Prevents runaway spend without changing behaviour
 //     when the upload is well under budget.
-export const CIPHER_YES = !!readEnv('CYPHER_BRAIN_YES');
+// #794: STRICTLY '1' — mirrors SKIP_FUNDS_CHECK's reasoning below. `!!readEnv(...)`
+// used to accept any non-empty string, so `CYPHER_BRAIN_YES=0` (a natural spelling
+// for "explicitly off") passed JS truthiness and silently granted the same consent
+// this variable exists to gate (a paid upload, an irreversible pg_restore). Every
+// documented contract (README/MANAGEMENT/--help) already spells this `=1`; only the
+// implementation was looser than what it claimed.
+export const CIPHER_YES = readEnv('CYPHER_BRAIN_YES') === '1';
 // #715: same non-integer-input crash as TON_PROVIDER_MAX_SPEND above, same fix — see
 // parseMaxSpendBigInt's doc comment there for why this records rather than throws.
 const MAX_SPEND_LOAD = parseMaxSpendBigInt(readEnv('CYPHER_BRAIN_MAX_SPEND'), 'CYPHER_BRAIN_MAX_SPEND');
