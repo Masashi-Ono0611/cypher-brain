@@ -253,6 +253,32 @@ const FIXTURES = [
       'ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND must be set to a positive nanoTON amount (a StorageV1 deploy spends real funds) — see `estimate --backend ton-provider` for a preview first',
     expect: 'CB-E024',
   },
+  // #800: CB-E025 is the MCP snapshot policy's single code, covering both halves of the
+  // gate (the recipient pin, the source roots). Its neighbour is CB-E005, whose pattern
+  // also mentions CYPHER_BRAIN_PIN_RECIPIENTS — one fixture per policy arm plus a
+  // CB-E005 positive proves the two do not shadow each other in either direction.
+  {
+    label: 'CB-E025 positive: MCP snapshot policy, no recipient pin configured',
+    message:
+      'CYPHER_BRAIN_PIN_RECIPIENTS is not set in this MCP server environment, so an untrusted caller could name ' +
+      'any recipient key it likes and receive a readable copy of the brain — refusing to snapshot over MCP ' +
+      '(#800). Set CYPHER_BRAIN_PIN_RECIPIENTS to the age1… key(s) allowed to decrypt, then restart this server.',
+    expect: 'CB-E025',
+  },
+  {
+    label: 'CB-E025 positive: MCP snapshot policy, dirs entry outside CYPHER_BRAIN_MCP_SOURCE_ROOTS',
+    message:
+      'dirs entry "/etc" resolves to /etc, which is not inside any CYPHER_BRAIN_MCP_SOURCE_ROOTS root ' +
+      '(/srv/brain) — refusing to snapshot over MCP (#800). Pass a directory inside one of those roots.',
+    expect: 'CB-E025',
+  },
+  {
+    label: 'CB-E005 positive: snapshot.ts pin violation still resolves to CB-E005, not CB-E025',
+    message:
+      'recipient "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" (via "recipient.txt") is NOT in ' +
+      'CYPHER_BRAIN_PIN_RECIPIENTS — refusing to snapshot (an unexpected recipient could decrypt your brain)',
+    expect: 'CB-E005',
+  },
 ];
 
 for (const { label, message, expect } of FIXTURES) {
@@ -264,6 +290,6 @@ for (const { label, message, expect } of FIXTURES) {
     );
   }
 }
-console.log(`[PASS] ${FIXTURES.length} CB-E007/CB-E024 fixtures resolve to the expected code (#781)`);
+console.log(`[PASS] ${FIXTURES.length} code-resolution fixtures resolve to the expected code (#781, #800)`);
 
 console.log('ERROR CODE PATTERNS: PASS');

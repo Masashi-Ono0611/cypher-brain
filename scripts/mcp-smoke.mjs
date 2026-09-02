@@ -343,7 +343,18 @@ async function runIdempotencyCorruptedLogTest(tmp) {
 
   const child = spawn(process.execPath, [SERVER_PATH], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CYPHER_BRAIN_HOME: home, CYPHER_BRAIN_FILE_DIR: store },
+    env: {
+      ...process.env,
+      CYPHER_BRAIN_HOME: home,
+      CYPHER_BRAIN_FILE_DIR: store,
+      // #800: snapshot_now is now fail-closed over MCP — it refuses unless the OPERATOR
+      // has pinned the recipients and declared which directories may be snapshot sources.
+      // Every server in this file that reaches that tool therefore configures both, the
+      // same way a real deployment must; the policy's own red cases live in
+      // scripts/selftest-mcp-snapshot-policy.mjs.
+      CYPHER_BRAIN_PIN_RECIPIENTS: recipientPath,
+      CYPHER_BRAIN_MCP_SOURCE_ROOTS: JSON.stringify([tmp]),
+    },
   });
   const { send, waitFor } = makeRpcClient(child);
   try {
@@ -511,6 +522,8 @@ async function runIdempotencyTtlTest(tmp) {
       CYPHER_BRAIN_HOME: home3,
       CYPHER_BRAIN_FILE_DIR: store3,
       CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS: '1', // 1s — short enough to expire within this test
+      CYPHER_BRAIN_PIN_RECIPIENTS: recipientPath3, // #800: see the note on run()'s own server env
+      CYPHER_BRAIN_MCP_SOURCE_ROOTS: JSON.stringify([tmp]),
     },
   });
   const { send, waitFor } = makeRpcClient(child3);
@@ -828,6 +841,11 @@ async function runScheduleStatusNotInstalledTest(tmp) {
 // (tonWalletConfigured(), frozen at module load), so this needs its OWN server with
 // CYPHER_BRAIN_TON_WALLET pointed at a file. No TON network is touched: the consent gate
 // fires before any push work, which is the whole point of it being a gate.
+// The single literal recipient this test encrypts to — named once so the pin
+// (CYPHER_BRAIN_PIN_RECIPIENTS, #800) and the call cannot drift apart, which would
+// refuse the call one gate EARLIER than the spend gate under test.
+const PAID_CONSENT_RECIPIENT = 'age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p';
+
 async function runPaidConsentDescriptionTest(tmp) {
   const home5 = join(tmp, 'home-paid-consent');
   const dataDir5 = join(tmp, 'paid-consent-src');
@@ -840,7 +858,16 @@ async function runPaidConsentDescriptionTest(tmp) {
   await writeFile(tonWallet5, '{}\n');
   const child5 = spawn(process.execPath, [SERVER_PATH], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CYPHER_BRAIN_HOME: home5, CYPHER_BRAIN_TON_WALLET: tonWallet5 },
+    env: {
+      ...process.env,
+      CYPHER_BRAIN_HOME: home5,
+      CYPHER_BRAIN_TON_WALLET: tonWallet5,
+      // #800: this test never gets past the SPEND gate, but the snapshot policy runs
+      // before it — so the pin has to name the same literal recipient args5 passes, and
+      // the roots have to cover dataDir5, or the refusal under test never fires.
+      CYPHER_BRAIN_PIN_RECIPIENTS: PAID_CONSENT_RECIPIENT,
+      CYPHER_BRAIN_MCP_SOURCE_ROOTS: JSON.stringify([tmp]),
+    },
   });
   const { send, waitFor } = makeRpcClient(child5);
   try {
@@ -870,7 +897,7 @@ async function runPaidConsentDescriptionTest(tmp) {
 
     const args5 = {
       dirs: [dataDir5],
-      recipients: ['age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p'],
+      recipients: [PAID_CONSENT_RECIPIENT],
       out: join(tmp, 'paid-consent-probe.age'),
     };
     // ton-provider: must be refused, must NOT claim permanence, must NOT be described as
@@ -1216,6 +1243,13 @@ async function run(tmp) {
       CYPHER_BRAIN_LAUNCHD_DIR: launchdDir, // install() writes a plist here even with --no-load
       // The MCP spend gate must hold EVEN when the CLI env escape hatch is set.
       CYPHER_BRAIN_YES: '1',
+      // #800: snapshot_now is now fail-closed over MCP — it refuses unless the OPERATOR
+      // has pinned the recipients and declared which directories may be snapshot sources.
+      // Every server in this file that reaches that tool therefore configures both, the
+      // same way a real deployment must; the policy's own red cases live in
+      // scripts/selftest-mcp-snapshot-policy.mjs.
+      CYPHER_BRAIN_PIN_RECIPIENTS: recipientPath,
+      CYPHER_BRAIN_MCP_SOURCE_ROOTS: JSON.stringify([tmp]),
     },
   });
 
@@ -3410,6 +3444,8 @@ async function runSignalCleanupTest(tmp) {
       CYPHER_BRAIN_FILE_DIR: store,
       TMPDIR: isolatedTmp, // os.tmpdir() — so the only cypher-brain-mcp-* dirs here are this server's
       PATH: `${stubBin}:${process.env.PATH}`,
+      CYPHER_BRAIN_PIN_RECIPIENTS: join(home, 'recipient.txt'), // #800: see run()'s own server env
+      CYPHER_BRAIN_MCP_SOURCE_ROOTS: JSON.stringify([tmp]),
     },
   });
   const { send, waitFor } = makeRpcClient(child);

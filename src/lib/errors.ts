@@ -348,6 +348,30 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
       'src/lib/backends/ton-provider.ts (put, "ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND must be ' +
       'set to a positive nanoTON amount …")',
   },
+  // #800: the MCP snapshot policy — a recipient pin that must resolve to at least one
+  // key, and (for a call naming `dirs`) source roots those directories must resolve
+  // under. Both halves refuse through ONE ToolError code (ERR_POLICY_DENIED) and share
+  // one sentence, so a single pattern covers every arm of the gate without listing them.
+  //
+  // The literal is the shared half of that sentence, written contiguously at exactly one
+  // place in src/mcp.ts (snapshotPolicyDenied()) rather than assembled from `+`-joined
+  // pieces — scripts/selftest-error-codes.mjs greps the .ts text, so a phrase split
+  // across a line break would make this entry unassertable (the same trap CB-E024's own
+  // comment above records paying for).
+  //
+  // Deliberately NOT overlapping CB-E005 (/is NOT in CYPHER_BRAIN_PIN_RECIPIENTS/): that
+  // one is snapshot.ts refusing an individual recipient that is off the allowlist, whose
+  // fix is to check the recipient. This one is the MCP server refusing to run AT ALL
+  // until the operator configures the policy, whose fix is an environment change no
+  // caller can make. A fixture in scripts/selftest-error-codes.mjs asserts a real
+  // message from each resolves to its own code rather than shadowing the other.
+  {
+    code: 'CB-E025',
+    title: 'MCP snapshot policy denied the call (recipient pin / source roots not satisfied)',
+    pattern: /refusing to snapshot over MCP/,
+    origin: 'ours',
+    source: 'src/mcp.ts (snapshotPolicyDenied, "… — refusing to snapshot over MCP (#800). …")',
+  },
 ];
 
 /** The first registry entry whose pattern matches `message`, if any. */

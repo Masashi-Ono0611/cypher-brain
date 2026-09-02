@@ -54,6 +54,9 @@ import {
   AR_MAX_SPEND_ERROR,
   TON_PROVIDER_MAX_SPEND_ERROR,
   NON_CONTENT_ADDRESSED_BACKENDS,
+  PIN_RECIPIENTS,
+  MCP_SOURCE_ROOTS,
+  MCP_SOURCE_ROOTS_ERROR,
 } from './lib/config.js';
 import { restoreRunbook } from './lib/runbook.js';
 import { drainWarnings } from './lib/warn.js';
@@ -78,7 +81,11 @@ import {
 } from './lib/idempotency.js';
 import { schedule, scheduleStatusReport, ScheduleNotInstalledError } from './lib/schedule.js';
 import { estimateCost } from './lib/estimate.js';
-import { keygenAt } from './lib/keys.js';
+import { keygenAt, recipientEntries, resolvePinnedRecipients } from './lib/keys.js';
+// #800: the exact-or-separator-bounded containment predicate, already written (and
+// already reviewed twice) for `--dir` coverage. Reused rather than re-derived so the
+// "/roots/a does not cover /roots/ab" rule has ONE implementation in this codebase.
+import { pathCoveredBy } from './lib/gbrain.js';
 import { wallet } from './lib/wallet.js';
 import { SCAN_SECRETS_MODES, isScanSecretsMode } from './lib/secrets-scan.js';
 import { exists, requireFile, MissingPathError, sha256, errMsg } from './lib/util.js';
@@ -863,6 +870,260 @@ async function resolveRestoreOutDir(outDir: string): Promise<string> {
   return await realpathOfNearestAncestor(abs);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #800: the MCP snapshot policy — fail-closed, operator-configured, CLI unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Every other containment check on this server scopes a path the caller named for a
+// WRITE (wallet_create's `out`, snapshot_now's `locator_file`, restore_now's `out_dir`).
+// `dirs` is the opposite direction and the one this server had left open: it names the
+// PLAINTEXT, and `recipients` names the key it is encrypted to. An untrusted caller —
+// which is exactly what this server's own threat model says an MCP caller is — could
+// therefore pick both halves and walk away with a readable copy of any directory the
+// server process can read, using nothing but the free `file` backend, which needs no
+// confirm_paid and so passes no consent gate at all. The disclosure is irreversible
+// once the ciphertext leaves, which is why this refuses rather than warns: an agent can
+// ignore a warning, and there is no undo behind it (issue #800's decision comment).
+//
+// Two independent conditions, both of which the OPERATOR sets in the server's own
+// environment and no caller can supply in the call:
+//
+//   1. CYPHER_BRAIN_PIN_RECIPIENTS must resolve to at least one key. That is what takes
+//      the KEY half away from the caller: with a pin in force, snapshot.ts refuses any
+//      recipient that is not on the allowlist, so a caller-chosen `recipients` can no
+//      longer name an attacker's own public key. This check deliberately only asks
+//      whether a usable pin EXISTS — snapshot.ts's own check stays authoritative for the
+//      expanded recipient set (files, multiple entries, non-age1 lines), and duplicating
+//      that logic here would create a second allowlist implementation to drift.
+//   2. For a call that names `dirs`, every entry must realpath-resolve inside one
+//      CYPHER_BRAIN_MCP_SOURCE_ROOTS root. That is the PLAINTEXT half. Unset, empty or
+//      malformed roots refuse every `dirs` call — the fail-closed default, since an
+//      operator who has not said which directories are snapshottable has not authorized
+//      any of them. A pinned pg-only call still works with no roots configured at all:
+//      `pg` is a connection URI the operator's own environment governs, not a filesystem
+//      path this policy can scope, and refusing it would break a legitimate setup for no
+//      gain.
+//
+// WHAT THIS IS NOT: an authorization check on the caller's intent. confirm_paid is
+// deliberately not treated as consent for the disclosure — it is attacker-supplied, and
+// it says "spend money", not "read this directory".
+//
+// RESIDUAL, stated rather than papered over: this is a path-based check, so a directory
+// swapped for a symlink AFTER it returns is followed by the snapshot all the same — the
+// same TOCTOU residual #648/#789/#792 already record for every other path check here,
+// and closing it needs openat/RESOLVE_BENEATH-bound reads Node does not expose. What it
+// does close is the case where the CALLER names the escape, which is the one an
+// untrusted caller controls.
+function snapshotPolicyDenied(reason: string, remedy: string): ToolError {
+  // One contiguous sentence, on purpose: src/lib/errors.ts's CB-E025 pattern greps the
+  // literal out of this file's text (scripts/selftest-error-codes.mjs), so splitting
+  // "refusing to snapshot over MCP" across a `+` join would make that entry unassertable.
+  return new ToolError('ERR_POLICY_DENIED', `${reason} — refusing to snapshot over MCP (#800). ${remedy}`);
+}
+
+const POLICY_DOC_REF = 'See MANAGEMENT.md ("MCP snapshot policy") for how to configure this.';
+
+// Anything this gate does on the filesystem — reading the pin file, resolving a root or
+// a source — can fail for reasons that are neither "allowed" nor "denied": an unreadable
+// pin, a permission error partway up a root. Those must not escape as ERR_INTERNAL
+// (multi-model review, #800): the caller is told the SERVER broke and invited to retry,
+// when in fact the policy could not be evaluated — which is a denial, because a check
+// that could not run has not passed. Every filesystem call in this gate goes through
+// here, so the fail-closed answer cannot be forgotten at one of them.
+//
+// `what` describes the step rather than echoing the raw error path for the PIN: that path
+// is operator-set and an untrusted caller has no business learning the server's local
+// layout from a refusal. A caller-supplied source path is different — the caller already
+// knows it, and the refusals below echo resolved source paths anyway.
+async function underPolicy<T>(what: string, remedy: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e instanceof ToolError) throw e; // already a policy refusal — do not re-wrap it
+    const code = (e as NodeJS.ErrnoException)?.code;
+    throw snapshotPolicyDenied(`${what} (${code ?? errMsg(e)}), so the snapshot policy could not be evaluated`, remedy);
+  }
+}
+
+async function assertSnapshotPolicy(dirs: readonly string[], recipients: readonly string[]): Promise<void> {
+  // ── 1. the key half ────────────────────────────────────────────────────────
+  // `undefined` (unset) and `''` are both "no pin", and are refused identically here.
+  // config.ts keeps them distinguishable for snapshot.ts, which must fail closed on the
+  // explicitly-empty case specifically; this gate refuses both anyway, so it does not
+  // need the distinction — only that a usable allowlist is present.
+  if (PIN_RECIPIENTS === undefined || PIN_RECIPIENTS.trim() === '') {
+    throw snapshotPolicyDenied(
+      'CYPHER_BRAIN_PIN_RECIPIENTS is not set in this MCP server environment, so an untrusted caller could ' +
+        'name any recipient key it likes and receive a readable copy of the brain',
+      'Set CYPHER_BRAIN_PIN_RECIPIENTS to the age1… key(s) allowed to decrypt (the `cypher-brain init` wizard ' +
+        'offers to write it, and `<CYPHER_BRAIN_HOME>/recipient.txt` is the usual value), then restart this ' +
+        `server. ${POLICY_DOC_REF}`,
+    );
+  }
+  // Bound to a local so the narrowing above survives into the closure below.
+  const pinValue: string = PIN_RECIPIENTS;
+  const pinned = await underPolicy(
+    'CYPHER_BRAIN_PIN_RECIPIENTS could not be read',
+    `Check that the path it names exists and is readable by this server. ${POLICY_DOC_REF}`,
+    () => resolvePinnedRecipients(pinValue),
+  );
+  if (pinned.size === 0) {
+    throw snapshotPolicyDenied(
+      'CYPHER_BRAIN_PIN_RECIPIENTS is set but resolves to no age1… pubkeys, which leaves the recipient ' +
+        'allowlist empty and hands the key choice back to an untrusted caller',
+      `Point it at a recipient file that contains at least one age1… key, or list the keys inline. ${POLICY_DOC_REF}`,
+    );
+  }
+
+  // A usable pin EXISTING is not the same as THIS call's recipients being on it, and the
+  // gap between the two is a replay (multi-model review, #800 — Critical). snapshot.ts's
+  // check is the authoritative one and stays exactly where it is, but it only runs when a
+  // snapshot actually runs: an idempotency replay returns a stored result without going
+  // near it. So a result recorded while recipient A was pinned could be replayed — and
+  // its locator re-written — after the operator narrowed the pin to B, which is precisely
+  // the "replays are not grandfathered" rule this gate exists to keep. Membership is
+  // therefore checked HERE too, over the same recipientEntries() expansion snapshot.ts
+  // uses, so the two cannot disagree about what a recipient argument means.
+  //
+  // A recipient argument that expands to NOTHING is refused here as well as in
+  // snapshot.ts (multi-model review round 2, #800). The membership loop below would
+  // otherwise pass it vacuously — no entries, nothing to reject — which on a REPLAY (the
+  // one path snapshot.ts never sees) turns an emptied recipient file into a way through
+  // this gate.
+  //
+  // RESIDUAL, stated rather than papered over (multi-model review round 2): this
+  // authorizes the recipients the call names AS THEY RESOLVE NOW. A replay whose
+  // recipient FILE was rewritten between the two calls — old key A out, currently-pinned
+  // key B in — passes, and returns the cached result for ciphertext that was encrypted to
+  // A. Nothing new is disclosed to A by that (the ciphertext was created and pushed while
+  // A was pinned, and the replay only re-reports its locator), and the window is bounded
+  // by CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS plus an exact fingerprint match on the same
+  // key. The SAME residual exists on the `dirs` side (multi-model review round 3): a
+  // replay authorizes each source as it resolves NOW, so a symlink retargeted between the
+  // two calls can be authorized under the new roots while the cached result belongs to the
+  // old ones. Both are stale-RESULT problems rather than new-disclosure ones — a replay
+  // reads no source and encrypts nothing; it re-reports a locator for ciphertext that was
+  // produced and pushed while the then-current policy allowed it, and can rewrite the
+  // caller's locator_file to point at it.
+  //
+  // Closing either properly means recording each call's EFFECTIVE recipients and resolved
+  // sources in the idempotency log and rejecting every record written before those fields
+  // existed — a store-schema change with a legacy-record migration that #800's decision
+  // did not scope, and that needs its own design pass rather than being smuggled in here.
+  for (const rec of recipients) {
+    const entries = await underPolicy(
+      `recipient ${JSON.stringify(rec)} could not be read`,
+      'Pass an age1… pubkey, or a readable recipients file.',
+      () => recipientEntries(rec),
+    );
+    if (entries.length === 0) {
+      throw snapshotPolicyDenied(
+        `recipient ${JSON.stringify(rec)} resolves to no recipients at all (an empty or fully commented-out ` +
+          'recipients file), so there is nothing to check against the allowlist',
+        `Pass a recipients file that contains at least one age1… key. ${POLICY_DOC_REF}`,
+      );
+    }
+    for (const entry of entries) {
+      if (!pinned.has(entry)) {
+        throw snapshotPolicyDenied(
+          `recipient ${JSON.stringify(entry)} (via ${JSON.stringify(rec)}) is not on the ` +
+            'CYPHER_BRAIN_PIN_RECIPIENTS allowlist this server enforces',
+          'Pass a recipient the operator has pinned. If this key SHOULD be able to decrypt, the operator adds ' +
+            `it to CYPHER_BRAIN_PIN_RECIPIENTS and restarts this server. ${POLICY_DOC_REF}`,
+        );
+      }
+    }
+  }
+
+  // ── 2. the plaintext half ─────────────────────────────────────────────────
+  // Only a call that actually names directories is governed by the roots.
+  //
+  // A `pg`-only call is therefore NOT scoped by anything here, and that is a limitation
+  // to state rather than imply away (multi-model review, #800): `pg` is a caller-supplied
+  // connection URI, so a caller can still name any database the server's ambient
+  // credentials (a Unix socket, ~/.pgpass, PG* environment variables) already reach.
+  // Scoping it needs its own allowlist mechanism, which #800's decision deliberately did
+  // not take on — the roots are a filesystem concept and a connection URI is not a path.
+  // The pin above still applies to such a call, so whatever is dumped is readable only by
+  // a key the operator allowlisted; what is missing is source authorization, and it is
+  // tracked as a follow-up rather than fixed here.
+  if (dirs.length === 0) return;
+
+  if (MCP_SOURCE_ROOTS_ERROR) {
+    // The parse detail names the operator's own value, so it goes to the server's stderr
+    // (outside captureCall, so it is NOT relayed to the caller) rather than into the
+    // refusal — see the containment refusal below for the same reasoning.
+    console.error(`snapshot policy: ${MCP_SOURCE_ROOTS_ERROR.message}`);
+    throw snapshotPolicyDenied(
+      'CYPHER_BRAIN_MCP_SOURCE_ROOTS is set but is not a usable list of roots, so no directory can be checked ' +
+        'against it (this server logged the specific reason to its own stderr)',
+      'Fix the variable — a JSON array of absolute paths, e.g. ["/srv/brain","/home/me/notes"] — and restart ' +
+        'this server. ' +
+        POLICY_DOC_REF,
+    );
+  }
+  if (MCP_SOURCE_ROOTS.length === 0) {
+    throw snapshotPolicyDenied(
+      'CYPHER_BRAIN_MCP_SOURCE_ROOTS is not set in this MCP server environment, so no directory is authorized ' +
+        'as a snapshot source over MCP',
+      'Set it to a JSON array of the absolute directories this server may snapshot, e.g. ' +
+        '["/srv/brain","/home/me/notes"], and restart this server. A call that snapshots only `pg` needs no ' +
+        'roots. ' +
+        POLICY_DOC_REF,
+    );
+  }
+
+  // Both sides resolved through the #648 helper before comparing — a symlinked root, a
+  // symlinked ancestor, or a `dirs` entry that IS a symlink pointing out of the roots all
+  // collapse to their real locations first, so none of them can smuggle a source past a
+  // check that compared the paths as written. A `dirs` entry that does not exist resolves
+  // to its nearest existing ancestor plus the literal tail, which keeps the containment
+  // answer honest while leaving "no such directory" to snapshot()'s own error — this gate
+  // must not change how a plain typo is reported.
+  const roots = await underPolicy(
+    'a CYPHER_BRAIN_MCP_SOURCE_ROOTS root could not be resolved',
+    `Check that every configured root exists and is reachable by this server. ${POLICY_DOC_REF}`,
+    () => Promise.all(MCP_SOURCE_ROOTS.map((r) => realpathOfNearestAncestor(r))),
+  );
+  // Resolved CONCURRENTLY, not one after another (multi-model review round 3). Sequential
+  // resolution makes the post-check window for the FIRST entry as long as the resolution
+  // of every later one, which a caller can pad at will by passing many directories. This
+  // does not eliminate the window — see the second call site's comment for what remains
+  // and why the real fix (revalidating each source immediately before it is archived)
+  // lives in snapshot.ts's own loop rather than here — it removes the part of it the
+  // caller controls the size of.
+  const resolvedDirs = await Promise.all(
+    dirs.map((dir) =>
+      underPolicy(`dirs entry ${JSON.stringify(dir)} could not be resolved`, 'Pass a path this server can reach.', () =>
+        realpathOfNearestAncestor(dir),
+      ),
+    ),
+  );
+  for (const [i, dir] of dirs.entries()) {
+    const resolved = resolvedDirs[i];
+    if (!pathCoveredBy(resolved, roots)) {
+      // The refusal names the caller's OWN path and nothing else (multi-model review
+      // round 2, #800). Echoing the resolved path would turn this gate into a symlink
+      // oracle — submit paths, read back where they really point — and echoing the root
+      // list would hand an untrusted caller the server's configured directory layout.
+      // Neither is needed to act on the refusal: the caller knows what it passed, and the
+      // operator, who is the only one who can change the roots, has the full detail on
+      // this server's stderr (logged outside captureCall, so it is not relayed back).
+      console.error(
+        `snapshot policy: refused dirs entry ${JSON.stringify(dir)} — resolves to ${resolved}, outside every ` +
+          `CYPHER_BRAIN_MCP_SOURCE_ROOTS root (${MCP_SOURCE_ROOTS.join(', ')})`,
+      );
+      throw snapshotPolicyDenied(
+        `dirs entry ${JSON.stringify(dir)} is not inside any directory this server is configured to snapshot ` +
+          '(CYPHER_BRAIN_MCP_SOURCE_ROOTS)',
+        'Pass a directory the operator has authorized, or have them add this location to ' +
+          'CYPHER_BRAIN_MCP_SOURCE_ROOTS and restart the server. ' +
+          POLICY_DOC_REF,
+      );
+    }
+  }
+}
+
 // #753: shared quoted, comma-joined rendering of an allowed-value list — used by both
 // requireBackend and assertDeclaredEnums below, so a caller sees the SAME list shape
 // whichever of the two "value must be one of a fixed set" checks refused it.
@@ -1210,6 +1471,20 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
   if (pg !== undefined && !isStr(pg)) throw new ToolError('ERR_INVALID_INPUT', 'pg must be a string connection URI');
   if (locatorFile !== undefined && !isStr(locatorFile))
     throw new ToolError('ERR_INVALID_INPUT', 'locator_file must be a string path');
+  // #800: the snapshot policy runs HERE — after the cheap type checks that make `dirs`
+  // a string[], and before ANYTHING with a side effect. Everything below this line
+  // creates something: resolveWritableLocatorFile reads a caller-named file, the
+  // idempotency claim writes a lock, the replay branch writes a locator file, and the
+  // snapshot itself stages plaintext, scans it and uploads the ciphertext. Placing the
+  // gate above all of it is what makes "a denied call leaves nothing behind" true rather
+  // than merely likely.
+  //
+  // It is also above the idempotency LOOKUP on purpose, so a replay is not
+  // grandfathered: a key recorded while the policy was looser (or before it existed)
+  // must not become a way to re-run a call the current policy would deny. The replay
+  // returns a stored result AND can write a locator file, so "nothing new is disclosed"
+  // is not a reason to let it through a policy the operator has since tightened.
+  await assertSnapshotPolicy(dirs, recipients);
   // #789: `locator_file` reaches push() as --save-locator, which mkdir's the parent and
   // RENAMES a temp sibling over the exact path named (src/lib/pushpull.ts) — an atomic,
   // unconditional replacement of whatever is there. Unscoped, that is an arbitrary-file-
@@ -1385,6 +1660,31 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
       );
     }
 
+    // #800, second evaluation — the same narrowing #792 applies to restore_now's out_dir,
+    // for the same reason and with the same honesty about what it buys. This gate is
+    // path-based, so it cannot BIND the snapshot to the directories it vetted; a symlink
+    // swapped into place after the first check is followed by the tar all the same
+    // (multi-model review, #800). What it can do is shrink the window: the first call
+    // happens before the locator resolution, the idempotency claim, the log lookup and
+    // the spend gate — all of which can take real time — while this one sits immediately
+    // before the read. The remaining gap is a few statements rather than the whole
+    // preamble.
+    //
+    // Two things this does NOT do, both stated rather than implied (multi-model review
+    // round 3). It is not per-SOURCE: snapshot.ts archives the directories one at a time,
+    // so the last entry's window is shorter than the first's, and closing that means
+    // revalidating each source immediately before it is archived — inside snapshot.ts's
+    // own loop, which is a change to the CLI path this policy is deliberately not on.
+    // What is done here instead is to resolve the sources concurrently (see
+    // assertSnapshotPolicy) so the caller cannot pad the window with extra entries.
+    //
+    // The vetted paths are deliberately NOT substituted for the caller's. tar does not
+    // dereference a top-level symlink argument (see snapshot.ts's own comment on that),
+    // so handing snapshot() a realpath'd path would silently change WHAT a legitimate
+    // symlink source archives — the link becomes the target's whole contents. Closing
+    // the residual properly needs descriptor-bound reads (openat/RESOLVE_BENEATH), which
+    // Node does not expose and which live in snapshot.ts, not here.
+    await assertSnapshotPolicy(dirs, recipients);
     const snapOpts: CliOptions = { out, pg, dirs, tables: [], recipients, scan_secrets: scanSecrets };
     let snap: CaptureResult<void>;
     try {
