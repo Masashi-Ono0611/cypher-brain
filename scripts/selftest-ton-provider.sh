@@ -1104,8 +1104,9 @@ echo "== issue #808: a confirmed spend killed before its receipt reached disk is
 I808_DIR="$TMP/issue808-ledger"
 mkdir -p "$I808_DIR"
 I808_LEDGER="$I808_DIR/receipt-ledger.jsonl"
-# Derived, not configured: pending-spend.ts puts its sidecar next to the receipt ledger.
-I808_PENDING="$I808_DIR/pending-spends.jsonl"
+# Derived, not configured: pending-spend.ts names its sidecar after the receipt ledger it
+# belongs to, in the same directory.
+I808_PENDING="$I808_DIR/receipt-ledger.jsonl.pending-spends.jsonl"
 mkdir -p "$TMP/issue808-src"
 printf 'ton-provider issue #808 crash-before-receipt payload\n' > "$TMP/issue808-src/note.txt"
 cb snapshot --dir "$TMP/issue808-src" --out "$TMP/issue808.age"

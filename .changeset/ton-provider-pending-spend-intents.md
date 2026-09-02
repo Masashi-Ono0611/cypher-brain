@@ -7,7 +7,7 @@ the process died at the wrong moment, and a retry no longer notifies a provider 
 contract was never deployed with (#808, #665).
 
 A `push --backend ton-provider` deploy now records what it is about to spend — contract
-address, bag id, provider pubkey and amount — to a `pending-spends.jsonl` file next to
+address, bag id, provider pubkey and amount — to a `receipt-ledger.jsonl.pending-spends.jsonl` file beside
 `receipt-ledger.jsonl`, *before* it broadcasts, and settles that record only once the
 receipt is verifiably on disk. Previously there was a several-second window between the
 contract going live on-chain (the money is gone from that instant) and the receipt being
