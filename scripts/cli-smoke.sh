@@ -391,10 +391,16 @@ echo "[PASS] dist zero arguments: exit 2, stdout empty, a ${NOARGS_LINES}-line s
 # covering a NESTED subcommand typo (schedule/wallet's own sub-verb) and an
 # ENUM-VALUED flag typo (--level/--backend/--chain) — neither got a suggestion
 # before #435, only the generic "expected X | Y | Z" listing.
-node "$DIST" schedule statuz > /dev/null 2> "$TMP/nested-schedule.err"
+# Each typo below must REFUSE (non-zero), not just print a suggestion and carry on. The
+# exact code is deliberately not pinned: today a top-level unknown command exits 2 while
+# these nested/enum typos exit 1 (#779) — asserting either value here would freeze that
+# inconsistency into the test.
+node "$DIST" schedule statuz > /dev/null 2> "$TMP/nested-schedule.err"; RC=$?
+[ "$RC" != "0" ] || { echo "[FAIL] 'schedule statuz' exited 0 — the typo was suggested but not refused"; cat "$TMP/nested-schedule.err"; exit 1; }
 grep -Fq 'schedule: expected install | uninstall | status, got: statuz (did you mean status?)' "$TMP/nested-schedule.err" \
   || { echo "[FAIL] 'schedule statuz' did not suggest 'status'"; cat "$TMP/nested-schedule.err"; exit 1; }
-node "$DIST" wallet adress > /dev/null 2> "$TMP/nested-wallet.err"
+node "$DIST" wallet adress > /dev/null 2> "$TMP/nested-wallet.err"; RC=$?
+[ "$RC" != "0" ] || { echo "[FAIL] 'wallet adress' exited 0 — the typo was suggested but not refused"; cat "$TMP/nested-wallet.err"; exit 1; }
 grep -Fq 'wallet: expected create | address | balance, got: adress (did you mean address?)' "$TMP/nested-wallet.err" \
   || { echo "[FAIL] 'wallet adress' did not suggest 'address'"; cat "$TMP/nested-wallet.err"; exit 1; }
 # a genuinely unrelated nested sub-verb still gets no suggestion (same #425 asymmetry
@@ -405,13 +411,16 @@ if grep -qi "did you mean" "$TMP/nested-wallet-unrelated.err"; then
 fi
 echo "[PASS] dist nested subcommand typos: 'schedule statuz'/'wallet adress' suggest their real sub-verb, 'wallet xyz' correctly gets no spurious suggestion"
 
-node "$DIST" verify --level remtoe --in "$TMP/does-not-exist.age" > /dev/null 2> "$TMP/enum-level.err"
+node "$DIST" verify --level remtoe --in "$TMP/does-not-exist.age" > /dev/null 2> "$TMP/enum-level.err"; RC=$?
+[ "$RC" != "0" ] || { echo "[FAIL] '--level remtoe' exited 0 — the typo was suggested but not refused"; cat "$TMP/enum-level.err"; exit 1; }
 grep -Fq 'did you mean --level remote?' "$TMP/enum-level.err" \
   || { echo "[FAIL] '--level remtoe' did not suggest '--level remote'"; cat "$TMP/enum-level.err"; exit 1; }
-node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend fille > /dev/null 2> "$TMP/enum-backend.err"
+node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend fille > /dev/null 2> "$TMP/enum-backend.err"; RC=$?
+[ "$RC" != "0" ] || { echo "[FAIL] '--backend fille' exited 0 — the typo was suggested but not refused"; cat "$TMP/enum-backend.err"; exit 1; }
 grep -Fq 'did you mean file?' "$TMP/enum-backend.err" \
   || { echo "[FAIL] '--backend fille' did not suggest 'file'"; cat "$TMP/enum-backend.err"; exit 1; }
-node "$DIST" wallet create --chain tona > /dev/null 2> "$TMP/enum-chain.err"
+node "$DIST" wallet create --chain tona > /dev/null 2> "$TMP/enum-chain.err"; RC=$?
+[ "$RC" != "0" ] || { echo "[FAIL] '--chain tona' exited 0 — the typo was suggested but not refused"; cat "$TMP/enum-chain.err"; exit 1; }
 grep -Fq 'did you mean ton?' "$TMP/enum-chain.err" \
   || { echo "[FAIL] '--chain tona' did not suggest 'ton'"; cat "$TMP/enum-chain.err"; exit 1; }
 # a genuinely unrelated enum value still gets no suggestion.

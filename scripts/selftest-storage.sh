@@ -95,10 +95,18 @@ fi
 echo "[PASS] no stray pull .part temp files left behind"
 
 echo "== negative control: an absent locator must fail =="
-if cb pull --locator "$CYPHER_BRAIN_FILE_DIR/deadbeef.age" --backend file --out "$TMP/no.age" 2>/dev/null; then
-  echo "[FAIL] absent locator returned bytes"; exit 1
-fi
-echo "[PASS] absent locator errors"
+# The name has to be a real <sha256>.age shape: a short name like deadbeef.age is
+# refused by the SHAPE check ([CB-E010]) before the backend ever looks on disk, so
+# it would pass here while proving nothing about the not-found path. Asserting the
+# not-found code ([CB-E018]) pins the test to the branch it claims to cover.
+ABSENT_HASH="2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+set +e
+ABSENT_ERR=$(cb pull --locator "$CYPHER_BRAIN_FILE_DIR/$ABSENT_HASH.age" --backend file --out "$TMP/no.age" 2>&1); ABSENT_RC=$?
+set -e
+if [ "$ABSENT_RC" = "0" ]; then echo "[FAIL] absent locator returned bytes"; exit 1; fi
+test ! -f "$TMP/no.age"
+printf '%s' "$ABSENT_ERR" | grep -q '\[CB-E018\]' || { echo "[FAIL] absent-locator error lacks the CB-E018 (not found) code"; echo "$ABSENT_ERR"; exit 1; }
+echo "[PASS] absent locator errors with [CB-E018]"
 
 echo "== issue #465: --wait warns (but does not error) for a backend that cannot retry (file) =="
 WAIT_ERR=$(cb pull --locator "$LOC" --backend file --out "$TMP/wait-warn.age" --wait 2 2>&1); WAIT_RC=$?
@@ -133,23 +141,34 @@ echo "[PASS] locator outside FILE_DIR is rejected"
 printf '%s' "$TRAVERSAL_ERR" | grep -q '\[CB-E010\]' || { echo "[FAIL] path-traversal error lacks the CB-E010 code"; echo "$TRAVERSAL_ERR"; exit 1; }
 echo "[PASS] path-traversal error carries [CB-E010]"
 
-if cb pull --locator "$CYPHER_BRAIN_FILE_DIR/../outside.age" --backend file --out "$TMP/leak2.age" 2>/dev/null; then
-  echo "[FAIL] relative traversal out of FILE_DIR was read"; exit 1
-fi
+set +e
+REL_TRAVERSAL_ERR=$(cb pull --locator "$CYPHER_BRAIN_FILE_DIR/../outside.age" --backend file --out "$TMP/leak2.age" 2>&1); REL_TRAVERSAL_RC=$?
+set -e
+if [ "$REL_TRAVERSAL_RC" = "0" ]; then echo "[FAIL] relative traversal out of FILE_DIR was read"; exit 1; fi
 test ! -f "$TMP/leak2.age"
-echo "[PASS] relative traversal (../) out of FILE_DIR is rejected"
+# same reason-check as the absolute case above: any non-zero exit (a crash on this
+# path, say) must not be mistaken for the traversal guard firing
+printf '%s' "$REL_TRAVERSAL_ERR" | grep -q '\[CB-E010\]' || { echo "[FAIL] relative-traversal error lacks the CB-E010 code"; echo "$REL_TRAVERSAL_ERR"; exit 1; }
+echo "[PASS] relative traversal (../) out of FILE_DIR is rejected with [CB-E010]"
 
 echo "== issue #93: a locator inside FILE_DIR with the wrong shape (not <sha256>.age) must be rejected =="
 cp "$TMP/outside.age" "$CYPHER_BRAIN_FILE_DIR/notasha.age"
-if cb pull --locator "$CYPHER_BRAIN_FILE_DIR/notasha.age" --backend file --out "$TMP/leak3.age" 2>/dev/null; then
-  echo "[FAIL] wrong-shape locator inside FILE_DIR was read"; exit 1
-fi
+set +e
+SHAPE_ERR=$(cb pull --locator "$CYPHER_BRAIN_FILE_DIR/notasha.age" --backend file --out "$TMP/leak3.age" 2>&1); SHAPE_RC=$?
+set -e
+if [ "$SHAPE_RC" = "0" ]; then echo "[FAIL] wrong-shape locator inside FILE_DIR was read"; exit 1; fi
 test ! -f "$TMP/leak3.age"
-echo "[PASS] wrong-shape locator inside FILE_DIR is rejected"
+printf '%s' "$SHAPE_ERR" | grep -q 'expected <sha256>.age shape' || { echo "[FAIL] wrong-shape refusal does not name the shape rule"; echo "$SHAPE_ERR"; exit 1; }
+printf '%s' "$SHAPE_ERR" | grep -q '\[CB-E010\]' || { echo "[FAIL] wrong-shape error lacks the CB-E010 code"; echo "$SHAPE_ERR"; exit 1; }
+echo "[PASS] wrong-shape locator inside FILE_DIR is rejected with [CB-E010]"
 
 echo "== backend is required (no silent default) =="
-if cb push --in "$TMP/got.age" 2>/dev/null; then echo "[FAIL] push ran with no --backend"; exit 1; fi
-echo "[PASS] push without --backend is rejected"
+set +e
+NOBACKEND_ERR=$(cb push --in "$TMP/got.age" 2>&1); NOBACKEND_RC=$?
+set -e
+if [ "$NOBACKEND_RC" = "0" ]; then echo "[FAIL] push ran with no --backend"; exit 1; fi
+printf '%s' "$NOBACKEND_ERR" | grep -q -- '--backend <file|arweave|turbo|rclone|ton> required' || { echo "[FAIL] push without --backend did not name the missing flag"; echo "$NOBACKEND_ERR"; exit 1; }
+echo "[PASS] push without --backend is rejected and names the flag"
 
 # ── same-hash skip (#70): the skip signal is the PLAINTEXT content digest sidecar ──
 # (age ciphertext hashes differ every run — ephemeral file key — so only the
