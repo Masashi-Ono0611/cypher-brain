@@ -27,6 +27,13 @@ def add_file(tf, name, data=b"data"):
     tf.addfile(ti, io.BytesIO(data))
 
 
+def add_dir(tf, name, mode=0o755):
+    ti = tarfile.TarInfo(name=name)
+    ti.type = tarfile.DIRTYPE
+    ti.mode = mode
+    tf.addfile(ti)
+
+
 def add_symlink(tf, name, linkname):
     ti = tarfile.TarInfo(name=name)
     ti.type = tarfile.SYMTYPE
@@ -83,5 +90,25 @@ with tarfile.open(out_path, "w") as tf:
         # holds "evil-link" as a symlink from the first restore) is what exercises
         # mergeNoClobber()'s dest-is-a-directory branch.
         add_file(tf, "evil-link/payload.txt", b"PWNED-MERGE")
+    elif shape == "merge-contract-first":
+        # First of a two-archive pair for the mergeNoClobber() no-clobber CONTRACT test
+        # (#784). Populates an out-dir so the SECOND restore into it takes the merge
+        # branch rather than the whole-tree rename.
+        add_dir(tf, "keep")
+        add_file(tf, "keep/existing.txt", b"first-restore-content")
+        add_file(tf, "collide.txt", b"ORIGINAL-MUST-SURVIVE")
+    elif shape == "merge-contract-second":
+        # Second archive: one name that already exists (must be left untouched) plus one
+        # of every entry kind the merge can legitimately have to MOVE — a new file inside
+        # an existing directory (the recurse-into-both-sides branch), a new directory tree
+        # carrying a restrictive mode (the mkdir-then-recurse-then-chmod branch), and a
+        # symlink (which must be recreated as a symlink, never followed).
+        add_file(tf, "collide.txt", b"SECOND-MUST-NOT-WIN")
+        add_dir(tf, "keep")
+        add_file(tf, "keep/fresh.txt", b"merged-into-existing-dir")
+        add_dir(tf, "newdir", mode=0o500)
+        add_dir(tf, "newdir/nested")
+        add_file(tf, "newdir/nested/deep.txt", b"deep-merged")
+        add_symlink(tf, "newlink", "keep/existing.txt")
     else:
         raise SystemExit(f"unknown CB_TAR_SHAPE: {shape}")

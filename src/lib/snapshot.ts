@@ -15,7 +15,7 @@ import {
 } from './config.js';
 import { run } from './proc.js';
 import { newEncrypter, encryptToFile } from './crypt.js';
-import { exists, fmtBytes, requirePath, sha256, errMsg, redactPgConn } from './util.js';
+import { exists, fmtBytes, requirePath, rmrf, sha256, errMsg, redactPgConn } from './util.js';
 import { warn } from './warn.js';
 import { findPgDataDirs, pgDataDirCopyWarning, pgDataDirTruncatedWarning } from './gbrain.js';
 import { recipientEntries, resolvePinnedRecipients } from './keys.js';
@@ -90,6 +90,73 @@ async function promoteSnapshot(part: string, out: string): Promise<void> {
   }
   await rm(part, { force: true }); // drop the redundant link; out is the durable copy
 }
+
+// #783: every path snapshot DERIVES from --out, alongside the artifact itself. --out has
+// had a no-clobber refusal since the beginning (see its check in snapshot() below) and an
+// atomic no-clobber promotion since #103; these three had neither — each was a plain,
+// truncating writeFile() with no pre-existence check at all. Two things fell out of that:
+//
+//   - writeFile() FOLLOWS a symlink, so a symlink planted at the (entirely predictable —
+//     it is whatever is in the operator's `schedule install` crontab, plus a fixed suffix)
+//     `<out>.digest` path redirected the write to any file the snapshotting user could
+//     write, truncating it, with the run still reporting success.
+//   - a `.minisig` left over from an EARLIER, unrelated artifact simply survived whenever
+//     this run did not sign (no signing identity present, or --no-sign). restore/verify
+//     then found a signature that is present, well-formed, and does not verify against
+//     these bytes — the hard-refusal branch — so a snapshot that was written successfully
+//     could never be restored, and said "the file may be tampered or the signature forged"
+//     while doing it.
+//
+// Refusing a pre-existing sidecar (rather than removing it) is the deliberate choice: the
+// same posture --out itself takes, and silently deleting a file an operator put there is
+// its own surprise. `what` names the sidecar in the refusal so the message says which of
+// the three is in the way.
+const sidecarSuffixes: { suffix: string; what: string }[] = [
+  { suffix: '.digest', what: 'content digest sidecar' },
+  { suffix: '.recipients-fingerprint', what: 'recipients fingerprint sidecar' },
+  { suffix: '.minisig', what: 'authenticity signature sidecar' },
+];
+
+// lstat, never exists()/stat(): a symlink is exactly the case this refuses, and both of
+// those resolve THROUGH it — a symlink pointing at a file that does not exist would read
+// as "nothing here" and be written through anyway. Anything that exists under any name is
+// a refusal; only ENOENT (nothing there at all) is allowed to continue. A non-ENOENT
+// failure (EACCES, ELOOP, …) is rethrown untouched rather than swallowed into "free to
+// write", the same discipline util.ts's requirePath() keeps.
+async function refuseExistingSidecars(out: string): Promise<void> {
+  for (const { suffix, what } of sidecarSuffixes) {
+    const p = `${out}${suffix}`;
+    let st: Awaited<ReturnType<typeof lstat>>;
+    try {
+      st = await lstat(p);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
+      throw e;
+    }
+    const kind = st.isSymbolicLink() ? 'a symlink' : st.isDirectory() ? 'a directory' : 'a file';
+    // Wording deliberately keeps "already exists — refusing to overwrite" contiguous: that
+    // is the literal errors.ts pattern that earns this the same CB-E009 code --out's own
+    // no-clobber refusal gets, and this IS that class of refusal. The kind goes after.
+    throw new Error(
+      `${p} already exists — refusing to overwrite the ${what} of a prior snapshot ` +
+        `(it is ${kind}; move it aside or choose a new --out). A stale ${suffix} sidecar left next to a ` +
+        `fresh snapshot misreports it — a leftover .minisig makes every later restore refuse the new ` +
+        `snapshot as invalidly signed`,
+    );
+  }
+}
+
+// Write one sidecar with an EXCLUSIVE create — O_CREAT|O_EXCL, which fails EEXIST rather
+// than truncating and, critically, does not follow a symlink at `path`. That makes the
+// no-clobber decision atomic instead of leaning on refuseExistingSidecars() above as a
+// check-then-act (which it would be on its own: minutes of staging/encrypt work separate
+// that preflight from these writes).
+//
+// Deliberately NOT the write-to-temp-then-rename idiom used for the artifact itself:
+// rename() REPLACES an existing destination, so it would undo the exact guarantee this
+// exists for. These files are one short line each, so the torn-read window a rename would
+// close is not worth reopening the clobber it would create.
+const writeSidecarExclusive = (path: string, data: string): Promise<void> => writeFile(path, data, { flag: 'wx' });
 
 const hexOf = (s: string): string => createHash('sha256').update(s).digest('hex');
 
@@ -457,6 +524,12 @@ export async function snapshot(o: CliOptions): Promise<void> {
     throw new Error(
       `${o.out} already exists — refusing to overwrite a prior snapshot (move it aside or choose a new --out)`,
     );
+  // #783: the same refusal for every path DERIVED from --out — see refuseExistingSidecars()
+  // above for what each one is and why a leftover is worse than a merely redundant file.
+  // Sited immediately after --out's own check and before any staging work, so a run that
+  // cannot write a complete, self-consistent set of outputs refuses while it still costs
+  // nothing.
+  await refuseExistingSidecars(o.out);
   // Fail-fast (#109) on a bad --out PARENT directory (a typo'd path, an unwritable
   // mount) HERE — before pg_dump / --dir tar+extract+digest work below, which can take
   // minutes for a large brain. Without this, the bad path only surfaces once
@@ -780,7 +853,18 @@ export async function snapshot(o: CliOptions): Promise<void> {
         }
       } finally {
         // must not leak into the snapshot: the final encryptToFile below tars stage/. whole
-        await rm(extractDir, { recursive: true, force: true });
+        //
+        // rmrf (util.ts), not a plain rm() (#782): the extraction just above runs with
+        // `-p`, so a source directory captured at a mode with no owner-write bit (0500,
+        // say) is RECREATED that way here — and unlinking an entry needs write on its
+        // PARENT, not on the entry. A plain rm() throws EACCES on such a tree, and the
+        // throw unwinds through the stage cleanup below (which fails the same way), so
+        // BOTH the extracted plaintext and the whole staging tree survive the process,
+        // under $TMPDIR, indefinitely. Measured: an ordinary --dir source containing one
+        // 0500 subdirectory reproduced it on the happy path, no attacker and no injected
+        // failure involved. rmrf chmods the tree owner-writable and retries, which is the
+        // fix #209 already applied to verify --level drill's scratch dir.
+        await rmrf(extractDir);
       }
       components.push({
         name,
@@ -862,7 +946,7 @@ export async function snapshot(o: CliOptions): Promise<void> {
     // verbatim; the recipients fingerprint is a genuinely separate signal and gets its
     // own sidecar right below, never folded into this one.
     try {
-      await writeFile(`${o.out}.digest`, `${contentDigest}\n`);
+      await writeSidecarExclusive(`${o.out}.digest`, `${contentDigest}\n`);
     } catch (e) {
       console.error(
         `warning: could not write digest sidecar ${o.out}.digest (${errMsg(e)}) — push --skip-unchanged will not have a digest for this snapshot`,
@@ -874,7 +958,7 @@ export async function snapshot(o: CliOptions): Promise<void> {
     // point of a "recipient" — safe to copy), so this sidecar carries no secrets
     // either. Best-effort, same as the content digest sidecar above.
     try {
-      await writeFile(`${o.out}.recipients-fingerprint`, `${recipientsFingerprint}\n`);
+      await writeSidecarExclusive(`${o.out}.recipients-fingerprint`, `${recipientsFingerprint}\n`);
     } catch (e) {
       console.error(
         `warning: could not write recipients-fingerprint sidecar ${o.out}.recipients-fingerprint (${errMsg(e)}) — push --skip-unchanged will not have a recipients fingerprint for this snapshot`,
@@ -897,7 +981,13 @@ export async function snapshot(o: CliOptions): Promise<void> {
       if (await exists(signIdentityPath)) {
         const { privateKey, keyId } = await loadSignIdentity(signIdentityPath);
         const minisig = await signDetached(privateKey, keyId, o.out);
-        await writeFile(`${o.out}.minisig`, minisig);
+        // Exclusive create, and NOT best-effort like the two sidecars above (#783): a
+        // digest/fingerprint that fails to appear only costs the --skip-unchanged
+        // optimization, but a signature that fails to appear where something else already
+        // sits leaves an artifact every later restore refuses as invalidly signed. If the
+        // preflight passed and this still hits EEXIST, something created it DURING this
+        // run — say so and fail rather than warn.
+        await writeSidecarExclusive(`${o.out}.minisig`, minisig);
         console.log(`signed: ${o.out}.minisig (minisign-compatible detached signature, key: ${signIdentityPath})`);
       } else if (o.sign_identity) {
         // The #252 fail-fast check above already refuses an explicitly-named
@@ -918,7 +1008,13 @@ export async function snapshot(o: CliOptions): Promise<void> {
     console.log(`content digest: ${contentDigest} (sidecar: ${o.out}.digest)`);
     console.log(`recipients fingerprint: ${recipientsFingerprint} (sidecar: ${o.out}.recipients-fingerprint)`);
   } finally {
-    await rm(stage, { recursive: true, force: true });
+    // rmrf, not rm (#782) — same reason as the per-component extractDir cleanup above:
+    // this tree holds the staged PLAINTEXT, and a restrictive mode anywhere under it made
+    // a plain rm() throw and leave all of it on disk. The setActiveStage(null) below stays
+    // strictly AFTER the await (AGENTS.md rule two): if the removal itself still throws,
+    // the slot is deliberately left registered so a later signal's forceRmSync is the one
+    // remaining path that can clear it.
+    await rmrf(stage);
     setActiveStage(null);
   }
 }

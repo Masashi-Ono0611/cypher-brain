@@ -132,6 +132,73 @@ echo "== #721: SIGTERM mid-merge (restore into a PRE-EXISTING --out-dir) leaves 
 # pre-existing marker file but fewer than the total, proving the merge is IN PROGRESS
 # (not finished) the instant the signal is sent. --scan-secrets off skips a gitleaks scan
 # per source that has nothing to do with what this is testing.
+# Shared by the #721 and #741 blocks below. Counts --out-dir's top-level entries with
+# bash globs only (no find/wc/tr forks): on a loaded CI runner each fork costs enough
+# that a 400-entry merge can complete between two polls.
+count_top_entries() {
+  local n=0 f
+  for f in "$1"/* "$1"/.[!.]* "$1"/..?*; do [ -e "$f" ] || [ -L "$f" ] || continue; n=$((n + 1)); done
+  printf '%s' "$n"
+}
+# Start a restore into a pre-existing --out-dir and SIGTERM it the instant the merge is
+# observably in progress (more entries than the pre-seeded ones, fewer than the total).
+# Arguments: <age file> <out dir> <pre-seeded entry count> <total entries when complete>
+#            <stderr log>. Sets LANDED=1 and MMPID on success.
+# Retries the whole attempt (the caller names a reseed function in RESEED that recreates
+# --out-dir's pre-existing contents) when the restore exits before the window was seen:
+# whether the window is hit is a race against the runner, and one miss must read as
+# "try again", not as a product failure. The macOS CI cell missed it once in ~13 s while
+# the same script passed locally and on ubuntu.
+land_sigterm_mid_merge() {
+  local age="$1" out="$2" seeded="$3" total="$4" errlog="$5" attempt deadline settle n rc
+  LANDED=0
+  for attempt in 1 2 3 4 5; do
+    "$RESEED"
+    CYPHER_BRAIN_HOME="$PRIMARY" node "${BIN_DEV_ARGS[@]}" "$BIN" restore --in "$age" --out-dir "$out" >/dev/null 2>"$errlog" &
+    MMPID=$!
+    deadline=$((SECONDS + 120))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      kill -0 "$MMPID" 2>/dev/null || break
+      n=$(count_top_entries "$out")
+      if [ "$n" -gt "$seeded" ] && [ "$n" -lt "$total" ]; then
+        # kill can lose the race against a natural exit between the count and here —
+        # under set -e that must read as a missed window (retry), not a script abort
+        kill -TERM "$MMPID" 2>/dev/null || break
+        # The signal can still arrive AFTER the last rename (the count above is already
+        # stale by the time the kernel delivers it): the restore then completes normally
+        # and the handler, correctly, drops no INCOMPLETE sentinel — the macOS CI cell hit
+        # exactly this ("did not drop the INCOMPLETE sentinel"). Wait (bounded, so a
+        # handler that blocks — #741's regression case — is still left for the caller to
+        # diagnose) and treat "every entry present" as a miss to retry, not as a verdict.
+        settle=$((SECONDS + 10))
+        while [ "$SECONDS" -lt "$settle" ] && kill -0 "$MMPID" 2>/dev/null; do sleep 0.05; done
+        if kill -0 "$MMPID" 2>/dev/null; then LANDED=1; return 0; fi # still alive: caller decides
+        n=$(count_top_entries "$out")
+        if [ "$n" -ge "$total" ]; then
+          wait "$MMPID" 2>/dev/null || true
+          echo "  (attempt $attempt: SIGTERM landed after the merge had completed — retrying)"
+          continue 2
+        fi
+        LANDED=1; return 0
+      fi
+    done
+    if kill -0 "$MMPID" 2>/dev/null; then
+      echo "[FAIL] restore still running after 120 s without reaching the merge (attempt $attempt)"; cat "$errlog"
+      kill -9 "$MMPID" 2>/dev/null || true; exit 1
+    fi
+    # Only a restore that COMPLETED is a timing miss worth retrying. A non-zero exit is a
+    # real failure (bad artifact, refused --out-dir, ...) and must surface as such, not be
+    # retried five times and then blamed on the window.
+    rc=0; wait "$MMPID" 2>/dev/null || rc=$?
+    if [ "$rc" != "0" ]; then
+      echo "[FAIL] restore exited $rc before the merge (attempt $attempt) — not a timing miss:"; cat "$errlog"; exit 1
+    fi
+    echo "  (attempt $attempt: restore finished before a mid-merge state was observed — retrying)"
+  done
+  echo "[FAIL] restore never observed in a mid-merge state in 5 attempts (test setup) — last restore stderr:"; cat "$errlog"
+  exit 1
+}
+
 MMTMP="$TMP/mid-merge"; mkdir -p "$MMTMP/src"
 MMDIRARGS=(); MMN=400
 for i in $(seq 1 "$MMN"); do
@@ -140,31 +207,9 @@ for i in $(seq 1 "$MMN"); do
 done
 cb "$PRIMARY" snapshot "${MMDIRARGS[@]}" --recipient "$PRIMARY/recipient.txt" --scan-secrets off \
   --out "$MMTMP/v.age" >/dev/null
-mkdir -p "$MMTMP/out"; touch "$MMTMP/out/.marker" # pre-existing --out-dir => mergeNoClobber(), not the rename()-whole-tree path
-CYPHER_BRAIN_HOME="$PRIMARY" node "${BIN_DEV_ARGS[@]}" "$BIN" restore --in "$MMTMP/v.age" --out-dir "$MMTMP/out" >/dev/null 2>&1 &
-MMPID=$!
-MMLANDED=0
-# Wall-clock deadline, not an iteration count: each poll forks a `find`, so 300
-# iterations was only ~3 s on a fast laptop but exhausted itself on a loaded CI runner
-# BEFORE the decrypt+extract phase had produced its first --out-dir entry (macOS cells
-# failed with "never observed in a mid-merge state" while the window itself, measured
-# locally, is ~2.5 s wide). The process-exit check below still ends the loop early.
-MMDEADLINE=$((SECONDS + 120))
-while [ "$SECONDS" -lt "$MMDEADLINE" ]; do
-  kill -0 "$MMPID" 2>/dev/null || break
-  MMCOUNT=$(find "$MMTMP/out" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
-  if [ "$MMCOUNT" -gt 1 ] && [ "$MMCOUNT" -lt "$((MMN + 1))" ]; then
-    MMLANDED=1
-    kill -TERM "$MMPID"
-    break
-  fi
-  sleep 0.01
-done
-if [ "$MMLANDED" != "1" ]; then
-  echo "[FAIL] restore never observed in a mid-merge state within 120 s (test setup) — try a larger MMN"
-  kill "$MMPID" 2>/dev/null || true
-  exit 1
-fi
+# pre-existing --out-dir => mergeNoClobber(), not the rename()-whole-tree path
+reseed_mm() { rm -rf "$MMTMP/out"; mkdir -p "$MMTMP/out"; touch "$MMTMP/out/.marker"; }
+RESEED=reseed_mm land_sigterm_mid_merge "$MMTMP/v.age" "$MMTMP/out" 1 "$((MMN + 1))" "$MMTMP/restore.err"
 wait "$MMPID" 2>/dev/null || true # signal exit is non-zero — expected
 MMLEFTOVER=$(find "$MMTMP" -maxdepth 1 -name 'out.restore-*' 2>/dev/null | wc -l | tr -d ' ')
 [ "$MMLEFTOVER" = "0" ] \
@@ -192,27 +237,9 @@ for i in $(seq 1 "$FN"); do
 done
 cb "$PRIMARY" snapshot "${FDIRARGS[@]}" --recipient "$PRIMARY/recipient.txt" --scan-secrets off \
   --out "$FTMP/v.age" >/dev/null
-mkdir -p "$FTMP/out"
-mkfifo "$FTMP/out/.cypher-brain-restore-INCOMPLETE"
-CYPHER_BRAIN_HOME="$PRIMARY" node "${BIN_DEV_ARGS[@]}" "$BIN" restore --in "$FTMP/v.age" --out-dir "$FTMP/out" >/dev/null 2>&1 &
-FPID=$!
-FLANDED=0
-FDEADLINE=$((SECONDS + 120)) # same wall-clock deadline as the #721 block above
-while [ "$SECONDS" -lt "$FDEADLINE" ]; do
-  kill -0 "$FPID" 2>/dev/null || break
-  FCOUNT=$(find "$FTMP/out" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
-  if [ "$FCOUNT" -gt 1 ] && [ "$FCOUNT" -lt "$((FN + 1))" ]; then
-    FLANDED=1
-    kill -TERM "$FPID"
-    break
-  fi
-  sleep 0.01
-done
-if [ "$FLANDED" != "1" ]; then
-  echo "[FAIL] restore never observed in a mid-merge state within 120 s (test setup) — try a larger FN"
-  kill -9 "$FPID" 2>/dev/null || true
-  exit 1
-fi
+reseed_f() { rm -rf "$FTMP/out"; mkdir -p "$FTMP/out"; mkfifo "$FTMP/out/.cypher-brain-restore-INCOMPLETE"; }
+RESEED=reseed_f land_sigterm_mid_merge "$FTMP/v.age" "$FTMP/out" 1 "$((FN + 1))" "$FTMP/restore.err"
+FPID=$MMPID
 # Bounded wait for exit, NOT an unbounded `wait`: the whole point being tested is that
 # the handler must NOT hang, so this loop (not `wait` itself) is what turns "still
 # blocked in open()" into an observable, non-hanging [FAIL] instead of wedging this
