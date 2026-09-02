@@ -925,6 +925,19 @@ printf '%s' "$OUT2" | grep -qi "CYPHER_BRAIN_YES\|--yes" \
   && { echo "[FAIL] CYPHER_BRAIN_YES=1 still hitting the --yes gate"; echo "$OUT2"; exit 1; } || true
 echo "[PASS] push arweave with CYPHER_BRAIN_YES=1 passes the --yes guard (fails further in: wallet/SDK)"
 
+# #794: CYPHER_BRAIN_YES=0 (or any other non-'1' spelling) must NOT pass the guard —
+# `!!'0'` is true in JS, so a naive `!!readEnv(...)` implementation silently grants
+# consent to the exact spelling an operator would use to mean "explicitly off". This is
+# a RED/GREEN regression test: reverting config.ts's CIPHER_YES to `!!readEnv(...)`
+# reproduces the gate being (wrongly) skipped for CYPHER_BRAIN_YES=0.
+set +e
+OUT_YES0=$(env "${AR_OFFLINE[@]}" CYPHER_BRAIN_YES=0 node "${BIN_DEV_ARGS[@]}" "$BIN" push --in "$TMP/snap.age" --backend arweave 2>&1); RC_YES0=$?
+set -e
+[ "$RC_YES0" != "0" ] || { echo "[FAIL] arweave push should fail (no wallet in test env)"; exit 1; }
+printf '%s' "$OUT_YES0" | grep -qi "re-run push with --yes" \
+  || { echo "[FAIL] #794 regression: CYPHER_BRAIN_YES=0 passed the consent gate (JS truthiness)"; echo "$OUT_YES0"; exit 1; }
+echo "[PASS] #794: push arweave with CYPHER_BRAIN_YES=0 still hits the --yes consent gate"
+
 echo "== issue #211: estimate --json prints the SAME CostEstimate object as one JSON line, human output unchanged =="
 # Capture the full output first (command substitution reads to EOF) rather than
 # piping the live process into `grep -q`, which can close its end of the pipe the
