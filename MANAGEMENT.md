@@ -535,6 +535,11 @@ pipes to a tool that does, or you wire your own healthcheck around it.)
 
 ## MCP snapshot policy
 
+> **Upgrading an existing MCP setup?** This is a breaking change, and the only one in
+> its release. A server that worked before will now refuse **every** `snapshot_now` call
+> with `ERR_POLICY_DENIED` / `CB-E025` until you set both variables below and restart it.
+> Nothing else — the CLI, the nightly schedule, every other MCP tool — is affected.
+
 If you run `cypher-brain-mcp` (the stdio MCP server), `snapshot_now` is **fail-closed**
 until you configure two things in that server's own environment (issue #800). The CLI is
 unaffected — this is an MCP-only policy, because over MCP the caller is an AI agent this

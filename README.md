@@ -198,6 +198,12 @@ stored object and no idempotency record:
   which directories are snapshottable has authorized none of them. A call that snapshots
   only `pg` needs no roots.
 
+**Upgrading breaks an existing MCP setup until you configure it.** Neither variable has a
+default that lets a call through, deliberately — so a server that worked before will refuse
+every `snapshot_now` call with `ERR_POLICY_DENIED` / `CB-E025` until an operator sets both
+and restarts it. That is the breaking part of this change, and the only one; the CLI, the
+nightly schedule and every other MCP tool are unaffected.
+
 A replay is not grandfathered: a call recorded under an `idempotency_key` while the
 policy allowed it is refused once the policy no longer does. The refusal is
 `ERR_POLICY_DENIED` / `CB-E025`, and it names the variable to fix — an agent cannot

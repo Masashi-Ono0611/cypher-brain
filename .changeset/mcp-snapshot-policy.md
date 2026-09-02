@@ -2,9 +2,11 @@
 'cypher-brain': minor
 ---
 
-The MCP server's `snapshot_now` tool is now fail-closed (#800), and needs two settings
-before it will run. This changes the default behaviour of an existing MCP setup; the CLI
-`snapshot` is untouched.
+**Breaking for existing MCP setups.** The MCP server's `snapshot_now` tool is now
+fail-closed (#800): a server that worked before will refuse **every** `snapshot_now` call
+with `ERR_POLICY_DENIED` / `CB-E025` until an operator sets both variables below in its
+environment and restarts it. The CLI `snapshot`, the nightly schedule and every other MCP
+tool are untouched.
 
 `snapshot_now` is the one tool where the caller — an AI agent this server's own threat
 model treats as untrusted — picked both the plaintext (`dirs`) and the key it is
