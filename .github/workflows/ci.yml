@@ -40,7 +40,12 @@ jobs:
           - os: macos-latest
             node: '22'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # 30, not 15: the verify step is ~40 serial selftests (#607) and the ubuntu-22 cell
+    # measured 12-15 min on main between 2026-09-01 and 09-02, then crossed 15 min on
+    # 2026-09-02 (run 33584921696: 15.2 min -> job 'cancelled' by the timeout while the
+    # other two cells passed). A cancelled cell is indistinguishable from a real failure
+    # in the required-checks view, so the cap needs headroom until #607 splits the suite.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

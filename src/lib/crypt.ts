@@ -26,6 +26,7 @@ import {
 import { AGE_MAGIC, AGE_ARMOR_HEADER, readEnv } from './config.js';
 import { ACTIVE_CHILDREN } from './proc.js';
 import { installEpipeGuard } from './ui.js';
+import { installStageSignalGuard, setActiveRawInputRestore } from './signal-guard.js';
 import { errMsg, warnIfLooseKeyPerms } from './util.js';
 
 // #228: this file's StrykerJS mutation run (`npm run mutation-test`) is deliberately
@@ -243,10 +244,16 @@ function promptHidden(question: string): Promise<string> {
     // uncaught EPIPE into a process crash mid-prompt).
     installEpipeGuard();
     const { stdin } = process;
-    if (!stdin.isTTY) {
+    // #739: the prompt itself renders on stderr (see the write just below), not
+    // stdin — a caller with an interactive stdin TTY but a redirected/piped stderr
+    // (e.g. `keygen --passphrase 2>setup.log`) would otherwise pass this check,
+    // enter raw mode, and sit there waiting on input the user can never see (the
+    // command just looks hung). Require BOTH streams to be a TTY before ever
+    // writing the prompt or touching raw mode.
+    if (!stdin.isTTY || !process.stderr.isTTY) {
       return reject(
         new Error(
-          'a passphrase is required but stdin is not a TTY — set CYPHER_BRAIN_PASSPHRASE for non-interactive use',
+          'a passphrase prompt requires both stdin and stderr to be a TTY (the prompt renders on stderr) — set CYPHER_BRAIN_PASSPHRASE for non-interactive use',
         ),
       );
     }
@@ -255,9 +262,40 @@ function promptHidden(question: string): Promise<string> {
     stdin.setRawMode(true);
     stdin.resume();
     let buf = '';
+    let settled = false;
+    // #738: a SIGTERM/SIGHUP mid-prompt (a service supervisor stopping the process,
+    // or a hung-up controlling terminal) previously tore the process down without
+    // ever reaching cleanup() below — restoration was reachable only from the
+    // Enter/Ctrl-C data branches. Register a restore callback with the shared
+    // signal-guard (installStageSignalGuard is idempotent, and this is the SAME
+    // SIGINT/SIGTERM/SIGHUP handler every other "must restore state before this
+    // process dies" resource in the CLI already uses) for the exact span this
+    // raw-mode read is pending, cleared the instant cleanup() runs the normal way.
+    // stdin ending/closing/erroring (the other end of the tty going away) is the
+    // non-signal half of the same hazard, handled below via onStreamEnd/
+    // onStreamError instead of the signal guard.
+    installStageSignalGuard();
+    setActiveRawInputRestore(() => {
+      try {
+        stdin.setRawMode(wasRaw);
+      } catch {}
+    });
     const cleanup = () => {
+      if (settled) return;
+      settled = true;
       stdin.off('data', onData);
-      stdin.setRawMode(wasRaw);
+      stdin.off('end', onStreamEnd);
+      stdin.off('close', onStreamEnd);
+      stdin.off('error', onStreamError);
+      setActiveRawInputRestore(null);
+      // Codex review: guard, don't let this throw skip pause()/the trailing newline
+      // (and, via onStreamError/onStreamEnd, the reject() right after this call) — the
+      // exact broken-stdin conditions those two handlers exist for are also the ones
+      // where the native setRawMode() binding can itself throw (e.g. the fd is no
+      // longer a valid tty).
+      try {
+        stdin.setRawMode(wasRaw);
+      } catch {}
       stdin.pause();
       process.stderr.write('\n');
     };
@@ -278,7 +316,18 @@ function promptHidden(question: string): Promise<string> {
         buf += ch;
       }
     };
+    const onStreamEnd = () => {
+      cleanup();
+      reject(new Error('stdin closed while waiting for a passphrase'));
+    };
+    const onStreamError = (e: Error) => {
+      cleanup();
+      reject(e);
+    };
     stdin.on('data', onData);
+    stdin.on('end', onStreamEnd);
+    stdin.on('close', onStreamEnd);
+    stdin.on('error', onStreamError);
   });
 }
 

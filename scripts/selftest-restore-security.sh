@@ -177,4 +177,88 @@ cb restore --in "$TMP/m-second.age" --out-dir "$OUT_MERGE" >/dev/null
 echo "[PASS] mergeNoClobber refuses to recurse through a pre-existing symlink; no write escaped out-dir"
 
 echo
+echo "== (q) #784: mergeNoClobber() moves with exclusive-create primitives, not check-then-act rename() =="
+
+# What this section proves and what it does NOT.
+#
+# The defect #784 fixes is a RACE: mergeNoClobber() used to decide a destination name was
+# free with lstat() and then act on that decision with rename(), which REPLACES an
+# existing destination — so anything created in between was silently overwritten. There is
+# no in-process hook to widen that window from a shell script, so this section does not
+# (and cannot honestly claim to) demonstrate the race closing. It proves the two things
+# that ARE observable from out here:
+#
+#   1. the primitives the fix relies on behave on THIS filesystem as the fix assumes —
+#      rename() replaces an occupied destination while link()/symlink()/mkdir() refuse it.
+#      Without this, the fix would be an untested assumption about the platform.
+#   2. rewriting the move from one rename() into per-kind link/symlink/mkdir did not
+#      change any observable merge behaviour: every entry kind still lands, with content,
+#      link-ness and directory modes intact, and a colliding name is still left untouched.
+#      This is a regression guard for the rewrite; it passes on the pre-fix code too.
+
+node -e '
+const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+const d = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "cb-prim-"));
+const fail = (m) => { console.error(m); process.exit(1); };
+// rename() onto an occupied destination: silently replaces (this is the defect).
+fs.writeFileSync(path.join(d, "s1"), "new"); fs.writeFileSync(path.join(d, "d1"), "OLD");
+fs.renameSync(path.join(d, "s1"), path.join(d, "d1"));
+if (fs.readFileSync(path.join(d, "d1"), "utf8") !== "new") fail("rename() did NOT replace an occupied destination — this platform does not match what the fix assumes");
+// link() onto an occupied destination: EEXIST (this is the fix).
+fs.writeFileSync(path.join(d, "s2"), "new"); fs.writeFileSync(path.join(d, "d2"), "OLD");
+try { fs.linkSync(path.join(d, "s2"), path.join(d, "d2")); fail("link() replaced an occupied destination instead of failing EEXIST"); }
+catch (e) { if (e.code !== "EEXIST") fail("link() onto an occupied destination failed with " + e.code + ", expected EEXIST"); }
+if (fs.readFileSync(path.join(d, "d2"), "utf8") !== "OLD") fail("link() disturbed the occupied destination");
+// symlink() and mkdir() onto an occupied destination: EEXIST.
+try { fs.symlinkSync("whatever", path.join(d, "d2")); fail("symlink() replaced an occupied destination"); }
+catch (e) { if (e.code !== "EEXIST") fail("symlink() failed with " + e.code + ", expected EEXIST"); }
+try { fs.mkdirSync(path.join(d, "d2")); fail("mkdir() replaced an occupied destination"); }
+catch (e) { if (e.code !== "EEXIST") fail("mkdir() failed with " + e.code + ", expected EEXIST"); }
+fs.rmSync(d, { recursive: true, force: true });
+' || { echo "[FAIL] the exclusive-create primitives mergeNoClobber() now relies on do not behave as assumed on this filesystem"; exit 1; }
+echo "[PASS] positive control: rename() replaces an occupied destination here; link()/symlink()/mkdir() refuse it with EEXIST"
+
+# Contract regression: two restores into the same out-dir, the second one merging.
+make_age "$TMP/mc-first.tar" merge-contract-first "$TMP/mc-first.age"
+make_age "$TMP/mc-second.tar" merge-contract-second "$TMP/mc-second.age"
+OUT_MC="$TMP/out-merge-contract"
+cb restore --in "$TMP/mc-first.age" --out-dir "$OUT_MC" >/dev/null
+cb restore --in "$TMP/mc-second.age" --out-dir "$OUT_MC" >/dev/null
+# The archive records newdir at 0500; read the mode the merge actually produced BEFORE
+# widening anything, then widen so a failure below cannot also break this script's own
+# EXIT trap (removing entries under a 0500 directory needs write on it).
+MC_MODE=$(node -e 'process.stdout.write((require("node:fs").lstatSync(process.argv[1]).mode & 0o777).toString(8))' "$OUT_MC/newdir")
+# Same for the directory's mtime: the old whole-directory rename() carried the archive's
+# timestamps along with the inode, mkdir() does not. The fixtures record epoch-0 mtimes,
+# so an unrestored timestamp shows up as "now" — decades away, no tolerance needed.
+MC_MTIME=$(node -e 'process.stdout.write(String(Math.round(require("node:fs").lstatSync(process.argv[1]).mtimeMs)))' "$OUT_MC/newdir")
+chmod -R u+rwX "$OUT_MC"
+
+[ "$(cat "$OUT_MC/collide.txt")" = "ORIGINAL-MUST-SURVIVE" ] \
+  || { echo "[FAIL] the merge overwrote a name that already existed in out-dir"; exit 1; }
+[ "$(cat "$OUT_MC/keep/fresh.txt")" = "merged-into-existing-dir" ] \
+  || { echo "[FAIL] a new file was not merged into a directory that existed on both sides"; exit 1; }
+[ "$(cat "$OUT_MC/keep/existing.txt")" = "first-restore-content" ] \
+  || { echo "[FAIL] the first restore's file inside the merged directory was disturbed"; exit 1; }
+[ "$(cat "$OUT_MC/newdir/nested/deep.txt")" = "deep-merged" ] \
+  || { echo "[FAIL] a new nested directory tree did not survive the merge"; exit 1; }
+[ -L "$OUT_MC/newlink" ] || { echo "[FAIL] a symlink entry was not recreated as a symlink by the merge"; exit 1; }
+[ "$(readlink "$OUT_MC/newlink")" = "keep/existing.txt" ] \
+  || { echo "[FAIL] the merged symlink points at $(readlink "$OUT_MC/newlink"), expected keep/existing.txt"; exit 1; }
+echo "[PASS] every entry kind still merges (new file, new nested tree, symlink) and a colliding name is still left untouched"
+
+# The archive records newdir at 0500. The old code moved a not-yet-existing directory
+# with one whole-tree rename(), which preserved that mode for free; the new code creates
+# it with mkdir() and has to put the mode back deliberately, AFTER its children have been
+# moved in (a 0500 directory cannot be written into). This is the assertion that catches
+# it if that chmod is dropped or moved ahead of the recursion.
+[ "$MC_MODE" = "500" ] \
+  || { echo "[FAIL] the merged directory landed at mode 0$MC_MODE, expected 0500 (the mode the archive recorded)"; exit 1; }
+echo "[PASS] the merged directory's recorded mode is applied to the destination, not left at the process umask"
+
+[ "$MC_MTIME" = "0" ] \
+  || { echo "[FAIL] the merged directory's mtime is $MC_MTIME ms, expected the archive's 0 (mkdir left it at 'now' instead of restoring it)"; exit 1; }
+echo "[PASS] the merged directory keeps the archive's mtime, as the old whole-directory rename() did"
+
+echo
 echo "RESTORE-SECURITY SELFTEST PASS"
