@@ -14,6 +14,7 @@ import { readPlanFile, validatePlan } from './plan.js';
 import { appendReceipt } from './receipt.js';
 import { recordAudit } from './audit.js';
 import { warn } from './warn.js';
+import { UsageError } from './errors.js';
 import type { CliOptions, ReceiptEvent } from './types.js';
 import type { SpendTracker } from './spend-tracker.js';
 import {
@@ -230,10 +231,13 @@ async function resolveSkipUnchanged(
 // value). Refused here, before backendFor()/put() ever runs, so the mistake is caught
 // at the point it was made — e.g. an operator copy-pasting a push invocation between
 // backends (rclone -> file for a quick local test) and forgetting to drop --remote.
+// #779: UsageError — a flag-combination refusal is the same "command line itself was
+// malformed" class as an unrecognized command/enum value or a missing required flag,
+// pure argument validation with no I/O involved.
 function assertRemoteRequiresRcloneBackend(o: CliOptions): void {
   if (o.remote === undefined) return;
   if (o.backend === 'rclone') return;
-  throw new Error(
+  throw new UsageError(
     `--remote <name>:<path> only applies to --backend rclone (it is the rclone destination "<remote>:<path>" that backend's put() writes to) — ` +
       `this run's --backend is "${o.backend}", which does not read --remote. ` +
       `Use --backend rclone to actually use --remote, or drop --remote if you meant --backend ${o.backend} on its own.`,
@@ -262,7 +266,7 @@ function assertRemoteRequiresRcloneBackend(o: CliOptions): void {
 function assertDigestRequiresSaveLocator(o: CliOptions): void {
   if (!o.digest) return;
   if (o.save_locator) return;
-  throw new Error(
+  throw new UsageError(
     `--digest <hex> only applies with --save-locator <file> (it becomes the content_digest THIS push records there, read back by a later --skip-unchanged run) — ` +
       `no --save-locator was given, so --digest would otherwise be silently ignored. ` +
       `Add --save-locator <file>, or drop --digest if you did not mean to seed a future --skip-unchanged comparison.`,
@@ -285,8 +289,9 @@ function displayLocator(backend: string, locator: string): string {
 async function pushCore(
   o: CliOptions,
 ): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
-  if (!o.in) throw new Error('--in <file.age> required');
-  if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton> required'); // no silent default
+  // #779: a required flag simply being absent is the same UsageError class as above.
+  if (!o.in) throw new UsageError('--in <file.age> required');
+  if (!o.backend) throw new UsageError('--backend <file|arweave|turbo|rclone|ton> required'); // no silent default
   assertRemoteRequiresRcloneBackend(o); // #655 — see the function's own doc comment (supersedes #658's warn-only version, since a hard refusal here makes that warn path unreachable)
   assertDigestRequiresSaveLocator(o); // #723 — see the function's own doc comment
   await requireFile(o.in); // #267: one shared check/wording across every command
@@ -791,7 +796,9 @@ export async function pull(o: CliOptions): Promise<void> {
   // operator to know that the two happen to be interchangeable for this backend.
   // An explicit --locator still wins if both are somehow given.
   if (o.backend === 'rclone' && !o.locator && o.remote) o.locator = o.remote;
-  if (!o.backend) throw new Error('--backend <file|arweave|turbo|rclone|ton> required');
+  // #779: required-flag-missing is the same UsageError class as pushCore()'s own
+  // --in/--backend checks above.
+  if (!o.backend) throw new UsageError('--backend <file|arweave|turbo|rclone|ton> required');
   // #677: reciprocal of push's own #655 refusal (assertRemoteRequiresRcloneBackend,
   // above) — pull's rclone-locator shortcut just above only CONSUMES --remote when
   // --backend IS rclone; for every other backend it was silently dropped with zero
@@ -805,8 +812,9 @@ export async function pull(o: CliOptions): Promise<void> {
   // when those are ALSO missing. --locator is still checked before --out, preserving
   // their original relative order (unrelated to this fix) for every other case.
   assertRemoteRequiresRcloneBackend(o);
-  if (!o.locator) throw new Error('--locator <id> required (or --from-locator-file <path>, or --remote for rclone)');
-  if (!o.out) throw new Error('--out <file.age> required');
+  if (!o.locator)
+    throw new UsageError('--locator <id> required (or --from-locator-file <path>, or --remote for rclone)');
+  if (!o.out) throw new UsageError('--out <file.age> required');
   // No-clobber (#107): refuse to overwrite an existing --out by default. wizard.ts's
   // printed recovery command reuses a FIXED path ("~/restored.age"), so a second pull
   // (a different backup, or a re-run of the recovery steps) would otherwise destroy

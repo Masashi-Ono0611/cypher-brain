@@ -23,6 +23,7 @@ import { warn } from './warn.js';
 import { arUsdRate, turboUsdRate, usdApprox, tonUsdRate } from './estimate.js';
 import { printJson } from './ui.js';
 import { didYouMean, nearestName } from './suggest.js';
+import { UsageError } from './errors.js';
 import type { CliOptions } from './types.js';
 import type { WalletContractV4 as TonWalletContractV4 } from '@ton/ton';
 
@@ -488,9 +489,11 @@ async function walletBalance(o: CliOptions): Promise<void> {
 // arweave branches below — their sub-verb set is identical, so a single helper keeps
 // the two switches from drifting on this message the way #300's header warns against.
 const WALLET_SUBCOMMANDS = ['create', 'address', 'balance'];
-function unknownWalletSubcommand(got: string | undefined): Error {
+// #779: UsageError — a mistyped sub-verb is a parser-level refusal (exit 2 via
+// cli.ts's main().catch(), not the generic-failure 1).
+function unknownWalletSubcommand(got: string | undefined): UsageError {
   const suggestion = got ? nearestName(got, WALLET_SUBCOMMANDS) : undefined;
-  return new Error(
+  return new UsageError(
     `wallet: expected create | address | balance, got: ${got || '(nothing)'}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`,
   );
 }
@@ -499,8 +502,9 @@ export async function wallet(o: CliOptions): Promise<void> {
   const chain = o.chain || 'arweave';
   if (chain !== 'arweave' && chain !== 'ton') {
     // #435: --chain is itself an enum-valued flag, same class as --level/--backend below.
+    // #779: UsageError, same reasoning as unknownWalletSubcommand() above.
     const suggestion = nearestName(chain, ['arweave', 'ton']);
-    throw new Error(
+    throw new UsageError(
       `wallet: --chain must be arweave or ton, got: ${JSON.stringify(chain)}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`,
     );
   }

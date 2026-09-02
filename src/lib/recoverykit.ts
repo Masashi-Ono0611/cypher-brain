@@ -31,6 +31,7 @@ import { promoteNoClobber, readSavedLocatorLine } from './pushpull.js';
 import type { CliOptions } from './types.js';
 import { exists, redactPgConn } from './util.js';
 import { warn } from './warn.js';
+import { UsageError } from './errors.js';
 
 export interface BackupKey {
   identityPath: string;
@@ -333,14 +334,17 @@ export async function writeRecoveryKitFile(path: string, text: string, opts: { c
 /** `cypher-brain recovery-kit` (#364) — regenerate the kit for the CURRENT latest
  *  push, from a save-locator file + on-disk key material. CLI-only (see file header). */
 export async function recoveryKit(o: CliOptions): Promise<void> {
+  // #779: a missing required flag or an invalid flag combination, with no I/O
+  // involved in the check itself, is the same "command line itself was malformed"
+  // UsageError class as an unrecognized command/enum value.
   if (!o.from_locator_file) {
-    throw new Error(
+    throw new UsageError(
       '--from-locator-file <path> required — the kit points a future restore at ONE specific push; name the ' +
         'save-locator file that push wrote (push --save-locator <file>)',
     );
   }
   if (o.backup_recipient && !o.backup_identity) {
-    throw new Error('--backup-recipient only makes sense WITH --backup-identity — pass both, or neither');
+    throw new UsageError('--backup-recipient only makes sense WITH --backup-identity — pass both, or neither');
   }
   const saved = await readSavedLocatorLine(o.from_locator_file);
   if (!saved) {

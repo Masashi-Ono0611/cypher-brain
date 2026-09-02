@@ -5,7 +5,7 @@
 // message, deliberately, so the existing throw sites (296, as of writing) stay untouched
 // (#212). The cost is stated in that file's own header: rewording a message can silently
 // stop a pattern matching, "with no compiler or test to catch it". At least a dozen of
-// the registry's 23 codes (as of writing — see src/lib/errors.ts's ERROR_CODES for the
+// the registry's 24 codes (as of writing — see src/lib/errors.ts's ERROR_CODES for the
 // current, authoritative count) are exercised end-to-end somewhere: CB-E001, CB-E002,
 // CB-E005, CB-E007, CB-E008, CB-E009, CB-E010, CB-E013, CB-E014, CB-E015, CB-E016, and
 // CB-E017, across selftest.sh, selftest-storage.sh, selftest-verify-levels.sh,
@@ -192,4 +192,78 @@ console.log(`[PASS] all ${checked} assertable CB-E### patterns still match a lit
 if (skipped.length) {
   console.log(`[SKIP] ${skipped.length} upstream-worded pattern(s) not asserted (by design): ${skipped.join(', ')}`);
 }
+
+// #781: CB-E007's pattern used to be broad enough (`/spends real funds/`) to ALSO
+// match two different "the spend cap isn't configured" refusals (schedule.ts's
+// ton-provider schedule-install check, backends/ton-provider.ts's push-time check),
+// so an agent/human reading `code: CB-E007` off either got the wrong remedy —
+// CB-E007's own title says "pass --yes", which does nothing for an unset
+// CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND. The literal-presence loop above only proves
+// each pattern's substring exists SOMEWHERE in src/; it cannot catch that kind of
+// overlap, because it never asks which code a REAL message resolves to
+// (matchErrorCode() — src/lib/errors.ts — returns the FIRST entry in ERROR_CODES
+// whose pattern matches, so two patterns matching the same string is a silent
+// mis-attribution, not a parse error). These fixtures exercise that resolution
+// directly: one positive case per code (CB-E007's own consent wording still
+// resolves to CB-E007), and two negative/positive pairs proving the two
+// spend-cap-not-configured messages now resolve to CB-E024 instead of shadowing
+// back onto CB-E007's old broad pattern.
+//
+// Reuses the SAME regex bodies+flags already present in errors.ts's source (parsed
+// fresh here, independent of the `entries`/`checked` loop above, so this addition
+// cannot perturb that loop's counts) — kept runnable under plain node like the rest
+// of this file, no TS loader/build step required.
+const FIXTURE_ENTRY_RE = /code: '(CB-E\d+)',\s*\n\s*title: '[^']*',\s*\n\s*pattern: \/(.*?)\/([a-z]*),/g;
+const compiled = [...src.matchAll(FIXTURE_ENTRY_RE)].map((m) => ({ code: m[1], re: new RegExp(m[2], m[3]) }));
+if (compiled.length !== declared) {
+  fail(
+    `fixture pass parsed ${compiled.length} of ${declared} entries — FIXTURE_ENTRY_RE fell out of sync with entryRe`,
+  );
+}
+const firstMatch = (message) => compiled.find(({ re }) => re.test(message))?.code;
+
+const FIXTURES = [
+  {
+    label: 'CB-E007 positive: push() arweave/turbo consent refusal',
+    message:
+      'arweave: uploading to a permanent Arweave store spends real funds — re-run push with --yes or set CYPHER_BRAIN_YES=1 in the environment to confirm',
+    expect: 'CB-E007',
+  },
+  {
+    label: 'CB-E007 positive: push() ton-provider consent refusal',
+    message:
+      'ton-provider: deploying a TON Storage contract to a paid provider spends real funds — re-run push with --yes or set CYPHER_BRAIN_YES=1 in the environment to confirm (a human must still sign the resulting Tonkeeper deeplink — set CYPHER_BRAIN_TON_WALLET to auto-sign instead)',
+    expect: 'CB-E007',
+  },
+  {
+    label: 'CB-E007 positive: MCP snapshot_now spend gate (src/mcp.ts, mcp-smoke.mjs asserts this one)',
+    message:
+      'backend "turbo" is a PAID, PERMANENT Arweave store — pushing spends real funds irreversibly. Re-call snapshot_now with confirm_paid=true to consent (the MCP equivalent of the CLI --yes guard). The CYPHER_BRAIN_YES environment escape hatch is not honored over MCP, so no call can spend without this flag.',
+    expect: 'CB-E007',
+  },
+  {
+    label: 'CB-E024 positive (was misclassified as CB-E007): schedule.ts spend-cap-not-configured',
+    message:
+      'ton-provider is a paid store: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) must be set in the environment before install — a StorageV1 deploy spends real funds, so there is no safe default to let an unattended schedule run uncapped through',
+    expect: 'CB-E024',
+  },
+  {
+    label: 'CB-E024 positive (was misclassified as CB-E007): backends/ton-provider.ts spend-cap-not-configured',
+    message:
+      'ton-provider backend: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND must be set to a positive nanoTON amount (a StorageV1 deploy spends real funds) — see `estimate --backend ton-provider` for a preview first',
+    expect: 'CB-E024',
+  },
+];
+
+for (const { label, message, expect } of FIXTURES) {
+  const got = firstMatch(message);
+  if (got !== expect) {
+    fail(
+      `${label}: expected ${expect}, got ${got ?? '(no match)'} for message ${JSON.stringify(message)} — ` +
+        `CB-E007/CB-E024 patterns are overlapping again`,
+    );
+  }
+}
+console.log(`[PASS] ${FIXTURES.length} CB-E007/CB-E024 fixtures resolve to the expected code (#781)`);
+
 console.log('ERROR CODE PATTERNS: PASS');

@@ -24,6 +24,7 @@ import { errMsg, exists, rmrf, sdkImportAdvice, sleep } from './util.js';
 import { warn } from './warn.js';
 import { installStageSignalGuard, addActiveTonTmpDir, removeActiveTonTmpDir } from './signal-guard.js';
 import { readSavedLocatorLine } from './pushpull.js';
+import { UsageError } from './errors.js';
 import { bagIdFrom, tonLocator } from './backends/ton.js';
 import { tonAdd, tonDetails, startLocalTonDaemon } from './backends/ton-client.js';
 import type { CliOptions } from './types.js';
@@ -53,9 +54,12 @@ const DNS_UPDATE_GAS_NANO = 20_000_000n; // 0.02 TON
 // way to a confusing tonapi 404.
 const DOMAIN_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.ton$/;
 
+// #779: UsageError — a flag's value failing its own format validation, with no I/O
+// involved in the check, is the same "command line itself was malformed" class as an
+// unrecognized command/enum value or a missing required flag.
 function validateDomain(domain: string): void {
   if (!DOMAIN_RE.test(domain)) {
-    throw new Error(
+    throw new UsageError(
       `--domain must be a lowercase .ton domain (dot-separated labels of [a-z0-9-], ending in ".ton", e.g. "myname.ton") — got ${JSON.stringify(domain)}`,
     );
   }
@@ -69,13 +73,13 @@ const MAX_WAIT_SECONDS = 86_400;
 function parseWaitSeconds(raw: string | undefined): number {
   if (raw === undefined) return 0;
   if (!/^\d+$/.test(raw)) {
-    throw new Error(
+    throw new UsageError(
       `--wait must be a non-negative whole number of seconds (0-${MAX_WAIT_SECONDS}) — got ${JSON.stringify(raw)}`,
     );
   }
   const n = Number(raw);
   if (n > MAX_WAIT_SECONDS) {
-    throw new Error(`--wait must be at most ${MAX_WAIT_SECONDS} seconds (24h) — got ${raw}`);
+    throw new UsageError(`--wait must be at most ${MAX_WAIT_SECONDS} seconds (24h) — got ${raw}`);
   }
   return n;
 }
@@ -290,10 +294,13 @@ async function probeInto(tmpRoot: string, bagId: string, deadline: number): Prom
 }
 
 export async function publishLatest(o: CliOptions): Promise<void> {
-  if (!o.domain) throw new Error('--domain <name>.ton required');
+  // #779: a required flag simply being absent is the same UsageError class as
+  // validateDomain()/parseWaitSeconds() above.
+  if (!o.domain) throw new UsageError('--domain <name>.ton required');
   validateDomain(o.domain);
   const waitS = parseWaitSeconds(o.wait);
-  if (!o.from_locator_file) throw new Error('--from-locator-file <path> required (written by push --save-locator)');
+  if (!o.from_locator_file)
+    throw new UsageError('--from-locator-file <path> required (written by push --save-locator)');
   // #482: distinguish "file missing" from "file has no valid locator" — same two
   // failure modes pull's --from-locator-file already separates (pushpull.ts, pull()),
   // instead of collapsing both into readSavedLocatorLine's generic null.
