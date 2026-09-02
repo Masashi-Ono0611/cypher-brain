@@ -81,10 +81,15 @@ export interface ErrorCodeEntry {
   readonly assertLiterals?: readonly string[];
 }
 
-// The doc anchor every annotated message points readers at. Keep in sync with the
-// "## Error codes" heading in MANAGEMENT.md (GitHub renders that heading's anchor as
-// exactly this slug).
-export const ERROR_DOC_REF = 'MANAGEMENT.md#error-codes';
+// The doc anchor every annotated message points readers at — a full GitHub URL rather
+// than a bare relative filename (#727). MANAGEMENT.md is NOT part of the published npm
+// package (package.json's `files` ships only `dist`; `npm pack --dry-run` confirms the
+// tarball holds just LICENSE/README.md/dist/package.json), so an agent or human running
+// the server via `npx`/a global install who followed a relative "MANAGEMENT.md" pointer
+// found no such file anywhere near the installed package. Keep the "MANAGEMENT.md#error-
+// codes" suffix in sync with the "## Error codes" heading in MANAGEMENT.md (GitHub
+// renders that heading's anchor as exactly this slug).
+export const ERROR_DOC_REF = 'https://github.com/Masashi-Ono0611/cypher-brain/blob/main/MANAGEMENT.md#error-codes';
 
 // Order is not currently significant (no two patterns below can both match the same
 // message), but new entries should stay specific enough to keep it that way — prefer a
