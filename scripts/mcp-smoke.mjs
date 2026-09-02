@@ -101,7 +101,19 @@
 // Exits 0 on success, 1 on any failure with a descriptive message on stderr.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, stat } from 'node:fs/promises';
+import {
+  mkdtemp,
+  mkdir,
+  writeFile,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  realpath,
+  chmod,
+  open,
+} from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -135,6 +147,8 @@ async function main() {
     await run(tmp);
     await runKeygenWalletTests(tmp);
     await runScheduleStatusNotInstalledTest(tmp);
+    await runPaidConsentDescriptionTest(tmp);
+    await runCleanupFailurePreservesOutcomeTest(tmp);
     await runIdempotencyTtlTest(tmp);
     await runIdempotencyTtlValidationTest(tmp);
     await runMaxSpendValidationTest(tmp);
@@ -803,12 +817,373 @@ async function runScheduleStatusNotInstalledTest(tmp) {
   }
 }
 
+// #796: snapshot_now's spend gate hard-coded "a PAID, PERMANENT Arweave store" for EVERY
+// member of PAID_BACKENDS — so a ton-provider push, whose data survives only while a
+// provider keeps renewing and serving the contract, told the operator at the consent
+// boundary that they were buying permanent Arweave storage. The tool DESCRIPTION had it
+// right; the sentence shown at the moment money is authorized did not, and that is the one
+// that has to be true.
+//
+// ton-provider only appears in the backend enum when a local TON wallet is configured
+// (tonWalletConfigured(), frozen at module load), so this needs its OWN server with
+// CYPHER_BRAIN_TON_WALLET pointed at a file. No TON network is touched: the consent gate
+// fires before any push work, which is the whole point of it being a gate.
+async function runPaidConsentDescriptionTest(tmp) {
+  const home5 = join(tmp, 'home-paid-consent');
+  const dataDir5 = join(tmp, 'paid-consent-src');
+  await mkdir(home5, { recursive: true });
+  await mkdir(dataDir5, { recursive: true });
+  await writeFile(join(dataDir5, 'note.txt'), 'paid consent description probe\n');
+  // Only its EXISTENCE is checked to decide whether ton-provider is offered; nothing here
+  // signs or spends, because the gate refuses first.
+  const tonWallet5 = join(tmp, 'paid-consent-ton-wallet.json');
+  await writeFile(tonWallet5, '{}\n');
+  const child5 = spawn(process.execPath, [SERVER_PATH], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CYPHER_BRAIN_HOME: home5, CYPHER_BRAIN_TON_WALLET: tonWallet5 },
+  });
+  const { send, waitFor } = makeRpcClient(child5);
+  try {
+    send({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'ci-smoke', version: '0.0.0' } },
+    });
+    await waitFor(1);
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    await wait(100);
+
+    // Precondition, asserted rather than assumed: if the wallet presence-check did not
+    // take, ton-provider is not in the enum and the call below would be refused by enum
+    // validation instead — a green test that never reached the gate at all.
+    send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+    const list5 = await waitFor(2);
+    const snapTool = (list5.result?.tools ?? []).find((t) => t.name === 'snapshot_now');
+    const backendEnum = snapTool?.inputSchema?.properties?.backend?.enum ?? [];
+    if (!backendEnum.includes('ton-provider')) {
+      throw new Error(
+        `ton-provider is not in snapshot_now's backend enum even with CYPHER_BRAIN_TON_WALLET set — this test ` +
+          `would not be exercising the spend gate at all: ${JSON.stringify(backendEnum)}`,
+      );
+    }
+
+    const args5 = {
+      dirs: [dataDir5],
+      recipients: ['age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p'],
+      out: join(tmp, 'paid-consent-probe.age'),
+    };
+    // ton-provider: must be refused, must NOT claim permanence, must NOT be described as
+    // Arweave, and must positively say the durability depends on the provider.
+    send({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: { name: 'snapshot_now', arguments: { ...args5, backend: 'ton-provider' } },
+    });
+    const tonGate = await waitFor(3);
+    const tonMsg = tonGate.result?.structuredContent?.message ?? '';
+    if (!tonGate.result?.isError || tonGate.result?.structuredContent?.code !== 'ERR_CONFIRM_REQUIRED')
+      throw new Error(`ton-provider spend gate is OFF: ${JSON.stringify(tonGate.result).slice(0, 400)}`);
+    // Matched on the CLAIM, not the words: "NOT permanent" and "Unlike arweave/turbo"
+    // legitimately contain both, and the bug was the assertion that this backend IS a
+    // permanent Arweave store. `(?<!NOT )` keeps the negated form from tripping it.
+    if (/(?<!NOT )permanent (arweave|store)/i.test(tonMsg) || /Arweave store/i.test(tonMsg))
+      throw new Error(
+        `ton-provider's consent text still claims PERMANENT / Arweave storage (#796 regression): ${JSON.stringify(tonMsg)}`,
+      );
+    if (!/NOT permanent/i.test(tonMsg) || !/provider/i.test(tonMsg))
+      throw new Error(
+        `ton-provider's consent text should say what it actually is — not permanent, provider-dependent: ${JSON.stringify(tonMsg)}`,
+      );
+    if (!/spends real funds/.test(tonMsg))
+      throw new Error(`ton-provider's consent text lost the "spends real funds" warning: ${JSON.stringify(tonMsg)}`);
+
+    // Control: arweave/turbo keep their (accurate) permanence claim, and each names
+    // ITSELF — proving the text is per-backend rather than one string with the backend
+    // name interpolated into it, which is what the bug was.
+    for (const [id, backend, mustSay] of [
+      [4, 'arweave', /PERMANENT Arweave store/],
+      [5, 'turbo', /Turbo bundler/],
+    ]) {
+      send({
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: { name: 'snapshot_now', arguments: { ...args5, backend } },
+      });
+      const gate = await waitFor(id);
+      const msg = gate.result?.structuredContent?.message ?? '';
+      if (!gate.result?.isError || gate.result?.structuredContent?.code !== 'ERR_CONFIRM_REQUIRED')
+        throw new Error(`${backend} spend gate is OFF: ${JSON.stringify(gate.result).slice(0, 400)}`);
+      if (!mustSay.test(msg))
+        throw new Error(`${backend}'s consent text should match ${mustSay}, got: ${JSON.stringify(msg)}`);
+    }
+
+    // Coverage, asserted rather than assumed (multi-model review, #796): EVERY paid backend
+    // the server actually offers must have its own recorded description, not the generic
+    // "no durability description recorded" fallback. Driven off the advertised enum, so a
+    // paid backend added later without a table entry fails here instead of silently
+    // shipping a consent message that declines to say what it is buying.
+    const paidFromEnum = backendEnum.filter((b) => b !== 'file');
+    if (paidFromEnum.length === 0) throw new Error('no paid backends in the enum — this coverage check is vacuous');
+    for (const backend of paidFromEnum) {
+      send({
+        jsonrpc: '2.0',
+        id: 6000 + paidFromEnum.indexOf(backend),
+        method: 'tools/call',
+        params: { name: 'snapshot_now', arguments: { ...args5, backend } },
+      });
+      const gate = await waitFor(6000 + paidFromEnum.indexOf(backend));
+      const msg = gate.result?.structuredContent?.message ?? '';
+      if (!gate.result?.isError || gate.result?.structuredContent?.code !== 'ERR_CONFIRM_REQUIRED')
+        throw new Error(
+          `${backend} is in the enum but its spend gate did not fire: ${JSON.stringify(gate.result).slice(0, 300)}`,
+        );
+      if (/no durability description recorded/.test(msg))
+        throw new Error(
+          `${backend} fell through to the generic paid-backend fallback — it needs its own entry in ` +
+            `PAID_BACKEND_CONSENT_DESCRIPTIONS (#796): ${JSON.stringify(msg)}`,
+        );
+    }
+
+    process.stdout.write(
+      `MCP SMOKE (paid consent descriptions): PASS — ton-provider refused WITHOUT a permanence/Arweave claim ` +
+        `and naming its provider dependency; arweave/turbo each keep their own accurate wording; all ` +
+        `${paidFromEnum.length} advertised paid backend(s) have a recorded description rather than the fallback\n`,
+    );
+  } finally {
+    try {
+      child5.stdin.end();
+    } catch {
+      /* ignore */
+    }
+    try {
+      child5.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// #793: verify_restore returned its verdict from INSIDE a try whose `finally` awaited
+// discardFetchDir(). A throw from a finally block replaces whatever the try was doing —
+// so a cleanup failure discarded a completed PASS, and (worse) discarded the
+// verification's OWN error, telling the caller the server broke rather than that an
+// artifact failed its integrity pin. handleRestoreNow already handled this correctly
+// (#650); the fix extracts that shape into helpers and applies it to all three sites.
+//
+// Forcing a real cleanup failure needs a window: TMPDIR must be writable when the server
+// mkdtemp's its fetch dir and NOT writable when it rmdir's it (rmdir needs write on the
+// PARENT — verified in isolation before this test was written on it). The window is
+// opened with a FIFO, not a sleep: `identity` points at one, so verify() blocks reading
+// it AFTER the pull has already created the fetch dir. Opening that FIFO for WRITING from
+// here does not return until the server has opened it for reading, which is a handshake
+// rather than a guess — at that instant the fetch dir provably exists, so TMPDIR can be
+// made read-only and the identity then fed through.
+//
+// Both prerequisites are checked rather than assumed, and a missing one SKIPS loudly
+// instead of passing: as root the chmod does not block anything, so the cleanup would
+// simply succeed and the assertions would fail for a reason that has nothing to do with
+// #793. GitHub-hosted runners are non-root and have mkfifo, so this runs in CI.
+async function runCleanupFailurePreservesOutcomeTest(tmp) {
+  if (process.getuid?.() === 0) {
+    process.stdout.write(
+      'MCP SMOKE (cleanup failure): SKIP — running as root, where chmod 0555 does not prevent writes, so the ' +
+        '#793 cleanup-failure window cannot be opened (this is BLOCKED, not PASS)\n',
+    );
+    return;
+  }
+  const home6 = join(tmp, 'home-cleanup-failure');
+  const store6 = join(tmp, 'store-cleanup-failure');
+  const data6 = join(tmp, 'data-cleanup-failure');
+  const serverTmp = join(tmp, 'tmpdir-cleanup-failure');
+  const outAge6 = join(tmp, 'cleanup-failure.age');
+  await mkdir(data6, { recursive: true });
+  await mkdir(store6, { recursive: true });
+  await mkdir(serverTmp, { recursive: true });
+  await writeFile(join(data6, 'hello.txt'), 'cleanup failure probe payload\n');
+
+  const cliPath = SERVER_PATH.replace(/mcp\.mjs$/, 'cli.mjs');
+  const cliEnv = { ...process.env, CYPHER_BRAIN_HOME: home6, CYPHER_BRAIN_FILE_DIR: store6 };
+  const runCli = (args) => {
+    const res = spawnSync(process.execPath, [cliPath, ...args], { env: cliEnv, encoding: 'utf8' });
+    if (res.status !== 0)
+      throw new Error(
+        `cleanup-failure setup: cypher-brain ${args[0]} failed (${res.status}): ${res.stderr || res.stdout}`,
+      );
+    return res.stdout.trim();
+  };
+  runCli(['keygen']);
+  const identityPath6 = join(home6, 'identity.age');
+  const identityText = await readFile(identityPath6, 'utf8');
+  runCli(['snapshot', '--dir', data6, '--out', outAge6, '--recipient', join(home6, 'recipient.txt')]);
+  const locator6 = runCli(['push', '--in', outAge6, '--backend', 'file']);
+  if (!locator6.endsWith('.age'))
+    throw new Error(`cleanup-failure setup: unexpected locator ${JSON.stringify(locator6)}`);
+
+  // mkfifo via the system binary — node:fs has no FIFO creation primitive.
+  const identityFifo = join(tmp, 'cleanup-failure-identity.fifo');
+  const mkfifo = spawnSync('mkfifo', ['-m', '600', identityFifo], { encoding: 'utf8' });
+  if (mkfifo.status !== 0) {
+    process.stdout.write(
+      `MCP SMOKE (cleanup failure): SKIP — mkfifo unavailable on this platform (${mkfifo.stderr?.trim() || mkfifo.error?.message}), ` +
+        'so the #793 cleanup-failure window could not be opened deterministically\n',
+    );
+    return;
+  }
+
+  const child6 = spawn(process.execPath, [SERVER_PATH], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...cliEnv, TMPDIR: serverTmp },
+  });
+  const { send, waitFor } = makeRpcClient(child6);
+  try {
+    send({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'ci-smoke', version: '0.0.0' } },
+    });
+    await waitFor(1);
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    await wait(100);
+
+    send({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: {
+        name: 'verify_restore',
+        arguments: { locator: locator6, backend: 'file', identity: identityFifo },
+      },
+    });
+
+    // Blocks until the server opens the FIFO for reading — the handshake described above.
+    const fifoHandle = await open(identityFifo, 'w');
+    try {
+      const fetchDirs = (await readdir(serverTmp)).filter((n) => n.startsWith('cypher-brain-mcp-'));
+      if (fetchDirs.length === 0) {
+        throw new Error(
+          'no cypher-brain-mcp-* fetch dir existed when the identity FIFO opened — the window this test needs ' +
+            'is not where it thinks it is, so a green result here would prove nothing',
+        );
+      }
+      await chmod(serverTmp, 0o555); // rmdir of the fetch dir now fails: its parent is unwritable
+      await fifoHandle.writeFile(identityText);
+    } finally {
+      await fifoHandle.close();
+    }
+
+    const res6 = await waitFor(2);
+    const sc6 = res6.result?.structuredContent;
+    // The assertion that fails against the pre-fix code: the verdict must survive.
+    if (res6.result?.isError)
+      throw new Error(
+        `verify_restore returned an ERROR because its fetch-dir CLEANUP failed — the completed verdict must ` +
+          `survive a cleanup failure (#793): ${JSON.stringify(res6.result).slice(0, 500)}`,
+      );
+    if (sc6?.verdict !== 'PASS' || sc6?.restorable_proven !== true)
+      throw new Error(
+        `verify_restore verdict lost after a cleanup failure (#793): ${JSON.stringify(sc6).slice(0, 500)}`,
+      );
+    // ...and the failure must not vanish either: it rides the result as a warning.
+    const warnings6 = Array.isArray(sc6?.warnings) ? sc6.warnings : [];
+    if (!warnings6.some((w) => /failed to clean up/.test(w))) {
+      throw new Error(
+        `the fetch-dir cleanup DID fail but was reported nowhere — it must surface as a warning on the ` +
+          `successful result, not be swallowed (#793): ${JSON.stringify(sc6?.warnings)}`,
+      );
+    }
+
+    // The other half, and the one that matters more (multi-model review, #793): when the
+    // call itself FAILS, the cleanup failure must not replace that error. A caller told
+    // "EACCES rmdir /tmp/..." instead of what went wrong with their artifact has lost the
+    // finding — and on this path the finding is a security one (a store whose object does
+    // not hash to its own locator).
+    //
+    // A bad identity is no use here: verify() catches that and reports a FAIL verdict
+    // rather than throwing, so nothing reaches the error path. The pull does throw, so the
+    // FIFO moves to the STORE instead — a `<64-hex>.age` entry in CYPHER_BRAIN_FILE_DIR
+    // whose bytes will not hash to the name it is filed under. The handshake is the same:
+    // opening it for writing returns only once the file backend has opened it for reading,
+    // by which point the fetch dir exists.
+    await chmod(serverTmp, 0o700); // writable again so the next call can create its fetch dir
+    const bogusLocator = join(store6, `${'a'.repeat(64)}.age`);
+    const mkfifo2 = spawnSync('mkfifo', ['-m', '600', bogusLocator], { encoding: 'utf8' });
+    if (mkfifo2.status !== 0) throw new Error(`mkfifo for the store FIFO failed: ${mkfifo2.stderr}`);
+    send({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: { name: 'verify_restore', arguments: { locator: bogusLocator, backend: 'file' } },
+    });
+    const fifoHandle2 = await open(bogusLocator, 'w');
+    try {
+      const fetchDirs2 = (await readdir(serverTmp)).filter((n) => n.startsWith('cypher-brain-mcp-'));
+      if (fetchDirs2.length === 0)
+        throw new Error(
+          'no fetch dir existed when the store FIFO opened — the error-path window is not where this test thinks',
+        );
+      await chmod(serverTmp, 0o555);
+      await fifoHandle2.writeFile('these bytes do not hash to the name this is filed under\n');
+    } finally {
+      await fifoHandle2.close();
+    }
+    const res7 = await waitFor(3);
+    const sc7 = res7.result?.structuredContent;
+    if (!res7.result?.isError)
+      throw new Error(
+        `verify_restore against a store object that does not match its own locator hash should fail: ${JSON.stringify(res7.result).slice(0, 400)}`,
+      );
+    if (/EACCES|rmdir/.test(sc7?.message ?? ''))
+      throw new Error(
+        `the fetch-dir cleanup failure REPLACED the real error — the caller is told the server broke instead of ` +
+          `the content-addressing violation that actually happened (#793): ${JSON.stringify(sc7?.message)}`,
+      );
+    if (!/does not match its own locator hash/.test(sc7?.message ?? ''))
+      throw new Error(
+        `expected the ORIGINAL pull error to survive the cleanup failure, got: ${JSON.stringify(sc7?.message)}`,
+      );
+    // ...while the cleanup failure still rides along on the error, via cbWarnings (#650's
+    // convention) rather than being lost to stderr alone.
+    const warnings7 = Array.isArray(sc7?.warnings) ? sc7.warnings : [];
+    if (!warnings7.some((w) => /failed to clean up/.test(w)))
+      throw new Error(
+        `the cleanup failure on the ERROR path reached nobody — it must ride the structured error's warnings ` +
+          `(#793): ${JSON.stringify(sc7?.warnings)}`,
+      );
+
+    process.stdout.write(
+      "MCP SMOKE (cleanup failure): PASS — a failing fetch-dir cleanup left verify_restore's PASS verdict intact " +
+        'on success and left the ORIGINAL error intact on failure, surfacing itself as a warning on both\n',
+    );
+  } finally {
+    await chmod(serverTmp, 0o700).catch(() => {});
+    try {
+      child6.stdin.end();
+    } catch {
+      /* ignore */
+    }
+    try {
+      child6.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 async function run(tmp) {
   const home = join(tmp, 'home');
   const store = join(tmp, 'store');
   const data = join(tmp, 'data');
   const outAge = join(tmp, 'snap.age');
-  const locatorFile = join(tmp, 'latest-locator.tsv');
+  // #789/#787: snapshot_now's locator_file (a write that REPLACES this path) and
+  // last_snapshot_status's locator_file/index_file (reads reported back to the caller)
+  // are both scoped to CYPHER_BRAIN_HOME now, which is where MANAGEMENT.md's own cadence
+  // already puts this file (`--save-locator ~/.cypher-brain/latest-locator.tsv`). These
+  // used to sit in `tmp`, alongside home rather than inside it.
+  const locatorFile = join(home, 'latest-locator.tsv');
   const launchdDir = join(tmp, 'launchagents'); // install() writes a plist here even with --no-load — must never touch the real ~/Library/LaunchAgents
 
   // keygen via the bundled CLI (dist/cli.mjs — already built by the time this smoke
@@ -968,6 +1343,63 @@ async function run(tmp) {
           `${toolName}.scan_secrets schema unexpected: ${JSON.stringify(scanProp).slice(0, 300)} (the CLI accepts ${JSON.stringify(cliScanModes)})`,
         );
       }
+      // #799: the enum check above says WHICH modes exist; this says what OMITTING the
+      // field does, which is the part that went stale. Both descriptions claimed "Omitted =
+      // no scan (same default as the CLI)" — untrue since #301, which made an omitted mode
+      // resolve to "warn" whenever there is a dirs entry and gitleaks is resolvable. An
+      // agent reads this description to decide whether it needs to pass a mode at all, so a
+      // false statement here is a false statement about whether a secret-scanning gate runs.
+      //
+      // Asserted as "does not claim the old default AND does mention the real one" rather
+      // than as an exact string, so ordinary rewording does not fail this while a
+      // reintroduction of the stale claim does.
+      const scanDesc = scanProp.description ?? '';
+      if (/Omitted\s*=\s*(no scan|the nightly does not scan)/i.test(scanDesc)) {
+        throw new Error(
+          `${toolName}.scan_secrets description still claims an omitted value means no scan — #301 made it ` +
+            `default to "warn" when there is a dirs entry and gitleaks is resolvable (#799): ${scanDesc.slice(0, 400)}`,
+        );
+      }
+      if (!/gitleaks is resolvable/i.test(scanDesc) || !/"warn"/.test(scanDesc)) {
+        throw new Error(
+          `${toolName}.scan_secrets description does not state the real #301 default (resolves to "warn" when ` +
+            `there is a dirs entry and gitleaks is resolvable): ${scanDesc.slice(0, 400)}`,
+        );
+      }
+    }
+
+    // 1c-i-b. #799's other half, measured rather than described: with gitleaks on PATH and
+    // a dirs entry, an OMITTED scan_secrets must come back as a mode that RAN. The
+    // description assertions above are about prose; this is the behavior they now describe,
+    // so the two cannot quietly disagree again. Skipped (loudly) when gitleaks is not
+    // installed, because then "nothing ran" is the correct answer and proves nothing.
+    if (gitleaksOnPath) {
+      const scanDefaultOut = join(tmp, 'scan-default-probe.age');
+      send({
+        jsonrpc: '2.0',
+        id: 1099,
+        method: 'tools/call',
+        params: {
+          name: 'snapshot_now',
+          arguments: { dirs: [data], recipients: [recipientPath], out: scanDefaultOut },
+        },
+      });
+      const scanDefault = await waitFor(1099);
+      const scanDefaultSc = scanDefault.result?.structuredContent;
+      if (scanDefault.result?.isError)
+        throw new Error(
+          `snapshot_now (omitted scan_secrets) failed: ${JSON.stringify(scanDefault.result).slice(0, 400)}`,
+        );
+      if (scanDefaultSc?.scan_secrets !== 'warn')
+        throw new Error(
+          `with gitleaks on PATH and a dirs entry, an OMITTED scan_secrets must resolve to "warn" (#301) — the ` +
+            `schema used to say it meant no scan at all (#799): ${JSON.stringify(scanDefaultSc?.scan_secrets)}`,
+        );
+    } else {
+      process.stdout.write(
+        'MCP SMOKE: SKIP — gitleaks not on PATH, so the #799 omitted-scan_secrets-resolves-to-warn behavior ' +
+          'check could not run (the description assertions above still ran)\n',
+      );
     }
 
     // 1c-ii. #756: the ton-provider "bootstrap a TON wallet" tangent used to be repeated
@@ -1312,7 +1744,7 @@ async function run(tmp) {
     // fingerprint, so a replay with a DIFFERENT locator_file than the original call must
     // still WRITE the recovery pointer to the NEWLY-requested path — nothing is
     // re-uploaded, but the requested side effect must not be silently dropped.
-    const idemReplayLocatorFile = join(tmp, 'idem-replay-locator.tsv');
+    const idemReplayLocatorFile = join(home, 'idem-replay-locator.tsv'); // #789: home-scoped, see locatorFile above
     if (existsSync(idemReplayLocatorFile)) throw new Error('idemReplayLocatorFile unexpectedly pre-exists');
     send({
       jsonrpc: '2.0',
@@ -1346,74 +1778,101 @@ async function run(tmp) {
     // then a LATER stage fails) must still be recorded under the idempotency_key even
     // though the overall snapshot_now call reports an error — otherwise the exact retry
     // this feature exists for would spend a second time for what already durably
-    // succeeded. Forced deterministically: locator_file's parent path component is a
-    // pre-existing regular FILE (not a directory), so push()'s own --save-locator mkdir
-    // fails with ENOTDIR strictly AFTER backend.put() (the real, "paid" step for
-    // arweave/turbo — here the free `file` backend stands in for the same code path)
-    // already succeeded — this is exactly PushLocatorWriteError's own scenario.
-    const idemPartialOut = join(tmp, 'idem-partial.age');
-    const idemPartialKey = 'idem-partial-failure-key';
-    const idemBadLocatorParent = join(tmp, 'idem-bad-locator-parent-is-a-file');
-    await writeFile(idemBadLocatorParent, 'not a directory\n');
-    const idemBadLocatorFile = join(idemBadLocatorParent, 'locator.tsv');
-    send({
-      jsonrpc: '2.0',
-      id: 22006,
-      method: 'tools/call',
-      params: {
-        name: 'snapshot_now',
-        arguments: {
-          dirs: [data],
-          recipients: [recipientPath],
-          out: idemPartialOut,
-          backend: 'file',
-          locator_file: idemBadLocatorFile,
-          idempotency_key: idemPartialKey,
-        },
-      },
-    });
-    const idem6 = await waitFor(22006);
-    const idem6Sc = idem6.result?.structuredContent;
-    if (!idem6.result?.isError || !/upload succeeded/.test(idem6Sc?.message ?? ''))
-      throw new Error(
-        `snapshot_now with a --save-locator write that fails AFTER a successful upload should refuse with a ` +
-          `"upload succeeded" PushLocatorWriteError message, not: ${JSON.stringify(idem6.result).slice(0, 500)}`,
+    // succeeded.
+    //
+    // Forced deterministically with an UNWRITABLE PARENT DIRECTORY: the locator file's
+    // directory exists (so push()'s recursive mkdir succeeds) but is mode 0555, so writing
+    // the temp sibling it renames from fails with EACCES — strictly AFTER backend.put()
+    // (the real, "paid" step for arweave/turbo; the free `file` backend stands in for the
+    // same code path) already succeeded. That is exactly PushLocatorWriteError's scenario.
+    //
+    // This used to point the locator file's parent at a regular FILE, relying on ENOTDIR
+    // from the same mkdir. #789's preflight now REFUSES that shape up front — deliberately,
+    // since it is knowably unwritable before any work happens and letting it through means
+    // a paid backend can spend and only then fail (multi-model review). An unwritable
+    // directory is the honest version of this test: nothing can detect it without
+    // attempting the write, so the failure genuinely belongs to the aftermath stage the
+    // partial-success path exists for.
+    //
+    // That trade has one cost, stated rather than left to be discovered: as root, chmod
+    // 0555 prevents nothing, so this case cannot be induced at all and is SKIPPED loudly
+    // rather than failing for an unrelated reason. CI runs non-root (no `container:` in
+    // .github/workflows/ci.yml), so it exercises this there.
+    if (process.getuid?.() === 0) {
+      process.stdout.write(
+        'MCP SMOKE: SKIP — running as root, where chmod 0555 does not prevent writes, so the #220 ' +
+          'partial-success push (a --save-locator write failing AFTER a successful upload) cannot be induced ' +
+          '(this is BLOCKED, not PASS)\n',
       );
+    } else {
+      const idemPartialOut = join(tmp, 'idem-partial.age');
+      const idemPartialKey = 'idem-partial-failure-key';
+      // #789: home-scoped so the containment preflight passes and the EACCES still comes from
+      // push()'s own --save-locator write, which is what this case is testing.
+      const idemBadLocatorDir = join(home, 'idem-unwritable-locator-dir');
+      await mkdir(idemBadLocatorDir, { recursive: true });
+      const idemBadLocatorFile = join(idemBadLocatorDir, 'locator.tsv');
+      await chmod(idemBadLocatorDir, 0o555);
+      send({
+        jsonrpc: '2.0',
+        id: 22006,
+        method: 'tools/call',
+        params: {
+          name: 'snapshot_now',
+          arguments: {
+            dirs: [data],
+            recipients: [recipientPath],
+            out: idemPartialOut,
+            backend: 'file',
+            locator_file: idemBadLocatorFile,
+            idempotency_key: idemPartialKey,
+          },
+        },
+      });
+      const idem6 = await waitFor(22006);
+      const idem6Sc = idem6.result?.structuredContent;
+      await chmod(idemBadLocatorDir, 0o755); // restore, so the tmp tree can be removed at the end
+      if (!idem6.result?.isError || !/upload succeeded/.test(idem6Sc?.message ?? ''))
+        throw new Error(
+          `snapshot_now with a --save-locator write that fails AFTER a successful upload should refuse with a ` +
+            `"upload succeeded" PushLocatorWriteError message, not: ${JSON.stringify(idem6.result).slice(0, 500)}`,
+        );
 
-    // The SAME key, called again with a WORKING locator_file: if the partial success was
-    // correctly recorded above despite the overall call erroring, this replays the cached
-    // result (idempotent_replay:true, pushed:true) instead of re-executing — a real
-    // re-execution would fail closed on `out` already existing (CB-E009), so hitting THAT
-    // instead would prove the record was lost, exactly the bug this fixes.
-    const idemPartialGoodLocatorFile = join(tmp, 'idem-partial-good-locator.tsv');
-    send({
-      jsonrpc: '2.0',
-      id: 22007,
-      method: 'tools/call',
-      params: {
-        name: 'snapshot_now',
-        arguments: {
-          dirs: [data],
-          recipients: [recipientPath],
-          out: idemPartialOut,
-          backend: 'file',
-          locator_file: idemPartialGoodLocatorFile,
-          idempotency_key: idemPartialKey,
+      // The SAME key, called again with a WORKING locator_file: if the partial success was
+      // correctly recorded above despite the overall call erroring, this replays the cached
+      // result (idempotent_replay:true, pushed:true) instead of re-executing — a real
+      // re-execution would fail closed on `out` already existing (CB-E009), so hitting THAT
+      // instead would prove the record was lost, exactly the bug this fixes.
+      const idemPartialGoodLocatorFile = join(home, 'idem-partial-good-locator.tsv'); // #789: home-scoped, see locatorFile above
+      send({
+        jsonrpc: '2.0',
+        id: 22007,
+        method: 'tools/call',
+        params: {
+          name: 'snapshot_now',
+          arguments: {
+            dirs: [data],
+            recipients: [recipientPath],
+            out: idemPartialOut,
+            backend: 'file',
+            locator_file: idemPartialGoodLocatorFile,
+            idempotency_key: idemPartialKey,
+          },
         },
-      },
-    });
-    const idem7 = await waitFor(22007);
-    const idem7Sc = idem7.result?.structuredContent;
-    if (idem7.result?.isError || idem7Sc?.idempotent_replay !== true || idem7Sc?.pushed !== true)
-      throw new Error(
-        `a repeat call with the SAME idempotency_key after a partial-success failure should replay the recorded ` +
-          `partial success (idempotent_replay:true, pushed:true), not re-execute or refuse: ` +
-          `${JSON.stringify(idem7.result).slice(0, 500)}`,
-      );
-    if (typeof idem7Sc?.locator !== 'string' || idem7Sc.locator.length === 0)
-      throw new Error(`replayed partial-success result is missing its recorded locator: ${JSON.stringify(idem7Sc)}`);
-    if (!existsSync(idemPartialGoodLocatorFile))
-      throw new Error('the replay of a recorded partial-success result did not write the requested locator_file');
+      });
+      const idem7 = await waitFor(22007);
+      const idem7Sc = idem7.result?.structuredContent;
+      if (idem7.result?.isError || idem7Sc?.idempotent_replay !== true || idem7Sc?.pushed !== true)
+        throw new Error(
+          `a repeat call with the SAME idempotency_key after a partial-success failure should replay the recorded ` +
+            `partial success (idempotent_replay:true, pushed:true), not re-execute or refuse: ` +
+            `${JSON.stringify(idem7.result).slice(0, 500)}`,
+        );
+      if (typeof idem7Sc?.locator !== 'string' || idem7Sc.locator.length === 0)
+        throw new Error(`replayed partial-success result is missing its recorded locator: ${JSON.stringify(idem7Sc)}`);
+      if (!existsSync(idemPartialGoodLocatorFile))
+        throw new Error('the replay of a recorded partial-success result did not write the requested locator_file');
+    }
 
     // 2c. last_snapshot_status reads the save-locator file back
     send({
@@ -1437,6 +1896,189 @@ async function run(tmp) {
     if (!(typeof latest?.age_seconds === 'number' && latest.age_seconds >= 0 && latest.age_seconds < 600)) {
       throw new Error(`last_snapshot_status age_seconds not sane: ${JSON.stringify(latest?.age_seconds)}`);
     }
+
+    // 2c-i. #787: last_snapshot_status used to readFile() any absolute path it was handed
+    // and, when the content did not parse as a locator line, echo the first non-comment
+    // line back VERBATIM in its error ("got: ..."). On a readOnlyHint:true tool that a host
+    // will happily auto-approve, that is a general local-file disclosure oracle: point it
+    // at an identity file, an .env, a private key, and its first line comes back.
+    //
+    // The reproduction that was filed, with a decoy secret standing in for the real thing.
+    // Two independent assertions, because the fix has two independent halves and either
+    // alone would still leave a hole: the path must be REFUSED (containment), and the
+    // refusal must NOT contain the file's bytes (no echo). A test that only checked
+    // isError would pass against a version that refuses AFTER quoting the content.
+    const secretDecoy = join(tmp, 'outside-home-secret.txt');
+    const secretDecoyLine = 'SUPER-SECRET-DECOY-VALUE-c0ffee';
+    await writeFile(secretDecoy, `${secretDecoyLine}\nsecond line\n`);
+    for (const field of ['locator_file', 'index_file']) {
+      send({
+        jsonrpc: '2.0',
+        id: field === 'locator_file' ? 5001 : 5002,
+        method: 'tools/call',
+        params: { name: 'last_snapshot_status', arguments: { [field]: secretDecoy } },
+      });
+      const discl = await waitFor(field === 'locator_file' ? 5001 : 5002);
+      const disclSc = discl.result?.structuredContent;
+      if (!discl.result?.isError)
+        throw new Error(
+          `last_snapshot_status {${field}} pointed OUTSIDE CYPHER_BRAIN_HOME must be refused, got: ${JSON.stringify(discl.result).slice(0, 400)}`,
+        );
+      if (!/must be inside CYPHER_BRAIN_HOME/.test(disclSc?.message ?? ''))
+        throw new Error(
+          `last_snapshot_status {${field}} refusal should name the CYPHER_BRAIN_HOME containment rule, got: ${JSON.stringify(disclSc?.message).slice(0, 400)}`,
+        );
+      if (JSON.stringify(discl.result).includes(secretDecoyLine))
+        throw new Error(
+          `last_snapshot_status {${field}} LEAKED the target file's content in its response: ${JSON.stringify(discl.result).slice(0, 400)}`,
+        );
+    }
+
+    // 2c-ii. #787, the other half: a file INSIDE home that does not parse must still not
+    // have its content echoed. Containment stops the arbitrary-path read; this stops the
+    // echo itself, so a file that is in-scope but holds something sensitive (a stray
+    // recipient/identity/env file an operator dropped in CYPHER_BRAIN_HOME) is described,
+    // not quoted.
+    const inHomeGarbage = join(home, 'not-a-locator.tsv');
+    const inHomeGarbageLine = 'IN-HOME-SECRET-DECOY-deadbeef';
+    await writeFile(inHomeGarbage, `${inHomeGarbageLine}\n`);
+    send({
+      jsonrpc: '2.0',
+      id: 5003,
+      method: 'tools/call',
+      params: { name: 'last_snapshot_status', arguments: { locator_file: inHomeGarbage } },
+    });
+    const garb = await waitFor(5003);
+    if (!garb.result?.isError)
+      throw new Error(
+        `last_snapshot_status on a file that is not a locator file must be refused: ${JSON.stringify(garb.result).slice(0, 400)}`,
+      );
+    if (JSON.stringify(garb.result).includes(inHomeGarbageLine))
+      throw new Error(
+        `last_snapshot_status echoed the rejected line's CONTENT back (#787 regression): ${JSON.stringify(garb.result).slice(0, 400)}`,
+      );
+    if (!/must contain/.test(garb.result?.structuredContent?.message ?? ''))
+      throw new Error(
+        `last_snapshot_status refusal should still say what shape it expected: ${JSON.stringify(garb.result?.structuredContent?.message).slice(0, 400)}`,
+      );
+
+    // 2c-iii. #787: a directory / non-regular file inside home is refused before any read,
+    // rather than being readFile()'d (an EISDIR ERR_INTERNAL) or, for a FIFO, blocking the
+    // server forever. home itself is the convenient in-scope directory to point at.
+    send({
+      jsonrpc: '2.0',
+      id: 5004,
+      method: 'tools/call',
+      params: { name: 'last_snapshot_status', arguments: { locator_file: home } },
+    });
+    const dirRes = await waitFor(5004);
+    if (!dirRes.result?.isError || !/is not a regular file/.test(dirRes.result?.structuredContent?.message ?? ''))
+      throw new Error(
+        `last_snapshot_status with a DIRECTORY as locator_file should be refused as not-a-regular-file: ${JSON.stringify(dirRes.result).slice(0, 400)}`,
+      );
+
+    // 2c-iv. #789: snapshot_now's locator_file is push --save-locator's destination, and
+    // push RENAMES a temp sibling over it — an atomic, unconditional replacement. Unscoped,
+    // that is an arbitrary-file-overwrite primitive reachable through the FREE `file`
+    // backend, i.e. with no confirm_paid and no consent gate whatsoever.
+    //
+    // Two cases, both of which must refuse WITHOUT touching the target: outside home, and
+    // inside home but pointing at a file that is not a save-locator file (recipient.txt is
+    // the realistic victim — it lives in CYPHER_BRAIN_HOME and clobbering it silently
+    // re-keys every future snapshot). The post-condition is the assertion that matters:
+    // an error response is not proof the file survived.
+    const clobberVictim = join(tmp, 'clobber-me.txt');
+    const clobberVictimBody = 'ORIGINAL-CONTENT-DO-NOT-REPLACE\n';
+    await writeFile(clobberVictim, clobberVictimBody);
+    const recipientBefore = await readFile(recipientPath, 'utf8');
+    const clobberCases = [
+      { id: 5011, target: clobberVictim, why: 'outside CYPHER_BRAIN_HOME', expect: /must be inside CYPHER_BRAIN_HOME/ },
+      {
+        id: 5012,
+        target: recipientPath,
+        why: 'inside home but not a save-locator file',
+        expect: /not a cypher-brain save-locator file/,
+      },
+    ];
+    for (const c of clobberCases) {
+      send({
+        jsonrpc: '2.0',
+        id: c.id,
+        method: 'tools/call',
+        params: {
+          name: 'snapshot_now',
+          arguments: {
+            dirs: [data],
+            recipients: [recipientPath],
+            out: join(tmp, `clobber-probe-${c.id}.age`),
+            backend: 'file',
+            locator_file: c.target,
+          },
+        },
+      });
+      const clob = await waitFor(c.id);
+      if (!clob.result?.isError || !c.expect.test(clob.result?.structuredContent?.message ?? ''))
+        throw new Error(
+          `snapshot_now with locator_file ${c.why} must be refused (${c.expect}): ${JSON.stringify(clob.result).slice(0, 400)}`,
+        );
+    }
+    if ((await readFile(clobberVictim, 'utf8')) !== clobberVictimBody)
+      throw new Error('snapshot_now REPLACED a file outside CYPHER_BRAIN_HOME via locator_file (#789 regression)');
+    if ((await readFile(recipientPath, 'utf8')) !== recipientBefore)
+      throw new Error("snapshot_now REPLACED CYPHER_BRAIN_HOME's recipient.txt via locator_file (#789 regression)");
+
+    // 2c-v. #789 (multi-model review): the overwrite gate cannot stop at "readLocatorFile
+    // parses it", which accepts ANY two non-empty tab-separated fields — an unrelated
+    // in-home TSV satisfies that, and `index.tsv` (timestamp<TAB>locator<TAB>sha256) is one
+    // that this very tool tells operators to keep. Authorizing an overwrite additionally
+    // requires the second field to be a real backend name.
+    //
+    // Also covered here: a path whose PARENT component is a regular file. That is knowably
+    // unwritable before any work happens, so it must be refused up front rather than after
+    // a snapshot and (on a paid backend) a real spend.
+    const indexDecoy = join(home, 'index-decoy.tsv');
+    await writeFile(indexDecoy, `2026-09-02T00:00:00Z\tsome-locator\t${'a'.repeat(64)}\n`);
+    const parentIsAFile = join(home, 'parent-is-a-regular-file');
+    await writeFile(parentIsAFile, 'not a directory\n');
+    const gateCases = [
+      { id: 5013, target: indexDecoy, why: 'an index.tsv, not a save-locator file', expect: /not one of the backends/ },
+      {
+        id: 5014,
+        target: join(parentIsAFile, 'locator.tsv'),
+        why: 'a path whose parent component is a regular file',
+        expect: /a component of that path is a regular file/,
+      },
+    ];
+    for (const c of gateCases) {
+      send({
+        jsonrpc: '2.0',
+        id: c.id,
+        method: 'tools/call',
+        params: {
+          name: 'snapshot_now',
+          arguments: {
+            dirs: [data],
+            recipients: [recipientPath],
+            out: join(tmp, `gate-probe-${c.id}.age`),
+            backend: 'file',
+            locator_file: c.target,
+          },
+        },
+      });
+      const gate = await waitFor(c.id);
+      if (!gate.result?.isError || !c.expect.test(gate.result?.structuredContent?.message ?? ''))
+        throw new Error(
+          `snapshot_now with locator_file = ${c.why} must be refused (${c.expect}): ${JSON.stringify(gate.result).slice(0, 400)}`,
+        );
+      // Refused BEFORE doing the work, not after: on a paid backend the difference is
+      // whether money was already spent by the time the caller hears about it.
+      if (existsSync(join(tmp, `gate-probe-${c.id}.age`)))
+        throw new Error(
+          `snapshot_now took a snapshot before refusing locator_file = ${c.why} — the preflight must run first (#789)`,
+        );
+    }
+    if ((await readFile(indexDecoy, 'utf8')).startsWith('2026-09-02') !== true)
+      throw new Error('snapshot_now REPLACED an index.tsv via locator_file (#789 regression)');
 
     // 2d. verify_restore pulls by locator and must reach a full PASS (the
     // private identity lives in this temp CYPHER_BRAIN_HOME).
@@ -1632,6 +2274,78 @@ async function run(tmp) {
     if (restoredContent !== 'cypher-brain mcp smoke payload\n') {
       throw new Error(`restore_now restored content mismatch: ${JSON.stringify(restoredContent)}`);
     }
+
+    // 2h-i-b. #792: restore_now's #559 "out_dir is outside CYPHER_BRAIN_HOME" warning was
+    // built on a LEXICAL resolve(), while src/lib/restore.ts reaches the destination with
+    // stat(), which FOLLOWS symlinks. An in-home symlink pointing outside home therefore
+    // read as "inside home" to the warning while the DECRYPTED PLAINTEXT landed outside it,
+    // and the result reported the in-home path — no warning, wrong destination. Same defect
+    // #648 fixed for wallet_create's out, one tool over.
+    //
+    // The reproduction that was filed. It is now refused outright (a final-component
+    // symlink has no legitimate workflow behind it and is exactly the shape that makes the
+    // warning inapplicable), so the assertions are: refused, refusal names the resolved
+    // target, and — the post-condition that actually proves nothing leaked — the escape
+    // destination is still empty.
+    const symlinkEscapeTarget = join(tmp, 'symlink-escape-target');
+    await mkdir(symlinkEscapeTarget, { recursive: true });
+    const symlinkOutDir = join(home, 'restore-via-symlink');
+    await symlink(symlinkEscapeTarget, symlinkOutDir);
+    send({
+      jsonrpc: '2.0',
+      id: 5021,
+      method: 'tools/call',
+      params: {
+        name: 'restore_now',
+        arguments: { locator: snapSc.locator, backend: 'file', out_dir: symlinkOutDir, confirm_write: true },
+      },
+    });
+    const symRes = await waitFor(5021);
+    if (!symRes.result?.isError || !/is a symlink/.test(symRes.result?.structuredContent?.message ?? ''))
+      throw new Error(
+        `restore_now with a SYMLINKED out_dir must be refused (#792): ${JSON.stringify(symRes.result).slice(0, 500)}`,
+      );
+    if (!symRes.result?.structuredContent?.message?.includes(await realpath(symlinkEscapeTarget)))
+      throw new Error(
+        `restore_now's symlink refusal should name where the link actually points: ${JSON.stringify(symRes.result?.structuredContent?.message).slice(0, 400)}`,
+      );
+    if ((await readdir(symlinkEscapeTarget)).length !== 0)
+      throw new Error(
+        'restore_now wrote DECRYPTED plaintext through a symlinked out_dir before refusing (#792 regression)',
+      );
+
+    // 2h-i-c. #792, the non-adversarial half: an ordinary out_dir under an ANCESTOR
+    // symlink is still allowed (that is macOS's own /var -> /private/var, among others) —
+    // it just has to be reported honestly. `out_dir` echoes what the caller passed, and
+    // `out_dir_resolved` appears only when following symlinks changed the destination.
+    const ancestorLinkParent = join(tmp, 'ancestor-link-real');
+    await mkdir(ancestorLinkParent, { recursive: true });
+    const ancestorLink = join(tmp, 'ancestor-link');
+    await symlink(ancestorLinkParent, ancestorLink);
+    const viaAncestorOutDir = join(ancestorLink, 'restored-via-ancestor');
+    send({
+      jsonrpc: '2.0',
+      id: 5022,
+      method: 'tools/call',
+      params: {
+        name: 'restore_now',
+        arguments: { locator: snapSc.locator, backend: 'file', out_dir: viaAncestorOutDir, confirm_write: true },
+      },
+    });
+    const ancRes = await waitFor(5022);
+    const ancSc = ancRes.result?.structuredContent;
+    if (ancRes.result?.isError)
+      throw new Error(
+        `restore_now through an ANCESTOR symlink must still work (#792 must not over-refuse): ${JSON.stringify(ancRes.result).slice(0, 500)}`,
+      );
+    if (ancSc?.out_dir !== viaAncestorOutDir)
+      throw new Error(`restore_now should echo the caller's own out_dir: ${JSON.stringify(ancSc?.out_dir)}`);
+    if (ancSc?.out_dir_resolved !== join(await realpath(ancestorLinkParent), 'restored-via-ancestor'))
+      throw new Error(
+        `restore_now should report where the plaintext actually landed as out_dir_resolved: ${JSON.stringify(ancSc?.out_dir_resolved)}`,
+      );
+    if (!existsSync(join(ancestorLinkParent, 'restored-via-ancestor', 'data.tar.gz')))
+      throw new Error('restore_now through an ancestor symlink did not actually extract into the real directory');
 
     // 2h-ii. restore_now file-input mode with a WRONG sha256 pin must fail closed
     // (fails BEFORE any decrypt/extract — restoreOutDir2 must never be created),

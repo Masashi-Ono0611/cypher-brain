@@ -37,6 +37,40 @@ import { tonWalletConfigured } from './lib/wallet.js';
 export const BACKENDS = ['file', 'arweave', 'turbo', ...((await tonWalletConfigured()) ? ['ton-provider'] : [])];
 export const PAID_BACKENDS = new Set(['arweave', 'turbo', 'ton-provider']); // ton-provider always spends real funds when reachable at all (#396 PR2) — safe to list unconditionally even when BACKENDS above omits it (an unreachable value can never trigger this check)
 
+// #796: what each paid backend actually IS, in one sentence, for the moment consent is
+// requested. snapshot_now's spend gate used to hard-code "a PAID, PERMANENT Arweave
+// store" for every member of PAID_BACKENDS above — so a ton-provider push, whose
+// durability depends on a live provider continuing to renew and serve the contract, told
+// the operator they were buying permanent Arweave storage. The tool DESCRIPTION already
+// distinguished them correctly; the description is read at tools/list time, potentially
+// by a different component and much earlier, while THIS is the text a human sees at the
+// decision point. That is the one place it has to be true.
+//
+// Lives beside PAID_BACKENDS rather than in mcp.ts so the set and the prose describing
+// its members cannot drift, and so adding a backend to one makes the other's gap
+// obvious. Keyed by every PAID_BACKENDS member; PAID_BACKEND_CONSENT_DESCRIPTIONS's own
+// coverage of that set is asserted in scripts/mcp-smoke.mjs rather than trusted.
+export const PAID_BACKEND_CONSENT_DESCRIPTIONS: Record<string, string> = {
+  arweave:
+    'a PAID, PERMANENT Arweave store — pushing spends real funds irreversibly, and what lands there cannot be deleted or recalled afterwards',
+  turbo:
+    'a PAID, PERMANENT Arweave store (via the Turbo bundler) — pushing spends real funds irreversibly, and what lands there cannot be deleted or recalled afterwards',
+  'ton-provider':
+    'a PAID TON Storage provider-market contract — pushing spends real funds irreversibly. Unlike arweave/turbo it is NOT permanent: the data stays available only while a provider keeps renewing and serving the contract, so its durability is weaker and depends on a third party continuing to honor it',
+};
+
+// The one-sentence description of a paid backend used at the consent boundary. Falls
+// back to a deliberately generic sentence rather than to Arweave's — a backend added to
+// PAID_BACKENDS without an entry above must not inherit another backend's durability
+// claim, which is the exact defect #796 was. The smoke test asserts the fallback is
+// unreachable in practice.
+export function paidBackendConsentDescription(backend: string): string {
+  return (
+    PAID_BACKEND_CONSENT_DESCRIPTIONS[backend] ??
+    'a PAID storage backend — pushing spends real funds irreversibly (this build has no durability description recorded for it, so do not assume the data is permanent)'
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool descriptors (JSON Schemas advertised via tools/list)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,7 +131,7 @@ export const SNAPSHOT_NOW_TOOL: Tool = {
       locator_file: {
         type: 'string',
         description:
-          'Path for push --save-locator: writes "<locator>\\t<backend>\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]" (the durable recovery pointer; back it up off-box).',
+          'Path for push --save-locator: writes "<locator>\\t<backend>\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]" (the durable recovery pointer; back it up off-box). Must resolve, after following symlinks, to a path inside CYPHER_BRAIN_HOME — where the documented cadence already keeps it — and, if a file is already there, to an existing save-locator file: this path is REPLACED outright, so it is scoped the same way wallet_create\'s out is rather than left able to clobber any writable file (#789).',
       },
       confirm_paid: {
         type: 'boolean',
@@ -108,7 +142,7 @@ export const SNAPSHOT_NOW_TOOL: Tool = {
         type: 'string',
         enum: [...SCAN_SECRETS_MODES],
         description:
-          'Run gitleaks over each dirs source\'s staged plaintext BEFORE it is archived+encrypted (the CLI --scan-secrets, #215): "warn" logs findings (rule ID + count only, never the secret) and proceeds, "deny" refuses the whole snapshot if any source has findings. Omitted = no scan (same default as the CLI). Requires the gitleaks binary on PATH: when set and gitleaks cannot be resolved, the call FAILS rather than silently skipping the scan.',
+          'Run gitleaks over each dirs source\'s staged plaintext BEFORE it is archived+encrypted (the CLI --scan-secrets, #215): "warn" logs findings (rule ID + count only, never the secret) and proceeds, "deny" refuses the whole snapshot if any source has findings, "off" skips the scan. OMITTED IS NOT "no scan" (#301, corrected in #799): it resolves to "warn" whenever there is at least one dirs entry AND gitleaks is resolvable, and to no scan otherwise — pass "off" explicitly to skip. The result reports the mode that actually ran (null when none did), so an omitted value is never ambiguous after the fact. An explicit mode other than "off" requires at least one dirs entry (a pg dump is not scanned), and requires the gitleaks binary on PATH: when set and gitleaks cannot be resolved, the call FAILS rather than silently skipping the scan.',
       },
       idempotency_key: {
         type: 'string',
@@ -152,11 +186,13 @@ export const LAST_SNAPSHOT_STATUS_TOOL: Tool = {
     properties: {
       locator_file: {
         type: 'string',
-        description: 'Path to a push --save-locator file. Default: <CYPHER_BRAIN_HOME>/latest-locator.tsv',
+        description:
+          'Path to a push --save-locator file. Default: <CYPHER_BRAIN_HOME>/latest-locator.tsv. Must resolve, after following symlinks, to a regular file inside CYPHER_BRAIN_HOME (#787): this tool reads the path it is given and reports on what it finds, so it is scoped to the directory it manages rather than left able to read anything on disk.',
       },
       index_file: {
         type: 'string',
-        description: 'Path to an append-only index.tsv (timestamp<TAB>locator<TAB>sha256 lines).',
+        description:
+          'Path to an append-only index.tsv (timestamp<TAB>locator<TAB>sha256 lines). Scoped to CYPHER_BRAIN_HOME the same way locator_file is (#787).',
       },
     },
     additionalProperties: false,
@@ -290,7 +326,7 @@ export const RESTORE_NOW_TOOL: Tool = {
       out_dir: {
         type: 'string',
         description:
-          'Directory to extract the decrypted snapshot into (created if missing). Existing files already there are never clobbered.',
+          'Directory to extract the decrypted snapshot into (created if missing). Existing files already there are never clobbered. It MAY sit outside CYPHER_BRAIN_HOME — that is the normal recovery case, and only produces a warning (#559) — but it may NOT itself be a symlink, which is refused: the result would then name one directory while the DECRYPTED plaintext landed in another (#792). Ancestor symlinks are followed, and reported as out_dir_resolved when they change the destination.',
       },
       identity: {
         type: 'string',
@@ -452,8 +488,11 @@ export const SCHEDULE_INSTALL_TOOL: Tool = {
         enum: [...SCAN_SECRETS_MODES],
         description:
           'Bake the gitleaks gate into the generated nightly runner (the CLI --scan-secrets, #215/#307): ' +
-          '"warn" logs findings and proceeds, "deny" refuses the whole snapshot on a finding. Omitted = the ' +
-          'nightly does not scan (same default as the CLI). Requires at least one dirs entry — the scan covers ' +
+          '"warn" logs findings and proceeds, "deny" refuses the whole snapshot on a finding, "off" skips the ' +
+          'scan. OMITTED IS NOT "the nightly does not scan" (#301, corrected in #799): install RESOLVES the ' +
+          'effective mode now and bakes THAT into the runner — "warn" when there is at least one dirs entry and ' +
+          'gitleaks is resolvable, "off" otherwise — so the nightly never re-derives a default from whatever is ' +
+          'on PATH at 03:30. Pass "off" explicitly to bake in a skip. Requires at least one dirs entry — the scan covers ' +
           'staged directory plaintext, not the pg dump. Install RESOLVES gitleaks now and PINS the absolute ' +
           'path into the runner as CYPHER_BRAIN_GITLEAKS_BIN (launchd/cron do not inherit a useful PATH, and a ' +
           'different gitleaks on theirs must not take its place), and FAILS if it cannot be resolved, rather ' +
