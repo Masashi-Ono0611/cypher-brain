@@ -1715,4 +1715,100 @@ else
 fi
 
 echo
+echo "== #782: a source directory with no owner-write bit leaves NO plaintext staging tree behind =="
+# snapshot re-extracts each component archive with `tar -p`, so a source directory
+# captured at 0500 is recreated at 0500 inside the staging tree — and unlinking an entry
+# needs write on its PARENT, not on the entry. Before the fix, the plain
+# rm({recursive,force}) that cleaned that up threw EACCES, the throw unwound through the
+# stage cleanup (which failed the same way), and BOTH the extracted plaintext and the
+# whole staging tree survived the process under $TMPDIR — with the snapshot itself
+# failing outright as well. Measured on main @ 389ab2c: exit 1, and
+# `cypher-brain-*/.extract-brain.tar.gz/brain/locked/note.txt` still on disk.
+#
+# TMPDIR is pointed at a directory of this test's own for the one call, so the assertion
+# below can be an exact "nothing named cypher-brain-* is here" rather than a filter over
+# whatever else the suite's shared TMPDIR holds.
+PERM_SRC="$TMP/perm-src"
+PERM_TMPDIR="$TMP/perm-tmpdir"
+mkdir -p "$PERM_SRC/locked" "$PERM_TMPDIR"
+printf 'perm-plaintext-marker\n' > "$PERM_SRC/locked/note.txt"
+printf 'top\n' > "$PERM_SRC/top.txt"
+chmod 0500 "$PERM_SRC/locked"
+set +e
+PERM_OUT=$(TMPDIR="$PERM_TMPDIR" cb snapshot --dir "$PERM_SRC" --out "$TMP/perm.age" --scan-secrets off 2>&1); PERM_RC=$?
+set -e
+# Restore write permission immediately: the EXIT trap's own recursive remove of $TMP hits
+# the very same EACCES this test is about, and a test that poisons the suite's temp
+# hygiene check (scripts/verify.mjs) while proving a temp-hygiene fix would be absurd.
+chmod 0700 "$PERM_SRC/locked"
+PERM_LEFT=$(find "$PERM_TMPDIR" -maxdepth 1 -name 'cypher-brain-*' 2>/dev/null | wc -l | tr -d ' ')
+if [ "$PERM_LEFT" != "0" ]; then
+  # Make the leftovers removable so this failure does not also break the EXIT trap.
+  chmod -R u+rwX "$PERM_TMPDIR" 2>/dev/null || true
+  echo "[FAIL] snapshot left $PERM_LEFT plaintext staging tree(s) under TMPDIR after a 0500 source directory"
+  find "$PERM_TMPDIR" | head -20
+  exit 1
+fi
+[ "$PERM_RC" = "0" ] || { echo "[FAIL] snapshot of a source containing a 0500 directory exited $PERM_RC"; echo "$PERM_OUT"; exit 1; }
+test -s "$TMP/perm.age" || { echo "[FAIL] snapshot of a 0500-containing source wrote no artifact"; exit 1; }
+# The restrictive mode must still be what was ARCHIVED — the fix chmods the throwaway
+# extraction, never the source, and must not have quietly changed what got captured.
+cb restore --in "$TMP/perm.age" --out-dir "$TMP/perm-out" >/dev/null
+# restore's auto-expand recreates that 0500 directory under --out-dir: tar's
+# --no-same-permissions only masks bits off, it cannot add owner-write back. Same reason
+# as above — make it removable now so the EXIT trap can still clean up.
+chmod -R u+rwX "$TMP/perm-out"
+PERM_MODE=$(tar -tvzf "$TMP/perm-out/perm-src.tar.gz" | awk '$NF ~ /locked\/$/ {print substr($1,2,9)}')
+[ "$PERM_MODE" = "r-x------" ] || { echo "[FAIL] the archived mode of the 0500 directory is '$PERM_MODE', expected r-x------"; exit 1; }
+echo "[PASS] a 0500 source directory snapshots cleanly, leaves no staging tree in TMPDIR, and is archived with its mode intact"
+
+echo
+echo "== #783: every sidecar derived from --out is no-clobber, and a symlink at one is not followed =="
+# --out itself has been no-clobber since the beginning; <out>.digest,
+# <out>.recipients-fingerprint and <out>.minisig were plain truncating writeFile()s with
+# no check at all. Two consequences, one per case below.
+SIDE_SRC="$TMP/sidecar-src"; mkdir -p "$SIDE_SRC"; printf 'sidecar\n' > "$SIDE_SRC/a.txt"
+
+# (a) writeFile() FOLLOWS a symlink, so a symlink planted at the (predictable) digest
+# sidecar path truncated whatever it pointed at, with the run still reporting success.
+# Measured on main @ 389ab2c: exit 0, and victim.txt replaced by the content digest.
+printf 'VICTIM-CONTENT-MUST-SURVIVE\n' > "$TMP/sidecar-victim.txt"
+ln -s "$TMP/sidecar-victim.txt" "$TMP/sidecar-a.age.digest"
+set +e
+SIDE_A=$(cb snapshot --dir "$SIDE_SRC" --out "$TMP/sidecar-a.age" --scan-secrets off 2>&1); SIDE_A_RC=$?
+set -e
+[ "$SIDE_A_RC" != "0" ] || { echo "[FAIL] snapshot exited 0 with a symlink pre-planted at its .digest sidecar path"; echo "$SIDE_A"; exit 1; }
+[ "$(cat "$TMP/sidecar-victim.txt")" = "VICTIM-CONTENT-MUST-SURVIVE" ] \
+  || { echo "[FAIL] the symlink target was written through — its content is now: $(cat "$TMP/sidecar-victim.txt")"; exit 1; }
+printf '%s' "$SIDE_A" | grep -Fq 'sidecar-a.age.digest already exists — refusing to overwrite' \
+  || { echo "[FAIL] the refusal does not name the symlinked sidecar in the no-clobber wording errors.ts codes as CB-E009"; echo "$SIDE_A"; exit 1; }
+printf '%s' "$SIDE_A" | grep -Fq 'it is a symlink' \
+  || { echo "[FAIL] the refusal does not say the sidecar path is a symlink"; echo "$SIDE_A"; exit 1; }
+printf '%s' "$SIDE_A" | grep -Fq 'CB-E009' \
+  || { echo "[FAIL] the sidecar no-clobber refusal did not get the CB-E009 code --out's own refusal gets"; echo "$SIDE_A"; exit 1; }
+test ! -e "$TMP/sidecar-a.age" || { echo "[FAIL] the refused run still wrote a snapshot"; exit 1; }
+echo "[PASS] a symlink at <out>.digest is refused, not followed; the target is untouched and no artifact is written"
+
+# (b) a .minisig left over from an EARLIER artifact used to survive a run that does not
+# sign — restore/verify then found a present, well-formed signature that does not verify
+# against these bytes and refused the artifact outright as tampered/forged. Measured on
+# main @ 389ab2c: snapshot exit 0, then `restore` fails with CB-E016 "the file may be
+# tampered or the signature forged" — a backup that can never be restored.
+printf 'untrusted-leftover-signature\n' > "$TMP/sidecar-b.age.minisig"
+set +e
+SIDE_B=$(cb snapshot --dir "$SIDE_SRC" --out "$TMP/sidecar-b.age" --no-sign --scan-secrets off 2>&1); SIDE_B_RC=$?
+set -e
+[ "$SIDE_B_RC" != "0" ] || { echo "[FAIL] snapshot exited 0 next to a stale .minisig, leaving an artifact no restore can accept"; echo "$SIDE_B"; exit 1; }
+test ! -e "$TMP/sidecar-b.age" || { echo "[FAIL] the refused run still wrote a snapshot next to a stale .minisig"; exit 1; }
+[ "$(cat "$TMP/sidecar-b.age.minisig")" = "untrusted-leftover-signature" ] \
+  || { echo "[FAIL] the pre-existing .minisig was modified instead of being refused"; exit 1; }
+echo "[PASS] a stale <out>.minisig is refused up front rather than left to make the new snapshot unrestorable"
+
+# The happy path must be unchanged: a clean --out still writes all its sidecars.
+cb snapshot --dir "$SIDE_SRC" --out "$TMP/sidecar-ok.age" --scan-secrets off >/dev/null
+test -s "$TMP/sidecar-ok.age.digest" || { echo "[FAIL] the digest sidecar is missing on a clean run"; exit 1; }
+test -s "$TMP/sidecar-ok.age.recipients-fingerprint" || { echo "[FAIL] the recipients-fingerprint sidecar is missing on a clean run"; exit 1; }
+echo "[PASS] a clean --out still writes its digest and recipients-fingerprint sidecars"
+
+echo
 echo "SELFTEST PASS"
