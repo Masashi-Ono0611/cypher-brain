@@ -1006,7 +1006,10 @@ export async function restore(o: CliOptions): Promise<void> {
 }
 
 async function restoreImpl(o: CliOptions): Promise<void> {
-  if (!o.in) throw new Error('--in <file.age> required');
+  // #779: a required flag simply being absent is the same "command line itself was
+  // malformed" class as an unrecognized command/enum value — UsageError, exit 2, not
+  // the generic-failure 1.
+  if (!o.in) throw new UsageError('--in <file.age> required');
   // #277 named this branch's "did you mean --out-dir" diagnosis for a mistyped
   // `--out` — that message now lives at the CLI layer instead: src/cli.ts's
   // FLAG_IRRELEVANT['restore'] entry refuses `restore --out` in assertFlagsRelevant()
@@ -1016,7 +1019,7 @@ async function restoreImpl(o: CliOptions): Promise<void> {
   // can no longer be set by the time this function runs; this stays a plain,
   // unconditional message.
   if (!o.out_dir) {
-    throw new Error('--out-dir <dir> required');
+    throw new UsageError('--out-dir <dir> required');
   }
   // pg_restore --clean --if-exists below DROPS and replaces objects in the target
   // database — an irreversible operation. Same consent gate as push's paid-backend
@@ -1385,7 +1388,8 @@ function printFileCheckVerdict(verdict: 'PASS' | 'FAIL' | 'PARTIAL'): void {
 // that hasn't run yet when this returns, and printing an interim one would be read as
 // final.
 async function runFileChecks(o: CliOptions, printVerdictLine: boolean): Promise<FileCheckResult> {
-  if (!o.in) throw new Error('--in <file.age> required');
+  // #779: same UsageError treatment as restoreImpl()'s own --in/--out-dir checks above.
+  if (!o.in) throw new UsageError('--in <file.age> required');
   await requireFile(o.in); // #267: before stat(), so a typo is not a raw ENOENT
   const sz = (await stat(o.in)).size;
   const head = await readHead(o.in, 64);
@@ -1660,7 +1664,8 @@ async function verifyImpl(o: CliOptions): Promise<number> {
     // commands print nothing to stdout on a basic usage/argument error (only the error
     // line goes to stderr), and quick used to violate that by printing "level: quick"
     // unconditionally ahead of this exact check.
-    if (!o.in) throw new Error('--in <file.age> required');
+    // #779: same UsageError treatment as runFileChecks()'s own --in check above.
+    if (!o.in) throw new UsageError('--in <file.age> required');
     await requireFile(o.in);
     // #536: remote/drill both print a "level: …" first line and carry a "level" field in
     // --json (below); quick used to have neither, so a caller inspecting only the JSON

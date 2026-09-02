@@ -17,6 +17,7 @@ import { run } from './proc.js';
 import { newEncrypter, encryptToFile } from './crypt.js';
 import { exists, fmtBytes, requirePath, rmrf, sha256, errMsg, redactPgConn } from './util.js';
 import { warn } from './warn.js';
+import { UsageError } from './errors.js';
 import { findPgDataDirs, pgDataDirCopyWarning, pgDataDirTruncatedWarning } from './gbrain.js';
 import { recipientEntries, resolvePinnedRecipients } from './keys.js';
 import { loadSignIdentity, signDetached } from './minisign.js';
@@ -417,8 +418,11 @@ export async function snapshot(o: CliOptions): Promise<void> {
   // paths. See profiles.ts's doc comment on these two guards for the full reasoning.
   assertVaultRequiresObsidianProfile(o);
   assertZipRequiresChatgptExportProfile(o);
+  // #779: this and the other pure flag-validation refusals below (no I/O involved in
+  // the check itself) are the same "command line itself was malformed" UsageError
+  // class as an unrecognized command/enum value or a missing required flag.
   if (!o.pg && o.dirs.length === 0)
-    throw new Error('nothing to snapshot: pass --profile <name>, --pg <conn> and/or --dir <path>');
+    throw new UsageError('nothing to snapshot: pass --profile <name>, --pg <conn> and/or --dir <path>');
   // #267: check every source path up front — before the --dry-run branch, before
   // --out is even required, and long before pg_dump or any staging — so a mistyped
   // --dir names itself instead of surfacing several steps later as a raw
@@ -437,14 +441,14 @@ export async function snapshot(o: CliOptions): Promise<void> {
   // let a request for the gate come back successful having inspected nothing.
   if (o.dry_run) {
     if (o.scan_secrets !== undefined)
-      throw new Error(
+      throw new UsageError(
         `--scan-secrets cannot be combined with --dry-run: a dry run stages no plaintext, so there is nothing for ` +
           `gitleaks to scan and the preview would exit 0 having checked nothing. Drop --dry-run to run the gate for ` +
           `real, or drop --scan-secrets to preview the .cypherbrainignore filtering.`,
       );
     return dryRun(o);
   }
-  if (!o.out) throw new Error('--out <file.age> required');
+  if (!o.out) throw new UsageError('--out <file.age> required');
   // --scan-secrets warn|deny|off (#215/#301): gitleaks over each --dir/--profile source's staged
   // plaintext before it is archived+encrypted. Validated AND gitleaks-availability-checked
   // here, before any pg_dump/tar/staging work below — the same fail-fast posture the
@@ -456,7 +460,7 @@ export async function snapshot(o: CliOptions): Promise<void> {
   let scanMode: ActiveScanMode | undefined;
   if (o.scan_secrets !== undefined) {
     if (!isScanSecretsMode(o.scan_secrets))
-      throw new Error(
+      throw new UsageError(
         `--scan-secrets must be ${SCAN_SECRETS_MODES.map((m) => `"${m}"`).join(', ')} (got ${JSON.stringify(o.scan_secrets)})`,
       );
     // The scan runs per --dir/--profile component (see the staging loop below), so with
@@ -473,7 +477,7 @@ export async function snapshot(o: CliOptions): Promise<void> {
     // rather than inferred, which is the whole point of it being a mode.
     if (o.scan_secrets !== 'off') {
       if (o.dirs.length === 0)
-        throw new Error(
+        throw new UsageError(
           `--scan-secrets ${o.scan_secrets} has nothing to scan: it covers --dir/--profile staged plaintext, and this ` +
             `snapshot has no --dir or --profile source (a --pg dump is not scanned). Add the source you meant to gate, ` +
             `or drop --scan-secrets — refusing rather than reporting a scan that would inspect no component.`,

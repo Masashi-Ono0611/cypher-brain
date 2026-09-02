@@ -151,11 +151,14 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
   // one-time operator/environment change, not a per-run consent flag. An agent (or
   // human) reading `code: CB-E007` off either of those got this entry's title ("…
   // needs explicit spend consent (--yes)") and retried with --yes, which does nothing
-  // for a cap that was never configured. Anchored instead to "re-run push with --yes
-  // or set CYPHER_BRAIN_YES=1 in the environment to confirm" — the tail wording ONLY
-  // the two genuine --yes-fixable consent refusals share — so it no longer shadows
-  // CB-E024 below. Deliberately does NOT include the "spends real funds — " prefix:
-  // in pushpull.ts's source that prefix and this tail are two SEPARATE template-
+  // for a cap that was never configured. Anchored instead to two tail phrases: the
+  // CLI's "re-run push with --yes or set CYPHER_BRAIN_YES=1 in the environment to
+  // confirm" (src/lib/pushpull.ts, arweave/turbo/ton-provider) and MCP's own
+  // "confirm_paid=true" consent gate (src/mcp.ts's snapshot_now spend gate — mcp-
+  // smoke.mjs asserts THIS one) — the wording every genuine --yes/confirm_paid-fixable
+  // consent refusal shares, so it no longer shadows CB-E024 below. Deliberately does
+  // NOT include the "spends real funds — "/"spends real funds " prefix either message
+  // uses: in both source files that prefix and its own tail are two SEPARATE template-
   // literal string pieces (concatenated with `+` across a line break), so a pattern
   // spanning both would not appear as one contiguous substring in the .ts file text
   // that scripts/selftest-error-codes.mjs's literal check greps against, even though
@@ -163,11 +166,13 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
   {
     code: 'CB-E007',
     title: 'paid backend upload needs explicit spend consent (--yes)',
-    pattern: /re-run push with --yes or set CYPHER_BRAIN_YES=1 in the environment to confirm/,
+    pattern: /re-run push with --yes or set CYPHER_BRAIN_YES=1 in the environment to confirm|confirm_paid=true/,
     origin: 'ours',
     source:
       'src/lib/pushpull.ts (push, "… spends real funds — re-run push with --yes or set CYPHER_BRAIN_YES=1 in the ' +
-      'environment to confirm…" — shared verbatim by the arweave/turbo and ton-provider consent refusals)',
+      'environment to confirm…" — shared verbatim by the arweave/turbo and ton-provider consent refusals) + ' +
+      'src/mcp.ts (snapshot_now\'s PAID_BACKENDS spend gate, "… Re-call snapshot_now with confirm_paid=true to ' +
+      'consent …")',
   },
   {
     code: 'CB-E008',

@@ -421,8 +421,11 @@ export function formatEstimate(e: CostEstimate): string[] {
 // re-implementation, so it can never disagree with either the human-readable report
 // or the MCP estimate_cost tool.
 export async function estimate(o: CliOptions): Promise<void> {
-  if (!o.in) throw new Error('--in <file.age> required');
-  if (!o.backend) throw new Error(`--backend <${STORAGE_BACKEND_NAMES.join('|')}> required`);
+  // #779: a required flag simply being absent is the same "command line itself was
+  // malformed" class as an unrecognized command/enum value — UsageError, exit 2, not
+  // the generic-failure 1 (matches this file's own unknown-backend refusal below).
+  if (!o.in) throw new UsageError('--in <file.age> required');
+  if (!o.backend) throw new UsageError(`--backend <${STORAGE_BACKEND_NAMES.join('|')}> required`);
   await requireFile(o.in); // #267: one shared check/wording across every command
   const st = await stat(o.in);
   if (!st.isFile())

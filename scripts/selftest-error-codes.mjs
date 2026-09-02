@@ -236,6 +236,12 @@ const FIXTURES = [
     expect: 'CB-E007',
   },
   {
+    label: 'CB-E007 positive: MCP snapshot_now spend gate (src/mcp.ts, mcp-smoke.mjs asserts this one)',
+    message:
+      'backend "turbo" is a PAID, PERMANENT Arweave store — pushing spends real funds irreversibly. Re-call snapshot_now with confirm_paid=true to consent (the MCP equivalent of the CLI --yes guard). The CYPHER_BRAIN_YES environment escape hatch is not honored over MCP, so no call can spend without this flag.',
+    expect: 'CB-E007',
+  },
+  {
     label: 'CB-E024 positive (was misclassified as CB-E007): schedule.ts spend-cap-not-configured',
     message:
       'ton-provider is a paid store: CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND (nanoTON) must be set in the environment before install — a StorageV1 deploy spends real funds, so there is no safe default to let an unattended schedule run uncapped through',
