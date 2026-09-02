@@ -47,6 +47,9 @@ export CYPHER_BRAIN_LAUNCHD_DIR="$TMP/launchagents"
 # not the wallet address, is the on-chain identifier).
 PROVIDER_PUBKEY="abababababababababababababababababababababababababababababababab"
 PROVIDER_WALLET="UQCCrKrQHLpB75vvrd5js78eB7qK6v7Cpz4WJpV2DoZnY-GC"
+# issue #665: a SECOND provider the mock registry can hand back instead, so a retry's
+# own selectProvider() picks someone the already-deployed contract was never built for.
+PROVIDER_PUBKEY_ALT="cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
 # Declared here (not down at its export near the push tests) so the tonapi mock
 # below can be launched already knowing which address the pre-deploy funds-check
 # positive control (#396 Phase B) needs to answer with a low balance.
@@ -63,6 +66,8 @@ const address = process.argv[4];
 const emptyFlagPath = process.argv[5]; // if this file exists, respond with zero candidates
 const badSpanFlagPath = process.argv[6]; // if this file exists, min_span rounds up past max_span
 const highPriceFlagPath = process.argv[7]; // if this file exists, price -> a rate that clears the #403 bounty floor for the high-price test payload
+const altPubkey = process.argv[8]; // issue #665: a SECOND, different provider pubkey
+const altPubkeyFlagPath = process.argv[9]; // issue #665: if this file exists, the registry answers with altPubkey instead — a retry's selectProvider() then picks a provider the contract was NEVER deployed with
 createServer((req, res) => {
   let body = '';
   req.on('data', (d) => (body += d));
@@ -71,13 +76,14 @@ createServer((req, res) => {
     const empty = emptyFlagPath && existsSync(emptyFlagPath);
     const badSpan = badSpanFlagPath && existsSync(badSpanFlagPath);
     const highPrice = highPriceFlagPath && existsSync(highPriceFlagPath);
+    const useAlt = altPubkeyFlagPath && existsSync(altPubkeyFlagPath);
     res.end(
       JSON.stringify({
         providers: empty
           ? []
           : [
               {
-                pubkey,
+                pubkey: useAlt ? altPubkey : pubkey,
                 address,
                 uptime: 99.5,
                 rating: 20.5,
@@ -100,8 +106,9 @@ createServer((req, res) => {
   });
 }).listen(port, '127.0.0.1');
 MOCKEOF
+ALT_PROVIDER_FLAG="$TMP/alt-provider-flag"
 MYTONPROVIDER_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-mytonprovider.mjs" "$MYTONPROVIDER_PORT" "$PROVIDER_PUBKEY" "$PROVIDER_WALLET" "$TMP/empty-providers-flag" "$TMP/bad-span-flag" "$TMP/high-price-flag" &
+node "$TMP/mock-mytonprovider.mjs" "$MYTONPROVIDER_PORT" "$PROVIDER_PUBKEY" "$PROVIDER_WALLET" "$TMP/empty-providers-flag" "$TMP/bad-span-flag" "$TMP/high-price-flag" "$PROVIDER_PUBKEY_ALT" "$ALT_PROVIDER_FLAG" &
 MYTONPROVIDER_PID=$!
 export CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL="http://127.0.0.1:$MYTONPROVIDER_PORT"
 
@@ -1079,6 +1086,195 @@ RECEIPT_COUNT_AFTER_RETRY_654=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LED
   || { echo "[FAIL] the retry that completed notify added a SECOND receipt for the SAME on-chain spend (double-counted) — count went from $RECEIPT_COUNT_AFTER_654 to $RECEIPT_COUNT_AFTER_RETRY_654"; exit 1; }
 echo "[PASS] issue #654: completing notify on a retry of an already-active contract does not double-count the receipt ledger"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore for any later runs
+
+echo "== issue #808: a confirmed spend killed before its receipt reached disk is recovered by the next push =="
+# #654 closed the "notify failed AFTER the receipt point" hole. This is the one BEFORE
+# it: waitForContractActive() has returned (the money is gone) and persistReceipt() is
+# still hashing the ciphertext when the process dies. No in-process handler can run, so
+# the only fix is a record written BEFORE the broadcast.
+#
+# The crash window is held open by a REAL blocking operation rather than aimed at with a
+# timer: this run's receipt ledger IS a FIFO with no reader, so appendReceipt()'s own
+# open(2) blocks indefinitely (measured: node's fs.appendFile on a reader-less FIFO never
+# resolves). The process therefore sits inside exactly the window #808 describes for as
+# long as the test wants, and the kill below has no race to lose. Both runs use the SAME
+# CYPHER_BRAIN_RECEIPT_LEDGER path — the FIFO is simply removed afterwards, so run 2
+# creates a regular file there, which is precisely the state a crashed run leaves behind
+# (the receipt never got written, wherever it was going).
+I808_DIR="$TMP/issue808-ledger"
+mkdir -p "$I808_DIR"
+I808_LEDGER="$I808_DIR/receipt-ledger.jsonl"
+# Derived, not configured: pending-spend.ts names its sidecar after the receipt ledger it
+# belongs to, in the same directory.
+I808_PENDING="$I808_DIR/receipt-ledger.jsonl.pending-spends.jsonl"
+mkdir -p "$TMP/issue808-src"
+printf 'ton-provider issue #808 crash-before-receipt payload\n' > "$TMP/issue808-src/note.txt"
+cb snapshot --dir "$TMP/issue808-src" --out "$TMP/issue808.age"
+I808_SIZE=$(stat -f%z "$TMP/issue808.age" 2>/dev/null || stat -c%s "$TMP/issue808.age")
+echo "$I808_SIZE" > "$TMP/notify-downloaded"
+
+mkfifo "$I808_LEDGER"
+: > "$BROADCAST_LOG"
+# `set -m` so the backgrounded push gets its OWN process group: kill -9 on the group
+# takes the ephemeral tonutils-storage daemon with it, where killing the direct child
+# alone would orphan it (the same reasoning selftest-lib.sh's with_timeout documents).
+set -m
+CYPHER_BRAIN_RECEIPT_LEDGER="$I808_LEDGER" CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue808.age" --backend ton-provider >"$TMP/issue808-run1.out" 2>"$TMP/issue808-run1.err" &
+I808_PID=$!
+set +m
+I808_CONFIRMED=0
+for _ in $(seq 1 600); do
+  if [ -f "$I808_PENDING" ] && grep -q '"state":"confirmed"' "$I808_PENDING"; then I808_CONFIRMED=1; break; fi
+  kill -0 "$I808_PID" 2>/dev/null || break
+  sleep 0.1
+done
+kill -9 -- "-$I808_PID" 2>/dev/null || true
+wait "$I808_PID" 2>/dev/null || true
+[ "$I808_CONFIRMED" = 1 ] \
+  || { echo "[FAIL] issue #808: the push never recorded a CONFIRMED pending spend before the receipt write (no intent to recover from)"; cat "$TMP/issue808-run1.err"; cat "$I808_PENDING" 2>/dev/null; exit 1; }
+# A SIGKILL runs no finally block, so put()'s own temp tree survives — and run-selftests.mjs
+# fails any test that leaves something in its TMPDIR. Sweeping it here is part of staging
+# the crash, not incidental cleanup.
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'cypher-brain-ton-provider-*' -exec rm -rf {} + 2>/dev/null || true
+grep -q '"state":"settled"' "$I808_PENDING" \
+  && { echo "[FAIL] issue #808: the intent was marked settled even though the receipt write never completed"; cat "$I808_PENDING"; exit 1; }
+[ -p "$I808_LEDGER" ] || { echo "[FAIL] issue #808 setup: the receipt ledger is no longer the FIFO the test created"; exit 1; }
+I808_CONTRACT=$(node -e '
+const fs = require("fs");
+const lines = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const confirmed = lines.filter((l) => l.state === "confirmed");
+if (confirmed.length !== 1) { console.error("expected exactly one confirmed intent, got " + confirmed.length); process.exit(1); }
+process.stdout.write(confirmed[confirmed.length - 1].contract_address);
+' "$I808_PENDING") || { echo "[FAIL] issue #808: could not read the confirmed intent"; cat "$I808_PENDING"; exit 1; }
+echo "[PASS] issue #808: the confirmed-but-unrecorded spend for $I808_CONTRACT is durably recorded before the crash"
+
+echo "== issue #808: 'doctor' surfaces a stale pending-spend intent (and stays quiet about a fresh one) =="
+rm -f "$I808_LEDGER" # the FIFO has done its job; run 2 (and doctor) need a real path
+cp "$I808_PENDING" "$I808_PENDING.orig"
+CYPHER_BRAIN_RECEIPT_LEDGER="$I808_LEDGER" cb doctor --json >"$TMP/issue808-doctor-fresh.json" 2>/dev/null || true
+I808_FRESH_STATUS=$(node -e '
+const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).checks.find((x) => x.id === "pending-spend-intents");
+process.stdout.write(c ? c.status : "MISSING");
+' "$TMP/issue808-doctor-fresh.json")
+[ "$I808_FRESH_STATUS" = "pass" ] \
+  || { echo "[FAIL] doctor's pending-spend-intents check reported '$I808_FRESH_STATUS' for a JUST-recorded intent — a doctor run alongside a live push must not report that push as a lost spend"; cat "$TMP/issue808-doctor-fresh.json"; exit 1; }
+# Backdate the REAL record this run wrote (not a hand-built fixture) past the staleness
+# grace period — the schema under test is the one production code emits.
+node -e '
+const fs = require("fs");
+const old = new Date(Date.now() - 3 * 86400000).toISOString();
+const out = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean)
+  .map((l) => JSON.stringify({ ...JSON.parse(l), timestamp: old, updated_at: old })).join("\n");
+fs.writeFileSync(process.argv[1], out + "\n");
+' "$I808_PENDING"
+CYPHER_BRAIN_RECEIPT_LEDGER="$I808_LEDGER" cb doctor --json >"$TMP/issue808-doctor-stale.json" 2>/dev/null || true
+node -e '
+const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).checks.find((x) => x.id === "pending-spend-intents");
+if (!c) { console.error("no pending-spend-intents check in the doctor report"); process.exit(1); }
+if (c.status !== "warn") { console.error("expected WARN for a 3-day-old unsettled intent, got " + c.status + ": " + c.message); process.exit(1); }
+if (!c.message.includes(process.argv[2])) { console.error("the finding does not name the contract address: " + c.message); process.exit(1); }
+if (!c.remediation) { console.error("the finding carries no remediation"); process.exit(1); }
+' "$TMP/issue808-doctor-stale.json" "$I808_CONTRACT" \
+  || { echo "[FAIL] issue #808: doctor did not surface the stale pending-spend intent"; cat "$TMP/issue808-doctor-stale.json"; exit 1; }
+echo "[PASS] issue #808: doctor WARNs on a stale unsettled spend naming the contract, and passes on a fresh one"
+mv "$I808_PENDING.orig" "$I808_PENDING" # back to the real, un-backdated crash state
+
+echo "== issue #808: the next push writes the missing receipt exactly once and settles the record =="
+I808_RUN2_BROADCASTS_BEFORE=$(grep -c '"boc"' "$BROADCAST_LOG" || true)
+[ "$I808_RUN2_BROADCASTS_BEFORE" = "1" ] \
+  || { echo "[FAIL] issue #808 setup: expected exactly 1 broadcast from the killed run, got $I808_RUN2_BROADCASTS_BEFORE"; cat "$BROADCAST_LOG"; exit 1; }
+CYPHER_BRAIN_RECEIPT_LEDGER="$I808_LEDGER" CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue808.age" --backend ton-provider >/dev/null 2>"$TMP/issue808-run2.err" \
+  || { echo "[FAIL] issue #808: the recovery push failed"; cat "$TMP/issue808-run2.err"; exit 1; }
+grep -q 'already shows on-chain activity' "$TMP/issue808-run2.err" \
+  || { echo "[FAIL] issue #808: the recovery push did not take the already-active branch"; cat "$TMP/issue808-run2.err"; exit 1; }
+grep -q 'recording a receipt an earlier run confirmed but never wrote' "$TMP/issue808-run2.err" \
+  || { echo "[FAIL] issue #808 REGRESSION: the already-active branch skipped the earlier run's unrecorded spend instead of recording it"; cat "$TMP/issue808-run2.err"; exit 1; }
+[ "$(grep -c '"boc"' "$BROADCAST_LOG" || true)" = "1" ] \
+  || { echo "[FAIL] issue #808: the recovery push re-funded the already-active contract"; cat "$BROADCAST_LOG"; exit 1; }
+i808_receipts_for_contract() {
+  node -e '
+const fs = require("fs");
+let n = 0;
+for (const line of fs.readFileSync(process.argv[1], "utf8").split("\n")) {
+  if (!line.trim()) continue;
+  const r = JSON.parse(line);
+  if (r.backend === "ton-provider" && r.raw && r.raw.contract_address === process.argv[2]) n++;
+}
+process.stdout.write(String(n));
+' "$I808_LEDGER" "$I808_CONTRACT"
+}
+[ "$(i808_receipts_for_contract)" = "1" ] \
+  || { echo "[FAIL] issue #808: expected EXACTLY ONE receipt for $I808_CONTRACT after recovery, got $(i808_receipts_for_contract)"; cat "$I808_LEDGER"; exit 1; }
+grep -q '"state":"settled"' "$I808_PENDING" \
+  || { echo "[FAIL] issue #808: the recovered intent was never marked settled"; cat "$I808_PENDING"; exit 1; }
+# The recovered receipt must carry the KILLED run's own figures, not this run's
+# recomputation — that is what makes it that spend's receipt rather than a second record
+# of one spend (the #638 objection the already-active branch is otherwise right about).
+node -e '
+const fs = require("fs");
+const intents = fs.readFileSync(process.argv[2], "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const intent = intents.find((i) => i.contract_address === process.argv[3]);
+const receipt = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l))
+  .find((r) => r.backend === "ton-provider" && r.raw && r.raw.contract_address === process.argv[3]);
+if (receipt.cost !== intent.amount_nano) { console.error("receipt cost " + receipt.cost + " != recorded " + intent.amount_nano); process.exit(1); }
+if (receipt.unit !== "nanoTON") { console.error("wrong unit: " + receipt.unit); process.exit(1); }
+if (receipt.raw.provider_pubkey !== intent.provider_pubkey) { console.error("provider mismatch"); process.exit(1); }
+' "$I808_LEDGER" "$I808_PENDING" "$I808_CONTRACT" \
+  || { echo "[FAIL] issue #808: the recovered receipt does not carry the recorded spend's own figures"; exit 1; }
+# Idempotent: a THIRD push must not add a second receipt for the same spend.
+CYPHER_BRAIN_RECEIPT_LEDGER="$I808_LEDGER" CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue808.age" --backend ton-provider >/dev/null 2>"$TMP/issue808-run3.err" \
+  || { echo "[FAIL] issue #808: the third push failed"; cat "$TMP/issue808-run3.err"; exit 1; }
+[ "$(i808_receipts_for_contract)" = "1" ] \
+  || { echo "[FAIL] issue #808: a further retry duplicated the receipt — now $(i808_receipts_for_contract) for $I808_CONTRACT"; cat "$I808_LEDGER"; exit 1; }
+CYPHER_BRAIN_RECEIPT_LEDGER="$I808_LEDGER" cb doctor --json >"$TMP/issue808-doctor-after.json" 2>/dev/null || true
+I808_AFTER_STATUS=$(node -e '
+const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).checks.find((x) => x.id === "pending-spend-intents");
+process.stdout.write(c ? c.status : "MISSING");
+' "$TMP/issue808-doctor-after.json")
+[ "$I808_AFTER_STATUS" = "pass" ] \
+  || { echo "[FAIL] doctor still reports a pending spend after it was settled (status $I808_AFTER_STATUS)"; cat "$TMP/issue808-doctor-after.json"; exit 1; }
+echo "[PASS] issue #808: the recovery writes the missing receipt exactly once, settles the record, and doctor goes quiet"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
+
+echo "== issue #665: an already-active retry notifies the provider the contract was DEPLOYED with, not this run's pick =="
+# modify_providers REPLACES rather than merges, so notifying whoever this run's
+# mytonprovider.org snapshot happens to return can address a provider that never held
+# this bag (and whose notify may legitimately refuse). The registry is flipped to a
+# DIFFERENT pubkey between the two pushes below, which is what makes the retry's own
+# selectProvider() disagree with the contract's on-chain dict.
+mkdir -p "$TMP/issue665-src"
+printf 'ton-provider issue #665 provider-resume payload\n' > "$TMP/issue665-src/note.txt"
+cb snapshot --dir "$TMP/issue665-src" --out "$TMP/issue665.age"
+I665_SIZE=$(stat -f%z "$TMP/issue665.age" 2>/dev/null || stat -c%s "$TMP/issue665.age")
+echo "$I665_SIZE" > "$TMP/notify-downloaded"
+: > "$BROADCAST_LOG"
+CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue665.age" --backend ton-provider >/dev/null 2>"$TMP/issue665-first.err" \
+  || { echo "[FAIL] issue #665 setup: the first (fresh) push failed"; cat "$TMP/issue665-first.err"; exit 1; }
+grep -qx -- "$PROVIDER_PUBKEY" "$TMP/notify-args.log" \
+  || { echo "[FAIL] issue #665 setup: the fresh push did not notify the registry's provider"; cat "$TMP/notify-args.log"; exit 1; }
+touch "$ALT_PROVIDER_FLAG" # the registry now returns a DIFFERENT provider
+CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue665.age" --backend ton-provider >/dev/null 2>"$TMP/issue665-retry.err" \
+  || { echo "[FAIL] issue #665: the retry push failed"; cat "$TMP/issue665-retry.err"; rm -f "$ALT_PROVIDER_FLAG"; exit 1; }
+rm -f "$ALT_PROVIDER_FLAG"
+grep -q "selected provider $PROVIDER_PUBKEY_ALT" "$TMP/issue665-retry.err" \
+  || { echo "[FAIL] issue #665 setup: the retry did not actually select the DIFFERENT provider (the mock flip did not take)"; cat "$TMP/issue665-retry.err"; exit 1; }
+grep -q 'already shows on-chain activity' "$TMP/issue665-retry.err" \
+  || { echo "[FAIL] issue #665 setup: the retry did not take the already-active branch"; cat "$TMP/issue665-retry.err"; exit 1; }
+grep -qx -- "$PROVIDER_PUBKEY" "$TMP/notify-args.log" \
+  || { echo "[FAIL] issue #665 REGRESSION: the retry notified a provider the contract was never deployed with — notify args:"; cat "$TMP/notify-args.log"; exit 1; }
+grep -qx -- "$PROVIDER_PUBKEY_ALT" "$TMP/notify-args.log" \
+  && { echo "[FAIL] issue #665 REGRESSION: the retry notified THIS run's freshly selected provider instead of the deployed one"; cat "$TMP/notify-args.log"; exit 1; }
+grep -q "was deployed with provider $PROVIDER_PUBKEY" "$TMP/issue665-retry.err" \
+  || { echo "[FAIL] issue #665: the retry did not report which provider it resumed with"; cat "$TMP/issue665-retry.err"; exit 1; }
+grep -q "reports the full bag downloaded" "$TMP/issue665-retry.err" \
+  || { echo "[FAIL] issue #665: the retry's notify never completed against the recorded provider"; cat "$TMP/issue665-retry.err"; exit 1; }
+echo "[PASS] issue #665: an already-active retry resumes notify with the recorded provider ($PROVIDER_PUBKEY), not this run's pick ($PROVIDER_PUBKEY_ALT)"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
 echo "== issue #654 (MCP-level): a snapshot_now notify timeout classifies as funding_confirmed, not a generic partial-success bucket =="
 # Reuses this run's ALREADY-RUNNING tonapi/mytonprovider/notify mocks (env vars

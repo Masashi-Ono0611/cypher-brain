@@ -62,6 +62,7 @@ import { scheduleStatusReport, ScheduleNotInstalledError } from './schedule.js';
 import { buildInfo, buildAgeDays, BUILD_STALE_DAYS } from './buildinfo.js';
 import { readAuditLog, verifyAuditChain } from './audit.js';
 import { readReceipts } from './receipt.js';
+import { readSpendIntents, isUnsettled, PENDING_SPENDS_LOG, type SpendIntentRecord } from './pending-spend.js';
 import { detectGbrainEngine, resolveGbrainConfigPath } from './gbrain.js';
 import { printJson, printMascot, moodForVerdict } from './ui.js';
 import type { CliOptions } from './types.js';
@@ -609,6 +610,91 @@ async function checkReceiptLedger(): Promise<DoctorCheck> {
   };
 }
 
+// How long an unsettled pending-spend intent is treated as "still in flight" rather than
+// stale (#808). It has to cover the whole of one put()'s confirm-then-record stretch —
+// waitForContractActive()'s on-chain poll plus persistReceipt()'s hash of a brain-sized
+// ciphertext — because a doctor run alongside a live push must not report that push's own
+// in-progress intent as a lost spend. It does NOT have to cover notify: the intent is
+// settled BEFORE notifyProviderWithRetry() runs. Generous rather than tight, since the
+// cost of waiting is a delayed report and the cost of being early is a false alarm on the
+// one check whose whole value is that it only fires on something real.
+const PENDING_SPEND_STALE_MS = 30 * 60 * 1000; // 30 minutes
+
+function describeIntent(i: SpendIntentRecord): string {
+  const amount = i.amount_nano ? `${i.amount_nano} nanoTON` : 'an unrecorded amount';
+  return `${i.contract_address} (${amount}, ${i.state}, recorded ${i.timestamp})`;
+}
+
+// #808: a ton-provider deploy writes a pending-spend intent BEFORE it broadcasts and
+// settles it only once the receipt is verifiably in the ledger. An intent still unsettled
+// long afterwards is therefore one of exactly two things, and both are worth an
+// operator's attention:
+//
+//   - `confirmed` — the contract went live, so the money IS gone, and the receipt never
+//     reached disk. `ledger`/`audit` totals understate real spend by this amount until a
+//     later push of the same artifact writes the missing receipt (ton-provider.ts's
+//     already-active branch does that automatically).
+//   - `pending` — the transfer was broadcast and this machine never saw it confirm. That
+//     is the #822 uncertain-spend case exactly: only an operator looking at the contract
+//     address on an explorer can say whether the funds moved.
+//
+// WARN, never FAIL: nothing here is insecure or broken, and both states resolve — one by
+// pushing the same artifact again, one by looking. A FAIL would also flip `verify`-style
+// exit codes for what is, at worst, an incomplete cost record.
+async function checkPendingSpends(): Promise<DoctorCheck> {
+  const id = 'pending-spend-intents';
+  let intents: SpendIntentRecord[];
+  let skippedLines: number;
+  try {
+    ({ intents, skippedLines } = await readSpendIntents());
+  } catch (e) {
+    return {
+      id,
+      status: 'fail',
+      message: `could not read the pending-spend log at ${PENDING_SPENDS_LOG}: ${errMsg(e)}`,
+      remediation: `check that every path component of ${PENDING_SPENDS_LOG} is accessible — while it cannot be read, a confirmed-but-unrecorded spend cannot be detected at all`,
+    };
+  }
+  const cutoff = Date.now() - PENDING_SPEND_STALE_MS;
+  const stale = intents.filter((i) => isUnsettled(i) && !(Date.parse(i.updated_at) > cutoff));
+  if (skippedLines > 0) {
+    return {
+      id,
+      status: 'warn',
+      message: `${skippedLines} unreadable line(s) in the pending-spend log (${PENDING_SPENDS_LOG})${stale.length ? `, alongside ${stale.length} stale intent(s)` : ''} — an unrecorded ton-provider spend could be hiding in them`,
+      remediation: `inspect ${PENDING_SPENDS_LOG} directly for the malformed line(s); each readable line names the contract address to check on a TON explorer`,
+    };
+  }
+  if (intents.length === 0) {
+    return {
+      id,
+      status: 'skip',
+      message: `no pending-spend log yet at ${PENDING_SPENDS_LOG} — no ton-provider push has run on this machine yet`,
+    };
+  }
+  if (stale.length === 0) {
+    return {
+      id,
+      status: 'pass',
+      message: `every recorded ton-provider spend is settled against the receipt ledger (${intents.length} intent${intents.length === 1 ? '' : 's'})`,
+    };
+  }
+  const unconfirmed = stale.filter((i) => i.state === 'pending').length;
+  const listed = stale.slice(0, 3).map(describeIntent).join('; ');
+  const more = stale.length > 3 ? `; and ${stale.length - 3} more` : '';
+  return {
+    id,
+    status: 'warn',
+    message:
+      `${stale.length} ton-provider spend(s) recorded but never settled: ${listed}${more}` +
+      (unconfirmed > 0
+        ? ` — ${unconfirmed} of them never confirmed on-chain from this machine, so whether the funds moved is UNKNOWN`
+        : ' — the funds moved; the receipt ledger is short by them'),
+    remediation:
+      "re-run 'cypher-brain push' for the same artifact (the already-active branch writes the missing receipt and settles the record), and check each 'pending' contract address on a TON explorer first — that state means this machine never saw the transfer confirm",
+  };
+}
+
 // #542: detectGbrainEngine() (gbrain.ts, #367) was, until now, wired ONLY into the init
 // wizard's one-time snapshot-source prompt — and `init` itself refuses to rerun once an
 // identity already exists, so a gbrain install that later CHANGES engine (e.g. migrates
@@ -1001,6 +1087,7 @@ const CHECK_DEFS: ReadonlyArray<{
   { id: 'schedule-last-run', run: () => checkSchedule() },
   { id: 'audit-chain-integrity', run: () => checkAuditChain() },
   { id: 'receipt-ledger-readability', run: () => checkReceiptLedger() },
+  { id: 'pending-spend-intents', run: () => checkPendingSpends() },
   { id: 'gbrain-engine-detection', run: () => checkGbrainEngine() },
 ];
 
