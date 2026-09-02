@@ -651,14 +651,15 @@ the storage; it buys availability, not permanence.
   on 2026-09-02 10:08 UTC**: `withdraw_owner` landed, the contract answered
   with `storage_contract_terminated` and returned `0.347618 TON` to the
   owner wallet (confirmed via tonapi transactions, not from this repo's own
-  logs); the contract remains on-chain (`status: active`) with the same
-  ~0.005 TON residual as the first contract. The owner wallet was then
-  swept (0.4212 TON) to the operator's main wallet. Net result: **no
+  logs); the contract remains on-chain (`status: active`, residual
+  balance not tracked here). The owner wallet was then swept (0.4212 TON)
+  to the operator's main wallet. Net result: **no
   StorageV1 contract currently pays this provider** — it stays registered
   on mytonprovider.org (uptime ~88%, `used_provider_space: 0`, i.e. no
   third-party contracts as of 2026-09-02) and its provider wallet
-  `EQD3InMQ7gkYfgOBmR1xH6yn991Ww42xdS9e8fS1_ttLku23` keeps ~0.205 TON
-  for proof gas should a contract ever arrive. Withdraw parameters were
+  `EQD3InMQ7gkYfgOBmR1xH6yn991Ww42xdS9e8fS1_ttLku23` is left funded for
+  proof gas should a contract ever arrive (balance deliberately not
+  recorded here — the chain is the source of truth; check tonapi). Withdraw parameters were
   read back from the contract's `get_storage_info` get-method (torrent
   hash, size 481490005, piece 131072, owner, merkle hash) rather than
   from any local record — the client's address re-derivation guard
