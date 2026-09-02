@@ -43,6 +43,10 @@ type accountState struct {
 	// Read by `providers` (providers.go) and by nothing else; every other
 	// caller of fetchAccountState ignores it.
 	Data string `json:"data"`
+	// Code is the account's code cell, hex-encoded — same endpoint, same
+	// caveat as Data. `providers` checks it against the compiled StorageV1
+	// code so it can only ever decode an account that really is one.
+	Code string `json:"code"`
 }
 
 // stateVerdict ports scripts/ton-provider-experiment.mjs's stateVerdict — the

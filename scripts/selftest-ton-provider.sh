@@ -1346,8 +1346,37 @@ grep -qx -- "$PROVIDER_PUBKEY_ONCHAIN" "$TMP/notify-args.log" \
   || { echo "[FAIL] issue #665 (b): with no local record, notify did not go to the on-chain provider — notify args:"; cat "$TMP/notify-args.log"; rm -f "$TMP/onchain-providers"; exit 1; }
 grep -q "no local record names the provider contract .* on-chain providers dict was read instead" "$TMP/issue665b-norecord.err" \
   || { echo "[FAIL] issue #665 (b): the no-record run did not report that it fell through to the chain"; cat "$TMP/issue665b-norecord.err"; rm -f "$TMP/onchain-providers"; exit 1; }
-rm -f "$TMP/onchain-providers" # back to "the on-chain read is unavailable" for every later test
 echo "[PASS] issue #665 (b): a contract with no local record at all is resolved from its own on-chain dict"
+
+# Positive controls for the two REFUSALS (b) adds. Both are cases where a local record —
+# or this run's registry pick — would happily name someone the contract does not, which
+# is exactly what #665 exists to stop. Nothing has moved funds on this branch, so failing
+# is free; the risk being guarded is notifying a provider that never held the bag.
+echo "== issue #665 (b): an EMPTY on-chain dict is an answer ('nobody'), and must refuse rather than fall back =="
+: > "$TMP/onchain-providers" # a SUCCESSFUL read of an empty dict, not a failed read
+if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue665.age" --backend ton-provider >/dev/null 2>"$TMP/issue665b-empty.err"; then
+  echo "[FAIL] issue #665 (b): a push against a contract whose on-chain dict is EMPTY was allowed to notify someone"
+  cat "$TMP/issue665b-empty.err"; rm -f "$TMP/onchain-providers"; exit 1
+fi
+grep -q "its own providers dict is EMPTY" "$TMP/issue665b-empty.err" \
+  || { echo "[FAIL] issue #665 (b): the empty-dict refusal did not say why"; cat "$TMP/issue665b-empty.err"; rm -f "$TMP/onchain-providers"; exit 1; }
+echo "[PASS] issue #665 (b): an empty on-chain dict refuses loudly instead of notifying a local record's provider"
+
+echo "== issue #665 (b): several on-chain providers with NO local record refuses rather than picking =="
+printf '%s\n%s\n' "$PROVIDER_PUBKEY_ONCHAIN" "$PROVIDER_PUBKEY_ALT" > "$TMP/onchain-providers"
+I665C_DIR="$TMP/issue665c-ledger"
+mkdir -p "$I665C_DIR"
+if CYPHER_BRAIN_RECEIPT_LEDGER="$I665C_DIR/receipt-ledger.jsonl" CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" \
+  CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue665.age" --backend ton-provider >/dev/null 2>"$TMP/issue665b-ambiguous.err"; then
+  echo "[FAIL] issue #665 (b): a contract naming 2 unrecorded providers let the push pick one anyway"
+  cat "$TMP/issue665b-ambiguous.err"; rm -f "$TMP/onchain-providers"; exit 1
+fi
+grep -q "this machine recorded none of them" "$TMP/issue665b-ambiguous.err" \
+  || { echo "[FAIL] issue #665 (b): the ambiguous-dict refusal did not say why"; cat "$TMP/issue665b-ambiguous.err"; rm -f "$TMP/onchain-providers"; exit 1; }
+echo "[PASS] issue #665 (b): a multi-provider dict with nothing recorded locally refuses instead of falling back to this run's pick"
+rm -f "$TMP/onchain-providers" # back to "the on-chain read is unavailable" for every later test
 echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
 echo "== issue #654 (MCP-level): a snapshot_now notify timeout classifies as funding_confirmed, not a generic partial-success bucket =="

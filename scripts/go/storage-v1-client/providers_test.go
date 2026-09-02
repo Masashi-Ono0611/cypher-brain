@@ -247,6 +247,7 @@ func TestRunProvidersPrintsJSON(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status":  "active",
 			"balance": 5000000000,
+			"code":    hex.EncodeToString(contract.V1Code.ToBOC()),
 			"data":    hex.EncodeToString(data.ToBOC()),
 		})
 	})
@@ -311,6 +312,50 @@ func TestRunProvidersFailsOnTonapiError(t *testing.T) {
 	}
 	if _, ok := err.(*guardError); ok {
 		t.Fatal("a tonapi failure must NOT be a guardError — exit 2 means a deliberate refusal, not 'could not read'")
+	}
+}
+
+// The account's CODE cell is what proves it really is a StorageV1 contract — a
+// data cell that merely happens to decode is not enough (multi-model review).
+// An active account with foreign, unreadable or missing code must fail (exit
+// 1), never print a provider list.
+func TestRunProvidersRejectsForeignCode(t *testing.T) {
+	pubkey := strings.Repeat("ab", 32)
+	data := buildLiveStorageV1Data(t, map[string][2]uint64{pubkey: {86400, 800}})
+	for name, codeHex := range map[string]string{
+		"missing code": "",
+		"foreign code": hex.EncodeToString(cell.BeginCell().MustStoreUInt(0xdead, 32).EndCell().ToBOC()),
+		"code not hex": "zzzz",
+	} {
+		t.Run(name, func(t *testing.T) {
+			withMockTonapiPaths(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":  "active",
+					"balance": 1,
+					"code":    codeHex,
+					"data":    hex.EncodeToString(data.ToBOC()),
+				})
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var out bytes.Buffer
+			err := runProviders(ctx, []string{"--address", "0:" + strings.Repeat("c", 64)}, &out)
+			if err == nil {
+				t.Fatalf("expected a refusal for %s, got nil (stdout: %s)", name, out.String())
+			}
+			if strings.Contains(out.String(), pubkey) {
+				t.Fatalf("%s: a provider list was printed anyway: %s", name, out.String())
+			}
+		})
+	}
+}
+
+// Positive control for the check above: the REAL StorageV1 code passes it, so
+// that test is measuring foreign code rather than a check that always refuses.
+func TestAssertStorageV1CodeAcceptsTheRealCode(t *testing.T) {
+	if err := assertStorageV1Code(hex.EncodeToString(contract.V1Code.ToBOC())); err != nil {
+		t.Fatalf("the compiled StorageV1 code was rejected: %v", err)
 	}
 }
 

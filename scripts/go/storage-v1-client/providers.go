@@ -37,6 +37,7 @@ package main
 // second is itself authoritative.
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -114,6 +115,38 @@ func parseProvidersFlags(args []string) (*providersParams, error) {
 		return nil, err
 	}
 	return &providersParams{contract: addr, testnet: !*mainnet}, nil
+}
+
+// assertStorageV1Code refuses an account whose code cell is not the compiled
+// StorageV1 code (contract.V1Code — the same BOC `deploy` puts in its
+// StateInit). Compared by cell hash rather than by raw BOC bytes: the same
+// cell can serialize to different BOCs, so a byte comparison would reject
+// genuine contracts.
+//
+// An account with no readable code is refused too, not waved through: this
+// only ever runs against an account tonapi already called 'active', and an
+// active account always has code. "Could not verify" must not read as
+// "verified" for the check whose whole job is to stop a wrong account being
+// interpreted as a provider list.
+func assertStorageV1Code(codeHex string) error {
+	if codeHex == "" {
+		return fmt.Errorf("tonapi returned no `code` cell for this active account, so it cannot be confirmed to be a StorageV1 contract")
+	}
+	raw, err := hex.DecodeString(codeHex)
+	if err != nil {
+		return fmt.Errorf("tonapi's `code` field is not hex: %w", err)
+	}
+	code, err := cell.FromBOC(raw)
+	if err != nil {
+		return fmt.Errorf("tonapi's `code` field is not a valid BOC: %w", err)
+	}
+	if !bytes.Equal(code.Hash(), contract.V1Code.Hash()) {
+		return fmt.Errorf(
+			"this account's code is not the StorageV1 contract (code hash %x, want %x) — is --address really a StorageV1 contract?",
+			code.Hash(), contract.V1Code.Hash(),
+		)
+	}
+	return nil
 }
 
 // decodeActiveProviders turns a StorageV1 account's raw `data` cell into the
@@ -219,6 +252,16 @@ func runProviders(ctx context.Context, args []string, stdout io.Writer) error {
 			"contract %s status is %q on %s, not 'active' — it holds no provider dict to read (%s)",
 			p.contract.StringRaw(), acc.Status, network, stateVerdict(acc.Status),
 		)
+	}
+	// Multi-model review (Critical/Warning): a successful TL-B decode is NOT
+	// proof that this account is a StorageV1 contract — another contract whose
+	// data cell happens to start with 256 bits + a dict + an address would
+	// decode "fine" and hand a caller a provider list that is not one. The
+	// account's CODE cell settles it: compare it to the compiled V1Code this
+	// program already deploys with, so the identity check uses the same
+	// artifact the deploy path does rather than a heuristic.
+	if err := assertStorageV1Code(acc.Code); err != nil {
+		return err
 	}
 	providers, err := decodeActiveProviders(acc.Data)
 	if err != nil {

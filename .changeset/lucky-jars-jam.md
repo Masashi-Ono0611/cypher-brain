@@ -19,7 +19,10 @@ be a provider that never held the bag. It now notifies the one the contract name
 
 If the on-chain read cannot answer (the Go client is not configured, tonapi is
 unreachable, the contract is not active yet), behaviour is unchanged from before — the
-local records decide — and a warning says the fallback happened. When the chain and a
-local record disagree, both are reported and the chain wins. When the chain names several
-providers and none of them matches anything local, the push refuses rather than picking
-one; no funds move on this path either way.
+local records decide — and a warning says so, naming the reason. When the chain and a
+local record disagree, both are reported and the chain wins.
+
+Two situations now refuse the push rather than notify someone: a contract whose on-chain
+dict is empty (it registers nobody, so notifying anyone addresses a provider it does not
+name), and a contract naming several providers none of which this machine recorded. No
+funds move on this path either way, so a refusal costs only a retry.
