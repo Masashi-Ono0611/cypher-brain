@@ -595,9 +595,19 @@ every other environment-backed setting here). Then:
 | `CYPHER_BRAIN_PIN_RECIPIENTS` unset, unreadable, or resolving to no `age1…` keys | every `snapshot_now` call refused |
 | a call naming a recipient that is not on that allowlist | that call refused (the CLI enforces the same rule; the MCP server checks it again so an `idempotency_key` replay cannot bypass it) |
 | `CYPHER_BRAIN_MCP_SOURCE_ROOTS` unset, empty, or not a JSON array of absolute paths | every call naming `dirs` refused |
+| any root in `CYPHER_BRAIN_MCP_SOURCE_ROOTS` that does not exist on disk as a directory | every call naming `dirs` refused, naming the offending root — **not** silently authorized as its nearest existing ancestor (#838) |
 | a `dirs` entry that resolves (after following symlinks) outside every root | that call refused — containment is exact-match-or-separator-bounded, so a `/roots/a` root does **not** cover `/roots/ab` |
 | a pinned call whose only source is `pg` | allowed with no roots configured |
 | a replay (`idempotency_key`) of a call the CURRENT policy would deny | refused — replays are not grandfathered |
+
+Every configured root must exist on disk as a directory — checked live, each time a
+`snapshot_now` call names `dirs`, not only once at server start. A typo'd or
+not-yet-created root (e.g. `/srv/brian` instead of `/srv/brain`) refuses **every** `dirs`
+call rather than silently falling back to authorizing its nearest existing ancestor
+(`/srv`), which would be broader than what you named (#838). A root that is itself a
+symlink is followed, and its resolved target is what gets compared — the same "resolve
+symlinks on both sides before comparing" rule this policy already applies to every `dirs`
+entry.
 
 A refusal is `ERR_POLICY_DENIED` with `cb_code` `CB-E025` and names the variable to set.
 Nothing is created on the way out: no `out` file, no object in the store, no idempotency

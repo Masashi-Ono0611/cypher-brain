@@ -23,6 +23,12 @@
 //   3. A replay is not grandfathered: a key recorded while the policy allowed the call is
 //      refused once the policy no longer does, and writes no locator file on the way out.
 //   4. The green cases still work, and the CLI is untouched by any of it.
+//   5. #838: a CYPHER_BRAIN_MCP_SOURCE_ROOTS root must exist on disk as a directory — a
+//      nonexistent or non-directory root fails the WHOLE policy closed (naming the
+//      offending root), rather than realpathOfNearestAncestor()'s "dirs entry" fallback
+//      silently authorizing its nearest existing ancestor instead. A root that is itself
+//      a symlink to a directory is still accepted, resolved-target compared, same as
+//      every other path this gate compares.
 //
 // Each `snapshot_now` case gets its own server process because the policy inputs are env
 // vars this server reads at module load — which is also the honest shape of the feature:
@@ -278,6 +284,71 @@ async function run(tmp) {
     await assertNoArtifacts(label, { out, store });
   }
 
+  // ── 6b. a configured root that does not exist on disk (#838) ─────────────
+  // The bug this closes: realpathOfNearestAncestor() used to "resolve" a nonexistent
+  // root to its nearest EXISTING ancestor instead of refusing it outright — so a typo'd
+  // root silently authorized a BROADER directory than the operator named, rather than
+  // being refused. rootA legitimately exists and covers `contained`, but rootGhost does
+  // not exist at all: the whole call must be refused (naming rootGhost), not served by
+  // silently falling back to rootA alone.
+  {
+    const rootGhost = join(rootsDir, 'ghost-does-not-exist');
+    const out = nextOut();
+    const frame = await callSnapshotNow(withRoots(JSON.stringify([rootA, rootGhost])), baseArgs(out));
+    assertPolicyDenied('a configured root that does not exist on disk', frame);
+    const msg = structured(frame).message ?? '';
+    if (!msg.includes(rootGhost)) fail(`nonexistent-root refusal did not name the offending root: ${msg}`);
+    await assertNoArtifacts('a configured root that does not exist on disk', { out, store });
+  }
+
+  // ── 6c. a configured root that exists but is a regular file, not a directory ──
+  {
+    const rootFile = join(rootsDir, 'not-a-directory');
+    await writeFile(rootFile, 'a file, not a directory\n');
+    const out = nextOut();
+    const frame = await callSnapshotNow(withRoots(JSON.stringify([rootFile])), baseArgs(out));
+    assertPolicyDenied('a configured root that is a regular file, not a directory', frame);
+    const msg = structured(frame).message ?? '';
+    if (!msg.includes(rootFile)) fail(`non-directory-root refusal did not name the offending root: ${msg}`);
+    await assertNoArtifacts('a configured root that is a regular file, not a directory', { out, store });
+  }
+
+  // ── 6d. a configured root that is a symlink to a FILE — non-disclosure ────
+  // Multi-model review, #838: the refusal must name the configured symlink (what the
+  // operator wrote) and must NOT leak the resolved target's path — a uniquely-named
+  // target file makes an accidental leak easy to catch by string search.
+  {
+    const uniqueTarget = join(tmp, 'unique-target-file-f83a91.txt');
+    await writeFile(uniqueTarget, 'not a directory\n');
+    const rootLinkToFile = join(rootsDir, 'link-to-a-file');
+    await symlink(uniqueTarget, rootLinkToFile);
+    const out = nextOut();
+    const frame = await callSnapshotNow(withRoots(JSON.stringify([rootLinkToFile])), baseArgs(out));
+    assertPolicyDenied('a configured root that is a symlink to a file', frame);
+    const msg = structured(frame).message ?? '';
+    if (!msg.includes(rootLinkToFile)) fail(`symlink-to-file root refusal did not name the configured root: ${msg}`);
+    if (msg.includes(uniqueTarget)) fail(`symlink-to-file root refusal leaked the resolved target path: ${msg}`);
+    await assertNoArtifacts('a configured root that is a symlink to a file', { out, store });
+  }
+
+  // ── 6e. a configured root that is a symlink LOOP (ELOOP) ──────────────────
+  // Exercises the generic (non-ENOENT/ENOTDIR) branch of resolveConfiguredRoot()'s first
+  // try/catch — a permission or loop error must still name the ORIGINAL root, not fall
+  // through to underPolicy()'s generic "a root could not be resolved" wrapper, which
+  // does not say WHICH root failed.
+  {
+    const loopA = join(rootsDir, 'loop-a');
+    const loopB = join(rootsDir, 'loop-b');
+    await symlink(loopB, loopA);
+    await symlink(loopA, loopB);
+    const out = nextOut();
+    const frame = await callSnapshotNow(withRoots(JSON.stringify([loopA])), baseArgs(out));
+    assertPolicyDenied('a configured root that is a symlink loop (ELOOP)', frame);
+    const msg = structured(frame).message ?? '';
+    if (!msg.includes(loopA)) fail(`symlink-loop root refusal did not name the offending root: ${msg}`);
+    await assertNoArtifacts('a configured root that is a symlink loop (ELOOP)', { out, store });
+  }
+
   // ── 7-10. a source the roots do not cover ─────────────────────────────────
   const escapeCases = [
     ['source outside every root', [outside], okRoots],
@@ -480,6 +551,31 @@ async function run(tmp) {
     if (frame.result?.isError)
       fail(`dirs entry equal to a root: expected success, got ${JSON.stringify(frame.result).slice(0, 500)}`);
     console.log('  [PASS] a dirs entry that IS a root — allowed (exact match, not only containment)');
+  }
+
+  // ── a configured root that is a symlink to a directory is accepted (#838) ────
+  // resolveConfiguredRoot() fully realpaths a root before checking it exists and is a
+  // directory — a root that is ITSELF a symlink resolves to its target, and that
+  // resolved target is what containment compares against: the same "resolve symlinks on
+  // both sides before comparing" rule this policy already applies to every `dirs` entry.
+  // Chosen over refusing a symlinked root outright for consistency with that existing
+  // rule, rather than introducing a second, different symlink policy just for roots.
+  {
+    const rootLink = join(rootsDir, 'link-to-b');
+    await symlink(rootB, rootLink);
+    const out = nextOut();
+    const frame = await callSnapshotNow(withRoots(JSON.stringify([rootLink])), {
+      dirs: [join(rootB, 'second')],
+      recipients: [recipientPath],
+      out,
+      backend: 'file',
+    });
+    if (frame.result?.isError)
+      fail(
+        `root that is a symlink to a directory: expected success, got ${JSON.stringify(frame.result).slice(0, 500)}`,
+      );
+    if (!existsSync(out)) fail('root-symlink case: reported success but wrote no ciphertext');
+    console.log('  [PASS] a configured root that is a symlink to a directory — accepted, resolved target compared');
   }
 
   // ── a pinned pg-only call needs no roots at all ───────────────────────────
