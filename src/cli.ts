@@ -1065,8 +1065,9 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       (configured, runner, ping, trigger: {type, loaded, legacy, ...}, last_run,
       next_run) — the SAME state read above, so it never disagrees with the
       human-readable report or the MCP schedule_status tool. "not installed" is an
-      ordinary state to poll for, not an exception, so it too answers in JSON on
-      stdout ({error, code: "CB-E014", exit_code}) instead of prose on stderr (#270).
+      ordinary state to poll for, not an exception (#426): it answers {"installed":
+      false} on stdout with exit 0 — no error/code/exit_code fields — so a script can
+      branch on the installed field alone instead of catching an error.
 
   cypher-brain schedule uninstall
       Unregister the trigger and remove the generated runner/plist/cron entry (idempotent;

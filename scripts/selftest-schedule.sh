@@ -121,6 +121,79 @@ else
 fi
 echo "[PASS] install (file): runner + trigger artifact with the expected pipeline, 03:30 default, no spend lines"
 
+# #803: SCHEDULE_DIR/logs/snapshots must be owner-only (0700), nightly.sh owner-only
+# executable (0700 — it bakes install-time secrets: wallet paths, CYPHER_BRAIN_YES=1,
+# etc.), and schedule.json owner-only readable (0600 — it mirrors much of the same
+# install-time config). GNU stat first, BSD fallback (same helper other selftest*.sh
+# scripts in this repo already use for mode checks).
+mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+echo "== (a1) SCHEDULE_DIR/logs/snapshots/nightly.sh/schedule.json are created owner-only =="
+[ "$(mode_of "$CYPHER_BRAIN_SCHEDULE_DIR")" = "700" ] || { echo "[FAIL] #803: $CYPHER_BRAIN_SCHEDULE_DIR is not mode 700 (got $(mode_of "$CYPHER_BRAIN_SCHEDULE_DIR"))"; exit 1; }
+[ "$(mode_of "$CYPHER_BRAIN_SCHEDULE_DIR/logs")" = "700" ] || { echo "[FAIL] #803: $CYPHER_BRAIN_SCHEDULE_DIR/logs is not mode 700 (got $(mode_of "$CYPHER_BRAIN_SCHEDULE_DIR/logs"))"; exit 1; }
+[ "$(mode_of "$CYPHER_BRAIN_SCHEDULE_DIR/snapshots")" = "700" ] || { echo "[FAIL] #803: $CYPHER_BRAIN_SCHEDULE_DIR/snapshots is not mode 700 (got $(mode_of "$CYPHER_BRAIN_SCHEDULE_DIR/snapshots"))"; exit 1; }
+[ "$(mode_of "$RUNNER")" = "700" ] || { echo "[FAIL] #803: $RUNNER is not mode 700 (got $(mode_of "$RUNNER"))"; exit 1; }
+[ "$(mode_of "$CONFIG")" = "600" ] || { echo "[FAIL] #803: $CONFIG is not mode 600 (got $(mode_of "$CONFIG"))"; exit 1; }
+echo "[PASS] #803: schedule dir tree is owner-only (0700 dirs/runner, 0600 schedule.json)"
+
+# #801: the Linux cron line must shell-quote cfg.runner with shq() (single-quote
+# escaping), not plain double quotes — double-quoted shell strings still expand
+# $(...)/backticks/$VAR, and cfg.runner derives from CYPHER_BRAIN_SCHEDULE_DIR, an
+# operator-controlled env var. Only reachable on the cron path (non-Darwin) — same
+# SKIP-honestly convention this file already uses for Darwin-only/non-Darwin-only
+# assertions elsewhere (see the plist-drift block below).
+if [ "$OS" = "Darwin" ]; then
+  echo "[SKIP] #801: cron-line shell-quoting only applies to the Linux cron trigger path (this platform: Darwin)"
+else
+  INJ_HOME="$TMP/inj-home"; INJ_SCHED="$TMP/inj-sched-\$(touch $TMP/pwned)"; INJ_SRC="$TMP/inj-src"
+  mkdir -p "$INJ_HOME" "$INJ_SRC"
+  echo inj > "$INJ_SRC/f.txt"
+  CYPHER_BRAIN_HOME="$INJ_HOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] #801 test setup: keygen exited non-zero"; exit 1; }
+  CYPHER_BRAIN_HOME="$INJ_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$INJ_SCHED" \
+    cb schedule install --backend file --dir "$INJ_SRC" --no-load > "$TMP/inj-install.log" 2>&1 \
+    || { echo "[FAIL] #801 test setup: install with a metacharacter-laden CYPHER_BRAIN_SCHEDULE_DIR exited non-zero"; cat "$TMP/inj-install.log"; exit 1; }
+  INJ_CRON_ENTRY="$INJ_SCHED/cron.entry"
+  [ -f "$INJ_CRON_ENTRY" ] || { echo "[FAIL] #801 test setup: no cron.entry written at $INJ_CRON_ENTRY"; exit 1; }
+  grep -Fq "'$INJ_SCHED/nightly.sh'" "$INJ_CRON_ENTRY" \
+    || { echo "[FAIL] #801: cron.entry does not single-quote the runner path"; cat "$INJ_CRON_ENTRY"; exit 1; }
+  [ -f "$TMP/pwned" ] && { echo "[FAIL] #801: shell metacharacter in CYPHER_BRAIN_SCHEDULE_DIR executed during install"; exit 1; }
+  echo "[PASS] #801: cron.entry shell-quotes the runner path with shq() (single quotes)"
+
+  # #801 follow-up (Codex review): shq()'s shell-level single-quoting cannot protect
+  # against crontab's OWN, earlier '%' handling (crontab(5): an unescaped '%' in the
+  # command field becomes a newline before the line ever reaches a shell) — '\%' is how
+  # crontab(5) spells a literal '%'.
+  PCT_HOME="$TMP/pct-home"; PCT_SCHED="$TMP/pct-sched-100%done"; PCT_SRC="$TMP/pct-src"
+  mkdir -p "$PCT_HOME" "$PCT_SRC"
+  echo pct > "$PCT_SRC/f.txt"
+  CYPHER_BRAIN_HOME="$PCT_HOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] #801-pct test setup: keygen exited non-zero"; exit 1; }
+  CYPHER_BRAIN_HOME="$PCT_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$PCT_SCHED" \
+    cb schedule install --backend file --dir "$PCT_SRC" --no-load > "$TMP/pct-install.log" 2>&1 \
+    || { echo "[FAIL] #801-pct test setup: install with a '%'-laden CYPHER_BRAIN_SCHEDULE_DIR exited non-zero"; cat "$TMP/pct-install.log"; exit 1; }
+  PCT_CRON_ENTRY="$PCT_SCHED/cron.entry"
+  [ -f "$PCT_CRON_ENTRY" ] || { echo "[FAIL] #801-pct test setup: no cron.entry written at $PCT_CRON_ENTRY"; exit 1; }
+  grep -Fq '100\%done' "$PCT_CRON_ENTRY" \
+    || { echo "[FAIL] #801: cron.entry does not escape '%' as '\\%' per crontab(5)"; cat "$PCT_CRON_ENTRY"; exit 1; }
+  echo "[PASS] #801: cron.entry escapes a literal '%' in the runner path as '\\%' (crontab(5))"
+
+  # #801 follow-up (Codex review): a literal newline/CR in the runner path would split
+  # this single crontab entry across physical lines no matter how the rest of the line
+  # is escaped (crontab is strictly line-based) — install must refuse outright rather
+  # than write a corrupted crontab entry.
+  NL_HOME="$TMP/nl-home"; NL_SCHED="$TMP/nl-sched-a"$'\n'"b"; NL_SRC="$TMP/nl-src"
+  mkdir -p "$NL_HOME" "$NL_SRC"
+  echo nl > "$NL_SRC/f.txt"
+  CYPHER_BRAIN_HOME="$NL_HOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] #801-nl test setup: keygen exited non-zero"; exit 1; }
+  set +e
+  CYPHER_BRAIN_HOME="$NL_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$NL_SCHED" \
+    cb schedule install --backend file --dir "$NL_SRC" --no-load > "$TMP/nl-install.log" 2>&1
+  NL_RC=$?
+  set -e
+  [ "$NL_RC" != "0" ] || { echo "[FAIL] #801: install with a newline in CYPHER_BRAIN_SCHEDULE_DIR exited 0 instead of refusing"; cat "$TMP/nl-install.log"; exit 1; }
+  grep -q 'newline/CR' "$TMP/nl-install.log" \
+    || { echo "[FAIL] #801: install did not name the newline/CR reason for refusing"; cat "$TMP/nl-install.log"; exit 1; }
+  echo "[PASS] #801: install refuses (rather than corrupts) a crontab entry when the runner path contains a newline/CR"
+fi
+
 echo "== (a2) non-default backend env vars (not just the FILE_DIR/PG_BIN/AR_WALLET/PIN_RECIPIENTS 4) are baked into the runner =="
 # launchd/cron start with a BARE env — anything read from process.env by config.mjs that
 # was set at install time and silently dropped makes a scheduled run of a non-default
