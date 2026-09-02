@@ -24,6 +24,7 @@ import {
   PushFundingConfirmedButIncompleteError,
   PushUploadConfirmedResponseLostError,
 } from './push-partial-success.js';
+import { PushUncertainSpendError } from './push-uncertain-spend.js';
 // Re-exported unchanged so existing `from './pushpull.js'` imports (mcp.ts, wizard.ts)
 // keep working — see push-partial-success.ts's own header comment for why these
 // classes live in a separate, import-cycle-free module in the first place.
@@ -34,6 +35,7 @@ export {
   PushFundingConfirmedButIncompleteError,
   PushUploadConfirmedResponseLostError,
 } from './push-partial-success.js';
+export { PushUncertainSpendError } from './push-uncertain-spend.js';
 
 // The plaintext content digest for the artifact being pushed: an explicit --digest
 // wins, else the "<in>.digest" sidecar snapshot writes next to its output. Returns
@@ -571,6 +573,20 @@ async function pushCore(
       if (e instanceof PushUploadConfirmedResponseLostError) {
         throw new PushUploadConfirmedResponseLostError(locator, e, e.locator);
       }
+      // #818: the SIDECAR's own paid step can end ambiguously too (its L1 POST lost its
+      // response and the follow-up probe found nothing; its ton-provider deploy broadcast
+      // left this process and could not be confirmed). Keeps its own identity rather than
+      // being wrapped as PushSignatureUploadError, which would report a possible spend as
+      // a plain "the sidecar failed to upload" and discard `checkIdentifier` — the id an
+      // operator settles the ambiguity with.
+      //
+      // But NOT re-thrown untouched (multi-model review, Critical): the CIPHERTEXT above
+      // uploaded successfully and its locator is confirmed. Losing it here would make the
+      // documented recovery ("verify, then use a NEW key") re-upload — and on a paid
+      // backend re-pay for — bytes that are already stored. Relying on push()'s own
+      // "pushed <in> -> <locator>" stderr line is not enough: mcp.ts persists and replays
+      // the STRUCTURED payload, and that line is not in it.
+      if (e instanceof PushUncertainSpendError) throw e.withConfirmedCiphertextLocator(locator);
       // The ciphertext (above) already durably uploaded — see PushPartialSuccessError's
       // own doc comment for why this must never be reported the same way as an
       // ordinary push() failure (a caller assuming "nothing happened" here would be

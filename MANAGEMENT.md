@@ -533,6 +533,56 @@ so a verification cron wires its own dead man's switch the same way that runner 
 bakes into the nightly runner — `verify` does not implement it itself, so the cron line
 pipes to a tool that does, or you wire your own healthcheck around it.)
 
+## MCP idempotency keys
+
+The MCP `snapshot_now` tool takes an optional `idempotency_key` (issue #220, Stripe's
+idempotency-key pattern) so an agent's own retry — a transport hiccup after the upload
+already landed — cannot spend twice. A repeat call carrying the SAME key and the same
+`dirs`/`pg`/`recipients`/`out`/`backend`/`scan_secrets` gets the FIRST call's result back
+(`idempotent_replay: true`) instead of re-executing. The records live in
+`<CYPHER_BRAIN_HOME>/idempotency-log.jsonl`, one JSON object per line. Only this server
+reads or writes that file; nothing else consumes it.
+
+Each record carries two fields an operator occasionally needs to know about:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `disposition` | `success` / `error` | How the first call ENDED. A replay is returned the same way it was reported the first time — an `error` record replays with `isError: true` and its recorded fields, never as a plain success (a recorded partial failure used to come back looking clean on retry). |
+| `retention` | `ttl` / `permanent` | `ttl` records expire after `CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS` (default 24h) and are dropped by the next write's compaction. `permanent` records are exempt from both: the TTL does not govern them and compaction always keeps them. |
+
+Records written before these fields existed have neither, and are read as `success` /
+`ttl` — exactly the behavior they had.
+
+**The uncertain-spend tombstone.** Exactly one outcome is recorded as
+`disposition: error, retention: permanent`: a paid push whose outcome is UNCERTAIN
+(CB-E027 above). The result stored under the key is
+`{code: "ERR_PUSH_OUTCOME_UNCERTAIN", spend_outcome: "uncertain", backend, check_kind,
+check_identifier, message}` — deliberately with **no** `pushed` and **no** `locator`,
+because there may be no upload to point at. Any later call with that key replays it as an
+error and does no paid work, forever. Expiring it would not settle the ambiguity; it would
+only postpone the retry that pays a second time. Settle it by checking
+`check_identifier` on-chain, then use a NEW key for whatever you decide to do next.
+
+One extra field appears when the ambiguous upload was the `.minisig` signature sidecar of
+a **signed** push, whose ciphertext had already uploaded successfully:
+`confirmed_ciphertext_locator`. That locator IS confirmed — record it, and do not re-push
+the artifact when you move to a new key, or you pay to store the same bytes twice. It is
+named separately from `locator` (and never accompanied by `pushed`) precisely so it cannot
+be read as "the push succeeded".
+
+A caveat on downgrades: a cypher-brain older than this release does not know what
+`retention: permanent` means and will treat such a record as an ordinary TTL one —
+replaying it as a success and eventually compacting it away. Do not roll back to an older
+version while an unresolved tombstone is live in the log.
+
+**A key that will not release.** If a call that may have spent cannot write its result
+record (a full disk, a read-only log), the server RETAINS the idempotency claim instead of
+releasing it (issue #809) — a freed claim plus a missing record is precisely the state in
+which a retry re-runs the paid path. The warning on that call names the claim lock file
+(`<CYPHER_BRAIN_HOME>/idempotency-log.jsonl.claim.<hash>.lock`). Verify what actually
+happened, then either remove that file by hand to unblock the key, or simply use a new
+one. The same manual step is the documented recovery for a claim whose holder crashed.
+
 ## Error codes
 
 Failures print with a stable `[CB-E0xx]` code and a link to this section, the same shape
@@ -578,6 +628,7 @@ is still the full story either way. Over MCP,
 | CB-E022 | `snapshot --sign-identity <path>` was given a path that doesn't exist. | Point `--sign-identity` at an existing signing private key (`cypher-brain keygen` writes one to the default path), or drop the flag to use the default. |
 | CB-E023 | `restore`/`verify --sign-recipient <path>` was given a path that doesn't exist. | Point `--sign-recipient` at an existing signing public key, or drop the flag to use the default. |
 | CB-E024 | `schedule install --backend ton-provider`, or `push --backend ton-provider`, ran with `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND` unset (or `<= 0`) — the operator never configured a spend cap for this paid backend. `--yes`/`CYPHER_BRAIN_YES=1` (CB-E007's fix) does nothing here: this is a missing environment/config value, not a missing per-run consent. | Set `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND` (nanoTON) in the environment before installing the schedule or pushing to `ton-provider`. |
+| CB-E027 | A paid push ended with the outcome **UNCERTAIN**: the payment may already have happened and nothing this process can read says whether it did. Either an `arweave` L1 POST that never answered (or was refused) whose follow-up probe of the signed tx id found nothing, or a `ton-provider` deploy whose broadcast failed *after* the signed message had already left this process and whose contract-address probe stayed inconclusive. Not finding it is **not** proof it is absent — a just-posted transaction is not immediately indexed. | Verify on-chain **before** retrying, using the identifier the message names (the Arweave tx id at `https://arweave.net/tx/<id>/status`, or the TON contract address on an explorer). If it landed, do not push again — record the locator/address. If it did not, retry with a **new** idempotency key: over MCP the old key is permanently blocked on purpose (see "MCP idempotency keys" below). |
 
 ## What's proven vs recommended
 

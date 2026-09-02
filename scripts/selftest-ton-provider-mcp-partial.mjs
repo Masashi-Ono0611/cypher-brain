@@ -130,9 +130,7 @@ async function main() {
     );
 
     // Same idempotency_key, called again: replays the RECORDED PARTIAL SUCCESS
-    // (isError:false, idempotent_replay:true — same shape the pre-existing
-    // PushSignatureUploadError/PushLocatorWriteError replay tests in mcp-smoke.mjs
-    // already assert) rather than attempting a second real broadcast — #220's
+    // (idempotent_replay:true) rather than attempting a second real broadcast — #220's
     // idempotency-key feature applied to this new error shape. This replayed result,
     // not the original call's own immediate error above, is where funding_confirmed/
     // provider_download_confirmed/partial_stage actually live (recordIdempotencyResult
@@ -155,10 +153,16 @@ async function main() {
     });
     const r2 = await waitFor(3);
     const sc2 = r2.result?.structuredContent;
-    if (r2.result?.isError || sc2?.idempotent_replay !== true) {
+    // issue #810: the replay is an ERROR result, not a success one. This assertion used to
+    // require `isError` to be ABSENT — which was the bug: the first call reported this
+    // outcome as an error and the replay reported the identical state as a clean success,
+    // so an agent retrying after a transport hiccup concluded a push whose provider never
+    // confirmed the download had fully succeeded. Both calls must agree.
+    if (r2.result?.isError !== true || sc2?.idempotent_replay !== true) {
       throw new Error(
         `a repeat call with the SAME idempotency_key after a confirmed-funding notify failure should replay the ` +
-          `recorded partial success (isError:false, idempotent_replay:true), not re-execute or refuse: ${JSON.stringify(r2.result).slice(0, 500)}`,
+          `recorded partial success as an ERROR (isError:true, idempotent_replay:true), not re-execute, refuse, or ` +
+          `report a clean success (#810): ${JSON.stringify(r2.result).slice(0, 500)}`,
       );
     }
     if (sc2?.funding_confirmed !== true) {

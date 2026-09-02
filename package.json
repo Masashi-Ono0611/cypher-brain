@@ -69,6 +69,7 @@
     "selftest:minisign": "bash scripts/selftest-minisign.sh",
     "selftest:push-partial-failure": "bash scripts/selftest-push-partial-failure.sh",
     "selftest:idempotency-lib": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-idempotency-lib.mjs",
+    "selftest:mcp-uncertain-spend": "node scripts/selftest-mcp-uncertain-spend.mjs",
     "selftest:import-quietly": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-import-quietly.mjs",
     "selftest:verify-levels": "bash scripts/selftest-verify-levels.sh",
     "selftest:schedule": "bash scripts/selftest-schedule.sh",

@@ -107,6 +107,7 @@ import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 // imports this file; if this file imported from pushpull.ts, that would close the loop.
 // See push-partial-success.ts's own header comment.
 import { PushFundingConfirmedButIncompleteError } from '../push-partial-success.js';
+import { PushUncertainSpendError } from '../push-uncertain-spend.js';
 import { spentSoFar, remainingSpendBudget, chargeSpendTracker } from '../spend-tracker.js';
 
 // Lazy loader for @ton/ton's VALUE exports (beginCell/Cell/Dictionary/Address/
@@ -1459,13 +1460,23 @@ export function tonProviderBackend(): StorageBackend {
               }
             }
             if (!landed) {
-              throw new Error(
-                `ton-provider backend: broadcasting the deploy failed (${errMsg(e)}) and the outcome is ` +
-                  `UNCERTAIN — the transfer of ${deploy.amountNano} nanoTON to ` +
-                  `${deploy.contractAddress.toRawString()} may or may not have been accepted (a probe could not ` +
-                  "find the contract, which is not proof it is absent). Check the address's state on a TON " +
-                  'explorer BEFORE re-running push.',
-              );
+              // #818: a TYPED error, not a plain one — see the identical change on
+              // arweave.ts's own ambiguous-POST branch and PushUncertainSpendError's doc
+              // comment. The contract address travels as structured data
+              // (checkIdentifier) so mcp.ts can persist it under the idempotency key and
+              // refuse a same-key retry, instead of releasing the key and letting the
+              // retry broadcast a second transfer.
+              throw new PushUncertainSpendError({
+                backend: 'ton-provider',
+                checkKind: 'ton_contract_address',
+                checkIdentifier: deploy.contractAddress.toRawString(),
+                detail:
+                  `broadcasting the deploy failed (${errMsg(e)}) — the transfer of ${deploy.amountNano} nanoTON ` +
+                  `to ${deploy.contractAddress.toRawString()} may or may not have been accepted (a probe could ` +
+                  'not find the contract, which is not proof it is absent)',
+                verifyHint: "the address's state on a TON explorer",
+                cause: e,
+              });
             }
             // Attribution is inferential, not proven (Codex review): what is observed is
             // that this address read `nonexist` moments ago, immediately before this run
