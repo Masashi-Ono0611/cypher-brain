@@ -1467,10 +1467,20 @@ export function tonProviderBackend(): StorageBackend {
                   'explorer BEFORE re-running push.',
               );
             }
+            // Attribution is inferential, not proven (Codex review): what is observed is
+            // that this address read `nonexist` moments ago, immediately before this run
+            // broadcast, and does not now. A concurrent push against the SAME bag+owner,
+            // or someone funding the address by hand inside that window, would produce
+            // the same transition. Correlating the exact message (seqno / balance delta)
+            // would settle it and is not done here. The alternative — treating a landed
+            // transfer as "nothing happened" — is the strictly worse error, because it
+            // is the one that leads to paying twice.
             warn(
               `ton-provider: the deploy broadcast reported a failure (${errMsg(e)}) but contract ` +
-                `${deploy.contractAddress.toRawString()} shows on-chain activity — the transfer landed despite the ` +
-                'error. Continuing with confirmation and the receipt for the spend that already happened (#664).',
+                `${deploy.contractAddress.toRawString()} — which read as 'nonexist' immediately before this run ` +
+                'broadcast — now shows on-chain activity, so the transfer is treated as having landed despite the ' +
+                'error. Continuing with confirmation and the receipt for that spend (#664). If something else ' +
+                'funded this exact address inside that window, the receipt below is attributed to this run in error.',
             );
           }
         } else {

@@ -969,7 +969,7 @@ CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= 
   || { echo "[FAIL] a broadcast that actually landed was still reported as a failure"; cat "$TMP/issue664.err"; exit 1; }
 rm -f "$BROADCAST_FAIL_FLAG"
 [ -s "$BROADCAST_LOG" ] || { echo "[FAIL] issue #664 setup: the broadcast never reached the mock"; exit 1; }
-grep -q 'the transfer landed despite the error' "$TMP/issue664.err" || { echo "[FAIL] the lost-response broadcast was not reported as having landed"; cat "$TMP/issue664.err"; exit 1; }
+grep -q 'the transfer is treated as having landed despite the' "$TMP/issue664.err" || { echo "[FAIL] the lost-response broadcast was not reported as having landed"; cat "$TMP/issue664.err"; exit 1; }
 RECEIPT_COUNT_AFTER_664=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
 [ "$RECEIPT_COUNT_AFTER_664" -gt "$RECEIPT_COUNT_BEFORE_664" ] \
   || { echo "[FAIL] the confirmed spend never reached the receipt ledger ($RECEIPT_COUNT_BEFORE_664 -> $RECEIPT_COUNT_AFTER_664)"; exit 1; }

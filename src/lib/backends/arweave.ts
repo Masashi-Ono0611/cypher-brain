@@ -713,19 +713,22 @@ export async function arweaveBackend(): Promise<StorageBackend> {
       // uses for the read side, #116) — without it a stalled gateway hangs this paid
       // upload forever, with no CYPHER_BRAIN_AR_HTTP_TIMEOUT_MS/PIPE_TIMEOUT_MS bound
       // applying here at all (unlike every read path in this file).
-      // #802: an EXCEPTION out of l1SignAndPost (the stall-abort added by #691, a socket
-      // reset, a DNS failure mid-upload) is the ambiguous case — the gateway may have
-      // accepted the signed transaction and simply never answered. Reported as an
-      // ordinary Error it looked identical to "nothing happened", `tx.id` was discarded,
-      // and a retry signed and paid for a SECOND transaction for the same content. Probe
-      // the tx id once, bounded, before letting anything propagate. A bad STATUS is a
-      // different thing entirely — the gateway answered — and keeps its existing path.
-      let res: { status: number; data?: unknown };
-      try {
-        res = await l1SignAndPost(ar, tx, jwk, AR_HTTP_TIMEOUT_MS);
-      } catch (e) {
-        const landed = await probeArweaveTxAccepted(ar, tx.id);
-        if (landed) {
+      // #802: once the transaction is signed, any outcome OTHER than a clean accept is
+      // ambiguous — the gateway may hold the transaction and simply never say so.
+      // Reported as an ordinary Error that looked identical to "nothing happened", with
+      // `tx.id` discarded, a retry signed and paid for a SECOND transaction for the same
+      // content. Two shapes reach this, and both are probed:
+      //   - an EXCEPTION (the #691 stall-abort, a reset socket, a DNS failure mid-upload)
+      //     — no answer at all;
+      //   - a NON-ACCEPT STATUS. The gateway answered, but a 5xx from a gateway or a
+      //     proxy in front of one can perfectly well follow a transaction it already
+      //     persisted (Codex review — the first version of this fix probed only the
+      //     exception path and left this one discarding the tx id).
+      // A probe that FINDS the transaction is the only thing treated as proof; not
+      // finding it is "unknown", never "nothing happened", because a just-posted
+      // transaction is not immediately indexed.
+      const confirmAmbiguousPost = async (why: string, cause: unknown): Promise<never> => {
+        if (await probeArweaveTxAccepted(ar, tx.id)) {
           // The spend is real and irreversible: record it at the same checkpoint a
           // successful post would have (#654's rule — the ledger entry belongs to the
           // moment the spend becomes irreversible, not to the moment the call returns),
@@ -734,22 +737,30 @@ export async function arweaveBackend(): Promise<StorageBackend> {
           // PushPartialSuccessError branch).
           await opts.onReceipt?.({
             locator: tx.id,
-            raw: { tx_id: tx.id, reward: tx.reward, post_status: 'unknown (response lost)' },
+            raw: { tx_id: tx.id, reward: tx.reward, post_status: why },
             cost: { amount: tx.reward, unit: 'winston' },
           });
-          throw new PushUploadConfirmedResponseLostError(tx.id, e);
+          throw new PushUploadConfirmedResponseLostError(tx.id, cause);
         }
-        // Inconclusive: the probe could not find the transaction, which is NOT proof it
-        // was never accepted (a just-posted tx is not immediately indexed). Say so, and
-        // name the tx id, so nobody retries on the assumption that nothing was spent.
         throw new Error(
-          `arweave: the upload response never arrived (${errMsg(e)}) and the outcome is UNCERTAIN — the ` +
-            `transaction was already signed as ${tx.id} for ${tx.reward} winston and may or may not have been ` +
-            `accepted. Check https://arweave.net/tx/${tx.id}/status (or any gateway) BEFORE retrying: a retry ` +
-            'signs and pays for a second transaction.',
+          `arweave: ${why} and the outcome is UNCERTAIN — the transaction was already signed as ${tx.id} for ` +
+            `${tx.reward} winston and may or may not have been accepted (a probe could not find it, which is not ` +
+            `proof it is absent). Check https://arweave.net/tx/${tx.id}/status (or any gateway) BEFORE retrying: ` +
+            'a retry signs and pays for a second transaction.',
         );
+      };
+      let res: { status: number; data?: unknown };
+      try {
+        res = await l1SignAndPost(ar, tx, jwk, AR_HTTP_TIMEOUT_MS);
+      } catch (e) {
+        await confirmAmbiguousPost(`the upload response never arrived (${errMsg(e)})`, e);
+        throw e; // unreachable — confirmAmbiguousPost always throws; satisfies control-flow analysis
       }
-      if (res.status !== 200 && res.status !== 208) throw new Error(describeArweavePostError(res.status, res.data));
+      if (res.status !== 200 && res.status !== 208) {
+        const posted = new Error(describeArweavePostError(res.status, res.data));
+        await confirmAmbiguousPost(`the gateway refused the upload (${posted.message})`, posted);
+        throw posted; // unreachable, same as above
+      }
       // #232: tx.reward is the AUTHORITATIVE actual cost — set either from the pre-flight
       // `reward` above (passed into createTransaction) or, if that estimate failed,
       // fetched internally by createTransaction itself (arweave-js always populates it;

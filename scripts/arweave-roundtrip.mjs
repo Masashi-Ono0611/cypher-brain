@@ -472,7 +472,7 @@ try {
     timeout: 120_000,
   });
   dropSrv.kill('SIGKILL');
-  const ambiguousTx = (ambiguous.stderr.match(/locator: ([A-Za-z0-9_-]{43})/) || [])[1];
+  const ambiguousTx = (ambiguous.stderr.match(/Ciphertext locator[^:]*: ([A-Za-z0-9_-]{43})/) || [])[1];
   ambiguous.status !== 0 && /CONFIRMED accepted by the network/.test(ambiguous.stderr) && TX_RE.test(ambiguousTx ?? '')
     ? pass('#802: the lost-response push fails with the tx id and a CONFIRMED-spend verdict')
     : fail(

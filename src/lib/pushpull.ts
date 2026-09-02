@@ -384,7 +384,16 @@ async function pushCore(
         const capVar = o.backend === 'ton-provider' ? 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND' : 'CYPHER_BRAIN_MAX_SPEND';
         console.error(
           `${o.backend}: combined ciphertext+signature spend is checked TOGETHER against ` +
-            `${capVar} (≈${BigInt(est.cost) + BigInt(sigEst.cost)} ${sigEst.unit ?? est.unit ?? 'units'} total)`,
+            `${capVar} (≈${BigInt(est.cost) + BigInt(sigEst.cost)} ${sigEst.unit ?? est.unit ?? 'units'} total). ` +
+            // Enforcement stays inside each backend's put() (see the block comment above
+            // — this early estimate can go stale before signing, and a second
+            // enforcement point would have to be kept in sync). The consequence is worth
+            // stating out loud rather than leaving the operator to discover it: if this
+            // total is over the cap, the ciphertext is uploaded and PAID FOR and the
+            // sidecar is then refused, leaving a signed artifact whose signature never
+            // reached the store (Codex review).
+            `If that total is over your cap, the ciphertext still uploads and the sidecar is then refused — ` +
+            `raise ${capVar} or re-snapshot without --sign first if you do not want that.`,
         );
       }
     }

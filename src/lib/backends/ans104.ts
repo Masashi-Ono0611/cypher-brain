@@ -17,7 +17,7 @@
 // directly would make this file depend on a package this project does not declare and
 // cannot guarantee is installed. Only the SIZE is computed here; nothing is encoded. The
 // result is checked against the SDK's own public signer in
-// `scripts/selftest-turbo-dep.mjs`, so a future change to either side fails a test rather
+// `scripts/selftest-ans104-sizing.mjs`, so a future change to either side fails a test rather
 // than silently drifting the price.
 
 export interface DataItemTag {
@@ -43,7 +43,8 @@ export const ARWEAVE_SIGNER_SIGNATURE_LENGTH = 512;
 // Byte length of an Avro zigzag-encoded long — the length prefix in front of every
 // string and of the array's block count.
 function zigzagVarintLength(value: number): number {
-  if (!Number.isInteger(value) || value < 0) throw new Error(`ans104: cannot size a non-negative integer: ${value}`);
+  if (!Number.isSafeInteger(value) || value < 0)
+    throw new Error(`ans104: cannot size a non-safe/negative integer: ${value}`);
   let encoded = value * 2; // zigzag for a non-negative value
   let bytes = 1;
   while (encoded >= 128) {
@@ -78,6 +79,18 @@ export function dataItemOverheadBytes(
   ownerLength: number = ARWEAVE_SIGNER_OWNER_LENGTH,
   signatureLength: number = ARWEAVE_SIGNER_SIGNATURE_LENGTH,
 ): number {
+  // Validated here rather than trusted from the caller (Codex review): this number feeds
+  // a spend cap, and a NaN or negative size would pass every `>` comparison downstream
+  // silently. Callers do sanitize (signerLengthsOrDefaults below), but the arithmetic
+  // must fail closed on its own — it is exported.
+  for (const [name, value] of [
+    ['ownerLength', ownerLength],
+    ['signatureLength', signatureLength],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`ans104: ${name} must be a positive safe integer, got ${value}`);
+    }
+  }
   const anchorLength = 1; // one length byte; this project never sets an anchor
   const targetLength = 1; // likewise, never a target
   const tagsLength = 16 + serializedTagsSize(tags); // two 8-byte counts + the serialized bytes
@@ -92,8 +105,8 @@ export function signedDataItemSize(
   ownerLength: number = ARWEAVE_SIGNER_OWNER_LENGTH,
   signatureLength: number = ARWEAVE_SIGNER_SIGNATURE_LENGTH,
 ): number {
-  if (!Number.isInteger(dataSize) || dataSize < 0) {
-    throw new Error(`ans104: data size must be a non-negative integer, got ${dataSize}`);
+  if (!Number.isSafeInteger(dataSize) || dataSize < 0) {
+    throw new Error(`ans104: data size must be a non-negative safe integer, got ${dataSize}`);
   }
   return dataSize + dataItemOverheadBytes(tags, ownerLength, signatureLength);
 }
@@ -102,7 +115,7 @@ export function signedDataItemSize(
 // that ever stopped exposing them must fall back to the ArweaveSigner constants above
 // rather than produce a NaN size that would sail through every comparison below.
 export function signerLengthsOrDefaults(signer: unknown): { ownerLength: number; signatureLength: number } {
-  const usable = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
+  const usable = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
   const s = signer as { ownerLength?: unknown; signatureLength?: unknown } | null;
   return {
     ownerLength: usable(s?.ownerLength) ? s.ownerLength : ARWEAVE_SIGNER_OWNER_LENGTH,

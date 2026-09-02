@@ -95,10 +95,16 @@ export class PushUploadConfirmedResponseLostError extends PushPartialSuccessErro
   constructor(locator: string, cause: unknown, sigLocator?: string) {
     super(
       `arweave: the upload response was lost (${cause instanceof Error ? cause.message : String(cause)}) but the ` +
-        `transaction is CONFIRMED accepted by the network (locator: ${sigLocator ?? locator}) — the fee was already spent and a ` +
-        'receipt-ledger entry was attempted for it. Do NOT re-push this artifact: a retry signs and pays for a ' +
-        'second transaction. Record this locator (`--save-locator` did not run) and verify with ' +
-        '`cypher-brain pull --locator <id>`; check `cypher-brain ledger` if you need to confirm the entry landed.',
+        'transaction is CONFIRMED accepted by the network — the fee was already spent and a receipt-ledger entry ' +
+        'was attempted for it. Do NOT re-push this artifact: a retry signs and pays for a second transaction. ' +
+        // Both ids, each labelled (Codex review): in the re-thrown sidecar case the
+        // confirmed-but-unanswered upload is the SIGNATURE, while the artifact a later
+        // `pull` has to fetch is the CIPHERTEXT — printing one unlabelled "locator" for
+        // both sent the operator to verify with the wrong id.
+        `Ciphertext locator (what \`cypher-brain pull --locator <id>\` needs): ${locator}` +
+        (sigLocator ? `; ".minisig" sidecar locator (the upload whose response was lost): ${sigLocator}` : '') +
+        '. Record them — `--save-locator` did not run — and check `cypher-brain ledger` if you need to confirm the ' +
+        'entry landed.',
       locator,
       sigLocator,
     );
