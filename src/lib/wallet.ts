@@ -166,8 +166,15 @@ async function tonWalletCreate(o: CliOptions): Promise<void> {
   // to the same address — first-time TON users otherwise have no way to know that.
   console.log('  (this is the bounceable "EQ..." encoding; some wallets/explorers may show the same account as');
   console.log('  "UQ..." instead — both refer to the same address)');
+  // #725: the 24-word mnemonic is never printed to the terminal (it lives ONLY inside
+  // outPath's JSON, same posture as the age identity/Arweave JWK below — this codebase
+  // never echoes raw key material to a screen/log that might be captured). The old
+  // wording ("back up the mnemonic now") told the operator to back up something they
+  // were never shown, with no hint that the words are the `mnemonic` array inside the
+  // file printed above. Mirrors the Arweave wallet's own "back up the wallet FILE"
+  // phrasing just below, which never made that same false promise.
   console.log(
-    `\n⚠  Back up the mnemonic now. Fund the address above with TON, then set CYPHER_BRAIN_TON_WALLET=${outPath} ` +
+    `\n⚠  Back up the wallet file now. Fund the address above with TON, then set CYPHER_BRAIN_TON_WALLET=${outPath} ` +
       'so ton-provider push auto-signs deploys with it instead of printing a Tonkeeper deeplink.',
   );
 }

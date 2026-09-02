@@ -40,7 +40,14 @@ export interface ReceiptEntry {
   // the backend could not name one for this upload. Never a forecast — that is
   // estimate.ts's job, and the two are never conflated.
   cost: string | null;
-  unit: 'winston' | 'winc' | 'nanoton' | null;
+  // #751: 'nanoton' (lowercase) is accepted here too for BACKWARD READ compatibility
+  // only — a receipt-ledger.jsonl already on disk from before this fix stored it that
+  // way (ton-provider.ts's own onReceipt call now always WRITES 'nanoTON', matching
+  // estimate.ts's CostEstimate.unit casing everywhere else this physical unit appears).
+  // Never normalized to the new casing on read: this module only reads back what a
+  // receipt actually said, verbatim (see this file's header comment on `raw`/`cost`
+  // honesty).
+  unit: 'winston' | 'winc' | 'nanoton' | 'nanoTON' | null;
   raw: unknown; // the backend's own response — verbatim for turbo, a normalized summary
   // for arweave/ton-provider (see this file's header comment for why they differ)
 }
@@ -106,7 +113,7 @@ export async function readReceipts(): Promise<ReadReceiptsResult> {
       size_bytes: typeof p.size_bytes === 'number' ? p.size_bytes : 0,
       payer_address: typeof p.payer_address === 'string' ? p.payer_address : null,
       cost: typeof p.cost === 'string' ? p.cost : null,
-      unit: p.unit === 'winston' || p.unit === 'winc' || p.unit === 'nanoton' ? p.unit : null,
+      unit: p.unit === 'winston' || p.unit === 'winc' || p.unit === 'nanoton' || p.unit === 'nanoTON' ? p.unit : null,
       raw: p.raw ?? null,
     };
   });

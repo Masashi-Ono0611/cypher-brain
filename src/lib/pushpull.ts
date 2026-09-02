@@ -269,6 +269,19 @@ function assertDigestRequiresSaveLocator(o: CliOptions): void {
   );
 }
 
+// #724: the ton/ton-provider backends' own put() already returns a locator with the
+// backend name baked in (e.g. "ton:v1:<64-hex>", "ton-provider:v1:<64-hex>" — see
+// util.ts's makeBagLocator()), unlike file/arweave/turbo, whose returned locator (a
+// content hash / tx id / data item id) carries no such prefix. Every "pushed/pulled ->
+// <backend>:<locator>" log line below used to prepend "${backend}:" unconditionally,
+// which doubled it for exactly those two backends ("ton:ton:v1:<64-hex>") while staying
+// correct for the others. Guard here instead of re-deriving per-backend prefix knowledge
+// at each call site: a locator that already starts with "<backend>:" is shown as-is.
+function displayLocator(backend: string, locator: string): string {
+  const prefix = `${backend}:`;
+  return locator.startsWith(prefix) ? locator : `${prefix}${locator}`;
+}
+
 async function pushCore(
   o: CliOptions,
 ): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
@@ -493,7 +506,7 @@ async function pushCore(
     spendTracker,
     onReceipt: (event) => persistReceipt(inPath, event),
   });
-  console.error(`pushed ${o.in} -> ${o.backend}:${locator}`);
+  console.error(`pushed ${o.in} -> ${displayLocator(o.backend, locator)}`);
   // Authenticity sidecar (#214): if snapshot() wrote a "<in>.minisig" next to the
   // ciphertext, upload it too — same backend, same already-granted consent (`yes`
   // covers the whole push() call, not a per-file re-prompt for a few-hundred-byte
@@ -561,7 +574,7 @@ async function pushCore(
       throw new PushSignatureUploadError(locator, e);
     }
     sigLocator = justUploaded;
-    console.error(`pushed ${sigPath} -> ${o.backend}:${justUploaded}`);
+    console.error(`pushed ${sigPath} -> ${displayLocator(o.backend, justUploaded)}`);
     // #232: a signed push to a paid backend is TWO separate uploads (ciphertext +
     // sidecar), each its own charge — the sidecar's own onReceipt (above) already
     // persisted its receipt from inside backend.put(), same as the ciphertext's own;
@@ -880,7 +893,7 @@ export async function pull(o: CliOptions): Promise<void> {
     await rm(part, { force: true });
     throw e;
   }
-  console.error(`pulled ${o.backend}:${o.locator} -> ${o.out}`);
+  console.error(`pulled ${displayLocator(o.backend, o.locator)} -> ${o.out}`);
   // Authenticity sidecar (#214): --sig-locator (explicit, or read from
   // --from-locator-file's 6th field above) says where push() parked the "<in>.minisig"
   // that was signed alongside this ciphertext — fetch it too, into "<out>.minisig", so
@@ -905,10 +918,10 @@ export async function pull(o: CliOptions): Promise<void> {
         // refuse a perfectly good sidecar for not being ciphertext — which is exactly what
         // it did before #318, making push --sign + pull impossible to round-trip there.
         await backend.get(o.sig_locator, sigOut, 'minisig');
-        console.error(`pulled ${o.backend}:${o.sig_locator} -> ${sigOut}`);
+        console.error(`pulled ${displayLocator(o.backend, o.sig_locator)} -> ${sigOut}`);
       } catch (e) {
         console.error(
-          `warning: could not fetch the authenticity signature (${o.backend}:${o.sig_locator} -> ${sigOut}): ${errMsg(e)}`,
+          `warning: could not fetch the authenticity signature (${displayLocator(o.backend, o.sig_locator)} -> ${sigOut}): ${errMsg(e)}`,
         );
       }
     }

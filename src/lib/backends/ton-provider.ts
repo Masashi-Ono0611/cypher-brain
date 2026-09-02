@@ -1545,7 +1545,11 @@ export function tonProviderBackend(): StorageBackend {
               deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
               amount_nano: deploy.amountNano.toString(),
             },
-            cost: { amount: deploy.amountNano.toString(), unit: 'nanoton' },
+            // #751: 'nanoTON' (matching estimate.ts's CostEstimate.unit casing) — this
+            // used to write lowercase 'nanoton', the one place this physical unit's
+            // casing disagreed with every other surface (estimate --json, this file's
+            // own comments/errors, the Go client's own output).
+            cost: { amount: deploy.amountNano.toString(), unit: 'nanoTON' },
           });
         }
 
