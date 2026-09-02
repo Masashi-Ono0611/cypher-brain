@@ -15,10 +15,11 @@
 # leaves the directory where scripts/verify.mjs will find it), and SIGTERM (children and
 # grandchildren die, the runner re-raises rather than exiting 1).
 #
-# It drives the runner through CB_RUNNER_PLAN, which swaps the real suite for fake tests —
-# see the note on that variable in scripts/run-selftests.mjs. Everything the fake tests
-# write goes in $TMP/markers, NOT in the TMPDIR the inner runner hands them, so the only
-# case that leaves anything behind is the one that means to.
+# It drives the runner through --plan, which swaps the real suite for fake tests — see the
+# note on that flag in scripts/run-selftests.mjs (a flag and not an environment variable so
+# that nothing inherited can silently empty the suite). Everything the fake tests write goes
+# in $TMP/markers, NOT in the TMPDIR the inner runner hands them, so the only case that
+# leaves anything behind is the one that means to.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,15 +32,15 @@ mkdir -p "$MARKERS"
 fail() { echo "[FAIL] $1"; exit 1; }
 now_ms() { node -e 'process.stdout.write(String(Date.now()))'; }
 
-# run_plan <case-name> <jobs> <plan-file> [env assignments...] -> RC, $TMP/<case>.log
+# run_plan <case-name> <jobs> <plan-file> [extra runner args...] -> RC, $TMP/<case>.log
 run_plan() {
   local case_name="$1" jobs="$2" plan="$3"
   shift 3
   local dir="$TMP/tmpdir-$case_name"
   mkdir -p "$dir"
   RC=0
-  env "$@" TMPDIR="$dir" TMP="$dir" TEMP="$dir" CB_RUNNER_PLAN="$plan" \
-    node "$RUNNER" --jobs "$jobs" >"$TMP/$case_name.log" 2>&1 || RC=$?
+  env TMPDIR="$dir" TMP="$dir" TEMP="$dir" \
+    node "$RUNNER" --jobs "$jobs" --plan "$plan" "$@" >"$TMP/$case_name.log" 2>&1 || RC=$?
 }
 
 # A fake test: $1 = script name, $2... = body lines.
@@ -52,7 +53,7 @@ mkfake() {
 }
 
 echo "== (1) --jobs validation: a bad value must exit 2, not fall back to a default =="
-for bad in "--jobs 0" "--jobs x" "--jobs" "--jobs=3x" "--bogus"; do
+for bad in "--jobs 0" "--jobs x" "--jobs" "--jobs=3x" "--jobs 65" "--plan" "--bogus"; do
   # shellcheck disable=SC2086 # deliberate word splitting: each case is a full argv
   RC=0
   node "$RUNNER" $bad >"$TMP/args.log" 2>&1 || RC=$?
@@ -64,34 +65,48 @@ cat >"$TMP/plan-noop.json" <<EOF
 EOF
 run_plan noop 2 "$TMP/plan-noop.json"
 [ "$RC" -eq 0 ] || { cat "$TMP/noop.log"; fail "a valid --jobs 2 run exited $RC"; }
-echo "[PASS] --jobs 0 / x / <missing> / 3x and an unknown flag all exit 2; a valid one runs"
+echo "[PASS] --jobs 0 / x / <missing> / 3x / 65, a valueless --plan and an unknown flag all exit 2; a valid one runs"
 
 echo "== (2) coverage guard: a selftest:* in package.json that the runner does not list =="
+# --check-list runs the guard and nothing else, so these cases assert the guard's verdict
+# without executing (or needing to invent) the tests the fixture package.json names.
 cat >"$TMP/pkg-drift.json" <<'EOF'
 {"scripts":{"selftest:zzz":"bash scripts/selftest-zzz.sh","build":"true"}}
 EOF
 cat >"$TMP/plan-drift.json" <<EOF
 {"packageJson":"$TMP/pkg-drift.json","parallel":[{"name":"noop","cmd":"true","args":[]}]}
 EOF
-run_plan drift 3 "$TMP/plan-drift.json"
+run_plan drift 3 "$TMP/plan-drift.json" --check-list
 [ "$RC" -eq 1 ] || { cat "$TMP/drift.log"; fail "the coverage guard exited $RC, expected 1"; }
 grep -q 'selftest:zzz' "$TMP/drift.log" || { cat "$TMP/drift.log"; fail "the guard did not name the unlisted script"; }
 grep -q 'out of sync with package.json' "$TMP/drift.log" || fail "the guard fired without saying what is wrong"
 # Fired for the right reason, not because any packageJson makes it fire: same fixture, now
 # listed, must pass. Without this the case above would be satisfied by an always-fail guard.
 cat >"$TMP/plan-covered.json" <<EOF
-{"packageJson":"$TMP/pkg-drift.json","parallel":[{"name":"selftest:zzz","cmd":"true","args":[]}]}
+{"packageJson":"$TMP/pkg-drift.json","parallel":[{"name":"selftest:zzz","cmd":"npm","args":["run","selftest:zzz"]}]}
 EOF
-run_plan covered 3 "$TMP/plan-covered.json"
+run_plan covered 3 "$TMP/plan-covered.json" --check-list
 [ "$RC" -eq 0 ] || { cat "$TMP/covered.log"; fail "the guard failed a run whose plan DOES list the script (rc=$RC)"; }
 # And the other direction: the runner listing a selftest package.json no longer declares.
 cat >"$TMP/plan-stale.json" <<EOF
-{"packageJson":"$TMP/pkg-drift.json","parallel":[{"name":"selftest:zzz","cmd":"true","args":[]},{"name":"selftest:gone","cmd":"true","args":[]}]}
+{"packageJson":"$TMP/pkg-drift.json","parallel":[{"name":"selftest:zzz","cmd":"npm","args":["run","selftest:zzz"]},{"name":"selftest:gone","cmd":"npm","args":["run","selftest:gone"]}]}
 EOF
-run_plan stale 3 "$TMP/plan-stale.json"
+run_plan stale 3 "$TMP/plan-stale.json" --check-list
 [ "$RC" -eq 1 ] || { cat "$TMP/stale.log"; fail "the guard exited $RC for a stale entry, expected 1"; }
 grep -q 'selftest:gone' "$TMP/stale.log" || fail "the guard did not name the stale entry"
-echo "[PASS] the coverage guard fires in both directions and stays quiet when the lists agree"
+# A name is not an execution: an entry named after a selftest but running something else
+# would leave the real script unrun while the coverage check reported it as listed.
+cat >"$TMP/plan-mislabel.json" <<EOF
+{"packageJson":"$TMP/pkg-drift.json","parallel":[{"name":"selftest:zzz","cmd":"true","args":[]}]}
+EOF
+run_plan mislabel 3 "$TMP/plan-mislabel.json" --check-list
+[ "$RC" -eq 1 ] || { cat "$TMP/mislabel.log"; fail "the guard accepted an entry that does not run the script it names (rc=$RC)"; }
+grep -q 'not npm run selftest:zzz' "$TMP/mislabel.log" || { cat "$TMP/mislabel.log"; fail "the guard did not explain the mislabelled entry"; }
+# The real thing, unmocked: this repo's own package.json against this repo's own list.
+RC=0
+node "$RUNNER" --check-list >"$TMP/checklist.log" 2>&1 || RC=$?
+[ "$RC" -eq 0 ] || { cat "$TMP/checklist.log"; fail "the real package.json and the real suite list disagree (rc=$RC)"; }
+echo "[PASS] the coverage guard fires on drift, stale and mislabelled entries, and passes on the real tree"
 
 echo "== (3) the pool really is concurrent: two 3s sleepers, --jobs 1 vs --jobs 3 =="
 S1="$(mkfake sleeper1 'sleep 3')"
@@ -158,27 +173,50 @@ cat >"$TMP/plan-signal.json" <<EOF
 EOF
 SIGDIR="$TMP/tmpdir-signal"
 mkdir -p "$SIGDIR"
-# Resolve these BEFORE the assignment prefix below: bash applies a simple command's
-# assignments left to right and later words in the SAME command see them, so writing
-# `TMP="$SIGDIR" ... CB_RUNNER_PLAN="$TMP/plan-signal.json"` would look up the new TMP.
 SIGNAL_PLAN="$TMP/plan-signal.json"
 SIGNAL_LOG="$TMP/signal.log"
-TMPDIR="$SIGDIR" TMP="$SIGDIR" TEMP="$SIGDIR" CB_RUNNER_PLAN="$SIGNAL_PLAN" \
-  node "$RUNNER" --jobs 2 >"$SIGNAL_LOG" 2>&1 &
-RUNNER_PID=$!
-UP=0
-for _ in $(seq 1 100); do
-  if pgrep -f "grandchild-$UNIQ" >/dev/null 2>&1; then UP=1; break; fi
-  sleep 0.1
-done
-[ "$UP" = 1 ] || { kill -9 "$RUNNER_PID" 2>/dev/null; cat "$SIGNAL_LOG"; fail "the fake test's grandchild never started — nothing to prove"; }
-kill -TERM "$RUNNER_PID"
+# A NODE supervisor, not `kill` + bash `wait` (multi-model review): bash reports 143 both
+# for a child killed by SIGTERM and for one that called exit(143), so a bash-only assertion
+# would still pass if the runner stopped re-raising and returned a plain code instead.
+# scripts/verify.mjs reads {code, signal} and treats them differently — code null with
+# signal 'SIGTERM' is the only shape that keeps an interrupt distinguishable from a failed
+# test — so the assertion has to be made on the same pair verify.mjs sees.
+cat >"$TMP/supervise.mjs" <<'EOF'
+// argv: <runner> <plan> <sandbox> <marker>
+import { spawn, spawnSync } from 'node:child_process';
+const [runner, plan, sandbox, marker] = process.argv.slice(2);
+const child = spawn(process.execPath, [runner, '--jobs', '2', '--plan', plan], {
+  stdio: ['ignore', 'inherit', 'inherit'],
+  env: { ...process.env, TMPDIR: sandbox, TMP: sandbox, TEMP: sandbox },
+});
+const alive = () => spawnSync('pgrep', ['-f', marker]).status === 0;
+const deadline = Date.now() + 20000;
+while (!alive()) {
+  if (Date.now() > deadline) {
+    child.kill('SIGKILL');
+    console.error('SUPERVISOR: the fake test never started — nothing to prove');
+    process.exit(9);
+  }
+  spawnSync('sleep', ['0.1']);
+}
+const settled = new Promise((r) => child.on('close', (code, signal) => r({ code, signal })));
+child.kill('SIGTERM');
+const t = setTimeout(() => child.kill('SIGKILL'), 20000);
+const { code, signal } = await settled;
+clearTimeout(t);
+console.error(`SUPERVISOR: runner settled with code=${code} signal=${signal}`);
+// Not `code === 143`: an exit(143) would satisfy that while looking nothing like a signal
+// death to scripts/verify.mjs.
+process.exit(code === null && signal === 'SIGTERM' ? 0 : 1);
+EOF
 SRC=0
-wait "$RUNNER_PID" || SRC=$?
-# 128+15: bash reports a signal-terminated child that way, so this asserts the runner died
-# OF SIGTERM rather than catching it and exiting 1 (which would hide an interrupt as a
-# test failure upstream — scripts/verify.mjs relies on the distinction).
-[ "$SRC" -eq 143 ] || { cat "$SIGNAL_LOG"; fail "the runner exited $SRC after SIGTERM, expected 143 (128+SIGTERM)"; }
+node "$TMP/supervise.mjs" "$RUNNER" "$SIGNAL_PLAN" "$SIGDIR" "grandchild-$UNIQ" >"$SIGNAL_LOG" 2>&1 || SRC=$?
+if [ "$SRC" -ne 0 ]; then
+  pkill -9 -f "$UNIQ" 2>/dev/null
+  cat "$SIGNAL_LOG"
+  [ "$SRC" -eq 9 ] && fail "the fake test's grandchild never started — nothing to prove"
+  fail "after SIGTERM the runner did not die OF the signal (code null / signal SIGTERM)"
+fi
 GONE=0
 for _ in $(seq 1 50); do
   if ! pgrep -f "child-$UNIQ" >/dev/null 2>&1 && ! pgrep -f "grandchild-$UNIQ" >/dev/null 2>&1; then GONE=1; break; fi
@@ -188,6 +226,6 @@ if [ "$GONE" != 1 ]; then
   pkill -9 -f "$UNIQ" 2>/dev/null
   fail "a child or grandchild survived the SIGTERM (the process group was not killed)"
 fi
-echo "[PASS] SIGTERM killed the whole process group and the runner re-raised it (exit 143)"
+echo "[PASS] SIGTERM killed the whole process group; the runner died OF the signal (code null, signal SIGTERM)"
 
 echo "[PASS] scripts/run-selftests.mjs: every failure path above was observed to fire"
