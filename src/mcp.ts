@@ -20,7 +20,9 @@
 // env escape hatch the CLI honors is deliberately NOT honored here, so an
 // agent can never spend without saying so in the call itself.
 
-import { stat, readFile, rm, copyFile, realpath } from 'node:fs/promises';
+import { stat, lstat, rm, copyFile, realpath, open } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep, dirname, basename } from 'node:path';
@@ -84,12 +86,22 @@ import { annotateErrorMessage, matchErrorCode } from './lib/errors.js';
 import { installStageSignalGuard, addActiveMcpFetchDir, removeActiveMcpFetchDir } from './lib/signal-guard.js';
 import { didYouMean, nearestName } from './lib/suggest.js';
 import type { CliOptions } from './lib/types.js';
+// #789: the full set of backend names a `push --save-locator` line can record — wider than
+// this server's own BACKENDS enum, because the file may have been written by a CLI push to
+// rclone/ton. Used to authorize OVERWRITING an existing locator file, never to read one.
+import { STORAGE_BACKEND_NAMES } from './lib/types.js';
 // #507: the ten `Tool` schema constants + the derived BACKENDS/PAID_BACKENDS enums they
 // advertise now live in src/mcp-tool-schemas.ts (pure declarative data, split out of this
 // file's handler implementation). BACKENDS/PAID_BACKENDS are re-exported from there because
 // the handlers below need them too (requireBackend, the spend gates); SNAPSHOT_NOW_TOOL is
 // needed for its `.name` in the #220 idempotency-key lock.
-import { ALL_TOOLS, BACKENDS, PAID_BACKENDS, SNAPSHOT_NOW_TOOL } from './mcp-tool-schemas.js';
+import {
+  ALL_TOOLS,
+  BACKENDS,
+  PAID_BACKENDS,
+  SNAPSHOT_NOW_TOOL,
+  paidBackendConsentDescription,
+} from './mcp-tool-schemas.js';
 
 const SERVER_NAME = 'cypher-brain-mcp';
 const SERVER_VERSION = '0.0.1'; // keep in sync with package.json "version"
@@ -309,6 +321,84 @@ async function discardFetchDir(dir: string | null): Promise<void> {
   removeActiveMcpFetchDir(dir);
 }
 
+// #793: cleaning up the fetch dir must never REPLACE the outcome it is cleaning up
+// after. A bare `finally { await discardFetchDir(tdir); }` does exactly that — a throw
+// from a finally block discards whatever the try was doing, both a pending `return`
+// (a completed verdict) and a pending `throw` (the verification's OWN error, which is
+// the finding the caller actually needs). handleRestoreNow got this right in #650; the
+// other two call sites did not, so the correct shape is extracted here rather than
+// written a third time. Same argument makeFetchDir()/discardFetchDir() themselves make
+// for routing every create and remove through one pair: three call sites, one behavior,
+// no room for it to drift.
+//
+// Success and failure need genuinely different handling, not one shared branch:
+//
+//   - after success there IS a result to attach to, so the cleanup failure becomes a
+//     warning ON it (`warnings`, the #347 relay array a human is guaranteed to see);
+//   - after a failure the original error must come back UNCHANGED, so the message rides
+//     on `e.cbWarnings` — the convention captureCall()'s own catch and reclassify()
+//     already use — which buildErrorPayload() folds into the structured error's
+//     `warnings`. Without that it would reach the server's stderr and nowhere an agent
+//     branching on the structured result could see it.
+//
+// Both branches also log to stderr, matching what #650 shipped.
+//
+// This function must not throw, under any circumstance (multi-model review, #793): it
+// runs inside the catch that exists to PRESERVE `e`, so a throw from here would replace
+// the very error it was called to protect — the identical masking bug, moved one frame
+// in. Two ways it could: `e` may be frozen or non-extensible (assigning `cbWarnings`
+// then throws in strict mode, which module code always is), and an existing
+// `cbWarnings` may be something other than an array (a caller-shaped object, a string)
+// whose spread throws. Hence the isArray check and the blanket try/catch — the stderr
+// line above has already run either way, so the warning is never lost entirely, only
+// its structured copy. A non-Error thrown value has nowhere to carry it and keeps the
+// stderr line alone; it is not normalized into an Error here because doing so would mean
+// replacing the thrown value, which is the thing this must not do.
+function noteCleanupWarningOnError(e: unknown, warnMsg: string): void {
+  console.error(`warning: ${warnMsg}`);
+  if (!(e instanceof Error)) return;
+  try {
+    const carrier = e as Error & { cbWarnings?: unknown };
+    const existing = Array.isArray(carrier.cbWarnings) ? (carrier.cbWarnings as string[]) : [];
+    carrier.cbWarnings = [...existing, warnMsg];
+  } catch {
+    /* frozen/non-extensible error, or an exotic cbWarnings setter — the stderr line above
+       is then the only record, which is strictly better than losing `e` itself. */
+  }
+}
+
+// Cleanup on the FAILURE path: never masks `e`, which the caller must still receive.
+async function discardFetchDirPreservingError(dir: string | null, e: unknown, context: string): Promise<void> {
+  try {
+    await discardFetchDir(dir);
+  } catch (cleanupErr) {
+    noteCleanupWarningOnError(
+      e,
+      `failed to clean up ${context} fetch/scratch dir ${dir} after a failed call: ${errMsg(cleanupErr)} ` +
+        '(it may remain on disk until server restart) — the error below is the one to act on.',
+    );
+  }
+}
+
+// Cleanup on the SUCCESS path: the work already completed, so a cleanup failure is a
+// warning on the result, never an ERR_INTERNAL that throws the result away.
+async function discardFetchDirWarningOnResult(
+  dir: string | null,
+  payload: Record<string, unknown>,
+  context: string,
+): Promise<void> {
+  try {
+    await discardFetchDir(dir);
+  } catch (cleanupErr) {
+    const warnMsg =
+      `failed to clean up ${context} fetch/scratch dir ${dir} after a successful ${context}: ` +
+      `${errMsg(cleanupErr)} — it may remain on disk until server restart.`;
+    console.error(`warning: ${warnMsg}`);
+    const existing = Array.isArray(payload.warnings) ? (payload.warnings as string[]) : [];
+    payload.warnings = [...existing, warnMsg];
+  }
+}
+
 // The structured {code, message[, cb_code][, warnings][, startup_warnings]} shape every
 // tools/call error carries in structuredContent (#212, #347) — factored out of
 // structuredErr() (#558) so resources/read and prompts/get can put the SAME payload in
@@ -443,16 +533,28 @@ function assertWithinHome(p: string): void {
 // symlinked CYPHER_BRAIN_HOME itself, not just a symlinked ancestor under it, produced
 // a false-positive rejection of a legitimately-scoped `out`, since HOME's own realpath
 // and `out`'s realpath then disagreed on whether HOME's symlink had been followed).
-// Only on ENOENT does it fall back to walking UP to the nearest ancestor that already
-// exists, resolving THAT (following any symlinks), and re-attaching the still-
-// nonexistent tail lexically — the tail cannot itself be a symlink escape because
-// nothing is there yet for a write to follow.
+// Only on "this path is not there as written" does it fall back to walking UP to the
+// nearest ancestor that already exists, resolving THAT (following any symlinks), and
+// re-attaching the still-nonexistent tail lexically — the tail cannot itself be a symlink
+// escape because nothing is there yet for a write to follow.
+//
+// ENOTDIR counts as "not there" alongside ENOENT (#789): it means some component of the
+// path is a regular file rather than a directory, so nothing exists at `p` either, and
+// walking up is exactly the right response — the walk terminates at that file, whose own
+// realpath resolves fine. Treating it as a hard error instead surfaced a raw
+// `ENOTDIR: ... realpath '<path>'` as ERR_INTERNAL, telling the caller the server broke
+// when in fact their path was simply unwritable; the honest failure comes one step later,
+// from the write that actually tries to mkdir the parent (for --save-locator, that is
+// PushLocatorWriteError, which the #220 partial-success handling depends on being able to
+// see). Both catch sites take it, since either realpath call can raise it.
+const PATH_ABSENT_CODES = new Set(['ENOENT', 'ENOTDIR']);
+
 async function realpathOfNearestAncestor(p: string): Promise<string> {
   const abs = resolve(p);
   try {
     return await realpath(abs);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') throw e;
+    if (!PATH_ABSENT_CODES.has((e as NodeJS.ErrnoException)?.code ?? '')) throw e;
   }
   let dir = dirname(abs);
   const tail: string[] = [basename(abs)];
@@ -461,7 +563,7 @@ async function realpathOfNearestAncestor(p: string): Promise<string> {
       const real = await realpath(dir);
       return join(real, ...tail);
     } catch (e) {
-      if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') throw e;
+      if (!PATH_ABSENT_CODES.has((e as NodeJS.ErrnoException)?.code ?? '')) throw e;
       const parent = dirname(dir);
       if (parent === dir) throw e; // reached the filesystem root and even that failed
       tail.unshift(basename(dir));
@@ -486,14 +588,193 @@ async function realpathOfNearestAncestor(p: string): Promise<string> {
 // codebase already carries — e.g. a symlink planted at the resolved path itself
 // after this check returns — is unavoidable without an O_NOFOLLOW-based openat
 // rewrite of every write primitive, which is out of scope for this check).
-async function resolveRealpathWithinHome(p: string): Promise<string> {
+//
+// `field` names the tool argument being checked, so a refusal says which one it was
+// (#789 gave this the same job for snapshot_now's locator_file, which is a different
+// argument on a different tool but the same containment question). It defaults to
+// 'out', leaving wallet_create's own message byte-identical to what #648 shipped.
+async function resolveRealpathWithinHome(p: string, field = 'out'): Promise<string> {
   const resolved = await realpathOfNearestAncestor(p);
   const homeResolved = await realpathOfNearestAncestor(HOME);
   if (resolved !== homeResolved && !resolved.startsWith(homeResolved + sep)) {
     throw new ToolError(
       'ERR_INVALID_INPUT',
-      `out must be inside CYPHER_BRAIN_HOME (${HOME}), got: ${p} (resolves to ${resolved} after following symlinks)`,
+      `${field} must be inside CYPHER_BRAIN_HOME (${HOME}), got: ${p} (resolves to ${resolved} after following symlinks)`,
     );
+  }
+  return resolved;
+}
+
+// #787: last_snapshot_status reads a caller-named path and reports on its contents, so
+// it needs the containment resolveRealpathWithinHome() gives every OTHER caller-named
+// path on this server PLUS two checks a write-side check has no reason to make.
+//
+// Containment first, for the reason assertWithinHome()'s own comment gives: over MCP a
+// shell-less caller has no other route to an arbitrary local file, and unlike
+// restore_now's out_dir (#559, which only warns because restoring outside home is its
+// entire normal use case) there is no legitimate reason to read a save-locator file from
+// outside the directory this server manages — the tool's own default lives in HOME. So
+// this REFUSES rather than warning.
+//
+// Then: a regular file, below a size bound. A locator file is one short line and an
+// index.tsv is a few thousand at most; a FIFO would block the read forever and a
+// multi-gigabyte file would be buffered whole into memory by readFile().
+//
+// All of that happens through ONE open file handle (multi-model review, #787). An earlier
+// version did realpath → stat(path) → readFile(path) → stat(path), which checks one file
+// and can then read another: three independent path lookups, each re-traversing the same
+// symlinks, so anything swapped in between is what actually gets read and reported. Every
+// property is now read off the handle instead — `isFile()`, the size, the CONTENT, and the
+// mtime a locator file's timestamp comes from all describe the same open inode, whatever
+// happens to the name afterwards.
+//
+// O_NONBLOCK matters as much as the single handle: opening a FIFO for reading BLOCKS until
+// a writer appears, and src/mcp.ts serializes every tool call through one mutex, so a FIFO
+// planted in CYPHER_BRAIN_HOME would wedge the whole server rather than be rejected by the
+// isFile() check further down. With O_NONBLOCK the open returns immediately and the FIFO is
+// refused like any other non-regular file. It is a no-op for regular files, and absent on
+// platforms that have no such flag (hence the `?? 0`).
+//
+// What this does NOT close: an ancestor directory swapped between the realpath above and
+// the open below. Node exposes no openat/RESOLVE_BENEATH, so binding the open to a verified
+// directory descriptor is not available here — the same documented residual #648 records
+// for wallet_create's `out`, narrowed to a single syscall pair rather than removed.
+const LOCATOR_FILE_MAX_BYTES = 1024 * 1024;
+
+interface ContainedFileRead {
+  resolved: string;
+  text: string;
+  mtime: Date;
+}
+
+async function readContainedFileWithinHome(p: string, field: string): Promise<ContainedFileRead> {
+  const resolved = await resolveRealpathWithinHome(p, field);
+  let handle: FileHandle;
+  try {
+    handle = await open(resolved, (constants.O_RDONLY | (constants.O_NONBLOCK ?? 0)) as number);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new ToolError('ERR_INVALID_INPUT', `no such ${field}: ${p}`);
+    // Linux lets open(O_RDONLY) succeed on a directory and fails at read time; other
+    // platforms refuse at open. Either way this is the not-a-regular-file refusal, not a
+    // server fault — the isFile() check below covers the platforms that get that far.
+    if (code === 'EISDIR')
+      throw new ToolError('ERR_INVALID_INPUT', `${field} (${p}) is not a regular file — refusing to read it`);
+    throw e;
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isFile())
+      throw new ToolError('ERR_INVALID_INPUT', `${field} (${p}) is not a regular file — refusing to read it`);
+    if (st.size > LOCATOR_FILE_MAX_BYTES)
+      throw new ToolError(
+        'ERR_INVALID_INPUT',
+        `${field} (${p}) is ${st.size} bytes, above the ${LOCATOR_FILE_MAX_BYTES}-byte limit for a locator/index file — refusing to read it`,
+      );
+    return { resolved, text: await handle.readFile('utf8'), mtime: st.mtime };
+  } finally {
+    await handle.close();
+  }
+}
+
+// #789: the write-side counterpart of resolveReadableFileWithinHome() above, for
+// snapshot_now's `locator_file` (push --save-locator's destination). Containment is the
+// main event, for the reason spelled out at the call site; the second check below is the
+// part worth explaining.
+//
+// Containment alone still permits replacing an unrelated file that happens to live under
+// CYPHER_BRAIN_HOME — recipient.txt, the identity, idempotency-log.jsonl. So an EXISTING
+// target must also parse as a save-locator file, using readLocatorFile()'s own format
+// check rather than a second copy of it. A path with nothing at it is fine and normal:
+// this is how the first push in a cadence creates the file.
+//
+// ENOENT means nothing is there, which is fine and normal — that is how the first push in
+// a cadence creates the file. ENOTDIR is NOT the same thing (multi-model review, #789): it
+// means a component of the path is a regular file, so the write is ALREADY KNOWN to be
+// impossible. Letting it through would run the whole snapshot and, on a paid backend with
+// confirm_paid, actually SPEND before push()'s --save-locator mkdir failed on something
+// this preflight could see from the start. It is refused here instead. (#220's
+// partial-success coverage in scripts/mcp-smoke.mjs induces PushLocatorWriteError with an
+// unwritable PARENT rather than this pre-detectable shape, so the aftermath path it tests
+// is a genuine post-upload failure.)
+//
+// readLocatorFile()'s parse is necessary but NOT sufficient for authorizing an overwrite
+// (multi-model review, #789): it accepts any two non-empty tab-separated fields, which an
+// unrelated in-home TSV — an index.tsv, notably — satisfies. So authorization additionally
+// requires the second field to be a REAL backend name and any third field to be a sha256,
+// which is a shape nothing but a save-locator file has. The split is deliberate: READING
+// stays liberal, so a legacy or hand-repaired locator file still works everywhere it used
+// to; only AUTHORIZING ITS DESTRUCTION is strict.
+const SAVE_LOCATOR_BACKENDS: ReadonlySet<string> = new Set(STORAGE_BACKEND_NAMES);
+
+function assertIsSaveLocatorFile(text: string, p: string, field: string): void {
+  // Returns the refusal rather than throwing it, so every rejection below reads as an
+  // explicit `throw` at the point it happens.
+  const refusal = (why: string): ToolError =>
+    new ToolError(
+      'ERR_INVALID_INPUT',
+      `${field} (${p}) already exists but is not a cypher-brain save-locator file — refusing to overwrite it ` +
+        `(push --save-locator REPLACES this path outright). Pick a path that is either empty or a previous ` +
+        `--save-locator file. ${why}`,
+    );
+  let parsed: LocatorSource;
+  try {
+    // The mtime is irrelevant to this check (only the fields are inspected), so a
+    // placeholder is passed rather than another stat of a path that could have changed.
+    parsed = parseLocatorFile(p, text, new Date(0));
+  } catch (e) {
+    throw refusal(`Reason it did not parse: ${e instanceof ToolError ? e.message : errMsg(e)}`);
+  }
+  if (!parsed.backend || !SAVE_LOCATOR_BACKENDS.has(parsed.backend))
+    throw refusal(
+      `Its second field is ${JSON.stringify(parsed.backend)}, which is not one of the backends a ` +
+        `--save-locator line records (${[...SAVE_LOCATOR_BACKENDS].join(', ')}).`,
+    );
+  if (parsed.sha256 && !SHA256_HEX.test(parsed.sha256))
+    throw refusal('Its third field is present but is not a 64-hex sha256, which every --save-locator line writes.');
+}
+
+async function resolveWritableLocatorFile(p: string, field: string): Promise<string> {
+  const resolved = await resolveRealpathWithinHome(p, field);
+  // Inspected through one open handle, for the reasons readContainedFileWithinHome()
+  // spells out — the existing file's type, size and content must all describe the SAME
+  // inode, or the overwrite gate is checking one file and authorizing the destruction of
+  // another.
+  let handle: FileHandle;
+  try {
+    handle = await open(resolved, (constants.O_RDONLY | (constants.O_NONBLOCK ?? 0)) as number);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') return resolved; // nothing there — the normal first-push case
+    if (code === 'ENOTDIR')
+      throw new ToolError(
+        'ERR_INVALID_INPUT',
+        `${field} (${p}) cannot be written: a component of that path is a regular file, not a directory. ` +
+          'Refusing before doing any snapshot or upload work, since saving the recovery pointer there could ' +
+          'only fail afterwards (on a paid backend, after the money was already spent).',
+      );
+    if (code === 'EISDIR')
+      throw new ToolError(
+        'ERR_INVALID_INPUT',
+        `${field} (${p}) already exists and is a directory — refusing to replace it with a save-locator file`,
+      );
+    throw e;
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isFile())
+      throw new ToolError(
+        'ERR_INVALID_INPUT',
+        `${field} (${p}) already exists and is not a regular file — refusing to replace it with a save-locator file`,
+      );
+    if (st.size > LOCATOR_FILE_MAX_BYTES)
+      throw new ToolError(
+        'ERR_INVALID_INPUT',
+        `${field} (${p}) already exists, is ${st.size} bytes, and is far larger than any save-locator file — refusing to replace it`,
+      );
+    assertIsSaveLocatorFile(await handle.readFile('utf8'), p, field);
+  } finally {
+    await handle.close();
   }
   return resolved;
 }
@@ -523,6 +804,63 @@ function outsideHomeWarning(outDir: string): string | undefined {
     "there, to a path this server does not otherwise scope or manage (unlike wallet_create's out, which " +
     'refuses outside CYPHER_BRAIN_HOME). Confirm this destination is what you intended (#559).'
   );
+}
+
+// #792: outsideHomeWarning() above is built on isOutsideHome(), whose resolve() is
+// LEXICAL — the same gap #648 closed for wallet_create's `out`, still open one tool
+// over. src/lib/restore.ts reaches the destination with stat(), which FOLLOWS symlinks,
+// so `$CYPHER_BRAIN_HOME/out -> /var/www/html` reads as "inside home" to the warning
+// while the plaintext lands in /var/www/html — no warning, and the result reports the
+// in-home path the caller passed rather than where the bytes actually went.
+//
+// Two things fix that, and they are deliberately different in strength:
+//
+//   1. Resolve the path the way restore.ts will, and warn/report on THAT. Ancestor
+//      symlinks are ordinary (a home under /var -> /private/var on macOS is one), so
+//      following them is not itself suspicious — reporting the wrong destination is.
+//   2. REFUSE when out_dir's own final component is a symlink. This is fail-closed
+//      where rule 1 is fail-open, and the asymmetry is the point: #559 chose to warn
+//      rather than refuse for a path outside home because restoring outside home is
+//      restore_now's entire normal use case, so refusing would break the legitimate
+//      workflow along with the adversarial one. A final-component symlink has no such
+//      workflow behind it — a caller who wants to restore into /var/www/html can name
+//      it — and it is the exact shape that makes the #559 warning silently
+//      inapplicable. Nothing legitimate is lost by refusing it, so refusing is free.
+//
+// lstat() (not stat()) is what rule 2 needs: the question is whether the final component
+// IS a link, not what it points at. ENOENT is fine and common — restore_now routinely
+// creates out_dir — and means there is no link there to follow.
+//
+// RESIDUAL, stated rather than papered over (multi-model review, #792): this is a
+// path-based check, so a symlink swapped into out_dir AFTER it returns is followed by
+// restore() all the same. Closing that needs the write itself bound to an already-open,
+// verified directory descriptor (openat/RESOLVE_BENEATH + friends), which Node does not
+// expose and which would mean rewriting every write primitive in src/lib/restore.ts —
+// out of scope here, and the SAME residual #648 already records for wallet_create's `out`.
+// What is done instead is to shrink the window: handleRestoreNow calls this twice, once
+// up front so an obviously-bad destination costs no pull, and again immediately before
+// restore() runs, so the gap is a few statements rather than the whole fetch+verify. That
+// narrows, it does not eliminate — an attacker who can write inside out_dir's parent
+// directory in that instant still wins, and a deployment where that is part of the threat
+// model needs the descriptor-bound rewrite, not this.
+async function resolveRestoreOutDir(outDir: string): Promise<string> {
+  const abs = resolve(outDir);
+  let linkSt: Awaited<ReturnType<typeof lstat>> | undefined;
+  try {
+    linkSt = await lstat(abs);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') throw e;
+  }
+  if (linkSt?.isSymbolicLink()) {
+    const target = await realpathOfNearestAncestor(abs);
+    throw new ToolError(
+      'ERR_INVALID_INPUT',
+      `out_dir (${outDir}) is a symlink (to ${target}) — refusing to restore DECRYPTED plaintext through it, ` +
+        'because the destination it reports and the destination it writes to are not the same path (#792). ' +
+        'Pass the real directory instead.',
+    );
+  }
+  return await realpathOfNearestAncestor(abs);
 }
 
 // #753: shared quoted, comma-joined rendering of an allowed-value list — used by both
@@ -872,6 +1210,33 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
   if (pg !== undefined && !isStr(pg)) throw new ToolError('ERR_INVALID_INPUT', 'pg must be a string connection URI');
   if (locatorFile !== undefined && !isStr(locatorFile))
     throw new ToolError('ERR_INVALID_INPUT', 'locator_file must be a string path');
+  // #789: `locator_file` reaches push() as --save-locator, which mkdir's the parent and
+  // RENAMES a temp sibling over the exact path named (src/lib/pushpull.ts) — an atomic,
+  // unconditional replacement of whatever is there. Unscoped, that is an arbitrary-file-
+  // replacement primitive reachable with NO consent gate at all, because the free `file`
+  // backend needs no confirm_paid. Same asymmetry assertWithinHome() was written for: the
+  // CLI's --save-locator is a human with a shell writing where they asked to; an MCP
+  // caller has no other route to this.
+  //
+  // Scoped to CYPHER_BRAIN_HOME, which is where MANAGEMENT.md's own cadence already puts
+  // it (`--save-locator ~/.cypher-brain/latest-locator.tsv`), and resolved through the
+  // #648 helper so a symlinked ancestor cannot smuggle the rename out. The RESOLVED path
+  // is what gets used from here on — carrying the caller's original through to the write
+  // would re-follow the symlink a second time, which is the Critical #648 already fixed
+  // once for wallet_create's `out`.
+  //
+  // RESIDUAL, stated rather than papered over (multi-model review, #789): the actual
+  // rename happens at the END of push(), potentially after a long upload, and a canonical
+  // pathname does not bind that rename to the object checked here — an ancestor swapped
+  // for a symlink in between is still followed. Removing that needs the write bound to an
+  // already-open, verified directory descriptor (openat/RESOLVE_BENEATH + renameat), which
+  // Node does not expose and which lives in src/lib/pushpull.ts, not here. This is the
+  // SAME residual #648 records for wallet_create's `out` — an attacker who can already
+  // create symlinks inside CYPHER_BRAIN_HOME at will. Re-checking just before the rename
+  // would narrow it without closing it, and cannot be done from this file at all.
+  const savedLocatorFile = isStr(locatorFile)
+    ? await resolveWritableLocatorFile(locatorFile, 'locator_file')
+    : undefined;
   // #308's assertDeclaredEnums now refuses a bad mode before dispatch, reading the same
   // SCAN_SECRETS_MODES this schema advertises — so this is not the check that stops one.
   // It stays for the reason requireBackend stays on this same handler: it is the assertion
@@ -981,19 +1346,23 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
         // Deliberately minimal (locator/backend/sha256 ONLY, no re-derived sidecar
         // fields) — see writeReplayedSavedLocator's own doc comment in pushpull.ts for why.
         let replayedResult = cached.result;
+        // #789: the RESOLVED, home-contained path — this branch writes the locator file
+        // just as the push path does, so it needs the same containment. Using the raw
+        // `locatorFile` here would leave the whole check bypassable by sending a second
+        // call with the same idempotency_key.
         if (
-          isStr(locatorFile) &&
+          savedLocatorFile !== undefined &&
           cached.result.pushed === true &&
           isStr(cached.result.locator) &&
           isStr(cached.result.backend) &&
           isStr(cached.result.sha256)
         ) {
-          await writeReplayedSavedLocator(locatorFile, {
+          await writeReplayedSavedLocator(savedLocatorFile, {
             locator: cached.result.locator,
             backend: cached.result.backend,
             sha256: cached.result.sha256,
           });
-          replayedResult = { ...replayedResult, locator_file: locatorFile };
+          replayedResult = { ...replayedResult, locator_file: savedLocatorFile };
         }
         return structuredOk({ ...replayedResult, idempotent_replay: true });
       }
@@ -1004,12 +1373,15 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
     // CYPHER_BRAIN_YES=1 for unattended cadence loops, but via MCP the consent
     // must be in the call itself.
     if (backend && PAID_BACKENDS.has(backend) && confirmPaid !== true) {
+      // #796: the durability sentence is per-backend, read from the table beside
+      // PAID_BACKENDS itself. It used to be hard-coded Arweave prose for every member of
+      // that set, which told a ton-provider caller they were buying PERMANENT storage —
+      // false, and false at the exact moment consent to spend is being requested.
       throw new ToolError(
         'ERR_CONFIRM_REQUIRED',
-        `backend "${backend}" is a PAID, PERMANENT Arweave store — pushing spends real funds ` +
-          `irreversibly. Re-call snapshot_now with confirm_paid=true to consent (the MCP equivalent ` +
-          `of the CLI --yes guard). The CYPHER_BRAIN_YES environment escape hatch is not honored ` +
-          `over MCP, so no call can spend without this flag.`,
+        `backend "${backend}" is ${paidBackendConsentDescription(backend)}. Re-call snapshot_now with ` +
+          `confirm_paid=true to consent (the MCP equivalent of the CLI --yes guard). The CYPHER_BRAIN_YES ` +
+          `environment escape hatch is not honored over MCP, so no call can spend without this flag.`,
       );
     }
 
@@ -1058,7 +1430,8 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
         in: out,
         backend,
         yes: confirmPaid === true,
-        save_locator: locatorFile,
+        save_locator: savedLocatorFile, // #789: the resolved, home-contained path, never the caller's raw one
+
         dirs: [],
         tables: [],
         recipients: [],
@@ -1132,7 +1505,7 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
       result.pushed = true;
       result.backend = backend;
       result.locator = locator;
-      if (locatorFile) result.locator_file = locatorFile;
+      if (savedLocatorFile) result.locator_file = savedLocatorFile;
       (result.log as string[]).push(...pushRes.err);
       // #649: `result.warnings` above was seeded from the SNAPSHOT phase (snap.warnings)
       // only — pushRes.warnings (an insufficient-funds-buffer notice, a receipt-
@@ -1205,8 +1578,13 @@ interface LocatorSource {
 // never break the recovery of an existing file. Only the first four fields are read
 // here; the later ones are push-side bookkeeping for --skip-unchanged (#214/#250) and
 // are ignored on this path, which is why a longer line needs no change here.
-async function readLocatorFile(path: string): Promise<LocatorSource> {
-  const text = await readFile(path, 'utf8');
+//
+// #787: takes the ALREADY-READ text and the mtime that came off the same open handle,
+// rather than opening the path itself. The caller (readContainedFileWithinHome) is what
+// enforces containment and reads once, so this function cannot re-traverse a path that
+// may have changed since — and it now has no way to read a file at all, which is the
+// structural half of that guarantee.
+function parseLocatorFile(path: string, text: string, mtime: Date): LocatorSource {
   const line = text
     .split('\n')
     .map((l) => l.trim())
@@ -1214,11 +1592,17 @@ async function readLocatorFile(path: string): Promise<LocatorSource> {
   if (!line) throw new ToolError('ERR_INVALID_INPUT', `locator file ${path} has no locator line`);
   const [locator, backend, digest, contentDigest] = line.split('\t');
   if (!locator || !backend)
+    // #787: the rejected line is NOT echoed. It used to be (`got: ${JSON.stringify(line)}`),
+    // which — combined with the unscoped path this function used to accept — handed the
+    // caller the first non-comment line of any readable file. The containment check on
+    // the way in is the real fix; this stays fail-safe alongside it, because "the tool
+    // only reads files it should" and "the tool never reports content it rejected" are
+    // independently worth having. What a caller needs to fix a genuinely malformed
+    // locator file is the expected SHAPE and how many fields arrived, not the bytes.
     throw new ToolError(
       'ERR_INVALID_INPUT',
-      `locator file ${path} must contain "<locator>\\t<backend>[\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]]" — got: ${JSON.stringify(line)}`,
+      `locator file ${path} must contain "<locator>\\t<backend>[\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]]" — its first non-comment line has ${line.split('\t').length} tab-separated field(s) and does not start with a locator and a backend`,
     );
-  const { mtime } = await stat(path);
   return {
     source: 'locator_file',
     path,
@@ -1231,8 +1615,8 @@ async function readLocatorFile(path: string): Promise<LocatorSource> {
 }
 
 // Parse an append-only index.tsv ("<timestamp>\t<locator>\t<sha256>", newest LAST).
-async function readIndexFile(path: string): Promise<LocatorSource> {
-  const text = await readFile(path, 'utf8');
+// Takes already-read text for the same reason parseLocatorFile above does (#787).
+function parseIndexFile(path: string, text: string): LocatorSource {
   const lines = text
     .split('\n')
     .map((l) => l.trim())
@@ -1241,9 +1625,10 @@ async function readIndexFile(path: string): Promise<LocatorSource> {
   const last = lines[lines.length - 1];
   const [timestamp, locator, digest] = last.split('\t');
   if (!timestamp || !locator)
+    // #787: see readLocatorFile's own note — the rejected line is described, never echoed.
     throw new ToolError(
       'ERR_INVALID_INPUT',
-      `index file ${path} lines must be "<timestamp>\\t<locator>[\\t<sha256>]" — got: ${JSON.stringify(last)}`,
+      `index file ${path} lines must be "<timestamp>\\t<locator>[\\t<sha256>]" — its last non-comment line has ${last.split('\t').length} tab-separated field(s) and does not start with a timestamp and a locator`,
     );
   // The index records timestamp+locator+sha256 but not the backend — that lives
   // in the save-locator file / the push command itself.
@@ -1282,13 +1667,19 @@ async function handleLastSnapshotStatus(args: ToolArgs): Promise<CallToolResult>
     }
   }
   const sources: LocatorSource[] = [];
+  // #787: contain-then-read through ONE handle, and PARSE what came back — this tool used
+  // to readFile() whatever absolute path it was handed and report on the contents, which
+  // made a readOnlyHint:true tool a general local-file disclosure oracle for an MCP caller.
+  // See readContainedFileWithinHome()'s own comment for why this refuses rather than
+  // warning the way restore_now's out_dir does, and for what the single handle buys over
+  // the check-then-read it replaced.
   if (locatorFile) {
-    if (!(await exists(locatorFile))) throw new ToolError('ERR_INVALID_INPUT', `no such locator file: ${locatorFile}`);
-    sources.push(await readLocatorFile(locatorFile));
+    const read = await readContainedFileWithinHome(locatorFile, 'locator_file');
+    sources.push(parseLocatorFile(locatorFile, read.text, read.mtime));
   }
   if (indexFile) {
-    if (!(await exists(indexFile))) throw new ToolError('ERR_INVALID_INPUT', `no such index file: ${indexFile}`);
-    sources.push(await readIndexFile(indexFile));
+    const read = await readContainedFileWithinHome(indexFile, 'index_file');
+    sources.push(parseIndexFile(indexFile, read.text));
   }
   for (const s of sources) s.age_seconds = ageSeconds(s.timestamp);
   // latest = the newest-timestamped entry across whichever sources were readable
@@ -1345,6 +1736,7 @@ async function handleVerifyRestore(args: ToolArgs): Promise<CallToolResult> {
   let pulled: Record<string, unknown> | undefined;
   let signature: Record<string, unknown> | undefined;
   let warning: string | undefined;
+  let resultPayload: Record<string, unknown>;
   try {
     if (file === undefined) {
       if (locator !== undefined) {
@@ -1417,7 +1809,11 @@ async function handleVerifyRestore(args: ToolArgs): Promise<CallToolResult> {
     const res = await captureCall(() => verify(verifyOpts));
     // verify() reports through process.exitCode: 0 PASS, 1 FAIL, 2 PARTIAL.
     const verdict = res.exitCode === 0 ? 'PASS' : res.exitCode === 2 ? 'PARTIAL' : 'FAIL';
-    return structuredOk({
+    // #793: built into a variable rather than returned from inside the try, so the
+    // cleanup below runs OUTSIDE it. Returning from inside the try left the cleanup in a
+    // bare `finally`, where a throw discarded this verdict — or, worse, discarded the
+    // verification's own error — and replaced it with a temp-dir failure.
+    resultPayload = {
       verdict,
       exit_code: res.exitCode,
       restorable_proven: verdict === 'PASS', // PARTIAL ≠ PASS: decryptability was not proven
@@ -1432,10 +1828,13 @@ async function handleVerifyRestore(args: ToolArgs): Promise<CallToolResult> {
             note: 'header + wrong-key checks passed but no private identity could prove decryptability on this box — run verify_restore where the identity lives for a full PASS.',
           }
         : {}),
-    });
-  } finally {
-    await discardFetchDir(tdir);
+    };
+  } catch (e) {
+    await discardFetchDirPreservingError(tdir, e, 'verify');
+    throw e;
   }
+  await discardFetchDirWarningOnResult(tdir, resultPayload, 'verify');
+  return structuredOk(resultPayload);
 }
 
 // #509: the resolved input restore_now hands to restore() — its dual-mode
@@ -1556,7 +1955,10 @@ async function resolveRestoreTarget(args: ToolArgs): Promise<ResolvedRestoreTarg
     }
     return { target, tdir, pulled, signature, effectivePin, warning };
   } catch (e) {
-    await discardFetchDir(tdir);
+    // #793: an unguarded `await discardFetchDir(tdir)` here replaced `e` — the sha256
+    // mismatch, the unfetchable signature — with a temp-dir error, telling the caller the
+    // server broke rather than that the artifact failed its pin.
+    await discardFetchDirPreservingError(tdir, e, 'restore');
     throw e;
   }
 }
@@ -1633,6 +2035,14 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
     );
   }
 
+  // #792: resolve out_dir the way src/lib/restore.ts's own stat() will — refusing a
+  // final-component symlink outright, following ancestors — BEFORE any pull/decrypt/
+  // extract work. See resolveRestoreOutDir()'s own comment for why the final component
+  // is fail-closed while ancestors are not. This sits after the confirm_write gate so
+  // the consent boundary still comes first, and before resolveRestoreTarget() so nothing
+  // has been fetched or written by the time it can refuse.
+  await resolveRestoreOutDir(outDir);
+
   const { target, tdir, pulled, signature, warning } = await resolveRestoreTarget(args);
   // #650: cleanup of the fetch/scratch dir used to live in a `finally` wrapping the try
   // block below. A `finally` that throws REPLACES whatever the try block already
@@ -1646,9 +2056,20 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
   // real error on a failed one.
   let resultPayload: Record<string, unknown>;
   try {
+    // Resolved AGAIN here, and THIS is the result that gets used (multi-model review,
+    // #792). The identical call before the pull is a fail-fast, so an obviously-bad
+    // destination costs no fetch; between the two sits the whole pull, pin check and
+    // signature verification, which is easily long enough for a symlink to be swapped in.
+    // Re-resolving immediately before restore() narrows that window to a few statements —
+    // it does not close it; see resolveRestoreOutDir()'s own RESIDUAL note. Inside the try
+    // so a refusal here still tears down the fetch dir rather than leaking it.
+    const resolvedOutDir = await resolveRestoreOutDir(outDir);
     const restoreOpts: CliOptions = {
       in: target,
-      out_dir: outDir,
+      // #792: the RESOLVED path, not the caller's — same reasoning as #648's
+      // resolveRealpathWithinHome(), which returns the resolved path precisely so the
+      // actual operation cannot re-follow an ancestor symlink a second time.
+      out_dir: resolvedOutDir,
       identity: isStr(identity) ? identity : undefined,
       pg: isStr(pg) ? pg : undefined,
       // #319: restore() checks authenticity FIRST — before the identity is loaded, before
@@ -1688,10 +2109,21 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
     }
     // #559: non-blocking — see outsideHomeWarning()'s own comment for why restore_now
     // warns rather than refuses when out_dir sits outside CYPHER_BRAIN_HOME.
-    const homeWarning = outsideHomeWarning(outDir);
+    //
+    // #792: asked about the RESOLVED path. Asked about the caller's raw one, this warning
+    // was silently inapplicable to exactly the case that needs it most — an in-home path
+    // whose symlink target is not in home read as "inside home" and produced no warning at
+    // all, while the plaintext landed outside. The final-component case is now refused
+    // outright (resolveRestoreOutDir), so what remains here is ancestor resolution.
+    const homeWarning = outsideHomeWarning(resolvedOutDir);
     const warnings = [...(homeWarning ? [homeWarning] : []), ...(warning ? [warning] : []), ...res.warnings];
     resultPayload = {
       out_dir: outDir,
+      // Reported only when the two differ (an ancestor symlink, e.g. macOS's /var ->
+      // /private/var), so a caller can always see where the plaintext actually landed
+      // rather than only where it asked for it. `out_dir` itself keeps the caller's own
+      // path: it names the same directory and is the value they can use again.
+      ...(resolvedOutDir !== outDir ? { out_dir_resolved: resolvedOutDir } : {}),
       ...(pulled ? { pulled } : {}),
       ...(signature ? { signature } : {}),
       pg_restored: Boolean(pg),
@@ -1703,42 +2135,18 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
     // fetch/scratch dir, but a cleanup failure here must never mask `e`: `e` is the
     // thing the caller needs to see and act on, and a cleanup error piggy-backing on
     // top of it would only obscure that (and revive the exact masking bug this fix is
-    // for, just on the failure path instead of the success one).
-    try {
-      await discardFetchDir(tdir);
-    } catch (cleanupErr) {
-      const warnMsg =
-        `failed to clean up restore fetch/scratch dir ${tdir} after a failed restore_now call: ` +
-        `${errMsg(cleanupErr)} (it may remain on disk until server restart) — the error below is the one to act on.`;
-      console.error(`warning: ${warnMsg}`);
-      // multi-model review, #650: ride this onto `e.cbWarnings` (the SAME convention
-      // captureCall()'s own catch / reclassify() already use to carry a warning onto a
-      // thrown error) so it reaches the structured error's `warnings` field via
-      // buildErrorPayload() too, not just the server's raw stderr — an agent branching
-      // on the structured result otherwise never sees it at all.
-      if (e instanceof Error) {
-        (e as Error & { cbWarnings?: string[] }).cbWarnings = [
-          ...((e as Error & { cbWarnings?: string[] }).cbWarnings ?? []),
-          warnMsg,
-        ];
-      }
-    }
+    // for, just on the failure path instead of the success one). #793 moved the body
+    // of this into discardFetchDirPreservingError() so verify_restore and
+    // resolveRestoreTarget get the same behavior instead of the bare `finally`/`catch`
+    // that discarded their outcomes; the `e.cbWarnings` relay #650 added lives there now.
+    await discardFetchDirPreservingError(tdir, e, 'restore');
     throw e;
   }
 
   // The restore already completed successfully by this point — a cleanup failure here
   // must not override that with ERR_INTERNAL (see the comment above `resultPayload`).
   // Surface it as a warning ON the already-successful result instead.
-  try {
-    await discardFetchDir(tdir);
-  } catch (cleanupErr) {
-    const warnMsg =
-      `failed to clean up restore fetch/scratch dir ${tdir} after a successful restore: ${errMsg(cleanupErr)} ` +
-      '— it may remain on disk until server restart.';
-    console.error(`warning: ${warnMsg}`);
-    const existingWarnings = Array.isArray(resultPayload.warnings) ? (resultPayload.warnings as string[]) : [];
-    resultPayload.warnings = [...existingWarnings, warnMsg];
-  }
+  await discardFetchDirWarningOnResult(tdir, resultPayload, 'restore');
   return structuredOk(resultPayload);
 }
 
