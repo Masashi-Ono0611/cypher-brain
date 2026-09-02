@@ -218,7 +218,10 @@ stored object and no idempotency record:
   directories may be snapshot sources over MCP. Every `dirs` entry must resolve, after
   following symlinks, to one of those roots or to something inside it. Unset, empty or
   malformed roots refuse every call that names `dirs` — an operator who has not said
-  which directories are snapshottable has authorized none of them. A call that snapshots
+  which directories are snapshottable has authorized none of them. Every configured root
+  must itself exist on disk as a directory (a symlink is followed and its resolved target
+  compared): a typo'd or not-yet-created root refuses the WHOLE call rather than silently
+  falling back to authorizing its nearest existing ancestor (#838). A call that snapshots
   only `pg` needs no roots.
 
 **Upgrading breaks an existing MCP setup until you configure it.** Neither variable has a

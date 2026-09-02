@@ -963,6 +963,45 @@ async function underPolicy<T>(what: string, remedy: string, fn: () => Promise<T>
   }
 }
 
+// #838: a CYPHER_BRAIN_MCP_SOURCE_ROOTS entry is an OPERATOR-set boundary, not a caller
+// argument — realpathOfNearestAncestor()'s "walk up to the nearest EXISTING ancestor"
+// fallback is the right behavior for a `dirs` entry (a typo there is refused later by
+// snapshot()'s own "no such directory" error, not by this gate — see the comment at this
+// function's call site), but reusing it HERE meant a typo'd root
+// (CYPHER_BRAIN_MCP_SOURCE_ROOTS=["/Users/me/brian"]) never refused at all: it silently
+// "resolved" to /Users/me instead, and every `dirs` call under /Users/me was authorized —
+// broader than what the operator named, for a caller this server's own threat model
+// treats as untrusted. A root must therefore exist ON DISK, as a directory, or this
+// throws — fully realpath'd first (a root that is itself a symlink is accepted, same as
+// every other path this gate compares: its RESOLVED target is what gets checked and
+// compared against, consistent with how a `dirs` entry that is a symlink is already
+// treated a few lines below), then confirmed to be a directory rather than a file. Either
+// failure throws a ToolError, which underPolicy() at the call site re-throws as-is
+// (`if (e instanceof ToolError) throw e`) — so ONE bad root fails the WHOLE policy closed
+// for this call (every `dirs` call refused, naming the offending root), rather than
+// silently dropping just that root while the rest keep authorizing sources.
+async function resolveConfiguredRoot(root: string): Promise<string> {
+  let resolved: string;
+  try {
+    resolved = await realpath(resolve(root));
+  } catch (e) {
+    if (!PATH_ABSENT_CODES.has((e as NodeJS.ErrnoException)?.code ?? '')) throw e; // handled by underPolicy()
+    throw snapshotPolicyDenied(
+      `CYPHER_BRAIN_MCP_SOURCE_ROOTS names a root that does not exist on disk: ${JSON.stringify(root)}`,
+      'Create the directory, or fix the path, in CYPHER_BRAIN_MCP_SOURCE_ROOTS, and restart this server. ' +
+        POLICY_DOC_REF,
+    );
+  }
+  const st = await stat(resolved);
+  if (!st.isDirectory()) {
+    throw snapshotPolicyDenied(
+      `CYPHER_BRAIN_MCP_SOURCE_ROOTS names a root that is not a directory: ${JSON.stringify(root)}`,
+      `Fix CYPHER_BRAIN_MCP_SOURCE_ROOTS to name a directory, and restart this server. ${POLICY_DOC_REF}`,
+    );
+  }
+  return resolved;
+}
+
 async function assertSnapshotPolicy(dirs: readonly string[], recipients: readonly string[]): Promise<void> {
   // ── 1. the key half ────────────────────────────────────────────────────────
   // `undefined` (unset) and `''` are both "no pin", and are refused identically here.
@@ -1091,17 +1130,19 @@ async function assertSnapshotPolicy(dirs: readonly string[], recipients: readonl
     );
   }
 
-  // Both sides resolved through the #648 helper before comparing — a symlinked root, a
-  // symlinked ancestor, or a `dirs` entry that IS a symlink pointing out of the roots all
-  // collapse to their real locations first, so none of them can smuggle a source past a
-  // check that compared the paths as written. A `dirs` entry that does not exist resolves
-  // to its nearest existing ancestor plus the literal tail, which keeps the containment
-  // answer honest while leaving "no such directory" to snapshot()'s own error — this gate
-  // must not change how a plain typo is reported.
+  // Both sides resolved to their real locations before comparing, but NOT the same way
+  // (#838): a `dirs` entry that does not exist resolves to its nearest existing ancestor
+  // plus the literal tail (realpathOfNearestAncestor(), below), which keeps the
+  // containment answer honest while leaving "no such directory" to snapshot()'s own
+  // error — this gate must not change how a plain typo in a CALL is reported. A
+  // CYPHER_BRAIN_MCP_SOURCE_ROOTS root is the opposite: it is the OPERATOR's boundary,
+  // not a call argument, so resolveConfiguredRoot() (above) requires it to actually exist
+  // as a directory and throws — refusing the WHOLE call — rather than silently falling
+  // back to authorizing an ancestor the operator did not name.
   const roots = await underPolicy(
     'a CYPHER_BRAIN_MCP_SOURCE_ROOTS root could not be resolved',
     `Check that every configured root exists and is reachable by this server. ${POLICY_DOC_REF}`,
-    () => Promise.all(MCP_SOURCE_ROOTS.map((r) => realpathOfNearestAncestor(r))),
+    () => Promise.all(MCP_SOURCE_ROOTS.map((r) => resolveConfiguredRoot(r))),
   );
   // Resolved CONCURRENTLY, not one after another (multi-model review round 3). Sequential
   // resolution makes the post-check window for the FIRST entry as long as the resolution
