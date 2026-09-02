@@ -157,17 +157,19 @@ grep -q 'no scrypt stanza' "$TMP/forged.err" || { echo "[FAIL] forged file must 
 echo "[PASS] forged post-header scrypt marker still classifies as recipient ciphertext"
 
 echo "== missing flag / missing file / truncated locator all fail closed =="
-if cb recovery-kit --from-locator-file "$TMP/nope.tsv" >/dev/null 2>&1; then
+if cb recovery-kit --from-locator-file "$TMP/nope.tsv" >/dev/null 2>"$TMP/nope.err"; then
   echo "[FAIL] a missing locator file must be an error"; exit 1
 fi
+grep -q 'has no locator line' "$TMP/nope.err" || { echo "[FAIL] the missing-file error must say the file has no locator line"; cat "$TMP/nope.err"; exit 1; }
 if cb recovery-kit >/dev/null 2>"$TMP/noflag.err"; then
   echo "[FAIL] recovery-kit without --from-locator-file must be an error"; exit 1
 fi
 grep -q 'from-locator-file' "$TMP/noflag.err" || { echo "[FAIL] the error must name the missing flag"; exit 1; }
 : > "$TMP/empty.tsv"
-if cb recovery-kit --from-locator-file "$TMP/empty.tsv" >/dev/null 2>&1; then
+if cb recovery-kit --from-locator-file "$TMP/empty.tsv" >/dev/null 2>"$TMP/empty.err"; then
   echo "[FAIL] an empty locator file must be an error"; exit 1
 fi
+grep -q 'has no locator line' "$TMP/empty.err" || { echo "[FAIL] the empty-file error must say the file has no locator line"; cat "$TMP/empty.err"; exit 1; }
 printf 'only-one-field\n' > "$TMP/truncated.tsv"
 if cb recovery-kit --from-locator-file "$TMP/truncated.tsv" >/dev/null 2>"$TMP/trunc.err"; then
   echo "[FAIL] a locator line without a backend column must be an error"; exit 1
