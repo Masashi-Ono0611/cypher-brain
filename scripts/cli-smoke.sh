@@ -641,4 +641,149 @@ grep -Fq -- 'does not read --json' "$TMP/m4-publish-latest.err" \
   || { echo "[FAIL] 'publish-latest --json' was not refused as unread — it is still format-by-outcome"; cat "$TMP/m4-publish-latest.err"; exit 1; }
 echo "[PASS] dist recovery-kit/init/publish-latest --json: refused upfront (not format-by-outcome) (#781)"
 
+### (m5) #832: the flag-relevance gate is an ALLOW-list (COMMAND_FLAGS), so the failure
+# mode inverted. Under the old deny-list a forgotten entry was silent (that IS #832:
+# `doctor --level remote` ran the full health check, exit 0, --level never mentioned);
+# under an allow-list a forgotten entry REFUSES a valid invocation. Three static reads of
+# src/cli.ts guard both directions — the same "read the source, not a runtime probe"
+# reasoning m2 above documents, plus the probe loop in m6 below for the false-refusal side.
+# This block also WRITES $TMP/probes.tsv, one probe per non-empty allow-list entry, which
+# m6 then executes: the probes are derived from the table itself, so a command or flag
+# added later is exercised without touching the smoke test.
+node -e "
+  const src = require('node:fs').readFileSync('$ROOT/src/cli.ts', 'utf8');
+  const setNames = (start) => { const s = src.slice(src.indexOf(start)); return [...s.slice(0, s.indexOf(']);')).matchAll(/'([a-z_0-9]+)'/g)].map((m) => m[1]); };
+  const bools = new Set(setNames('const BOOL_FLAGS'));
+  const values = new Set(setNames('const VALUE_FLAGS'));
+  const repeatable = [...src.slice(src.indexOf('const REPEATABLE_FLAG_FIELDS')).slice(0, 400).matchAll(/\['([a-z_]+)', '[a-z_]+'\]/g)].map((m) => m[1]);
+  const knownFlags = [...repeatable, ...bools, ...values];
+
+  // Split a Record<string, …[]> literal into one body per key, so an entry written on one
+  // line and one spread over ten parse the same way (both shapes exist in both tables).
+  //
+  // Codex review: a text parser's real failure mode is reading LESS than is there and
+  // still passing — a key it cannot see is simply not checked, and the orphan check below
+  // can stay green because some other command owns the skipped flags. So this refuses any
+  // shape it does not fully understand rather than parsing what it can: a spread
+  // (\`push: [...COMMON, 'wallet']\`) or a member written in a form \`forbidden\` describes
+  // hides members, and a key written in a form the narrow regex misses is caught by
+  // counting key-shaped lines and demanding the same number back.
+  const bodies = (start, forbidden) => {
+    const s = src.slice(src.indexOf(start));
+    const text = s.slice(0, s.indexOf('\n};')).split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    if (text.includes('...')) { console.error(start + ': contains a spread — this guard cannot see the flags it hides'); process.exit(1); }
+    const bad = text.match(forbidden);
+    if (bad) { console.error(start + ': ' + JSON.stringify(bad[0]) + ' is a member form this guard cannot read — it would silently skip it'); process.exit(1); }
+    const marks = [...text.matchAll(/\n  '?([-A-Za-z][-A-Za-z0-9_ ]*)'?: \[/g)];
+    const keyish = [...text.matchAll(/\n  \S[^\n]*?: \[/g)];
+    if (marks.length !== keyish.length) { console.error(start + ': ' + (keyish.length - marks.length) + ' entr(ies) are written in a form this guard does not parse'); process.exit(1); }
+    return marks.map((m, i) => [m[1], text.slice(m.index + m[0].length, i + 1 < marks.length ? marks[i + 1].index : text.length)]);
+  };
+  const entries = bodies('const COMMAND_FLAGS', /[\"\`]/).map(([k, b]) => [k, [...b.matchAll(/'([a-z_0-9]+)'/g)].map((m) => m[1])]);
+  if (entries.length === 0) { console.error('no allow-list entries parsed — COMMAND_FLAGS changed shape'); process.exit(1); }
+  if (bools.size === 0 || values.size === 0 || repeatable.length !== 4) { console.error('flag sets changed shape — BOOL_FLAGS/VALUE_FLAGS/REPEATABLE_FLAG_FIELDS did not parse'); process.exit(1); }
+  const allow = new Map(entries);
+
+  // (a0) every name in the allow-list is a flag the parser actually knows. A typo here
+  // would otherwise reach the CLI as an unknown flag, which m6's probe below would not
+  // tell apart from a healthy run (Codex review).
+  const unreal = [...allow].flatMap(([k, fs]) => fs.filter((f) => !knownFlags.includes(f)).map((f) => k + ' --' + f.replace(/_/g, '-')));
+  if (unreal.length) {
+    console.error('allow-list names the parser does not recognize as flags (#832): ' + unreal.join(', '));
+    process.exit(1);
+  }
+
+  // (a) every command the dispatch switch can reach owns an allow-list entry.
+  const body = src.slice(src.indexOf('switch (cmd) {'));
+  const cases = [...body.matchAll(/^\s*case '([^']+)':/gm)].map((m) => m[1]);
+  if (cases.length === 0) { console.error('no case labels found — the dispatch switch changed shape'); process.exit(1); }
+  const undeclared = cases.filter((c) => !allow.has(c));
+  if (undeclared.length) {
+    console.error('commands the dispatch switch can reach with no flag allow-list (#832): ' + undeclared.join(', '));
+    console.error('add each to COMMAND_FLAGS in src/cli.ts naming every flag it reads, using [] if it reads none');
+    process.exit(1);
+  }
+
+  // (b) every flag the PARSER knows is owned by at least one command. An unowned flag is
+  // one the CLI accepts and no command can ever use — refused everywhere, silently dead.
+  const owned = new Set([].concat(...[...allow.values()]));
+  const orphans = knownFlags.filter((f) => !owned.has(f));
+  if (orphans.length) {
+    console.error('flags the parser accepts that NO command declares reading (#832): ' + orphans.map((f) => '--' + f.replace(/_/g, '-')).join(', '));
+    console.error('either add each to the COMMAND_FLAGS entry of the command that reads it, or drop it from BOOL_FLAGS/VALUE_FLAGS');
+    process.exit(1);
+  }
+
+  // (c) no entry may both allow a flag and deny it — the deny-list only supplies the
+  // REASON text now, so a flag in both tables is a contradiction that would never print.
+  const denyEntries = bodies('const FLAG_IRRELEVANT', /flag:\s*[^'\s]/).map(([k, b]) => [k, [...b.matchAll(/flag: '([a-z_0-9]+)'/g)].map((m) => m[1])]);
+  if (denyEntries.length === 0) { console.error('no declarations parsed — FLAG_IRRELEVANT changed shape'); process.exit(1); }
+  const contradictions = [];
+  for (const [key, denied] of denyEntries) {
+    for (const f of denied) if ((allow.get(key) ?? []).includes(f)) contradictions.push(key + ' --' + f.replace(/_/g, '-'));
+  }
+  if (contradictions.length) {
+    console.error('flags a command both allows and denies (#832): ' + contradictions.join(', '));
+    process.exit(1);
+  }
+
+  // The probe list m6 runs: every flag of an entry at once, values pointed at paths that
+  // do not exist so each command fails its own validation rather than doing work.
+  const probes = [];
+  for (const [key, flags] of entries) {
+    if (flags.length === 0) continue;
+    const argv = key.split(' ');
+    for (const f of flags) {
+      argv.push('--' + f.replace(/_/g, '-'));
+      if (!bools.has(f)) argv.push('$TMP/probe-' + f.replace(/_/g, '-'));
+    }
+    probes.push(argv.join('\t'));
+  }
+  require('node:fs').writeFileSync('$TMP/probes.tsv', probes.join('\n') + '\n');
+  console.log('checked ' + cases.length + ' dispatch cases and ' + knownFlags.length + ' known flags against ' + entries.length + ' allow-list entries (' + probes.length + ' probes)');
+" || { echo "[FAIL] the COMMAND_FLAGS allow-list is incomplete or contradicts FLAG_IRRELEVANT (#832)"; exit 1; }
+echo "[PASS] every dispatchable command has an allow-list, every known flag is owned, neither table contradicts the other (#832)"
+
+### (m6) the two directions of #832, at run time.
+# (m6a) it FIRES: a flag that belongs to another command is refused, naming the owner —
+# `doctor --level quick` is the issue's own repro (it ran the full health check, exit 0).
+node "$DIST" doctor --level quick > "$TMP/m6-doctor.out" 2> "$TMP/m6-doctor.err"
+M6_RC=$?
+[ "$M6_RC" = "2" ] \
+  || { echo "[FAIL] 'doctor --level quick' exited $M6_RC, expected 2 (a flag belonging to another command must be refused)"; cat "$TMP/m6-doctor.err"; exit 1; }
+[ ! -s "$TMP/m6-doctor.out" ] || { echo "[FAIL] doctor --level quick wrote to stdout on the error path"; cat "$TMP/m6-doctor.out"; exit 1; }
+grep -Fq -- 'does not read --level' "$TMP/m6-doctor.err" \
+  || { echo "[FAIL] 'doctor --level quick' was not refused as unread (#832)"; cat "$TMP/m6-doctor.err"; exit 1; }
+grep -Fq -- 'it belongs to verify' "$TMP/m6-doctor.err" \
+  || { echo "[FAIL] 'doctor --level quick' did not name the command --level belongs to"; cat "$TMP/m6-doctor.err"; exit 1; }
+echo "[PASS] dist doctor --level: refused, exit 2, naming verify as the owner (#832)"
+
+# (m6b) it does NOT over-fire: every command, handed its OWN whole allow-list, must get
+# past this check. This is the regression an allow-list invites and a deny-list could not
+# have — one forgotten flag and a valid invocation starts failing. The commands still fail
+# (their values are paths that do not exist), which is the point: only the refusal
+# SENTENCE is asserted against, never the exit code, so each probe can die in the
+# command's own validation without doing work. Sub-verb keys are probed as themselves.
+SENTINEL='a flag that is silently dropped looks exactly like one that was honored'
+PROBE_HOME="$TMP/probe-home"
+PROBED=0
+while IFS=$'\t' read -r -a PROBE_ARGV; do
+  [ "${#PROBE_ARGV[@]}" -gt 0 ] || continue
+  CYPHER_BRAIN_HOME="$PROBE_HOME" node "$DIST" "${PROBE_ARGV[@]}" > /dev/null 2> "$TMP/m6-probe.err" < /dev/null
+  if grep -Fq -- "$SENTINEL" "$TMP/m6-probe.err"; then
+    echo "[FAIL] the allow-list refused a flag its own COMMAND_FLAGS entry declares: ${PROBE_ARGV[*]}"
+    cat "$TMP/m6-probe.err"; exit 1
+  fi
+  # A probe that dies on "unknown flag" never reached the relevance check at all, so the
+  # assertion above proved nothing about it (Codex review). (a0) makes this unreachable
+  # from a typo'd table; it also catches a flag dropped from BOOL_FLAGS/VALUE_FLAGS.
+  if grep -Fq -- 'unknown flag:' "$TMP/m6-probe.err"; then
+    echo "[FAIL] an allow-list probe never reached the relevance check — the parser rejected the flag outright: ${PROBE_ARGV[*]}"
+    cat "$TMP/m6-probe.err"; exit 1
+  fi
+  PROBED=$((PROBED + 1))
+done < "$TMP/probes.tsv"
+[ "$PROBED" -gt 0 ] || { echo "[FAIL] no allow-list probes ran — \$TMP/probes.tsv was empty"; exit 1; }
+echo "[PASS] all $PROBED allow-list probes accepted every flag their own command declares (#832)"
+
 echo "CLI SMOKE: PASS"

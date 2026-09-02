@@ -299,7 +299,9 @@ try {
     // fix, understating the true total for every signed arweave/turbo push).
     cbOk({}, 'keygen', '--sign');
     const signedSnap = join(tmp, 'signed-snap.age');
-    cbOk({}, 'snapshot', '--dir', src, '--out', signedSnap, '--sign');
+    // #832: NOT `--sign` (keygen's flag, never read by snapshot) — the keygen above is
+    // what makes this snapshot a signed one.
+    cbOk({}, 'snapshot', '--dir', src, '--out', signedSnap);
     console.error('push --backend arweave (signed)...');
     const signedLoc = cbOk({}, 'push', '--in', signedSnap, '--backend', 'arweave');
     const entriesAfterSignedPush = await readReceiptsAt(ledgerPath);

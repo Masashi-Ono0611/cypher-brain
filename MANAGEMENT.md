@@ -627,6 +627,44 @@ which a retry re-runs the paid path. The warning on that call names the claim lo
 happened, then either remove that file by hand to unblock the key, or simply use a new
 one. The same manual step is the documented recovery for a claim whose holder crashed.
 
+## A flag belongs to one command
+
+Every `--flag` is owned by the command(s) whose code reads it, and passing one to a
+different command is an error (**exit 2**, and `{"error": …, "exit_code": 2}` under
+`--json`) rather than something the run quietly drops:
+
+```
+$ cypher-brain doctor --level quick
+error: doctor does not read --level: --level (not one of doctor's flags — it belongs
+to verify; run 'cypher-brain doctor --help'). Refused rather than ignored: a flag that
+is silently dropped looks exactly like one that was honored.
+```
+
+`--level` is `verify`'s depth selector; `doctor` has no notion of depth. Before #832 that
+invocation ran the full health check and exited 0 with `--level` never mentioned — the
+parser recognised the flag globally, so it was neither an unknown flag (#253, which is
+still what `--bogus` gets) nor a bad enum value. The check is now an **allow-list** per
+command and sub-command (`src/cli.ts`'s `COMMAND_FLAGS`, derived from what each command's
+code actually reads), so a flag nobody thought to consider is refused by default instead
+of accepted by default. Some refusals carry a specific explanation instead of the generic
+one above — `restore --out` names `--out-dir`, `ledger --backend` explains that the report
+is already grouped by backend (#277/#460/#647).
+
+Practical consequences when scripting:
+
+- **`--json` is not universal.** It is refused on commands that have no JSON success
+  document (`push`, `pull`, `restore`, `keygen`, `snapshot`, `init`, `recovery-kit`,
+  `publish-latest`, `wallet create`, `wallet address`, `schedule install`,
+  `schedule uninstall`) precisely so a caller never has to guess which shape it will get
+  (#647/#722/#781). It works on `doctor`, `ledger`, `audit`, `verify`, `estimate`,
+  `schedule status` and `wallet balance`.
+- **Sub-commands are judged as themselves.** `wallet balance --json` is valid while
+  `wallet address --json` is refused, because only one of them prints JSON.
+- **`<command> --help` is where that command's flags are documented**, and the refusal
+  message points at it. A few low-traffic ones are described in that section's prose or in
+  the `Env:` block rather than on the usage line (`push`/`estimate --wallet`, for
+  instance), so read the section, not only its first line.
+
 ## Error codes
 
 Failures print with a stable `[CB-E0xx]` code and a link to this section, the same shape

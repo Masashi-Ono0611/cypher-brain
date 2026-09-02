@@ -3037,10 +3037,13 @@ async function run(tmp) {
     const cliRun = (args) => spawnSync(process.execPath, [CLI, ...args], { env: { ...process.env }, encoding: 'utf8' });
     const kgSign = cliRun(['keygen', '--sign']);
     if (kgSign.status !== 0) throw new Error(`setup: keygen --sign failed: ${kgSign.stderr || kgSign.stdout}`);
-    const snapSign = cliRun(['snapshot', '--dir', signedSrc, '--out', signedAge, '--sign']);
-    if (snapSign.status !== 0) throw new Error(`setup: snapshot --sign failed: ${snapSign.stderr || snapSign.stdout}`);
+    // #832: NOT `--sign` — that is keygen's flag, which snapshot never read and now
+    // refuses; snapshot signs whenever a signing identity exists, as the keygen above
+    // just arranged.
+    const snapSign = cliRun(['snapshot', '--dir', signedSrc, '--out', signedAge]);
+    if (snapSign.status !== 0) throw new Error(`setup: signed snapshot failed: ${snapSign.stderr || snapSign.stdout}`);
     if (!existsSync(`${signedAge}.minisig`)) {
-      throw new Error('setup: snapshot --sign did not write a .minisig, so the sidecar probe cannot run');
+      throw new Error('setup: the snapshot did not write a .minisig, so the sidecar probe cannot run');
     }
     const signedSha = createHash('sha256')
       .update(await readFile(signedAge))

@@ -900,7 +900,10 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       --out <path.json> (#231): ALSO write a "plan" pinning this exact estimate to the
       artifact (sha256 of --in), --backend, --remote (rclone only, null otherwise), the
       configured payer address (if any wallet is set up for this backend — null
-      otherwise), and an expiry 15 minutes from now. Additive to the normal report
+      otherwise; --wallet <path> picks which key file that address is derived from,
+      exactly as it does for "wallet address", and push reads it the same way when
+      re-checking a plan and when recording a receipt), and an expiry 15 minutes from
+      now. Additive to the normal report
       above (stdout/exit code unchanged either way). Refuses if --out already exists
       (same no-clobber posture as "snapshot --out", #470) — pass --force to overwrite
       it anyway. Feed the path to
@@ -1253,10 +1256,15 @@ function helpForCommand(cmd: string): string | null {
  * EMPTY IS A REAL ANSWER, and a command with no declaration fails the build —
  * scripts/cli-smoke.sh compares the dispatch switch's case labels against this table.
  *
- * A deny-list, not an allow-list. An allow-list cannot be derived from HELP (the usage
- * lines are abbreviated), and a hand-written one fails in the direction that matters: a
- * flag missing from it starts REFUSING a valid invocation. A missing deny-list entry only
- * preserves today's behaviour, so the table can grow instead of having to be right at once.
+ * #832: this table used to be the WHOLE mechanism, as a deny-list — which meant a flag
+ * nobody had thought to name here was accepted and dropped in silence. `doctor --level
+ * remote` ran the full health check, exit 0, with --level never mentioned: the parser
+ * knows --level (it is verify's), and FLAG_IRRELEVANT['doctor'] happened to be []. The
+ * outer gate is now COMMAND_FLAGS below — an ALLOW-list, one entry per command, derived
+ * from what the command's code actually reads. This table stays as the source of the
+ * REASON text: a refused flag named here is refused with its own explanation, and one
+ * that is not gets a generic "it belongs to <command>" instead. Nothing here is dead —
+ * every `because` string below is still what the user sees.
  *
  * Entries record what the command DOES with the flag, not what the flag is called.
  * "Does not read" is the user-facing phrasing; "never honors" is the precise one — restore()
@@ -1492,6 +1500,189 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   '-V': [],
 };
 
+/**
+ * #832 — every flag each command READS, keyed exactly like FLAG_IRRELEVANT above (the
+ * command word, plus an optional `${cmd} ${o._}` sub-verb key that overrides it). This
+ * is the outer gate: a flag the parser recognizes but that is absent from the command's
+ * entry is REFUSED, whether or not FLAG_IRRELEVANT has an explanation for it.
+ *
+ * Derived from the CODE, not from HELP: each entry is the set of `o.<field>` reads
+ * reachable from that command's handler, including the ones it reaches through shared
+ * helpers (snapshot/schedule install both read --vault/--zip/--export/--force-vault via
+ * profiles.ts; push/estimate both read --wallet via wallet.ts's payerAddressFor(), which
+ * names the payer address recorded in a plan/receipt). Where HELP and the code disagreed,
+ * the code won and HELP was corrected in the same change. A flag a command reads ONLY to
+ * refuse it (verify's --pg under --level drill) belongs here too — otherwise the specific
+ * refusal it already writes is replaced by this generic one.
+ *
+ * A parent key is the UNION of its sub-verbs, and is what answers when the sub-verb is
+ * missing or unrecognized (`wallet --json`, `schedule bogus --at 03:30`): the sub-verb
+ * dispatch below produces the real diagnostic there, and narrowing the flag check first
+ * would bury it. Whenever a sub-verb key exists, IT is what the invocation is judged
+ * against.
+ *
+ * Getting an entry WRONG in the missing direction refuses a valid invocation, which is
+ * why scripts/cli-smoke.sh (m5/m6) asserts three things on every run: every dispatchable
+ * command has an entry, every flag the parser knows is owned by at least one command, and
+ * every command still accepts its own whole entry without this check firing.
+ */
+const COMMAND_FLAGS: Record<string, readonly string[]> = {
+  // init(_o) ignores the options bag entirely (src/lib/wizard.ts) — it is an interactive
+  // wizard that asks for everything. Empty is the honest answer, and now a load-bearing
+  // one: under the deny-list, `init --pq` was accepted and dropped.
+  init: [],
+  keygen: ['passphrase', 'force', 'pq', 'wrap_in_place', 'sign', 'sign_identity', 'sign_recipient'],
+  snapshot: [
+    'out',
+    'dir',
+    'recipient',
+    'profile',
+    'pg',
+    'pg_table',
+    'pg_filter',
+    'pg_exclude_table_data',
+    'vault',
+    'zip',
+    'export',
+    'force_vault',
+    'dry_run',
+    'scan_secrets',
+    'no_sign',
+    'sign_identity',
+  ],
+  restore: [
+    'in',
+    'out_dir',
+    'identity',
+    'pg',
+    'yes',
+    'no_expand_components',
+    'sha256',
+    'sign_recipient',
+    'require_signature',
+    'verbose',
+  ],
+  // --locator/--backend/--from-locator-file/--sig-locator are --level remote's fetch
+  // inputs and --pg is the one --level drill refuses; all five are read by verifyImpl().
+  verify: [
+    'in',
+    'identity',
+    'sha256',
+    'sign_recipient',
+    'require_signature',
+    'json',
+    'level',
+    'verbose',
+    'locator',
+    'backend',
+    'from_locator_file',
+    'sig_locator',
+    'pg',
+  ],
+  push: ['in', 'backend', 'remote', 'yes', 'plan', 'save_locator', 'skip_unchanged', 'digest', 'force', 'wallet'],
+  pull: ['out', 'locator', 'backend', 'remote', 'from_locator_file', 'wait', 'sha256', 'sig_locator', 'force'],
+  estimate: ['in', 'backend', 'json', 'out', 'remote', 'force', 'wallet'],
+  'publish-latest': ['domain', 'from_locator_file', 'yes', 'wait'],
+  'recovery-kit': ['from_locator_file', 'out', 'force', 'inline_identity', 'backup_identity', 'backup_recipient'],
+  schedule: [
+    'json',
+    'backend',
+    'at',
+    'max_spend',
+    'no_load',
+    'profile',
+    'pg',
+    'pg_table',
+    'pg_filter',
+    'pg_exclude_table_data',
+    'dir',
+    'recipient',
+    'vault',
+    'zip',
+    'export',
+    'force_vault',
+    'save_locator',
+    'index_file',
+    'ping_url',
+    'ping_url_fail',
+    'scan_secrets',
+  ],
+  'schedule install': [
+    'backend',
+    'at',
+    'max_spend',
+    'no_load',
+    'profile',
+    'pg',
+    'pg_table',
+    'pg_filter',
+    'pg_exclude_table_data',
+    'dir',
+    'recipient',
+    'vault',
+    'zip',
+    'export',
+    'force_vault',
+    'save_locator',
+    'index_file',
+    'ping_url',
+    'ping_url_fail',
+    'scan_secrets',
+  ],
+  'schedule status': ['json'],
+  'schedule uninstall': ['no_load'],
+  wallet: ['out', 'force', 'chain', 'wallet', 'address', 'json'],
+  'wallet create': ['out', 'force', 'chain'],
+  'wallet address': ['wallet', 'chain'],
+  'wallet balance': ['wallet', 'address', 'json', 'chain'],
+  doctor: ['json'],
+  ledger: ['json', 'csv'],
+  audit: ['json'],
+  // The flagless routes. They print and return; nothing reads an option bag.
+  help: [],
+  '--help': [],
+  '-h': [],
+  '--version': [],
+  '-V': [],
+};
+
+// The four repeatable flags parseArgs() collects into arrays rather than storing under
+// their own name — `--dir docs` lands in o.dirs, not o.dir. Named here so the check below
+// speaks ONE vocabulary (the flag as typed, in snake_case) across BOOL_FLAGS, VALUE_FLAGS
+// and these, which is also what COMMAND_FLAGS above is written in.
+const REPEATABLE_FLAG_FIELDS: ReadonlyArray<
+  readonly [string, 'dirs' | 'tables' | 'recipients' | 'pg_exclude_table_data']
+> = [
+  ['dir', 'dirs'],
+  ['pg_table', 'tables'],
+  ['recipient', 'recipients'],
+  ['pg_exclude_table_data', 'pg_exclude_table_data'],
+];
+
+/** The flags this invocation actually set, in the same vocabulary. */
+function flagsGiven(o: CliOptions): string[] {
+  const rec = o as unknown as Record<string, unknown>;
+  const given: string[] = [];
+  for (const [flag, field] of REPEATABLE_FLAG_FIELDS) {
+    const v = rec[field];
+    if (Array.isArray(v) && v.length > 0) given.push(flag);
+  }
+  for (const flag of [...BOOL_FLAGS, ...VALUE_FLAGS]) if (rec[flag] !== undefined) given.push(flag);
+  return given;
+}
+
+/**
+ * Which command(s) DO read `flag` — the "it belongs to X" half of a generic refusal.
+ * Only LEAF keys count: a parent entry (`wallet`, `schedule`) is the union of its
+ * sub-verbs, so naming it alongside `wallet balance` would just say the same thing twice.
+ */
+function ownersOfFlag(flag: string): string[] {
+  const keys = Object.keys(COMMAND_FLAGS);
+  return keys
+    .filter((k) => !keys.some((other) => other.startsWith(`${k} `)))
+    .filter((k) => COMMAND_FLAGS[k].includes(flag));
+}
+
 // A command with no entry has not been considered, and "not considered" must not read as
 // "nothing to declare" — that is exactly how #277's cases survived #253. Guarded against
 // the SAME derived list the unknown-command reply prints, so adding a command to HELP
@@ -1508,6 +1699,13 @@ function assertFlagsDeclared(cmd: string | undefined): void {
       `internal: ${cmd} has no flag-relevance declaration (#277) — add an entry to FLAG_IRRELEVANT in src/cli.ts, using [] if no flag another command accepts is ignored by this one`,
     );
   }
+  // #832: and the allow-list, which is the gate that actually decides. A command missing
+  // HERE would accept every flag the parser knows, which is the exact hole #832 closed.
+  if (!Object.hasOwn(COMMAND_FLAGS, cmd)) {
+    throw new Error(
+      `internal: ${cmd} has no flag allow-list (#832) — add an entry to COMMAND_FLAGS in src/cli.ts naming every flag this command reads, using [] if it reads none`,
+    );
+  }
 }
 
 function assertFlagsRelevant(cmd: string | undefined, o: CliOptions): void {
@@ -1519,22 +1717,43 @@ function assertFlagsRelevant(cmd: string | undefined, o: CliOptions): void {
   // them. Falls back to the plain top-level `cmd` key when no such entry exists —
   // every command without sub-verbs (push, pull, restore, ...) only ever has that one.
   const subKey = typeof o._ === 'string' ? `${cmd} ${o._}` : undefined;
-  const key = subKey !== undefined && Object.hasOwn(FLAG_IRRELEVANT, subKey) ? subKey : cmd;
-  if (!Object.hasOwn(FLAG_IRRELEVANT, key)) return;
-  const rec = o as unknown as Record<string, unknown>;
-  const ignored = FLAG_IRRELEVANT[key].filter((r) => rec[r.flag] !== undefined);
+  // #832: two tables, two lookups. The allow-list decides WHICH flags are refused; the
+  // deny-list only supplies the sentence explaining one of them. They are keyed the same
+  // way but need not both carry the same sub-verb key ('wallet balance' has an allow-list
+  // and no deny-list entry), so each falls back to the plain command word on its own.
+  const allowKey = subKey !== undefined && Object.hasOwn(COMMAND_FLAGS, subKey) ? subKey : cmd;
+  const reasonKey = subKey !== undefined && Object.hasOwn(FLAG_IRRELEVANT, subKey) ? subKey : cmd;
+  if (!Object.hasOwn(COMMAND_FLAGS, allowKey)) return;
+  const allowed = new Set(COMMAND_FLAGS[allowKey]);
+  const reasons = new Map((FLAG_IRRELEVANT[reasonKey] ?? []).map((r) => [r.flag, r]));
+  const ignored = flagsGiven(o).filter((flag) => !allowed.has(flag));
   if (ignored.length === 0) return;
+  // The message names the most specific key that answered, so `wallet address --json`
+  // still reads "wallet address does not read --json" rather than blaming `wallet`.
+  const key = subKey !== undefined && subKey === allowKey ? subKey : cmd;
+  const dashed = (flag: string) => `--${flag.replace(/_/g, '-')}`;
   // The near-miss suggestion comes from the same helper #305's MCP refusal and restore's own
   // #279 hint use, so a user who typed --out on restore reads the same sentence they did
   // before this check existed — the refusal moved earlier, the help did not get worse.
   const named = ignored
-    .map((r) => `--${r.flag.replace(/_/g, '-')} (${r.because}${r.instead ? ` — ${didYouMean(r.instead)}` : ''})`)
+    .map((flag) => {
+      const r = reasons.get(flag);
+      if (r) return `${dashed(flag)} (${r.because}${r.instead ? ` — ${didYouMean(r.instead)}` : ''})`;
+      // #832: no hand-written explanation for this one, so say the structural thing
+      // instead — which command DOES read it, and where to look. Capped at four owners:
+      // --json is read by seven, and listing all of them buries the answer.
+      const owners = ownersOfFlag(flag);
+      const shown = owners.slice(0, 4).join(', ');
+      const more = owners.length > 4 ? ` and ${owners.length - 4} more` : '';
+      const belongs = owners.length > 0 ? `it belongs to ${shown}${more}` : 'no command reads it';
+      return `${dashed(flag)} (not one of ${key}'s flags — ${belongs}; run 'cypher-brain ${cmd} --help')`;
+    })
     .join('; ');
   // #779: UsageError — the command line itself named a flag that command does not
   // read, the same "malformed invocation" class as an unknown command/flag or an
   // enum-valued flag's bad value, not a failure that happened while doing the work.
   throw new UsageError(
-    `${key} does not read ${ignored.map((r) => `--${r.flag.replace(/_/g, '-')}`).join(', ')}: ${named}. ` +
+    `${key} does not read ${ignored.map(dashed).join(', ')}: ${named}. ` +
       `Refused rather than ignored: a flag that is silently dropped looks exactly like one that was honored.`,
   );
 }

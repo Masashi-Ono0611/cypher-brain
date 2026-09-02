@@ -305,7 +305,10 @@ try {
   log('#318: push --sign parks a sidecar on arweave, and pull fetches it back');
   cb('keygen', '--sign');
   const signedSnap = join(tmp, 'signed.age');
-  cb('snapshot', '--dir', src, '--out', signedSnap, '--sign');
+  // #832: NOT `--sign` — snapshot never read that flag (it is keygen's), it signs whenever
+  // a signing identity exists, which the keygen above just created. The flag was accepted
+  // and dropped in silence until the per-command allow-list started refusing it.
+  cb('snapshot', '--dir', src, '--out', signedSnap);
   const signedLocFile = join(tmp, 'signed-loc.tsv');
   cb('push', '--in', signedSnap, '--backend', 'arweave', '--save-locator', signedLocFile);
   await mine();
@@ -388,7 +391,7 @@ try {
   // succeed, which is exactly what this asserts cannot happen.
   log('#797: the spend cap bounds the ciphertext AND the .minisig sidecar together');
   const combinedSnap = join(tmp, 'combined.age');
-  cb('snapshot', '--dir', src, '--out', combinedSnap, '--sign');
+  cb('snapshot', '--dir', src, '--out', combinedSnap); // signs on its own — see the #832 note above
   const cipherPrice = BigInt(await ar.transactions.getPrice((await readFile(combinedSnap)).length));
   const sigPrice = BigInt(await ar.transactions.getPrice((await readFile(`${combinedSnap}.minisig`)).length));
   const larger = cipherPrice > sigPrice ? cipherPrice : sigPrice;
@@ -626,7 +629,7 @@ try {
     });
   });
   const sidecarSnap = join(tmp, 'sidecar-uncertain.age');
-  cb('snapshot', '--dir', src, '--out', sidecarSnap, '--sign');
+  cb('snapshot', '--dir', src, '--out', sidecarSnap); // signs on its own — see the #832 note above
   const sidecarPush = spawnSync('node', [...DEV_ARGS, BIN, 'push', '--in', sidecarSnap, '--backend', 'arweave'], {
     env: {
       ...env,
