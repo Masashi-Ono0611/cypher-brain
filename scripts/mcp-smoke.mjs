@@ -72,7 +72,16 @@
 //      runIdempotencyTtlValidationTest(): CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS
 //      set to a NaN/zero/negative/Infinity value refuses to start the server
 //      (naming the variable) rather than silently defeating replay; unset
-//      still starts normally. runIdempotencyCorruptedLogTest(): the
+//      still starts normally. runMaxSpendValidationTest() (#715):
+//      CYPHER_BRAIN_MAX_SPEND/CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND set to a
+//      non-integer value (a decimal, a comma-grouped number, plain text) refuses
+//      to start the server with a clean "must be an integer" message naming the
+//      variable — never the raw, unhandled BigInt() SyntaxError this used to
+//      throw at module-import time; a NEGATIVE integer (which BigInt() itself
+//      parses without error) is refused too, with its own "must be a
+//      non-negative integer" message — a negative cap would otherwise parse
+//      "successfully" into one silently indistinguishable from 0/unset (no cap
+//      at all). Leaving both unset still starts normally. runIdempotencyCorruptedLogTest(): the
 //      idempotency log corrupted EXTERNALLY between two calls makes a
 //      BRAND NEW key refuse fail-closed (ERR_IDEMPOTENCY_STORE_UNREADABLE)
 //      rather than silently proceeding as "no prior calls". The signature-
@@ -128,6 +137,7 @@ async function main() {
     await runScheduleStatusNotInstalledTest(tmp);
     await runIdempotencyTtlTest(tmp);
     await runIdempotencyTtlValidationTest(tmp);
+    await runMaxSpendValidationTest(tmp);
     await runIdempotencyCorruptedLogTest(tmp);
     await runSignalCleanupTest(tmp);
   } finally {
@@ -199,6 +209,99 @@ async function runIdempotencyTtlValidationTest(tmp) {
   process.stdout.write(
     `MCP SMOKE (idempotency TTL validation): PASS — refused to start for ${badValues.length} invalid TTL value(s) ` +
       '(naming the variable each time), started normally with the TTL unset\n',
+  );
+}
+
+// #715: CYPHER_BRAIN_MAX_SPEND/CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND used to feed straight
+// into BigInt() at module-import time — a non-integer value (a decimal, a comma-grouped
+// number, plain text) threw a raw, unhandled SyntaxError (a Node stack trace, `.ts` source
+// paths and all) before this server's own main().catch() ever got a chance to run. Same
+// shape of positive control as runIdempotencyTtlValidationTest() just above: asserts the
+// server refuses to start (nonzero exit, a stderr message naming the variable, no raw
+// stack trace) for each bad value, and that leaving both unset still starts fine.
+async function runMaxSpendValidationTest(tmp) {
+  const cases = [
+    {
+      name: 'CYPHER_BRAIN_MAX_SPEND',
+      // non-integer (BigInt() itself throws) vs. negative (BigInt() parses it fine, but
+      // it must still be refused — see parseMaxSpendBigInt's doc comment in config.ts)
+      // are DIFFERENT failure modes with DIFFERENT wording; kept as separate lists so
+      // each is asserted against the wording it actually produces.
+      nonInteger: ['0.5', '1,000,000', 'notanumber', 'Infinity'],
+      negative: ['-1', '-5'],
+    },
+    { name: 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND', nonInteger: ['0.5', 'notanumber'], negative: ['-1'] },
+  ];
+  const wordingFor = { nonInteger: 'must be an integer', negative: 'must be a non-negative integer' };
+  for (const { name, ...groups } of cases) {
+    for (const [kind, values] of Object.entries(groups)) {
+      const wording = wordingFor[kind];
+      for (const bad of values) {
+        const home = join(tmp, `home-max-spend-${name}-${bad}`.replace(/[^a-zA-Z0-9_-]/g, '_'));
+        const res = spawnSync(process.execPath, [SERVER_PATH], {
+          env: { ...process.env, CYPHER_BRAIN_HOME: home, [name]: bad },
+          input: '',
+          encoding: 'utf8',
+          timeout: 5000,
+        });
+        if (res.status === 0) {
+          throw new Error(`max-spend validation: ${name}=${bad} started successfully (should refuse)`);
+        }
+        const stderr = res.stderr ?? '';
+        if (!new RegExp(name).test(stderr)) {
+          throw new Error(
+            `max-spend validation: ${name}=${bad} did not name the variable in its refusal: ` +
+              `${JSON.stringify(stderr).slice(0, 400)}`,
+          );
+        }
+        if (!stderr.includes(wording)) {
+          throw new Error(
+            `max-spend validation: ${name}=${bad} did not use the "${wording}" wording: ` +
+              `${JSON.stringify(stderr).slice(0, 400)}`,
+          );
+        }
+        if (/^\s*at /m.test(stderr)) {
+          throw new Error(
+            `max-spend validation: ${name}=${bad} printed a raw stack trace instead of a clean refusal: ` +
+              `${JSON.stringify(stderr).slice(0, 400)}`,
+          );
+        }
+      }
+    }
+  }
+  // Unset (the default, 0/no-cap): must still start and serve normally.
+  const okChild = spawn(process.execPath, [SERVER_PATH], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CYPHER_BRAIN_HOME: join(tmp, 'home-max-spend-ok') },
+  });
+  const { send, waitFor } = makeRpcClient(okChild);
+  try {
+    send({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'ci-smoke', version: '0.0.0' } },
+    });
+    const initRes = await waitFor(1);
+    if (!initRes.result)
+      throw new Error(
+        `max-spend validation: server with both variables UNSET failed to initialize: ${JSON.stringify(initRes)}`,
+      );
+  } finally {
+    try {
+      okChild.stdin.end();
+    } catch {
+      /* ignore */
+    }
+    try {
+      okChild.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+  process.stdout.write(
+    'MCP SMOKE (max-spend validation): PASS — refused to start for invalid CYPHER_BRAIN_MAX_SPEND/' +
+      'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND values (naming the variable, no raw stack trace), started normally unset\n',
   );
 }
 
