@@ -190,6 +190,19 @@ grep -qi "At least one directory is required" "$TMP/nodir2.log" || { echo "[FAIL
 [ -f "$NODIR2_CB_HOME/sign-identity.key" ] || { echo "[FAIL] signing identity is missing — the #605 repro's own rollback target must survive a nonexistent directory answer"; exit 1; }
 echo "[PASS] a nonexistent directory answer re-prompts instead of throwing — primary, backup AND signing identities all survive (issue #605 fixed)"
 
+# issue #732: the mid-run "does not exist — skipping it" notice used to be a plain
+# console.log, invisible to warn.ts's own end-of-run "run summary" block — the exact
+# curated block an agent relaying this run is told to show verbatim (see
+# src/lib/warn.ts's own header comment). It now goes through warn(), so the SAME
+# dropped path must appear TWICE in this transcript: once immediately (warn() still
+# prints right away), and again inside the final run-summary block. Before the fix
+# this count would be 1 (the summary block never mentioned it at all — the transcript
+# had no run summary for this event whatsoever).
+grep -q '⚠  run summary' "$TMP/nodir2.log" || { echo "[FAIL] issue #732: no end-of-run warning summary was printed even though a directory was dropped mid-run"; cat "$TMP/nodir2.log"; exit 1; }
+NODIR2_BADPATH_MENTIONS="$(grep -oF "$NODIR2_BADPATH does not exist" "$TMP/nodir2.log" | wc -l | tr -d ' ')"
+[ "$NODIR2_BADPATH_MENTIONS" -ge 2 ] || { echo "[FAIL] issue #732: expected the dropped directory to be mentioned at least twice (mid-run notice + run-summary recap via warn()), got $NODIR2_BADPATH_MENTIONS"; cat "$TMP/nodir2.log"; exit 1; }
+echo "[PASS] the dropped (typo'd) directory survives into the end-of-run warning summary via warn() (issue #732)"
+
 echo "== (c2) select() offers ton-provider by name, and picking it with no CYPHER_BRAIN_TON_PROVIDER_OWNER/MAX_SPEND set refuses BEFORE spending (issue #396 Phase B) =="
 TONPROV_USER_HOME="$TMP/tonprov-user-home"; mkdir -p "$TONPROV_USER_HOME" # HOME override, same as test (d)'s WIZ_HOME below: without this, step 6 detects the REAL machine's ~/.gbrain/config.json (if any) and asks an extra --pg prompt this qa.json does not script for
 TONPROV_HOME="$TMP/tonprov-home"
@@ -218,17 +231,26 @@ cat > "$TMP/qa-tonprov.json" <<JSON
   ["Choose a backend", "\u001b[A"]
 ]
 JSON
-CYPHER_BRAIN_HOME="$TONPROV_HOME" HOME="$TONPROV_USER_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+# issue #731: this early-exit path used to share exit 0 with a fully-completed run
+# (the same exit code as a run that actually pushed a snapshot) despite explicitly
+# printing "nothing has been rolled back ... cannot be re-run" — a script/agent
+# checking $? saw success either way. It now sets a non-zero exit code, so the
+# invocation below is expected to FAIL (drive-init.mjs propagates the child's own
+# exit code) — the `if ...; then FAIL; fi` shape (same idiom test (o3) below already
+# uses for its own "still aborts" case) asserts exactly that, while the grep checks
+# right after confirm this is the RIGHT reason (missing prerequisites, not a crash).
+if CYPHER_BRAIN_HOME="$TONPROV_HOME" HOME="$TONPROV_USER_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
   CYPHER_BRAIN_TON_PROVIDER_OWNER= CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND= \
   with_timeout 30 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-tonprov.json" --out "$TMP/tonprov.log" \
-  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
-  || { echo "[FAIL] the ton-provider select()+refuse run did not complete cleanly"; cat "$TMP/tonprov.log"; exit 1; }
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] issue #731: the ton-provider select()+refuse run exited 0 despite missing prerequisites and no push"; cat "$TMP/tonprov.log"; exit 1
+fi
 grep -q 'ton-provider' "$TMP/tonprov.log" || { echo "[FAIL] the select() menu never showed ton-provider"; cat "$TMP/tonprov.log"; exit 1; }
 grep -q 'CYPHER_BRAIN_TON_PROVIDER_OWNER' "$TMP/tonprov.log" || { echo "[FAIL] missing-prerequisites guidance did not name CYPHER_BRAIN_TON_PROVIDER_OWNER"; cat "$TMP/tonprov.log"; exit 1; }
 grep -q 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND' "$TMP/tonprov.log" || { echo "[FAIL] missing-prerequisites guidance did not name CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND"; cat "$TMP/tonprov.log"; exit 1; }
 [ -f "$TONPROV_HOME/identity.age" ] || { echo "[FAIL] the primary identity this run set up before the backend step was rolled back / never written"; exit 1; }
 [ ! -f "$TONPROV_HOME/latest-locator.tsv" ] || { echo "[FAIL] a push happened despite the missing ton-provider prerequisites"; exit 1; }
-echo "[PASS] select() offers ton-provider, arrow-key navigation picks it, and the missing-prerequisites guard refuses before any push — identity preserved, nothing rolled back"
+echo "[PASS] select() offers ton-provider, arrow-key navigation picks it, and the missing-prerequisites guard refuses before any push (non-zero exit, issue #731) — identity preserved, nothing rolled back"
 
 echo "== (d) THE SCRIPTED END-TO-END RUN (issue #68 acceptance criterion 1): init -> first push, driven entirely via a scripted stdin sequence =="
 SRC="$TMP/brain-src"; mkdir -p "$SRC"
@@ -527,6 +549,11 @@ printf 'pass-marker\n' > "$F_SRC/note.txt"
 F_KIT_PATH="$F_HOME/recovery-kit.txt"
 mkdir -p "$(dirname "$F_KIT_PATH")"
 : > "$F_KIT_PATH"; chmod 644 "$F_KIT_PATH" # pre-existing, permissive-mode file — proves the chmod-after-write fix below too
+# #717: a pre-existing file at the answered kit path now triggers an explicit
+# "Overwrite it?" confirm() before the wizard writes over it — this run answers "y"
+# (the QA script below), proving that path still lands the wizard's real content at
+# mode 600 (checked further down). (u2) below covers the DECLINE branch: an existing,
+# non-empty, real kit must survive untouched.
 PRE_KIT_MODE="$(file_mode "$F_KIT_PATH")"
 [ "$PRE_KIT_MODE" = "644" ] || { echo "[FAIL] test setup: could not pre-create the kit path at mode 644"; exit 1; }
 
@@ -540,7 +567,8 @@ cat > "$TMP/qa-pass.json" <<JSON
   ["Profile (what to back up)", ""],
   ["Directory path(s) to back up", "$F_SRC"],
   ["Choose a backend", ""],
-  ["Path to write the recovery kit", "$F_KIT_PATH"]
+  ["Path to write the recovery kit", "$F_KIT_PATH"],
+  ["Overwrite it?", "y"]
 ]
 JSON
 
@@ -1311,29 +1339,32 @@ cat > "$TMP/qa-confirm-default.json" <<JSON
 JSON
 # #492 changed the directory prompt from "throws on empty" to "loops until non-empty"
 # (see (c) above), so this test can no longer use an empty directory answer as its
-# shortcut to a fast, clean exit before push. It now uses the SAME shortcut as test
-# (o) below: a real directory + picking "arweave" with no CYPHER_BRAIN_AR_WALLET
+# shortcut to a fast exit before push. It now uses the SAME shortcut as test (o)
+# below: a real directory + picking "arweave" with no CYPHER_BRAIN_AR_WALLET
 # configured, which the wizard refuses BEFORE the spend-consent prompt (issue #161)
-# — exit 0, no push, no network call, and it happens right after the backend prompt
-# this QA script already answers.
+# — no push, no network call, and it happens right after the backend prompt this QA
+# script already answers. Non-zero exit (issue #731 — see (c2) above for the same
+# inversion and why), not "exit 0" as this comment used to claim.
 unset CYPHER_BRAIN_AR_WALLET # this suite's own environment must not already have one set
-CYPHER_BRAIN_HOME="$NODEFAULT_HOME" HOME="$NODEFAULT_USER_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+if CYPHER_BRAIN_HOME="$NODEFAULT_HOME" HOME="$NODEFAULT_USER_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
   with_timeout 30 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-confirm-default.json" --out "$TMP/confirm-default.log" \
-  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
-  || { echo "[FAIL] the confirm-default run did not exit cleanly via the no-wallet backend precheck (issue #161)"; cat "$TMP/confirm-default.log"; exit 1; }
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] issue #731: the confirm-default run exited 0 via the no-wallet backend precheck (should be non-zero — no push happened)"; cat "$TMP/confirm-default.log"; exit 1
+fi
 grep -qi 'backup identity written to' "$TMP/confirm-default.log" || { echo "[FAIL] a bare Enter on the backup-keypair prompt did not honor its stated default (Yes) — it should have generated a backup keypair"; cat "$TMP/confirm-default.log"; exit 1; }
 if grep -qi 'Skipping the backup key' "$TMP/confirm-default.log"; then echo "[FAIL] a bare Enter on the backup-keypair prompt was silently read as 'no' — the exact #96 failure mode"; cat "$TMP/confirm-default.log"; exit 1; fi
 echo "[PASS] a bare-Enter answer on the security-relevant backup-keypair prompt honors its stated Yes default (never silently reads as 'no') — confirm()'s toggle UI also makes the OLD free-text misread (#96) structurally unreachable"
 
-echo "== (o) paid backend chosen with no CYPHER_BRAIN_AR_WALLET configured exits CLEANLY before the spend-consent prompt — no rollback (issue #161) =="
+echo "== (o) paid backend chosen with no CYPHER_BRAIN_AR_WALLET configured refuses before the spend-consent prompt — no rollback, non-zero exit (issues #161/#731) =="
 # Before the fix, picking arweave/turbo with no wallet set sailed past the "spends
 # real funds" consent prompt, then failed deep inside push() (`arweave put needs
 # CYPHER_BRAIN_AR_WALLET ...`) — pushSucceeded stayed false, so the outer catch
 # rolled back the identity/backup key/recipient-pin choices this same run just spent
 # several steps creating. Drive a run through backup=yes (so both primary AND backup
 # identities exist), then answer the backend prompt with "arweave": the wizard must
-# print the wallet-setup guidance and return successfully (exit 0) WITHOUT ever
-# reaching the consent prompt, and WITHOUT touching anything already on disk.
+# print the wallet-setup guidance WITHOUT ever reaching the consent prompt, and
+# WITHOUT touching anything already on disk. Non-zero exit (issue #731): this run
+# never pushed a snapshot, so it must not share exit 0 with a completed run.
 O_HOME="$TMP/wallet-precheck-home"; mkdir -p "$O_HOME"
 O_CB_HOME="$TMP/wallet-precheck-cb-home"
 O_SRC="$TMP/wallet-precheck-src"; mkdir -p "$O_SRC"
@@ -1359,16 +1390,17 @@ JSON
 # the QA script intentionally stops there too.)
 
 unset CYPHER_BRAIN_AR_WALLET # this suite's own environment must not already have one set
-CYPHER_BRAIN_HOME="$O_CB_HOME" HOME="$O_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+if CYPHER_BRAIN_HOME="$O_CB_HOME" HOME="$O_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
   with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-wallet-precheck.json" --out "$TMP/wallet-precheck.log" \
-  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
-  || { echo "[FAIL] the no-wallet paid-backend run did not exit cleanly (should return 0, not fail/roll back)"; cat "$TMP/wallet-precheck.log"; exit 1; }
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] issue #731: the no-wallet paid-backend run exited 0 despite never pushing a snapshot"; cat "$TMP/wallet-precheck.log"; exit 1
+fi
 grep -qF 'needs a funded wallet to push' "$TMP/wallet-precheck.log" || { echo "[FAIL] wizard did not print the wallet-precheck guidance"; cat "$TMP/wallet-precheck.log"; exit 1; }
 grep -q 'cypher-brain wallet create' "$TMP/wallet-precheck.log" || { echo "[FAIL] guidance does not mention wallet create"; cat "$TMP/wallet-precheck.log"; exit 1; }
 grep -q 'cypher-brain wallet address' "$TMP/wallet-precheck.log" || { echo "[FAIL] guidance does not mention wallet address"; cat "$TMP/wallet-precheck.log"; exit 1; }
 if grep -qF 'PAID, PERMANENT store' "$TMP/wallet-precheck.log"; then echo "[FAIL] the spend-consent prompt was reached despite no wallet being configured"; cat "$TMP/wallet-precheck.log"; exit 1; fi
 if grep -q 'cypher-brain init: complete' "$TMP/wallet-precheck.log"; then echo "[FAIL] wizard reported completion despite exiting early on the wallet precheck"; cat "$TMP/wallet-precheck.log"; exit 1; fi
-echo "[PASS] choosing arweave with no wallet configured prints setup guidance and exits cleanly (exit 0), never reaching the spend-consent prompt"
+echo "[PASS] choosing arweave with no wallet configured prints setup guidance and exits non-zero (issue #731), never reaching the spend-consent prompt"
 
 [ -f "$O_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity was deleted on the wallet-precheck early exit — this must be a graceful exit, not a rollback"; exit 1; }
 [ -f "$O_CB_HOME/recipient.txt" ] || { echo "[FAIL] primary recipient was deleted on the wallet-precheck early exit"; exit 1; }
@@ -1400,13 +1432,14 @@ cat > "$TMP/qa-wallet-precheck-missing.json" <<JSON
 ]
 JSON
 
-CYPHER_BRAIN_HOME="$O2_CB_HOME" HOME="$O2_HOME" CYPHER_BRAIN_AR_WALLET="$O2_WALLET" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+if CYPHER_BRAIN_HOME="$O2_CB_HOME" HOME="$O2_HOME" CYPHER_BRAIN_AR_WALLET="$O2_WALLET" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
   with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-wallet-precheck-missing.json" --out "$TMP/wallet-precheck-missing.log" \
-  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
-  || { echo "[FAIL] the missing-wallet-file turbo run did not exit cleanly"; cat "$TMP/wallet-precheck-missing.log"; exit 1; }
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] issue #731: the missing-wallet-file turbo run exited 0 despite never pushing a snapshot"; cat "$TMP/wallet-precheck-missing.log"; exit 1
+fi
 grep -qF 'needs a funded wallet to push' "$TMP/wallet-precheck-missing.log" || { echo "[FAIL] wizard did not print the wallet-precheck guidance for a nonexistent wallet file"; cat "$TMP/wallet-precheck-missing.log"; exit 1; }
 [ -f "$O2_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity was deleted on the missing-wallet-file early exit"; exit 1; }
-echo "[PASS] CYPHER_BRAIN_AR_WALLET pointing at a nonexistent file is treated the same as unset — guidance shown, primary identity preserved"
+echo "[PASS] CYPHER_BRAIN_AR_WALLET pointing at a nonexistent file is treated the same as unset — guidance shown, primary identity preserved, non-zero exit (issue #731)"
 
 echo "== (o3) a wallet file actually present on disk still reaches the existing spend-consent prompt unchanged (issue #161: precheck only gates when the wallet is MISSING) =="
 O3_HOME="$TMP/wallet-precheck-present-home"; mkdir -p "$O3_HOME"
@@ -1440,6 +1473,45 @@ if grep -qF 'needs a funded wallet to push' "$TMP/wallet-precheck-present.log"; 
 grep -qi "aborted before spending" "$TMP/wallet-precheck-present.log" || { echo "[FAIL] declined-consent error message missing (unchanged existing behavior expected)"; cat "$TMP/wallet-precheck-present.log"; exit 1; }
 [ ! -f "$O3_CB_HOME/identity.age" ] || { echo "[FAIL] declining consent should still roll back the identity (unchanged existing behavior, issue #161 non-goal)"; exit 1; }
 echo "[PASS] a configured, present-on-disk wallet still reaches the existing spend-consent prompt unchanged, and declining it still aborts + rolls back exactly as before"
+
+echo "== (o4) a wallet created at the DEFAULT path (no CYPHER_BRAIN_AR_WALLET set) is recognized by the same precheck 'wallet create' itself documents (issue #735) =="
+# wallet.ts's own walletConfigured() default parameter is AR_WALLET alone — but
+# 'wallet create's OWN completion message (wallet.ts) tells users push/estimate/
+# 'wallet address'/'balance' already find a default-path wallet.json with NO env var
+# set at all. The wizard's precheck used to call walletConfigured() with no argument
+# (falling back to that same AR_WALLET-only default), so a wallet that exists ONLY at
+# the default path — exactly what a bare `wallet create` (no --out) produces — was
+# incorrectly reported as "not configured", abandoning the rest of setup even though
+# push itself would have found and used it without any trouble.
+O4_HOME="$TMP/wallet-precheck-defaultpath-home"; mkdir -p "$O4_HOME"
+O4_CB_HOME="$TMP/wallet-precheck-defaultpath-cb-home"; mkdir -p "$O4_CB_HOME"
+O4_SRC="$TMP/wallet-precheck-defaultpath-src"; mkdir -p "$O4_SRC"
+printf 'wallet-precheck-defaultpath-marker\n' > "$O4_SRC/note.txt"
+unset CYPHER_BRAIN_AR_WALLET # this suite's own environment must not already have one set
+CYPHER_BRAIN_HOME="$O4_CB_HOME" cb wallet create > "$TMP/wallet-precheck-defaultpath-walletcreate.log" 2>&1 \
+  || { echo "[FAIL] test setup: could not create a default-path wallet fixture"; cat "$TMP/wallet-precheck-defaultpath-walletcreate.log"; exit 1; }
+
+cat > "$TMP/qa-wallet-precheck-defaultpath.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$O4_SRC"],
+  ["Choose a backend", "\u001b[A\u001b[A"],
+  ["PAID, PERMANENT store", "n"]
+]
+JSON
+
+if CYPHER_BRAIN_HOME="$O4_CB_HOME" HOME="$O4_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-wallet-precheck-defaultpath.json" --out "$TMP/wallet-precheck-defaultpath.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] declining the spend-consent prompt should still abort (unchanged existing behavior)"; cat "$TMP/wallet-precheck-defaultpath.log"; exit 1
+fi
+if grep -qF 'needs a funded wallet to push' "$TMP/wallet-precheck-defaultpath.log"; then echo "[FAIL] issue #735: the wallet-precheck guidance fired despite a wallet existing at the default path with no CYPHER_BRAIN_AR_WALLET set"; cat "$TMP/wallet-precheck-defaultpath.log"; exit 1; fi
+grep -qF 'PAID, PERMANENT store' "$TMP/wallet-precheck-defaultpath.log" || { echo "[FAIL] the spend-consent prompt was never reached despite a wallet at the default path"; cat "$TMP/wallet-precheck-defaultpath.log"; exit 1; }
+echo "[PASS] a wallet at the default path (CYPHER_BRAIN_HOME/wallet.json), with no CYPHER_BRAIN_AR_WALLET set, is recognized by the paid-backend precheck — matching 'wallet create's own documented default (issue #735)"
 
 echo "== (p) CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 with FILE-redirected (non-pipe) stdin surfaces the real cancellation, not a masking TypeError (P2 fix) =="
 # Node's process.stdin is a plain fs.ReadStream (no unref()/ref()) when stdin comes
@@ -1510,6 +1582,290 @@ if esc_bytes == 0:
     sys.exit(1)
 print(f"[PASS] zero SGR color escape codes in the piped, NO_COLOR=1 automation transcript (styleText's own isTTY check holds); {esc_bytes} non-color cursor-movement ESC byte(s) remain, exactly as the corrected doc comment now says")
 PY
+
+echo "== (r) init refuses to reuse a MISMATCHED existing signing pair instead of silently baking an unverifiable public key into the recovery kit (issue #736) =="
+# Arrange sign-identity.key/sign-recipient.pub to come from two DIFFERENT setups: a
+# real "keygen --sign" run (A), then a --force regeneration (B) that replaces BOTH
+# files with a NEW keypair, then manually restoring ONLY the public half back to A's
+# — sign-identity.key is now B's private key, sign-recipient.pub is A's public key: a
+# genuinely mismatched pair, exactly the #736 repro shape.
+MISMATCH_HOME="$TMP/mismatch-home"; mkdir -p "$MISMATCH_HOME"
+MISMATCH_CB_HOME="$TMP/mismatch-cb-home"
+MISMATCH_SRC="$TMP/mismatch-src"; mkdir -p "$MISMATCH_SRC"
+printf 'mismatch-marker\n' > "$MISMATCH_SRC/note.txt"
+
+CYPHER_BRAIN_HOME="$MISMATCH_CB_HOME" cb keygen --sign > "$TMP/mismatch-setup-a.log" 2>&1 \
+  || { echo "[FAIL] test setup: could not generate signing keypair A"; cat "$TMP/mismatch-setup-a.log"; exit 1; }
+cp "$MISMATCH_CB_HOME/sign-recipient.pub" "$TMP/mismatch-recipient-a.pub"
+
+CYPHER_BRAIN_HOME="$MISMATCH_CB_HOME" cb keygen --sign --force > "$TMP/mismatch-setup-b.log" 2>&1 \
+  || { echo "[FAIL] test setup: could not regenerate signing keypair B"; cat "$TMP/mismatch-setup-b.log"; exit 1; }
+cp "$TMP/mismatch-recipient-a.pub" "$MISMATCH_CB_HOME/sign-recipient.pub"
+
+cat > "$TMP/qa-mismatch.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"]
+]
+JSON
+
+# No CYPHER_BRAIN_HOME/identity.age exists yet (only the signing files above), so
+# init's own top-level "an identity already exists" refusal does not fire here — it
+# proceeds through step 1 (primary keygen), skips the backup keypair (step 2, "n"),
+# then reaches step 3's "already exists — reusing it" branch with NO prompt of its
+# own, where the new consistency check should throw immediately.
+if CYPHER_BRAIN_HOME="$MISMATCH_CB_HOME" HOME="$MISMATCH_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 30 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-mismatch.json" --out "$TMP/mismatch.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] issue #736: init completed despite a mismatched signing keypair — it should refuse before reusing an inconsistent pair"; cat "$TMP/mismatch.log"; exit 1
+fi
+grep -qi "does not match" "$TMP/mismatch.log" || { echo "[FAIL] issue #736: no mismatch-related error message found"; cat "$TMP/mismatch.log"; exit 1; }
+[ ! -f "$MISMATCH_CB_HOME/identity.age" ] || { echo "[FAIL] issue #736: the primary identity this run created was not rolled back after the signing-pair mismatch was detected"; exit 1; }
+[ -f "$MISMATCH_CB_HOME/sign-identity.key" ] || { echo "[FAIL] issues #736/#719: the pre-existing (mismatched) signing identity was deleted — it must never be touched by this run"; exit 1; }
+[ -f "$MISMATCH_CB_HOME/sign-recipient.pub" ] || { echo "[FAIL] issues #736/#719: the pre-existing (mismatched) signing public key was deleted — it must never be touched by this run"; exit 1; }
+echo "[PASS] init refuses to reuse a mismatched signing keypair, rolls back only what this run created, and leaves the pre-existing (mismatched) signing files untouched (issues #736, #719)"
+
+echo "== (r2) init also refuses a signing pair whose CRYPTOGRAPHIC keys match but whose recorded key ids disagree (issue #736, review-hardening) =="
+# The minisign wire format's 8-byte key id is NOT derived from the key material —
+# it is chosen independently at random and both files only happen to agree because
+# keygenSignAt() writes both from the same in-memory value. A hand-edited identity
+# file (or a bad manual merge) could carry the SAME real private key but a stale/
+# wrong "# key id:" comment — signingKeypairMatches()'s sign->verify round trip alone
+# would pass such a pair (the keys genuinely correspond), but restore/verify's own
+# verifyDetached() rejects any signature whose embedded key id does not match the
+# id recorded in the public file, making the "reused" pair unusable regardless. Only
+# the identity file's COMMENT is edited below — the PEM private key body is
+# untouched, so the actual keypair still matches.
+KEYID_HOME="$TMP/keyid-mismatch-home"; mkdir -p "$KEYID_HOME"
+KEYID_CB_HOME="$TMP/keyid-mismatch-cb-home"
+
+CYPHER_BRAIN_HOME="$KEYID_CB_HOME" cb keygen --sign > "$TMP/keyid-mismatch-setup.log" 2>&1 \
+  || { echo "[FAIL] test setup: could not generate a signing keypair"; cat "$TMP/keyid-mismatch-setup.log"; exit 1; }
+python3 - "$KEYID_CB_HOME/sign-identity.key" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+m = re.search(r'^# key id: ([0-9a-f]{16})$', text, re.MULTILINE)
+assert m, "no '# key id:' line found in " + path
+old = m.group(1)
+new = old[:-1] + ('0' if old[-1] != '0' else '1')
+assert new != old
+text = text.replace(f'# key id: {old}\n', f'# key id: {new}\n', 1)
+open(path, 'w').write(text)
+PY
+
+cat > "$TMP/qa-keyid-mismatch.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"]
+]
+JSON
+
+if CYPHER_BRAIN_HOME="$KEYID_CB_HOME" HOME="$KEYID_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 30 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-keyid-mismatch.json" --out "$TMP/keyid-mismatch.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] issue #736: init completed despite a key-id mismatch between the signing identity and its public key"; cat "$TMP/keyid-mismatch.log"; exit 1
+fi
+grep -qi "does not match" "$TMP/keyid-mismatch.log" || { echo "[FAIL] issue #736: no mismatch-related error message found for the key-id-only mismatch"; cat "$TMP/keyid-mismatch.log"; exit 1; }
+[ -f "$KEYID_CB_HOME/sign-identity.key" ] || { echo "[FAIL] the pre-existing signing identity was deleted"; exit 1; }
+[ -f "$KEYID_CB_HOME/sign-recipient.pub" ] || { echo "[FAIL] the pre-existing signing public key was deleted"; exit 1; }
+echo "[PASS] init also refuses a pair whose cryptographic keys match but whose recorded key ids disagree (issue #736, review-hardening)"
+
+echo "== (s) EOF on stdin mid-wizard (a closed pipe / Ctrl-D) triggers the SAME cancel+rollback path as Ctrl-C, not a silent exit 0 with orphaned key material (issue #718) =="
+EOF_HOME="$TMP/eof-home"; mkdir -p "$EOF_HOME"
+EOF_CB_HOME="$TMP/eof-cb-home"
+cat > "$TMP/qa-eof.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"]
+]
+JSON
+# drive-init-eof.mjs (see its own header comment) answers the two prompts above
+# normally, then — the instant the NEXT prompt's own text appears — calls
+# child.stdin.end() instead of sending an answer, simulating a closed pipe/Ctrl-D
+# mid-wizard. Before #718's fix this produced a silent exit 0 with the primary
+# identity/recipient this run already generated left orphaned on disk.
+if CYPHER_BRAIN_HOME="$EOF_CB_HOME" HOME="$EOF_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 30 node "$ROOT/scripts/drive-init-eof.mjs" --qa "$TMP/qa-eof.json" \
+  --eof-after "Protect the primary identity with a passphrase now?" \
+  --out "$TMP/eof.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] issue #718: init exited 0 despite stdin hitting EOF mid-wizard — should cancel + roll back, exit non-zero"; cat "$TMP/eof.log"; exit 1
+fi
+grep -qi "cancelled" "$TMP/eof.log" || { echo "[FAIL] issue #718: no cancellation message printed after EOF on stdin"; cat "$TMP/eof.log"; exit 1; }
+[ ! -f "$EOF_CB_HOME/identity.age" ] || { echo "[FAIL] issue #718: the primary identity was not rolled back after stdin hit EOF mid-wizard"; exit 1; }
+[ ! -f "$EOF_CB_HOME/recipient.txt" ] || { echo "[FAIL] issue #718: the primary recipient was not rolled back after stdin hit EOF mid-wizard"; exit 1; }
+echo "[PASS] EOF on stdin mid-wizard cancels the run (same rollback path as Ctrl-C) instead of silently exiting 0 with orphaned key material (issue #718)"
+
+echo "== (u) recovery kit default path is scoped to CYPHER_BRAIN_HOME, not the OS \$HOME — two different identities sharing one \$HOME never collide on a bare-Enter kit path (issue #717) =="
+DEFKIT_OS_HOME="$TMP/defkit-os-home"; mkdir -p "$DEFKIT_OS_HOME"
+DEFKIT_CB_HOME_1="$TMP/defkit-cb-home-1"
+DEFKIT_CB_HOME_2="$TMP/defkit-cb-home-2"
+DEFKIT_SRC_1="$TMP/defkit-src-1"; mkdir -p "$DEFKIT_SRC_1"
+DEFKIT_SRC_2="$TMP/defkit-src-2"; mkdir -p "$DEFKIT_SRC_2"
+printf 'defkit-marker-1\n' > "$DEFKIT_SRC_1/note.txt"
+printf 'defkit-marker-2\n' > "$DEFKIT_SRC_2/note.txt"
+
+cat > "$TMP/qa-defkit-1.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$DEFKIT_SRC_1"],
+  ["Choose a backend", ""],
+  ["Path to write the recovery kit", ""]
+]
+JSON
+CYPHER_BRAIN_HOME="$DEFKIT_CB_HOME_1" CYPHER_BRAIN_FILE_DIR="$TMP/defkit-store-1" HOME="$DEFKIT_OS_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-defkit-1.json" --out "$TMP/defkit-1.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] the first defkit run did not complete"; cat "$TMP/defkit-1.log"; exit 1; }
+[ -f "$DEFKIT_CB_HOME_1/recovery-kit.txt" ] || { echo "[FAIL] issue #717: the default kit path was not scoped under the FIRST identity's CYPHER_BRAIN_HOME"; cat "$TMP/defkit-1.log"; exit 1; }
+DEFKIT_1_SHA="$(sha "$DEFKIT_CB_HOME_1/recovery-kit.txt")"
+
+cat > "$TMP/qa-defkit-2.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$DEFKIT_SRC_2"],
+  ["Choose a backend", ""],
+  ["Path to write the recovery kit", ""]
+]
+JSON
+# SAME OS $HOME as the first run above (os.homedir()-based defaults would collide
+# here), but a DIFFERENT CYPHER_BRAIN_HOME — exactly the two-identities-one-machine
+# repro from issue #717.
+CYPHER_BRAIN_HOME="$DEFKIT_CB_HOME_2" CYPHER_BRAIN_FILE_DIR="$TMP/defkit-store-2" HOME="$DEFKIT_OS_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-defkit-2.json" --out "$TMP/defkit-2.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] the second defkit run (SAME OS \$HOME, DIFFERENT CYPHER_BRAIN_HOME) did not complete"; cat "$TMP/defkit-2.log"; exit 1; }
+[ -f "$DEFKIT_CB_HOME_2/recovery-kit.txt" ] || { echo "[FAIL] issue #717: the default kit path was not scoped under the SECOND identity's CYPHER_BRAIN_HOME"; cat "$TMP/defkit-2.log"; exit 1; }
+[ ! -e "$DEFKIT_OS_HOME/recovery-kit.txt" ] || { echo "[FAIL] issue #717: a kit was ALSO written at the OS \$HOME-level default path — the old os.homedir()-based default is still in play"; exit 1; }
+[ "$(sha "$DEFKIT_CB_HOME_1/recovery-kit.txt")" = "$DEFKIT_1_SHA" ] || { echo "[FAIL] issue #717: the FIRST identity's recovery kit changed after the SECOND identity's init run — it was silently overwritten"; exit 1; }
+grep -qF "$DEFKIT_CB_HOME_1/identity.age" "$DEFKIT_CB_HOME_1/recovery-kit.txt" || { echo "[FAIL] first kit no longer references its own identity"; exit 1; }
+grep -qF "$DEFKIT_CB_HOME_2/identity.age" "$DEFKIT_CB_HOME_2/recovery-kit.txt" || { echo "[FAIL] second kit does not reference its own identity"; exit 1; }
+echo "[PASS] two identities sharing one OS \$HOME each get their OWN default recovery-kit path under their own CYPHER_BRAIN_HOME — no cross-identity collision, no shared OS-\$HOME kit written at all (issue #717)"
+
+echo "== (u2) an existing, REAL (non-empty) recovery kit is never silently overwritten — declining the new confirm() leaves it byte-for-byte untouched (issue #717) =="
+# The maintainer's own prior selftest (test (f) above) only ever seeded an EMPTY
+# placeholder file at the kit path — this seeds a REAL, previously-generated kit
+# (defkit-1's own, from test (u) above) at a SECOND identity's default kit path, then
+# DECLINES the new overwrite confirmation, proving the pre-existing content survives
+# byte-for-byte and the wizard instead asks for (and writes to) a different path.
+DECLINE_HOME="$TMP/decline-os-home"; mkdir -p "$DECLINE_HOME"
+DECLINE_CB_HOME="$TMP/decline-cb-home"
+DECLINE_SRC="$TMP/decline-src"; mkdir -p "$DECLINE_SRC"
+printf 'decline-marker\n' > "$DECLINE_SRC/note.txt"
+mkdir -p "$DECLINE_CB_HOME"
+cp "$DEFKIT_CB_HOME_1/recovery-kit.txt" "$DECLINE_CB_HOME/recovery-kit.txt" # a REAL, non-empty, previously-generated kit — not an empty placeholder
+DECLINE_PRE_SHA="$(sha "$DECLINE_CB_HOME/recovery-kit.txt")"
+DECLINE_ALT_KIT="$TMP/decline-alt-recovery-kit.txt"
+
+cat > "$TMP/qa-decline.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$DECLINE_SRC"],
+  ["Choose a backend", ""],
+  ["Path to write the recovery kit", ""],
+  ["Overwrite it?", "n"],
+  ["Choose a different path for the recovery kit", "$DECLINE_ALT_KIT"]
+]
+JSON
+CYPHER_BRAIN_HOME="$DECLINE_CB_HOME" CYPHER_BRAIN_FILE_DIR="$TMP/decline-store" HOME="$DECLINE_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-decline.json" --out "$TMP/decline.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] the decline-overwrite run did not complete"; cat "$TMP/decline.log"; exit 1; }
+[ "$(sha "$DECLINE_CB_HOME/recovery-kit.txt")" = "$DECLINE_PRE_SHA" ] || { echo "[FAIL] issue #717: the pre-existing, real recovery kit changed after declining the overwrite confirmation — it was overwritten anyway"; exit 1; }
+[ -f "$DECLINE_ALT_KIT" ] || { echo "[FAIL] issue #717: no kit was written at the alternate path offered after declining the overwrite"; exit 1; }
+grep -qF "$DECLINE_CB_HOME/identity.age" "$DECLINE_ALT_KIT" || { echo "[FAIL] the alternate-path kit does not reference this run's own identity"; exit 1; }
+echo "[PASS] declining the overwrite confirmation leaves a real, pre-existing recovery kit byte-for-byte untouched, and the wizard writes to the alternate path instead (issue #717)"
+
+echo "== (v) the per-day snapshot filename uses the operator's LOCAL calendar day, not UTC (issue #761) =="
+TZDATE_HOME="$TMP/tzdate-home"; mkdir -p "$TZDATE_HOME"
+TZDATE_CB_HOME="$TMP/tzdate-cb-home"
+TZDATE_STORE="$TMP/tzdate-store"
+TZDATE_SRC="$TMP/tzdate-src"; mkdir -p "$TZDATE_SRC"
+printf 'tzdate-marker\n' > "$TZDATE_SRC/note.txt"
+# Pacific/Kiritimati (UTC+14, the largest standard UTC offset) maximizes the window
+# during which the LOCAL calendar day is already one ahead of the UTC one — the exact
+# divergence issue #761 is about (JST, UTC+9, hits the same bug class for a smaller
+# window each day). Forced via TZ on the wizard's own child process only — nothing
+# else in this suite depends on the machine's local timezone.
+TZDATE_LOCAL="$(TZ='Pacific/Kiritimati' date '+%Y-%m-%d')"
+TZDATE_UTC="$(date -u '+%Y-%m-%d')"
+
+cat > "$TMP/qa-tzdate.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$TZDATE_SRC"],
+  ["Choose a backend", ""],
+  ["Path to write the recovery kit", ""]
+]
+JSON
+
+TZ='Pacific/Kiritimati' CYPHER_BRAIN_HOME="$TZDATE_CB_HOME" CYPHER_BRAIN_FILE_DIR="$TZDATE_STORE" HOME="$TZDATE_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-tzdate.json" --out "$TMP/tzdate.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
+  || { echo "[FAIL] the TZ-forced wizard run did not complete"; cat "$TMP/tzdate.log"; exit 1; }
+[ -f "$TZDATE_CB_HOME/brain-${TZDATE_LOCAL}.age" ] || { echo "[FAIL] issue #761: no brain-${TZDATE_LOCAL}.age snapshot found under CYPHER_BRAIN_HOME (LOCAL date, TZ=Pacific/Kiritimati) — actual: $(ls "$TZDATE_CB_HOME" | grep '^brain-' || true)"; exit 1; }
+if [ "$TZDATE_LOCAL" != "$TZDATE_UTC" ]; then
+  [ ! -f "$TZDATE_CB_HOME/brain-${TZDATE_UTC}.age" ] || { echo "[FAIL] issue #761: a brain-${TZDATE_UTC}.age (UTC date) snapshot was ALSO written — the old UTC-based dateStamp regression"; exit 1; }
+  echo "[PASS] snapshot filename uses the LOCAL calendar day (${TZDATE_LOCAL}), not the UTC one (${TZDATE_UTC}) — issue #761"
+else
+  echo "[PASS] snapshot filename uses the LOCAL calendar day (${TZDATE_LOCAL}) — local and UTC coincide at this exact moment, so this run alone can't distinguish the two, but the filename is correct either way"
+fi
+
+echo "== (w) a snapshot already sitting at today's dated --out path is NEVER deleted by rollback — snapshot()'s own no-clobber refusal must not look like something THIS run created (issue #733, review-hardening) =="
+# #733's fix records snapshotOutPath BEFORE calling snapshot(), so rollback also
+# covers a durable artifact snapshot() managed to promote before a LATER step inside
+# it throws. Naively doing that unconditionally would make rollback delete a file
+# THIS run never created whenever snapshot()'s own no-clobber check refuses (the
+# dated --out is once-per-day, so a stray/leftover file already sitting there is a
+# real scenario) — this proves that specific regression does not exist: a
+# pre-existing, non-empty file at today's exact dated path must survive byte-for-byte.
+PREEXIST_HOME="$TMP/preexist-snap-home"; mkdir -p "$PREEXIST_HOME"
+PREEXIST_CB_HOME="$TMP/preexist-snap-cb-home"; mkdir -p "$PREEXIST_CB_HOME"
+PREEXIST_SRC="$TMP/preexist-snap-src"; mkdir -p "$PREEXIST_SRC"
+printf 'preexist-snap-marker\n' > "$PREEXIST_SRC/note.txt"
+PREEXIST_DATESTAMP="$(date '+%Y-%m-%d')"
+PREEXIST_OUT="$PREEXIST_CB_HOME/brain-${PREEXIST_DATESTAMP}.age"
+printf 'a pre-existing snapshot this run did NOT create\n' > "$PREEXIST_OUT"
+PREEXIST_PRE_SHA="$(sha "$PREEXIST_OUT")"
+
+cat > "$TMP/qa-preexist-snap.json" <<JSON
+[
+  ["Generate an offline backup keypair now?", "n"],
+  ["Generate a signing keypair now?", "n"],
+  ["Protect the primary identity with a passphrase now?", "n"],
+  ["Show a suggested CYPHER_BRAIN_PIN_RECIPIENTS line", "n"],
+  ["Profile (what to back up)", ""],
+  ["Directory path(s) to back up", "$PREEXIST_SRC"],
+  ["Choose a backend", ""]
+]
+JSON
+
+if CYPHER_BRAIN_HOME="$PREEXIST_CB_HOME" CYPHER_BRAIN_FILE_DIR="$TMP/preexist-snap-store" HOME="$PREEXIST_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 60 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-preexist-snap.json" --out "$TMP/preexist-snap.log" \
+  -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
+  echo "[FAIL] init completed despite the dated --out path already existing — snapshot()'s own no-clobber refusal should have fired"; cat "$TMP/preexist-snap.log"; exit 1
+fi
+grep -qi "already exists" "$TMP/preexist-snap.log" || { echo "[FAIL] no no-clobber refusal message found in the transcript"; cat "$TMP/preexist-snap.log"; exit 1; }
+[ "$(sha "$PREEXIST_OUT")" = "$PREEXIST_PRE_SHA" ] || { echo "[FAIL] issue #733: the pre-existing file at today's dated snapshot path was modified/deleted by rollback — it was never this run's to touch"; exit 1; }
+[ ! -f "$PREEXIST_CB_HOME/identity.age" ] || { echo "[FAIL] the primary identity this run created was not rolled back"; exit 1; }
+echo "[PASS] a pre-existing file at today's dated snapshot path survives rollback byte-for-byte — snapshot()'s own no-clobber refusal is never mistaken for something this run created (issue #733, review-hardening)"
 
 echo
 echo "INIT SELFTEST PASS"

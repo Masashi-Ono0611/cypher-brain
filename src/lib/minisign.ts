@@ -415,6 +415,41 @@ export async function loadSignIdentity(path: string): Promise<LoadedSignIdentity
   return { privateKey, keyId };
 }
 
+// A cheap, self-contained "do these two halves actually belong together?" check
+// (#736): sign a small FIXED buffer with `privateKey` and verify it against
+// `publicKey`, using the SAME raw Ed25519 primitives verifyDetached()/
+// signDetached() use above (crypto.sign/crypto.verify with a null digest
+// algorithm — RFC 8032 PureEdDSA) — no file I/O, no minisign wire framing, just
+// the asymmetric primitive itself. The init wizard calls this before REUSING an
+// existing signing pair (sign-identity.key + sign-recipient.pub that may have
+// been written by two unrelated prior runs — e.g. two separate "keygen --sign"
+// invocations, one of which only partially replaced the pair) so a mismatched
+// pair is caught here instead of silently baking a public key into the recovery
+// kit that can never verify anything signed with the paired private key.
+//
+// Also compares `privateKeyId`/`publicKeyId` (review-hardening): the minisign wire
+// format's 8-byte key id is NOT derived from the key material — generateSignKeypair()
+// picks it independently at random and both files just happen to record the SAME
+// value because keygenSignAt() writes both from one in-memory `keyId` — so two files
+// whose Ed25519 keys genuinely correspond can still carry DIFFERENT recorded key ids
+// (e.g. a hand-edited/merged identity file that kept the old comment). The
+// cryptographic check alone would pass such a pair, but verifyDetached() (above)
+// rejects any signature whose embedded key id — always the LOADED IDENTITY's own,
+// via loadSignIdentity() — does not equal the id recorded in the public file, making
+// the "reused" pair unusable regardless of what this check alone would say. Checked
+// FIRST since a Buffer.equals() is far cheaper than a sign+verify round trip.
+const KEYPAIR_CONSISTENCY_PROBE = Buffer.from('cypher-brain signing keypair consistency probe (#736)');
+export function signingKeypairMatches(
+  privateKey: KeyObject,
+  publicKey: KeyObject,
+  privateKeyId: Buffer,
+  publicKeyId: Buffer,
+): boolean {
+  if (!privateKeyId.equals(publicKeyId)) return false;
+  const signature = sign(null, KEYPAIR_CONSISTENCY_PROBE, privateKey);
+  return verify(null, KEYPAIR_CONSISTENCY_PROBE, publicKey, signature);
+}
+
 // ---------- the higher-level "does this artifact's signature check out?" call restore/verify make ----------
 
 export type SignatureStatus = 'verified' | 'no_signature' | 'no_pubkey' | 'invalid';
