@@ -277,6 +277,20 @@ async function main() {
       gateway.state.submissions === 1,
       `submissions=${gateway.state.submissions}`,
     );
+    // The recorded payload — not just the immediate response — carries the call's
+    // warnings, so the replay relays them too (#347's contract does not stop applying to
+    // the second delivery of the same result). The single-recipient warning is guaranteed
+    // here: this fixture snapshots to exactly one recipient key.
+    check(
+      'setup control: the first call really did record a warning to replay (the single-recipient one)',
+      (firstSc?.warnings ?? []).some((w) => /SINGLE recipient key/.test(w)),
+      JSON.stringify(firstSc?.warnings ?? []).slice(0, 400),
+    );
+    check(
+      "the replay carries the first call's warnings verbatim, not an empty array",
+      JSON.stringify(replaySc?.warnings ?? []) === JSON.stringify(firstSc?.warnings ?? []),
+      JSON.stringify({ first: firstSc?.warnings, replay: replaySc?.warnings }).slice(0, 500),
+    );
 
     // ---------- 3. past the TTL, and past a compaction: still blocked ----------
     // A fresh server with a 1-second TTL, a wait, and then a record write for ANOTHER key

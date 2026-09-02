@@ -462,15 +462,35 @@ export async function recordIdempotencyResult(
   const disposition = options.disposition ?? 'success';
   const retention = options.retention ?? 'ttl';
   await withLogLock(path, async () => {
-    const { records: existing } = await readAllRecords(path);
+    const { records: existing, corrupted } = await readAllRecords(path);
+    // Fail closed on a corrupted log (multi-model review, Critical): this function
+    // REWRITES the whole file from the records it could parse, so a line it could not
+    // parse is dropped by the very next write. If that line was a permanent tombstone,
+    // the rewrite produces a clean log with nothing to refuse the retry, and the paid
+    // operation runs again. lookupIdempotencyResult already refuses to answer "no prior
+    // call" from a corrupted log for exactly this reason; a write has strictly more to
+    // lose, because it also destroys the evidence.
+    if (corrupted) {
+      throw new IdempotencyStoreError(
+        `the idempotency log ${path} contains at least one line that could not be parsed — refusing to rewrite it ` +
+          `(recording a result for tool=${JSON.stringify(tool)}, key=${JSON.stringify(key)} would drop that line, ` +
+          'and if it held a permanent record for a paid operation whose outcome was never settled, dropping it is ' +
+          'what lets a retry pay twice). Inspect/repair or remove the corrupted line(s) in that file.',
+      );
+    }
     // #818: OTHER keys' records now survive compaction whenever they are permanent, not
     // merely fresh — an expiring log must not be the thing that unblocks a key whose
     // payment was never settled.
     //
     // The SAME (tool, key) is still superseded, exactly as before (that is what the
     // partial-success path needs) — EXCEPT when what is being superseded is a live
-    // permanent record and the incoming one is not (multi-model review, Suggestion).
-    // Reaching that needs a caller bug: a later call under such a key finds the tombstone
+    // PERMANENT record, which is never overwritten by anything (multi-model review:
+    // raised as a Suggestion, then tightened from "not by a ttl one" to "not by anything"
+    // in round 2 — a permanent write carries the DEFAULT disposition 'success', so
+    // allowing permanent-over-permanent would let an ordinary success replace an uncertain
+    // -spend tombstone and turn the replay back into a clean success).
+    //
+    // Reaching this needs a caller bug: a later call under such a key finds the tombstone
     // on lookup — which isLive() returns regardless of age — and replays it before doing
     // any work, so no second record for it is ever written today. Enforced here anyway
     // rather than argued: "the tombstone is never overwritten" is the invariant the whole
@@ -481,12 +501,13 @@ export async function recordIdempotencyResult(
     const supersededPermanent = existing.find(
       (r) => r.tool === tool && r.key === key && r.retention === 'permanent' && isLive(r, ttlSeconds, now),
     );
-    if (supersededPermanent && retention !== 'permanent') {
+    if (supersededPermanent) {
       throw new IdempotencyStoreError(
         `refusing to overwrite the PERMANENT idempotency record for (tool=${JSON.stringify(tool)}, ` +
-          `key=${JSON.stringify(key)}) in ${path} with a ${retention}-retention one: that record exists because a ` +
-          'paid operation under this key had an outcome nothing could confirm, and dropping it is exactly how a ' +
-          'retry ends up paying twice. Verify the outcome on-chain and use a NEW key.',
+          `key=${JSON.stringify(key)}) in ${path}: that record exists because a paid operation under this key had ` +
+          'an outcome nothing could confirm, and replacing it — with a shorter-lived record, or with one that ' +
+          'reports success — is exactly how a retry ends up paying twice. Verify the outcome on-chain and use a ' +
+          'NEW key.',
       );
     }
     const kept = existing.filter((r) => !(r.tool === tool && r.key === key) && isLive(r, ttlSeconds, now));

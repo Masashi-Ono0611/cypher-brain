@@ -1520,6 +1520,11 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
         // the retry that would otherwise pay a second time, and expiring it would not
         // settle the ambiguity — only postpone that retry until the TTL had passed.
         if (e instanceof PushUncertainSpendError) {
+          // Folded into the payload BEFORE it is recorded (multi-model review, Warning):
+          // the snapshot's own warnings (a single-recipient snapshot, a secret-scan
+          // finding) and any the failing push recorded must ride the REPLAY too, not only
+          // the immediate response — a replay is meant to be the first call's result, and
+          // #347's relay contract does not stop applying to the second delivery of it.
           const uncertainWarnings = [
             ...(Array.isArray(result.warnings) ? (result.warnings as string[]) : []),
             ...((e as Error & { cbWarnings?: string[] }).cbWarnings ?? []),
@@ -1544,6 +1549,7 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
             message: annotateErrorMessage(e.message),
             idempotency_key: idempotencyKey ?? null,
             idempotent_replay: false,
+            ...(uncertainWarnings.length ? { warnings: uncertainWarnings } : {}),
           };
           if (idempotencyKey && fingerprint) {
             try {
@@ -1558,13 +1564,17 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
                 { disposition: 'error', retention: 'permanent' },
               );
             } catch (recordErr) {
-              uncertainWarnings.push(warnRecordFailure(recordErr, 'the push outcome is UNCERTAIN'));
+              // Only this one cannot be in the persisted copy — there is no persisted copy
+              // to put it in. Spliced onto the RESPONSE instead, which is the only place
+              // it can be delivered at all.
+              const recordWarning = warnRecordFailure(recordErr, 'the push outcome is UNCERTAIN');
+              return structuredOutcome(
+                { ...uncertainResult, warnings: [...uncertainWarnings, recordWarning] },
+                { isError: true },
+              );
             }
           }
-          return structuredOutcome(
-            { ...uncertainResult, ...(uncertainWarnings.length ? { warnings: uncertainWarnings } : {}) },
-            { isError: true },
-          );
+          return structuredOutcome(uncertainResult, { isError: true });
         }
         // #220 (multi-model review, P1): a PushPartialSuccessError means the ciphertext
         // upload — the actual paid, permanent spend — already happened even though THIS

@@ -402,6 +402,31 @@ try {
       overwriteThrew instanceof IdempotencyStoreError,
       overwriteThrew ? `${overwriteThrew.constructor.name}: ${overwriteThrew.message}` : 'the write succeeded (BUG)',
     );
+    // ...and so is a PERMANENT one: a permanent write carries the default
+    // disposition 'success', so allowing it would let an ordinary success replace the
+    // uncertain-spend tombstone and turn its replay back into a clean success.
+    let permanentOverwriteThrew;
+    try {
+      await recordIdempotencyResult(
+        logPath,
+        'snapshot_now',
+        'tombstoned-key',
+        'fp-tomb',
+        { pushed: true },
+        86400,
+        Date.now(),
+        { retention: 'permanent' },
+      );
+    } catch (e) {
+      permanentOverwriteThrew = e;
+    }
+    check(
+      'a PERMANENT write for that key is refused too (a success must not replace an error tombstone)',
+      permanentOverwriteThrew instanceof IdempotencyStoreError,
+      permanentOverwriteThrew
+        ? `${permanentOverwriteThrew.constructor.name}: ${permanentOverwriteThrew.message}`
+        : 'the write succeeded (BUG)',
+    );
     const survived = await lookupIdempotencyResult(logPath, 'snapshot_now', 'tombstoned-key', 86400);
     check(
       'the tombstone survived that refused write, unchanged',
@@ -419,6 +444,42 @@ try {
       'control: an ordinary write for a DIFFERENT key still succeeds alongside the tombstone',
       unrelatedThrew === undefined,
       unrelatedThrew ? `${unrelatedThrew.constructor.name}: ${unrelatedThrew.message}` : undefined,
+    );
+  }
+
+  // ---------- #818: a corrupted log is never REWRITTEN, only refused ----------
+  {
+    // recordIdempotencyResult rewrites the whole file from the lines it could parse, so a
+    // line it could NOT parse is dropped by the next write. If that line held a permanent
+    // tombstone, the rewrite would produce a clean log with nothing left to refuse the
+    // retry. Fail closed instead — the same posture lookup already takes for a read.
+    const logPath = join(tmp, 'corrupt-rewrite-log.jsonl');
+    const tombstone = JSON.stringify({
+      key: 'permanent-key',
+      tool: 'snapshot_now',
+      recordedAt: new Date().toISOString(),
+      fingerprint: 'fp-perm',
+      result: { code: 'ERR_PUSH_OUTCOME_UNCERTAIN' },
+      disposition: 'error',
+      retention: 'permanent',
+    });
+    await writeFile(logPath, `${tombstone}\n{"key": "trunca\n`, { flag: 'w' });
+    let writeThrew;
+    try {
+      await recordIdempotencyResult(logPath, 'snapshot_now', 'some-new-key', 'fp-new', { pushed: true }, 86400);
+    } catch (e) {
+      writeThrew = e;
+    }
+    check(
+      'a write against a log with an unparseable line is refused, not allowed to rewrite it',
+      writeThrew instanceof IdempotencyStoreError,
+      writeThrew ? `${writeThrew.constructor.name}: ${writeThrew.message}` : 'the write succeeded (BUG)',
+    );
+    const onDisk = await readFile(logPath, 'utf8');
+    check(
+      'the permanent record AND the corrupted line both survive that refusal',
+      onDisk.includes('"retention":"permanent"') && onDisk.includes('{"key": "trunca'),
+      onDisk.slice(0, 400),
     );
   }
 
