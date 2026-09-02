@@ -588,15 +588,17 @@ unit-conversion note above — divide by 1024×200×30 to get back to
 nanoTON/MB/day before comparing). Self-hosted TON is cheap because you are
 the storage; it buys availability, not permanence.
 
-## Operational inventory (what exists where, as of 2026-08-26)
+## Operational inventory (what exists where, as of 2026-09-02)
 
 - Droplet (mainnet, production): `tonutils-storage.service` (seeder, unchanged)
   plus `tsp-canary.service` (provider role, pubkey `3a7fe754…`, udp 18557,
   `/opt/tsp-canary/`) — the live provider identity since the 2026-08-25
   parallel-canary migration (see above). `tonutils-storage-provider.service`
   (the original provider role, pubkey `f5f603c7…`) was stopped and disabled
-  the same day and is no longer running; its contract is orphaned (see the
-  `storage-v1-client` bullet below). The cypher-brain bag layout lives under
+  the same day and is no longer running; its contract was drained on
+  2026-08-26 and the canary's own contract on 2026-09-02 (see the
+  `storage-v1-client` bullet below) — the provider currently serves no
+  paid contract. The cypher-brain bag layout lives under
   `~/cypher-brain-ton/`, healthcheck pinned to the live brain bag. The
   provider service is registered in the mytonprovider.org registry (see
   above) — same binary as the seeder, two roles (seeds our bag for free;
@@ -642,6 +644,22 @@ the storage; it buys availability, not permanence.
   ~0.005 TON — this log has not confirmed whether that is a StorageV1
   protocol-mandated minimum or just what `withdraw_owner` happened to
   leave. The live provider identity
-  going forward is the canary contract `0:ebf4e8cb…` deployed under
-  pubkey `3a7fe754…` (see above for the migration detail; full
-  address/balance not yet recorded in this log).
+  going forward is the canary provider identity (pubkey `3a7fe754…`, see
+  above for the migration detail). Its own self-paid canary contract,
+  `0:ebf4e8cb87907c514bc8cab24951122cfdcdfd83a97f22fb1f6866cd5c566b45`
+  (owner = the abandoned `4c9f6003…` wallet), was **drained via `withdraw`
+  on 2026-09-02 10:08 UTC**: `withdraw_owner` landed, the contract answered
+  with `storage_contract_terminated` and returned `0.347618 TON` to the
+  owner wallet (confirmed via tonapi transactions, not from this repo's own
+  logs); the contract remains on-chain (`status: active`) with the same
+  ~0.005 TON residual as the first contract. The owner wallet was then
+  swept (0.4212 TON) to the operator's main wallet. Net result: **no
+  StorageV1 contract currently pays this provider** — it stays registered
+  on mytonprovider.org (uptime ~88%, `used_provider_space: 0`, i.e. no
+  third-party contracts as of 2026-09-02) and its provider wallet
+  `EQD3InMQ7gkYfgOBmR1xH6yn991Ww42xdS9e8fS1_ttLku23` keeps ~0.205 TON
+  for proof gas should a contract ever arrive. Withdraw parameters were
+  read back from the contract's `get_storage_info` get-method (torrent
+  hash, size 481490005, piece 131072, owner, merkle hash) rather than
+  from any local record — the client's address re-derivation guard
+  accepted them, which is the cross-check that they were right.
