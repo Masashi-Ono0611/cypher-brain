@@ -1157,6 +1157,27 @@ export async function init(_o: CliOptions): Promise<boolean> {
         }
       }
 
+      // ---------- 6b. MCP snapshot policy suggestion (CYPHER_BRAIN_MCP_SOURCE_ROOTS) ----------
+      // #800/#820: the MCP server's snapshot_now tool additionally refuses any call
+      // naming `dirs` unless CYPHER_BRAIN_MCP_SOURCE_ROOTS lists the absolute directories
+      // it may read from — a JSON array, unlike step 5's space-separated
+      // CYPHER_BRAIN_PIN_RECIPIENTS, since a directory name may legitimately contain a
+      // space or comma (config.ts's parseMcpSourceRoots). This is the sibling of step 5's
+      // suggestion, placed HERE rather than there because it needs the actual directories
+      // just chosen — snapshot_now via MCP takes dirs/pg only (no --profile/--vault/--zip/
+      // --export), so there is nothing meaningful to suggest for a profile-based backup;
+      // only printed when this run picked real directories (profile "none").
+      if (snapshotOpts.dirs.length > 0) {
+        const sourceRootsLine = `CYPHER_BRAIN_MCP_SOURCE_ROOTS='${JSON.stringify(snapshotOpts.dirs)}'`;
+        console.log(
+          '\nOnly needed if you will drive snapshots through the MCP server (cypher-brain-mcp) rather than this ' +
+            'CLI: its snapshot_now tool additionally refuses any call naming directories unless ' +
+            'CYPHER_BRAIN_MCP_SOURCE_ROOTS authorizes them (#800). Suggested line, naming the directories you ' +
+            `just chose (add it to the same ${CONFIG_FILE_PATH} as the CYPHER_BRAIN_PIN_RECIPIENTS line above, ` +
+            `if you added one):\n${sourceRootsLine}`,
+        );
+      }
+
       // ---------- 7. initial snapshot + push ----------
       console.log('\n== 7/7: first snapshot + push ==');
       console.log('Pick where the encrypted snapshot goes — see the hint next to each choice for the tradeoff.');

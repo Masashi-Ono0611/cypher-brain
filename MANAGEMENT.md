@@ -77,6 +77,21 @@ defenses, ideally both:
   secret-bearing (it can read every snapshot); FileVault / LUKS protects it (and any
   off-box copies) if the disk or USB is lost or stolen.
 
+#### Cleaning up identity backups
+
+Every `keygen --force`/`keygen --sign --force` run that replaces an EXISTING identity
+leaves one `<original>.bak-<timestamp>-<random>` file behind (`identity.age.bak-…` or
+`sign-identity.key.bak-…`, #786) — these accumulate, one per `--force` run, with nothing
+removing them automatically. `cypher-brain doctor`'s `identity-backup-accumulation` check
+(#811) surfaces the count and the oldest one's date once at least one exists (WARN, never
+FAIL — each backup is mode 0600, the same posture as the identity it copies).
+
+A backup is safe to delete once every snapshot encrypted to the OLD recipient it
+preserves has been re-encrypted to the current identity, or is no longer needed. Until
+then, it is the ONLY thing that can still `restore --identity <that backup>` a snapshot
+taken before that `--force` run — do not delete it while any such snapshot is still
+something you might need.
+
 > **M-of-N (Shamir) split** — splitting the identity into *N* shares where any *K*
 > reconstruct it (no single point of loss *or* compromise) is tracked as a future
 > option rather than hand-rolled here. See the repo issues.
@@ -546,6 +561,12 @@ unaffected — this is an MCP-only policy, because over MCP the caller is an AI 
 server's threat model treats as untrusted, and `snapshot_now` is the one tool where such a
 caller picks both the plaintext (`dirs`) and the key it is encrypted to (`recipients`).
 See README's "Threat model" for the full argument.
+
+`cypher-brain doctor`'s `mcp-snapshot-policy` check WARNs once an identity exists and
+either variable is missing or malformed (never FAIL — a CLI-only setup that never runs
+the MCP server is unaffected), and `cypher-brain init` suggests a line for
+`CYPHER_BRAIN_MCP_SOURCE_ROOTS` (alongside its `CYPHER_BRAIN_PIN_RECIPIENTS` suggestion)
+naming the directories you just chose to back up.
 
 ```sh
 # 1. Which keys may ever decrypt. Required for EVERY snapshot_now call.

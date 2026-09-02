@@ -59,6 +59,12 @@
 #       renderer (--json was already safe by construction).
 #   (z5) POSITIVE CONTROL — #764: a raw ANSI escape byte embedded in GBRAIN_HOME
 #       cannot reach the plain-text renderer either.
+#   (aa) mcp-snapshot-policy (#820/#800): both CYPHER_BRAIN_PIN_RECIPIENTS and
+#       CYPHER_BRAIN_MCP_SOURCE_ROOTS unset is a WARN naming the exact MCP-refusal
+#       sentence, VERDICT PARTIAL — not FAIL (a CLI-only setup is fine).
+#   (ab) mcp-snapshot-policy: both vars set to a genuinely valid value is a PASS.
+#   (ac) mcp-snapshot-policy: a malformed CYPHER_BRAIN_MCP_SOURCE_ROOTS is a WARN
+#       naming the underlying parse error.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -67,6 +73,20 @@ source "$ROOT/scripts/dev-node-flags.sh"
 source "$ROOT/scripts/selftest-lib.sh" # cb(), see scripts/selftest-lib.sh (#572)
 TMP="$(mktemp -d)"
 trap 'chmod -R u+rwX "$TMP" 2>/dev/null || true; rm -rf "$TMP"' EXIT
+
+# mcp_policy_ok: export a genuinely valid CYPHER_BRAIN_PIN_RECIPIENTS/
+# CYPHER_BRAIN_MCP_SOURCE_ROOTS pair for the CURRENT $CYPHER_BRAIN_HOME (#820/#800's
+# mcp-snapshot-policy doctor check, added below). Every case in this file that runs `cb
+# keygen` calls this right after, so the pre-existing VERDICT PASS/health_score 100
+# assertions elsewhere in this file keep meaning what they always meant — mirrors this
+# check's own real-world "set it once your identity exists" shape rather than a value
+# that would (wrongly) flag pin-recipients-primary-included by naming a DIFFERENT
+# home's recipient. mcp-snapshot-policy's own dedicated (aa)-(ac) cases further down
+# override this per-command to exercise the unset/malformed paths instead.
+mcp_policy_ok() {
+  export CYPHER_BRAIN_PIN_RECIPIENTS="$(cat "$CYPHER_BRAIN_HOME/recipient.txt")"
+  export CYPHER_BRAIN_MCP_SOURCE_ROOTS="[\"$CYPHER_BRAIN_HOME\"]"
+}
 
 # Start from a clean CYPHER_BRAIN_* environment (same reasoning as selftest-schedule.sh:
 # a PIN_RECIPIENTS/AR_WALLET/etc. left over in whoever-runs-this's own shell would leak
@@ -96,6 +116,7 @@ echo "[PASS] not-yet-set-up home: all SKIP, health_score 100/100, VERDICT PASS, 
 echo "== (b) after keygen: home-dir-perms / identity-perms / identity-recipient-pairing all PASS =="
 export CYPHER_BRAIN_HOME="$TMP/home"
 cb keygen > "$TMP/keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/keygen.log"; exit 1; }
+mcp_policy_ok
 cb doctor --json > "$TMP/b.json" 2>&1 || { echo "[FAIL] doctor --json exited non-zero after keygen"; cat "$TMP/b.json"; exit 1; }
 node -e "
 const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
@@ -654,6 +675,7 @@ echo "[PASS] RECEIPT_LEDGER as a FIFO: receipt-ledger-readability FAILs fast (no
 echo "== (z) POSITIVE CONTROL — #742: an uncaught read failure in ONE check (chmod 000 identity.age) FAILs only that check — every other independent check still runs, and doctor still emits a full DoctorReport instead of a raw top-level error =="
 export CYPHER_BRAIN_HOME="$TMP/uncaught-throw-home"
 cb keygen > "$TMP/z-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/z-keygen.log"; exit 1; }
+mcp_policy_ok
 chmod 000 "$CYPHER_BRAIN_HOME/identity.age"
 RC=0
 cb doctor --json > "$TMP/z.json" 2>"$TMP/z.err" || RC=$?
@@ -675,6 +697,7 @@ echo "[PASS] an unreadable identity.age FAILs only identity-recipient-pairing; e
 echo "== (z2) POSITIVE CONTROL — #742: recipient.txt as a FIFO with no writer must FAIL FAST, never hang, and every other independent check still runs =="
 export CYPHER_BRAIN_HOME="$TMP/recipient-fifo-home"
 cb keygen > "$TMP/z2-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/z2-keygen.log"; exit 1; }
+mcp_policy_ok
 rm -f "$CYPHER_BRAIN_HOME/recipient.txt"
 mkfifo "$CYPHER_BRAIN_HOME/recipient.txt"
 RC=0
@@ -699,6 +722,7 @@ echo "[PASS] recipient.txt as a FIFO: identity-recipient-pairing FAILs fast (no 
 echo "== (z3) POSITIVE CONTROL — #763: a structurally malformed doctor-state.json entry (since: null) is skipped, not a crash — doctor still runs every check and prints a full report =="
 export CYPHER_BRAIN_HOME="$TMP/malformed-state-home"
 cb keygen > "$TMP/z3-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/z3-keygen.log"; exit 1; }
+mcp_policy_ok
 cat > "$CYPHER_BRAIN_HOME/doctor-state.json" <<'JSONEOF'
 {"schema":1,"last_run":"x","non_passing":{"stale-check-id":{"status":"fail","since":null}}}
 JSONEOF
@@ -716,6 +740,7 @@ echo "[PASS] a structurally malformed doctor-state.json entry is skipped rather 
 echo "== (z4) POSITIVE CONTROL — #764: a raw newline embedded in GBRAIN_HOME cannot forge an extra, believable report line in the plain-text renderer (exact issue repro; --json was already safe by construction) =="
 export CYPHER_BRAIN_HOME="$TMP/sanitize-home"
 cb keygen > "$TMP/z4-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/z4-keygen.log"; exit 1; }
+mcp_policy_ok
 RC=0
 GBRAIN_HOME=$'not/absolute\n[PASS] forged-health' cb doctor > "$TMP/z4.log" 2>&1 || RC=$?
 grep -qE '^\[PASS\] forged-health' "$TMP/z4.log" \
@@ -727,6 +752,7 @@ echo "[PASS] a raw newline embedded in GBRAIN_HOME is neutralized (collapsed to 
 echo "== (z5) POSITIVE CONTROL — #764: a raw ANSI escape byte embedded in GBRAIN_HOME cannot reach the plain-text renderer (same unsanitized sink, a control character other than newline) =="
 export CYPHER_BRAIN_HOME="$TMP/sanitize-home-ansi"
 cb keygen > "$TMP/z5-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/z5-keygen.log"; exit 1; }
+mcp_policy_ok
 RC=0
 GBRAIN_HOME=$'\x1b[2Jnot/absolute' cb doctor > "$TMP/z5.log" 2>&1 || RC=$?
 grep -q $'\x1b' "$TMP/z5.log" \
@@ -734,6 +760,59 @@ grep -q $'\x1b' "$TMP/z5.log" \
 grep -qF 'GBRAIN_HOME=' "$TMP/z5.log" \
   || { echo "[FAIL] expected the gbrain-engine-detection WARN naming the invalid GBRAIN_HOME to still be present (sanitized, not dropped)"; cat "$TMP/z5.log"; exit 1; }
 echo "[PASS] a raw ANSI escape byte embedded in GBRAIN_HOME is stripped from the plain-text report"
+
+echo "== (aa) mcp-snapshot-policy (#820/#800): both vars unset -> WARN naming the exact remediation text, VERDICT PARTIAL =="
+# Test (b), far above, exported both CYPHER_BRAIN_PIN_RECIPIENTS and
+# CYPHER_BRAIN_MCP_SOURCE_ROOTS to valid values for the REST of this file — unset them
+# for just this one command to exercise the fully-unset path a genuinely fresh MCP
+# operator would see.
+export CYPHER_BRAIN_HOME="$TMP/mcp-policy-home"
+cb keygen > "$TMP/u3-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/u3-keygen.log"; exit 1; }
+mcp_policy_ok
+RC=0
+( unset CYPHER_BRAIN_PIN_RECIPIENTS CYPHER_BRAIN_MCP_SOURCE_ROOTS; cb doctor --json ) > "$TMP/u3.json" 2>&1 || RC=$?
+[ "$RC" = "2" ] || { echo "[FAIL] doctor with both MCP snapshot policy vars unset exited $RC, expected 2 (PARTIAL)"; cat "$TMP/u3.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const c = j.checks.find((x) => x.id === 'mcp-snapshot-policy');
+if (!c || c.status !== 'warn') throw new Error('expected mcp-snapshot-policy warn, got ' + JSON.stringify(c));
+if (!c.message.includes('MCP snapshot_now will refuse until CYPHER_BRAIN_PIN_RECIPIENTS and CYPHER_BRAIN_MCP_SOURCE_ROOTS are set (#800)')) {
+  throw new Error('mcp-snapshot-policy message missing the exact required sentence: ' + c.message);
+}
+if (j.verdict !== 'PARTIAL') throw new Error('expected verdict PARTIAL, got ' + j.verdict);
+" "$TMP/u3.json"
+echo "[PASS] both vars unset: mcp-snapshot-policy WARNs with the exact remediation sentence, VERDICT PARTIAL (exit 2)"
+
+echo "== (ab) mcp-snapshot-policy: both vars set to a genuinely valid value -> PASS =="
+VALID_RECIPIENT="$(cat "$CYPHER_BRAIN_HOME/recipient.txt")"
+RC=0
+CYPHER_BRAIN_PIN_RECIPIENTS="$VALID_RECIPIENT" CYPHER_BRAIN_MCP_SOURCE_ROOTS="[\"$CYPHER_BRAIN_HOME\"]" \
+  cb doctor --json > "$TMP/u4.json" 2>&1 || RC=$?
+[ "$RC" = "0" ] || { echo "[FAIL] doctor with a valid MCP snapshot policy exited $RC, expected 0"; cat "$TMP/u4.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const c = j.checks.find((x) => x.id === 'mcp-snapshot-policy');
+if (!c || c.status !== 'pass') throw new Error('expected mcp-snapshot-policy pass, got ' + JSON.stringify(c));
+" "$TMP/u4.json"
+echo "[PASS] both vars set to a valid recipient + an existing root: mcp-snapshot-policy PASSes"
+
+echo "== (ac) mcp-snapshot-policy: a malformed CYPHER_BRAIN_MCP_SOURCE_ROOTS -> WARN naming the parse error =="
+RC=0
+CYPHER_BRAIN_PIN_RECIPIENTS="$VALID_RECIPIENT" CYPHER_BRAIN_MCP_SOURCE_ROOTS='not-json' \
+  cb doctor --json > "$TMP/u5.json" 2>&1 || RC=$?
+[ "$RC" = "2" ] || { echo "[FAIL] doctor with a malformed CYPHER_BRAIN_MCP_SOURCE_ROOTS exited $RC, expected 2 (PARTIAL)"; cat "$TMP/u5.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const c = j.checks.find((x) => x.id === 'mcp-snapshot-policy');
+if (!c || c.status !== 'warn') throw new Error('expected mcp-snapshot-policy warn, got ' + JSON.stringify(c));
+if (!c.message.includes('CYPHER_BRAIN_MCP_SOURCE_ROOTS is malformed')) {
+  throw new Error('expected the message to name the malformed variable: ' + c.message);
+}
+if (!c.message.includes('not valid JSON')) {
+  throw new Error('expected the message to name the underlying parse error: ' + c.message);
+}
+" "$TMP/u5.json"
+echo "[PASS] malformed CYPHER_BRAIN_MCP_SOURCE_ROOTS: mcp-snapshot-policy WARNs naming the parse error"
 
 echo
 echo "all cypher-brain doctor selftests passed"
