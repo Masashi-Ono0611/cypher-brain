@@ -313,6 +313,42 @@ async function run(tmp) {
     await assertNoArtifacts('a configured root that is a regular file, not a directory', { out, store });
   }
 
+  // ── 6d. a configured root that is a symlink to a FILE — non-disclosure ────
+  // Multi-model review, #838: the refusal must name the configured symlink (what the
+  // operator wrote) and must NOT leak the resolved target's path — a uniquely-named
+  // target file makes an accidental leak easy to catch by string search.
+  {
+    const uniqueTarget = join(tmp, 'unique-target-file-f83a91.txt');
+    await writeFile(uniqueTarget, 'not a directory\n');
+    const rootLinkToFile = join(rootsDir, 'link-to-a-file');
+    await symlink(uniqueTarget, rootLinkToFile);
+    const out = nextOut();
+    const frame = await callSnapshotNow(withRoots(JSON.stringify([rootLinkToFile])), baseArgs(out));
+    assertPolicyDenied('a configured root that is a symlink to a file', frame);
+    const msg = structured(frame).message ?? '';
+    if (!msg.includes(rootLinkToFile)) fail(`symlink-to-file root refusal did not name the configured root: ${msg}`);
+    if (msg.includes(uniqueTarget)) fail(`symlink-to-file root refusal leaked the resolved target path: ${msg}`);
+    await assertNoArtifacts('a configured root that is a symlink to a file', { out, store });
+  }
+
+  // ── 6e. a configured root that is a symlink LOOP (ELOOP) ──────────────────
+  // Exercises the generic (non-ENOENT/ENOTDIR) branch of resolveConfiguredRoot()'s first
+  // try/catch — a permission or loop error must still name the ORIGINAL root, not fall
+  // through to underPolicy()'s generic "a root could not be resolved" wrapper, which
+  // does not say WHICH root failed.
+  {
+    const loopA = join(rootsDir, 'loop-a');
+    const loopB = join(rootsDir, 'loop-b');
+    await symlink(loopB, loopA);
+    await symlink(loopA, loopB);
+    const out = nextOut();
+    const frame = await callSnapshotNow(withRoots(JSON.stringify([loopA])), baseArgs(out));
+    assertPolicyDenied('a configured root that is a symlink loop (ELOOP)', frame);
+    const msg = structured(frame).message ?? '';
+    if (!msg.includes(loopA)) fail(`symlink-loop root refusal did not name the offending root: ${msg}`);
+    await assertNoArtifacts('a configured root that is a symlink loop (ELOOP)', { out, store });
+  }
+
   // ── 7-10. a source the roots do not cover ─────────────────────────────────
   const escapeCases = [
     ['source outside every root', [outside], okRoots],

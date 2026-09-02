@@ -15,6 +15,6 @@ A configured root must now exist on disk as a directory (fully realpath'd — a 
 is itself a symlink to a directory is accepted, its resolved target compared, same as
 every other path this gate compares) or `assertSnapshotPolicy()` refuses the WHOLE call
 with `ERR_POLICY_DENIED` / `CB-E025`, naming the offending root, rather than silently
-authorizing just a narrower slice of what the operator meant. `dirs` entries are
-unchanged — a call-time typo is still left to `snapshot()`'s own "no such directory"
-error, not this gate.
+falling back to authorizing a broader ancestor directory than the operator meant. `dirs`
+entries are unchanged — a call-time typo is still left to `snapshot()`'s own "no such
+directory" error, not this gate.

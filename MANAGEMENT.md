@@ -571,13 +571,14 @@ every other environment-backed setting here). Then:
 | a pinned call whose only source is `pg` | allowed with no roots configured |
 | a replay (`idempotency_key`) of a call the CURRENT policy would deny | refused — replays are not grandfathered |
 
-Every configured root must exist on disk as a directory when the server starts — a
-typo'd or not-yet-created root (e.g. `/srv/brian` instead of `/srv/brain`) refuses
-**every** `dirs` call rather than silently falling back to authorizing its nearest
-existing ancestor (`/srv`), which would be broader than what you named (#838). A root
-that is itself a symlink is followed, and its resolved target is what gets compared —
-the same "resolve symlinks on both sides before comparing" rule this policy already
-applies to every `dirs` entry.
+Every configured root must exist on disk as a directory — checked live, each time a
+`snapshot_now` call names `dirs`, not only once at server start. A typo'd or
+not-yet-created root (e.g. `/srv/brian` instead of `/srv/brain`) refuses **every** `dirs`
+call rather than silently falling back to authorizing its nearest existing ancestor
+(`/srv`), which would be broader than what you named (#838). A root that is itself a
+symlink is followed, and its resolved target is what gets compared — the same "resolve
+symlinks on both sides before comparing" rule this policy already applies to every `dirs`
+entry.
 
 A refusal is `ERR_POLICY_DENIED` with `cb_code` `CB-E025` and names the variable to set.
 Nothing is created on the way out: no `out` file, no object in the store, no idempotency
