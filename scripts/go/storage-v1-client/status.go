@@ -36,6 +36,13 @@ func tonapiBase(testnet bool) string {
 type accountState struct {
 	Status  string `json:"status"`
 	Balance uint64 `json:"balance"`
+	// Data is the account's raw state data cell, hex-encoded — returned by the
+	// /v2/blockchain/accounts/ endpoint only (the /v2/accounts/ fallback below
+	// has no such field, which is fine: that fallback only ever answers for an
+	// account that has never been used, so there is no dict to read anyway).
+	// Read by `providers` (providers.go) and by nothing else; every other
+	// caller of fetchAccountState ignores it.
+	Data string `json:"data"`
 }
 
 // stateVerdict ports scripts/ton-provider-experiment.mjs's stateVerdict — the

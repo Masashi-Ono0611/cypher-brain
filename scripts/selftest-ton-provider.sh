@@ -50,6 +50,11 @@ PROVIDER_WALLET="UQCCrKrQHLpB75vvrd5js78eB7qK6v7Cpz4WJpV2DoZnY-GC"
 # issue #665: a SECOND provider the mock registry can hand back instead, so a retry's
 # own selectProvider() picks someone the already-deployed contract was never built for.
 PROVIDER_PUBKEY_ALT="cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+# issue #665 authority (b): a THIRD pubkey, only ever served by the mock `providers`
+# subcommand as what the contract's OWN on-chain dict names. Distinct from both the
+# registry's default pick and its alt pick so a test can tell "used the chain" apart from
+# "used a local record" and from "used this run's selection" by the pubkey alone.
+PROVIDER_PUBKEY_ONCHAIN="efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
 # Declared here (not down at its export near the push tests) so the tonapi mock
 # below can be launched already knowing which address the pre-deploy funds-check
 # positive control (#396 Phase B) needs to answer with a low balance.
@@ -303,6 +308,31 @@ RATES_UNAVAILABLE_FLAG="$TMP/rates-unavailable-flag"
 RATES_HIGH_RATE_FLAG="$TMP/rates-high-rate-flag"
 RATES_NARROW_SPAN_FLAG="$TMP/rates-narrow-span-flag"
 SUB="\$1"
+# issue #665 authority (b): the \`providers\` subcommand, which reads the contract's OWN
+# on-chain ActiveProviders dict (providers.go). Driven by an OPTIONAL control file whose
+# lines are the pubkeys the chain names:
+#   file absent  -> exit 1, i.e. "the on-chain read is unavailable/failed". This is the
+#                   DEFAULT so every pre-existing test in this script keeps exercising
+#                   authority (a) exactly as it did before (b) existed.
+#   file present -> a successful read of exactly those pubkeys (an EMPTY file is a
+#                   successful read of an EMPTY dict, a different fact entirely).
+ONCHAIN_PROVIDERS_FILE="$TMP/onchain-providers"
+if [ "\$SUB" = "providers" ]; then
+  printf '%s\n' "\$@" > "$TMP/providers-args.log"
+  [ -f "\$ONCHAIN_PROVIDERS_FILE" ] || {
+    echo "storage-v1-client: providers: simulated on-chain read failure (no control file)" >&2
+    exit 1
+  }
+  ADDR=""
+  while [ "\$#" -gt 0 ]; do
+    case "\$1" in
+      --address) ADDR="\$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  ONCHAIN_FILE="\$ONCHAIN_PROVIDERS_FILE" ADDR="\$ADDR" node -e 'const fs=require("fs");const pubkeys=fs.readFileSync(process.env.ONCHAIN_FILE,"utf8").split("\n").map((s)=>s.trim()).filter(Boolean);process.stdout.write(JSON.stringify({address:process.env.ADDR,network:"mainnet",status:"active",providers:pubkeys.map((pubkey)=>({pubkey,terms:{max_span_seconds:86400,rate_nano_per_mb_day:"800"}}))},null,2)+"\n");'
+  exit 0
+fi
 if [ "\$SUB" = "rates" ]; then
   printf '%s\n' "\$@" > "$TMP/rates-args.log"
   AVAILABLE=true
@@ -1273,7 +1303,51 @@ grep -q "was deployed with provider $PROVIDER_PUBKEY" "$TMP/issue665-retry.err" 
   || { echo "[FAIL] issue #665: the retry did not report which provider it resumed with"; cat "$TMP/issue665-retry.err"; exit 1; }
 grep -q "reports the full bag downloaded" "$TMP/issue665-retry.err" \
   || { echo "[FAIL] issue #665: the retry's notify never completed against the recorded provider"; cat "$TMP/issue665-retry.err"; exit 1; }
+grep -q "could not read contract .* own on-chain providers dict" "$TMP/issue665-retry.err" \
+  || { echo "[FAIL] issue #665 (b): the failed on-chain read fell back to a local record WITHOUT saying so"; cat "$TMP/issue665-retry.err"; exit 1; }
 echo "[PASS] issue #665: an already-active retry resumes notify with the recorded provider ($PROVIDER_PUBKEY), not this run's pick ($PROVIDER_PUBKEY_ALT)"
+echo "[PASS] issue #665 (b): an on-chain read that CANNOT answer falls back to authority (a) and warns that it did"
+
+# ---- issue #665 authority (b): the contract's own on-chain dict outranks every local record ----
+# The retry above already proved (a). These two reuse the SAME already-active contract
+# (same artifact -> same bag -> same derived address) and only change what the chain
+# says, so what is being measured is purely the authority ordering.
+echo "== issue #665 (b): the contract's on-chain providers dict outranks this machine's records =="
+echo "$PROVIDER_PUBKEY_ONCHAIN" > "$TMP/onchain-providers" # the chain names a THIRD provider
+touch "$ALT_PROVIDER_FLAG"                                 # ...and the registry still picks the alt one
+CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue665.age" --backend ton-provider >/dev/null 2>"$TMP/issue665b-onchain.err" \
+  || { echo "[FAIL] issue #665 (b): the on-chain-authority retry failed"; cat "$TMP/issue665b-onchain.err"; rm -f "$ALT_PROVIDER_FLAG" "$TMP/onchain-providers"; exit 1; }
+rm -f "$ALT_PROVIDER_FLAG"
+grep -qx -- "$PROVIDER_PUBKEY_ONCHAIN" "$TMP/notify-args.log" \
+  || { echo "[FAIL] issue #665 (b): notify did not go to the provider the on-chain dict names — notify args:"; cat "$TMP/notify-args.log"; rm -f "$TMP/onchain-providers"; exit 1; }
+grep -qx -- "$PROVIDER_PUBKEY" "$TMP/notify-args.log" \
+  && { echo "[FAIL] issue #665 (b): notify went to the RECORDED provider even though the chain named a different one"; cat "$TMP/notify-args.log"; rm -f "$TMP/onchain-providers"; exit 1; }
+grep -qx -- "$PROVIDER_PUBKEY_ALT" "$TMP/notify-args.log" \
+  && { echo "[FAIL] issue #665 (b): notify went to THIS run's registry pick even though the chain named a different one"; cat "$TMP/notify-args.log"; rm -f "$TMP/onchain-providers"; exit 1; }
+grep -q "OWN on-chain providers dict names" "$TMP/issue665b-onchain.err" \
+  || { echo "[FAIL] issue #665 (b): the record-vs-chain disagreement was not reported"; cat "$TMP/issue665b-onchain.err"; rm -f "$TMP/onchain-providers"; exit 1; }
+grep -qx -- "--address" "$TMP/providers-args.log" \
+  || { echo "[FAIL] issue #665 (b): the providers subcommand was not called with --address"; cat "$TMP/providers-args.log"; rm -f "$TMP/onchain-providers"; exit 1; }
+echo "[PASS] issue #665 (b): the on-chain dict ($PROVIDER_PUBKEY_ONCHAIN) beats both the local record ($PROVIDER_PUBKEY) and this run's pick ($PROVIDER_PUBKEY_ALT)"
+
+# The case authority (a) CANNOT cover at all: an already-funded contract this machine
+# holds no record of (a fresh receipt ledger, so neither a pending-spend intent nor a
+# receipt names its provider). Before (b) this warned and notified whoever this run's
+# registry happened to return; now the contract itself answers.
+echo "== issue #665 (b): a contract with NO local record is answered by the chain, not by this run's pick =="
+I665B_DIR="$TMP/issue665b-ledger"
+mkdir -p "$I665B_DIR"
+CYPHER_BRAIN_RECEIPT_LEDGER="$I665B_DIR/receipt-ledger.jsonl" CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" \
+  CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue665.age" --backend ton-provider >/dev/null 2>"$TMP/issue665b-norecord.err" \
+  || { echo "[FAIL] issue #665 (b): the no-record retry failed"; cat "$TMP/issue665b-norecord.err"; rm -f "$TMP/onchain-providers"; exit 1; }
+grep -qx -- "$PROVIDER_PUBKEY_ONCHAIN" "$TMP/notify-args.log" \
+  || { echo "[FAIL] issue #665 (b): with no local record, notify did not go to the on-chain provider — notify args:"; cat "$TMP/notify-args.log"; rm -f "$TMP/onchain-providers"; exit 1; }
+grep -q "no local record names the provider contract .* on-chain providers dict was read instead" "$TMP/issue665b-norecord.err" \
+  || { echo "[FAIL] issue #665 (b): the no-record run did not report that it fell through to the chain"; cat "$TMP/issue665b-norecord.err"; rm -f "$TMP/onchain-providers"; exit 1; }
+rm -f "$TMP/onchain-providers" # back to "the on-chain read is unavailable" for every later test
+echo "[PASS] issue #665 (b): a contract with no local record at all is resolved from its own on-chain dict"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
 echo "== issue #654 (MCP-level): a snapshot_now notify timeout classifies as funding_confirmed, not a generic partial-success bucket =="

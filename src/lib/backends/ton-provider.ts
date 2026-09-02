@@ -986,6 +986,67 @@ async function createLocalBag(apiUrl: string, bagDir: string): Promise<LocalBagI
   }
 }
 
+// ---------- #665 authority (b): the contract's OWN on-chain provider dict ----------
+// The only source that outranks this machine's records about which provider a contract
+// was deployed with. `modify_providers` REPLACES the dict rather than merging into it,
+// so whatever the chain holds now IS the registration — a local note can only ever be a
+// (possibly stale) claim about it, and for a contract this machine has no record of at
+// all it is the ONLY answer that exists.
+//
+// Shells out to the same tested Go program notify/rates already go through
+// (scripts/go/storage-v1-client, CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN) rather than
+// decoding a StorageV1 account's TL-B data cell a second time in TypeScript: that program
+// already owns the cell layout — it BUILDS the same dict for `deploy`/`update-providers`,
+// against the upstream bindings — so a divergence between the two languages' idea of the
+// layout is impossible by construction rather than by review.
+//
+// Returns null for EVERY failure mode (binary not configured, spawn error, non-zero exit,
+// unparseable output) — deliberately soft, because the caller's fallback is authority
+// (a), the behaviour that shipped in #824, and hardening this into a refusal would make a
+// tonapi blip break retries that used to work. Returns [] only for a positively-read
+// EMPTY dict, which is a different fact the caller handles separately.
+interface OnChainProvidersOutput {
+  address?: unknown;
+  providers?: unknown;
+}
+
+const PROVIDERS_READ_TIMEOUT_MS = 30_000;
+
+function parseOnChainProvidersOutput(out: string): string[] | null {
+  let parsed: OnChainProvidersOutput;
+  try {
+    parsed = JSON.parse(out) as OnChainProvidersOutput;
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.providers)) return null;
+  const pubkeys: string[] = [];
+  for (const entry of parsed.providers) {
+    const pubkey = (entry as { pubkey?: unknown } | null)?.pubkey;
+    // A malformed entry makes the WHOLE read unusable rather than shrinking the set:
+    // silently dropping one entry could turn "the contract names two providers, pick
+    // carefully" into "it names one, use it" — the failure mode this authority exists to
+    // prevent, arrived at from the other direction.
+    if (typeof pubkey !== 'string' || !/^[0-9a-f]{64}$/i.test(pubkey)) return null;
+    pubkeys.push(pubkey.toLowerCase());
+  }
+  return [...new Set(pubkeys)];
+}
+
+async function readOnChainProviders(contractAddrRaw: string): Promise<string[] | null> {
+  if (!TON_PROVIDER_NOTIFY_BIN) return null;
+  try {
+    const { out } = await run(
+      TON_PROVIDER_NOTIFY_BIN,
+      ['providers', '--address', contractAddrRaw, ...(TON_NETWORK_CONFIG ? [] : ['--mainnet'])],
+      { timeoutMs: PROVIDERS_READ_TIMEOUT_MS },
+    );
+    return parseOnChainProvidersOutput(out);
+  } catch {
+    return null;
+  }
+}
+
 // ---------- #808: the receipt-ledger side of the pending-spend reconciliation ----------
 // The receipt ledger is the AUTHORITY on "has this contract's spend already been
 // recorded" — the pending-spend sidecar is only ever a hint about it. Both are consulted
@@ -1515,10 +1576,10 @@ export function tonProviderBackend(): StorageBackend {
             `ton-provider: contract ${deploy.contractAddress.toRawString()} already shows on-chain activity ` +
               `(status=${observedStatus}) — this looks like a retry of an already-broadcast (or already-completed) ` +
               `deploy for the same bag/owner. Skipping re-funding (no new ${deploy.amountNano} nanoTON transfer) ` +
-              'and going straight to notifying the provider. If the provider selected THIS run differs from ' +
-              "whichever one the contract's on-chain dict was actually deployed with, notify below may fail for " +
-              'it — re-run `update-providers` (scripts/go/storage-v1-client) to register the correct one instead ' +
-              'of relying on a second deploy.',
+              "and going straight to notify. Which provider is notified is NOT this run's registry pick: it is " +
+              "read back from the contract's own on-chain providers dict, falling back to this machine's " +
+              'pending-spend intent and then the receipt if that read cannot answer, and refusing rather than ' +
+              'guessing if none of them can (#665). The lines below say which source answered.',
           );
         }
 
@@ -1556,11 +1617,10 @@ export function tonProviderBackend(): StorageBackend {
           const logsFullyReadable = intentSkipped === 0 && receiptLookup.skippedLines === 0;
           // Authority (a): this backend's own durable records — the intent written before
           // the deploy that actually paid (#808), else the receipt written after it
-          // (#654/#484). Authority (b), reading the StorageV1 contract's own on-chain
-          // `providers` dict, is NOT implemented: neither @ton/ton as used here nor
-          // scripts/go/storage-v1-client exposes a call for it today, so it is new
-          // cross-language plumbing rather than a read of something already available.
-          // Tracked as the remaining half of issue #665.
+          // (#654/#484). Authority (b) — the contract's own on-chain dict, read just
+          // below — outranks both; this block computes (a) first because (b) also uses
+          // it to disambiguate a contract that names more than one provider, and because
+          // (a) is what stays in charge when the on-chain read cannot answer.
           //
           // Ranked, not "most recent wins": a CONFIRMED intent and a receipt each describe
           // a deploy that was actually observed on-chain, while a `pending` intent records
@@ -1572,7 +1632,93 @@ export function tonProviderBackend(): StorageBackend {
           const attested = [...new Set([...recorded.confirmed, ...(receiptPubkey ? [receiptPubkey] : [])])];
           const haveSomeRecord =
             intents.some((i) => i.contract_address === contractAddressRaw) || priorReceipt !== null;
-          if (attested.length > 1) {
+          // Everything this machine's own logs offer as a candidate, attested or not —
+          // used below both as authority (a)'s answer and, when the chain names more than
+          // one provider, as the tie-break among them.
+          const localCandidates = [...new Set([...attested, ...recorded.unconfirmed])];
+          // Unchanged from #824 except for the explicit `attested.length === 0` guard,
+          // which used to be implied by position (this was computed only after the
+          // disagreement throw, so attested.length was 0 or 1 by then). An unconfirmed
+          // candidate is still used only when it is the ONLY one and nothing attested
+          // contradicts it.
+          const recordedPubkey =
+            attested.length === 1
+              ? attested[0]
+              : attested.length === 0 && recorded.unconfirmed.length === 1
+                ? recorded.unconfirmed[0]
+                : null;
+
+          // Authority (b), the top of the ranking: the contract's OWN on-chain
+          // `providers` dict. Read AFTER the logs above because a contract naming more
+          // than one provider still needs a local record (or this run's own pick) to
+          // choose between them — the chain says who is registered, not which of several
+          // registrations this push is a retry of.
+          const onChainPubkeys = await readOnChainProviders(contractAddressRaw);
+          const fromChain =
+            onChainPubkeys === null || onChainPubkeys.length === 0
+              ? null
+              : onChainPubkeys.length === 1
+                ? onChainPubkeys[0]
+                : (localCandidates.find((c) => onChainPubkeys.includes(c)) ??
+                  (onChainPubkeys.includes(provider.pubkey) ? provider.pubkey : null));
+          if (onChainPubkeys === null) {
+            // Soft, on purpose: this is exactly the case authority (a) already handles,
+            // and it shipped working in #824. Reported rather than swallowed because a
+            // reader of the run summary must be able to tell an answer that came from the
+            // chain from one that came from a local note (#347's relay contract).
+            warn(
+              `ton-provider: could not read contract ${contractAddressRaw}'s own on-chain providers dict ` +
+                '(scripts/go/storage-v1-client `providers` is unavailable, failed, or answered unusably) — falling ' +
+                "back to this machine's own records to decide whom to notify (#665).",
+            );
+          } else if (onChainPubkeys.length === 0) {
+            warn(
+              `ton-provider: contract ${contractAddressRaw}'s on-chain providers dict is EMPTY — the contract ` +
+                'currently registers NO provider, so notify cannot succeed for anyone until `update-providers` ' +
+                "(scripts/go/storage-v1-client) registers one. Falling back to this machine's own records to " +
+                'decide whom to notify anyway (#665).',
+            );
+          }
+
+          if (onChainPubkeys !== null && onChainPubkeys.length > 0) {
+            if (fromChain === null) {
+              throw new Error(
+                `ton-provider backend: contract ${contractAddressRaw}'s on-chain providers dict names ` +
+                  `${onChainPubkeys.length} providers (${onChainPubkeys.join(', ')}), none of which this machine ` +
+                  `recorded and none of which this run selected (${provider.pubkey}) — refusing to pick one on your ` +
+                  'behalf, since notifying the wrong one addresses a provider that may never have held this bag. ' +
+                  'Re-run `update-providers` (scripts/go/storage-v1-client) to register a single provider ' +
+                  'deliberately (#665). No funds moved.',
+              );
+            }
+            notifyPubkey = fromChain;
+            const contradicted = localCandidates.filter((c) => !onChainPubkeys.includes(c));
+            if (contradicted.length > 0) {
+              warn(
+                `ton-provider: this machine's records name provider(s) ${contradicted.join(', ')} for contract ` +
+                  `${contractAddressRaw}, but the contract's OWN on-chain providers dict names ` +
+                  `${onChainPubkeys.join(', ')} — using the on-chain answer (${fromChain}), which outranks a local ` +
+                  'note because `modify_providers` REPLACES the dict rather than merging into it, so whatever the ' +
+                  `chain holds now IS the registration. Reconcile ${PENDING_SPENDS_LOG} / ${RECEIPT_LEDGER} if this ` +
+                  'is a surprise (#665).',
+              );
+            } else if (localCandidates.length === 0) {
+              warn(
+                `ton-provider: no local record names the provider contract ${contractAddressRaw} was deployed with, ` +
+                  `so the contract's own on-chain providers dict was read instead — notifying ${fromChain}, the ` +
+                  'provider the contract itself registers (#665).',
+              );
+            }
+            if (fromChain !== provider.pubkey) {
+              warn(
+                `ton-provider: contract ${contractAddressRaw} was deployed with provider ${fromChain}, but this ` +
+                  `run's registry snapshot selected ${provider.pubkey} — notifying ${fromChain}, the one the ` +
+                  "contract's own on-chain dict names (#665). To hand this bag to a DIFFERENT provider, register " +
+                  'it deliberately with `update-providers` (scripts/go/storage-v1-client) — a retry must not do it ' +
+                  'by accident.',
+              );
+            }
+          } else if (attested.length > 1) {
             throw new Error(
               `ton-provider backend: this machine's records disagree about which provider contract ` +
                 `${contractAddressRaw} was deployed with (${attested.join(', ')}) — refusing to notify any of them, ` +
@@ -1581,12 +1727,7 @@ export function tonProviderBackend(): StorageBackend {
                 'or re-run `update-providers` (scripts/go/storage-v1-client) to register one deliberately (#665). ' +
                 'No funds moved.',
             );
-          }
-          // attested.length is 0 or 1 by here (>1 threw above). An unconfirmed candidate is
-          // used only when it is the ONLY one and nothing attested contradicts it.
-          const recordedPubkey =
-            attested.length === 1 ? attested[0] : recorded.unconfirmed.length === 1 ? recorded.unconfirmed[0] : null;
-          if (recordedPubkey !== null) {
+          } else if (recordedPubkey !== null) {
             notifyPubkey = recordedPubkey;
             if (attested.length === 0) {
               warn(

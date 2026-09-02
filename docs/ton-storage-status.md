@@ -129,7 +129,7 @@ checked in any future assessment.
   non-`internal`) and `pkg/transport` (`RequestStorageInfo`, the same RLDP
   client the real daemon uses, also non-`internal`) directly — reuses tested
   code instead of re-deriving the cell layout and ADNL handshake by hand.
-  `deploy`/`notify`/`status`/`update-providers` subcommands; never touches a
+  `deploy`/`notify`/`status`/`providers`/`update-providers` subcommands; never touches a
   wallet private key (prints a Tonkeeper deeplink for a human to sign). Lives
   alongside the other operator-run experiment scripts, not the shipped CLI.
 - **Real-money incident during the first live use (2026-08-23) — full
@@ -619,8 +619,12 @@ the storage; it buys availability, not permanence.
   StorageV1 client program described above; **not installed on the droplet**
   (the droplet only runs prebuilt Go binaries, it doesn't compile).
 - `scripts/go/storage-v1-client` (local, not deployed anywhere — a laptop
-  CLI): `deploy`/`notify`/`status`/`update-providers`/`withdraw` (the last
-  added 2026-08-26), 44 tests, contract deployment + provider
+  CLI): `deploy`/`notify`/`status`/`providers`/`update-providers`/`withdraw`
+  (`withdraw` added 2026-08-26; `providers` — a read-only print of the
+  contract's own on-chain ActiveProviders dict, which
+  `src/lib/backends/ton-provider.ts` consults as the authority on which
+  provider an already-funded contract was deployed with — added 2026-09-02 for
+  issue #665), contract deployment + provider
   discovery/fetch confirmed working end to end, including a confirmed
   proof-reward payout (see above). Its original mainnet contract,
   `0:465347a9b5152bf6f69e1bc47ce82c537aee5ae4e3d00437d4a514f0e9cc452a` —
