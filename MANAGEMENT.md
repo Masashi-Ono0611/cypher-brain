@@ -65,8 +65,14 @@ defenses, ideally both:
   with a scrypt passphrase (you enter it on `restore`/`verify`). An exfiltrated identity
   file is then useless without the passphrase. **Do not** use `keygen --passphrase
   --force` to add a passphrase to an existing identity — `--force` always generates a
-  brand-new keypair (it does not wrap the old one), so every snapshot already encrypted
-  to the old identity becomes unrecoverable; `--wrap-in-place` keeps the same keypair.
+  brand-new keypair (it does not wrap the old one), so `recipient.txt` no longer names
+  the old identity and every snapshot already encrypted to it stops being reachable
+  through the normal `restore`/default-identity path; `--wrap-in-place` keeps the same
+  keypair instead. (`--force` does back up the OLD identity it is about to replace to a
+  sibling `identity.age.bak-<timestamp>-<random>` file, #786 — so the old snapshots stay
+  recoverable via `restore --identity <that backup>` if you ever need them, but
+  `--wrap-in-place` is still the right tool for "add a passphrase", not a recovery plan
+  to lean on.)
 - **Full-disk-encrypt the identity host.** The machine that holds the identity is
   secret-bearing (it can read every snapshot); FileVault / LUKS protects it (and any
   off-box copies) if the disk or USB is lost or stolen.

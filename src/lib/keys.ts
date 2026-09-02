@@ -1,5 +1,5 @@
 // keygen + identity/recipient helpers.
-import { mkdir, writeFile, rm, rename, chmod, readFile } from 'node:fs/promises';
+import { mkdir, writeFile, rm, rename, chmod, readFile, stat } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import {
   HOME,
@@ -36,6 +36,10 @@ export interface KeygenAtOpts {
 export interface KeygenAtResult {
   recipient: string;
   wrapped: boolean;
+  // Set only when --force just replaced an EXISTING identity — the path
+  // backupIdentityFile() (below) wrote the OLD identity's exact bytes to before
+  // either write in keygenAt() touched anything (#786).
+  backupPath?: string;
 }
 
 // Elide a long recipient string for terminal display (issue #424): a --pq hybrid
@@ -87,6 +91,40 @@ export async function writeKeyFile(
   }
 }
 
+// Preserve the OLD identity's exact bytes before a --force run may replace it, as
+// a sibling `<path>.bak-<timestamp>-<random>` file (#786). This is the safety net
+// for the case where a --force run's TWO separate writeKeyFile() calls (identity +
+// recipient/public key — see keygenAt()/keygenSignAt() below) BOTH succeed, an
+// ordinary run completing normally: write order alone (see the comment above those
+// two calls) already protects the FAILURE case (one write erroring never destroys
+// the old identity), but a run that fully succeeds still discards the old identity
+// the instant it completes, and the only thing standing between that and an
+// operator who forgot to copy it aside first is a printed warning they can miss.
+// Unconditional whenever --force is about to replace an EXISTING identity — not
+// opt-in behind a flag — because the cost (one small extra file) is negligible
+// next to what it prevents (every prior snapshot becoming permanently
+// unrecoverable). Written with the SAME exclusive-create, no-clobber semantics
+// writeKeyFile()'s own !force branch uses: a backup filename COLLISION
+// (astronomically unlikely — the suffix already combines a millisecond timestamp
+// with 4 random bytes) fails loudly instead of silently overwriting an earlier
+// backup.
+//
+// Skips (returns undefined) rather than throwing when `path` is not a regular file
+// (a directory, a FIFO, ...) sitting there instead of a real identity: there is
+// nothing sensible to preserve in that case, and the write that follows this call
+// already fails on its own, with a clear filesystem error, the moment it hits the
+// same obstacle. The stat()-then-isFile() guard before ever calling readFile()
+// mirrors doctor.ts's identical guard on the same class of path, for the same
+// reason — readFile() on a FIFO with no writer blocks indefinitely.
+export async function backupIdentityFile(path: string): Promise<string | undefined> {
+  const st = await stat(path).catch(() => null);
+  if (!st?.isFile()) return undefined;
+  const raw = await readFile(path);
+  const backupPath = `${path}.bak-${Date.now()}-${randomBytes(4).toString('hex')}`;
+  await writeFile(backupPath, raw, { mode: 0o600, flag: 'wx' });
+  return backupPath;
+}
+
 export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
   // 0700: the home dir holds the private identity (and often the JWK wallet) — it must
   // not be world/group-listable. chmod too, in case it pre-existed with a looser mode.
@@ -104,7 +142,8 @@ export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
   // all — letting whoever can trigger a keygen re-key every FUTURE snapshot a
   // pinned recipient.txt was meant to protect against. Checked identity-first so the
   // (unchanged) identity refusal still wins when BOTH already exist.
-  if ((await exists(opts.identityPath)) && !opts.force) {
+  const identityExisted = await exists(opts.identityPath);
+  if (identityExisted && !opts.force) {
     throw new Error(
       `identity already exists at ${opts.identityPath} (refusing to overwrite — losing it = losing the brain). Pass --force only if you are certain.`,
     );
@@ -129,9 +168,39 @@ export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
   // Both the new identity and the new recipient are fully prepared by this point —
   // only from here on is an existing file (--force) ever touched, and even then via
   // write-new-then-rename, never delete-then-write (#122; see writeKeyFile above).
-  await writeKeyFile(opts.identityPath, payload, 0o600, !!opts.force);
+  //
+  // #786: back up the OLD identity right here, now that every step that could still
+  // fail before anything is touched (generateKeypair, the passphrase prompt) has
+  // already succeeded — mirrors the "prepare fully, THEN replace" ordering #122
+  // established, so a doomed --force attempt (bad passphrase confirmation, no TTY,
+  // ...) never leaves a stray backup of an identity that was never actually at risk.
+  const backupPath = opts.force && identityExisted ? await backupIdentityFile(opts.identityPath) : undefined;
+  // Announced IMMEDIATELY, not deferred to a success message the caller prints after
+  // keygenAt() returns: the two writes below can still fail (recipient path became a
+  // directory, EACCES, ...), and if either does, keygenAt() throws and the caller's
+  // own "old identity backed up to: ..." line never runs. The backup itself is
+  // unaffected by that later failure — it is already durably on disk by this point —
+  // so the operator should be told where it is regardless of whether the rest of
+  // this call goes on to succeed.
+  if (backupPath) console.log(`old identity backed up to: ${backupPath}`);
+  //
+  // The PUBLIC recipient is written FIRST, the PRIVATE identity LAST — reversed
+  // from this function's original order. Each writeKeyFile() call is already
+  // atomic on its own (#122), but the two calls together are NOT atomic as a pair:
+  // with identity written first, a failure in the SECOND (recipient) call left the
+  // brand-new identity already in place with no way back to the old one.
+  // Reordering closes that: if the recipient write itself fails, identity.age is
+  // never even touched; if it succeeds but the identity write then fails,
+  // identity.age's own write-new-then-rename atomicity means it is STILL
+  // untouched (a failed writeKeyFile() call never leaves a partial write at
+  // `path` — see writeKeyFile above). Either way, the worst a partial --force run
+  // can now do is leave recipient.txt pointing at a key nothing on disk holds yet
+  // — recoverable by re-running --force (or reverting recipient.txt) — never
+  // "the old identity is simply gone." backupIdentityFile() above is the
+  // remaining safety net for the case both writes succeed.
   await writeKeyFile(opts.recipientPath, `${recipient}\n`, 0o644, !!opts.force);
-  return { recipient, wrapped };
+  await writeKeyFile(opts.identityPath, payload, 0o600, !!opts.force);
+  return { recipient, wrapped, backupPath };
 }
 
 // Passphrase-wrap an ALREADY-EXISTING identity file in place (#110): unlike `keygen
@@ -206,7 +275,9 @@ async function keygenSign(o: CliOptions): Promise<void> {
   // none of which line their two labels up column-for-column with an extra space the
   // way this pair (issue #263) used to. The two labels below now simply start their
   // values at different columns, same as every other pair of differently-sized
-  // labels in this pattern.
+  // labels in this pattern. (#786: keygenSignAt() itself already announced "old
+  // signing identity backed up to: ..." immediately, if --force just replaced an
+  // existing signing identity — not repeated here.)
   console.log(`signing identity (PRIVATE, keep offline): ${identityPath}${wrapped ? ' (passphrase-wrapped)' : ''}`);
   console.log(`signing public key (PUBLIC, safe to copy): ${recipientPath}`);
   console.log(pubkeyText.trimEnd());
@@ -278,7 +349,9 @@ export async function keygen(o: CliOptions): Promise<void> {
     pq: o.pq,
   });
   // Both labels are the same width (33 chars), so a single space after each
-  // colon is what actually lines the two paths up (issue #263).
+  // colon is what actually lines the two paths up (issue #263). (#786: keygenAt()
+  // itself already announced "old identity backed up to: ..." immediately, if
+  // --force just replaced an existing identity — not repeated here.)
   console.log(`identity (PRIVATE, keep offline): ${IDENTITY}${wrapped ? ' (passphrase-wrapped)' : ''}`);
   console.log(`recipient (PUBLIC, safe to copy): ${RECIPIENT}`);
   // --pq's hybrid recipient is ~1960 bytes — printed in full it line-wraps across
