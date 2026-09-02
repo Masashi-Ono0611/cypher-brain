@@ -1,4 +1,6 @@
 node_modules/
+# bun.lock is the only lockfile; a stray `npm install` must not add a second one
+package-lock.json
 *.age
 work/
 logs
