@@ -98,8 +98,9 @@
     "selftest:receipt": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-receipt.mjs",
     "selftest:audit": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-audit.mjs",
     "selftest:otel": "node scripts/selftest-otel.mjs",
+    "selftest:runner": "bash scripts/selftest-runner.sh",
     "mutation-test": "stryker run",
-    "verify:suite": "npm run build && npm run typecheck && npm run lint && npm run check:help-docs && npm run selftest && npm run selftest:profiles && npm run selftest:cypherbrainignore && npm run selftest:interop && npm run selftest:storage && npm run selftest:rclone && npm run selftest:ton && npm run selftest:ton-provider && npm run selftest:ton-dns && npm run selftest:recovery && npm run selftest:recovery-kit && npm run selftest:restore-security && npm run selftest:pq && npm run selftest:minisign && npm run selftest:push-partial-failure && npm run selftest:idempotency-lib && npm run selftest:import-quietly && npm run selftest:verify-levels && npm run selftest:schedule && npm run selftest:config-file && npm run selftest:init && npm run selftest:gbrain-pglite && npm run selftest:help-docs && npm run selftest:arweave && npm run selftest:arweave-nodeps && npm run selftest:arweave-gateway-cap && npm run selftest:file-toctou && npm run selftest:usd-rate && npm run selftest:wallet-balance && npm run selftest:sdk-advice && npm run selftest:turbo-dep && npm run selftest:ans104-sizing && npm run selftest:error-codes && npm run selftest:progress && npm run selftest:push-balance-report && npm run selftest:doctor && npm run selftest:keygen-force && npm run selftest:properties && npm run selftest:cctv-age && npm run selftest:plan && npm run selftest:ledger && npm run selftest:receipt && npm run selftest:audit && npm run selftest:otel && npm run selftest:mcp-snapshot-policy && bash scripts/cli-smoke.sh && node scripts/mcp-smoke.mjs"
+    "verify:suite": "node scripts/run-selftests.mjs --jobs 3"
   },
   "engines": {
     "node": ">=22.6.0"
