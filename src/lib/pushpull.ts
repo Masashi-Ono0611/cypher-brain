@@ -575,15 +575,18 @@ async function pushCore(
       }
       // #818: the SIDECAR's own paid step can end ambiguously too (its L1 POST lost its
       // response and the follow-up probe found nothing; its ton-provider deploy broadcast
-      // left this process and could not be confirmed). Re-thrown UNCHANGED rather than
-      // re-wrapped: unlike the two branches above there is no confirmed spend and no
-      // sidecar locator to carry, so this error's own `checkIdentifier` — the id an
-      // operator settles the ambiguity with — is the whole payload, and wrapping it as
-      // PushSignatureUploadError would both discard it and report a possible spend as a
-      // plain "the sidecar failed to upload". The ciphertext's own locator is not lost by
-      // rethrowing: push() already printed it above ("pushed <in> -> <locator>"), which is
-      // what mcp.ts captures into the call's log.
-      if (e instanceof PushUncertainSpendError) throw e;
+      // left this process and could not be confirmed). Keeps its own identity rather than
+      // being wrapped as PushSignatureUploadError, which would report a possible spend as
+      // a plain "the sidecar failed to upload" and discard `checkIdentifier` — the id an
+      // operator settles the ambiguity with.
+      //
+      // But NOT re-thrown untouched (multi-model review, Critical): the CIPHERTEXT above
+      // uploaded successfully and its locator is confirmed. Losing it here would make the
+      // documented recovery ("verify, then use a NEW key") re-upload — and on a paid
+      // backend re-pay for — bytes that are already stored. Relying on push()'s own
+      // "pushed <in> -> <locator>" stderr line is not enough: mcp.ts persists and replays
+      // the STRUCTURED payload, and that line is not in it.
+      if (e instanceof PushUncertainSpendError) throw e.withConfirmedCiphertextLocator(locator);
       // The ciphertext (above) already durably uploaded — see PushPartialSuccessError's
       // own doc comment for why this must never be reported the same way as an
       // ordinary push() failure (a caller assuming "nothing happened" here would be

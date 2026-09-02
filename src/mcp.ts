@@ -1534,6 +1534,13 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
             // either field would act on a fiction.
             check_kind: e.checkKind,
             check_identifier: e.checkIdentifier,
+            // Present ONLY when the ambiguous upload was the ".minisig" sidecar and the
+            // ciphertext's own upload had already succeeded (multi-model review,
+            // Critical). Distinctly named rather than `locator`, and never accompanied by
+            // `pushed`, so it cannot be mistaken for "the push succeeded": it is the one
+            // thing here that IS confirmed, and losing it would make the "use a NEW key"
+            // recovery re-pay for bytes that are already stored.
+            ...(e.confirmedCiphertextLocator ? { confirmed_ciphertext_locator: e.confirmedCiphertextLocator } : {}),
             message: annotateErrorMessage(e.message),
             idempotency_key: idempotencyKey ?? null,
             idempotent_replay: false,
@@ -1690,23 +1697,26 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
     // best-effort I/O (see claimIdempotencyKey's own doc comment for what it does and does
     // not remove — it never touches a claim it did not itself create).
     //
-    // #809: UNLESS the result of a possibly-paid call could not be recorded. Releasing
-    // then removes the last thing standing between a retry and a second charge: the log
-    // has no record to replay, and a freed claim lets the retry straight through to the
-    // paid path. Both claims stay held — the in-process Set for a retry against THIS
-    // server, the lock file for one against another process sharing this
-    // CYPHER_BRAIN_HOME — until an operator removes the file named in the warning above.
-    // A wedged key an operator can clear by hand is a strictly better failure than a
-    // silent double-spend, and it is the same fail-closed trade ERR_IDEMPOTENCY_STORE_
-    // UNREADABLE already makes for an unreadable log.
+    // #809: the CROSS-PROCESS claim is kept when the result of a possibly-paid call could
+    // not be recorded. Releasing it removes the last thing standing between a retry and a
+    // second charge: the log has no record to replay, and a freed claim lets the retry
+    // straight through to the paid path. A wedged key an operator can clear by hand is a
+    // strictly better failure than a silent double-spend, and it is the same fail-closed
+    // trade ERR_IDEMPOTENCY_STORE_UNREADABLE already makes for an unreadable log.
+    //
+    // The IN-PROCESS Set entry is dropped either way (multi-model review, Warning). Keeping
+    // it would make the recovery this call's own warning documents — "remove the lock file
+    // to unblock this key" — not actually work against THIS still-running server, which
+    // would then also need a restart. Dropping it loses nothing: a retry in this process
+    // still has to take the file claim, and that `writeFile(..., 'wx')` fails on the
+    // retained lock exactly as another process's would, so both are refused until the file
+    // is gone — and once an operator removes it, both are unblocked.
     //
     // Written as a guarded block rather than an early `return`: a `return` inside a
     // `finally` DISCARDS whatever the `try` was throwing or returning, which would swallow
     // the very error this branch exists to report.
-    if (!retainClaim) {
-      if (lockId) idempotencyInFlight.delete(lockId);
-      if (releaseClaim) await releaseClaim();
-    }
+    if (lockId) idempotencyInFlight.delete(lockId);
+    if (!retainClaim && releaseClaim) await releaseClaim();
   }
 }
 

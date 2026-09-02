@@ -374,6 +374,54 @@ try {
     check('the expired ttl record beside it WAS dropped by that same compaction (the control)', !droppedTtl);
   }
 
+  // ---------- #818: a permanent record cannot be superseded by a ttl one ----------
+  {
+    // Positive control for the guard, not just its absence: the write is attempted and
+    // must be REFUSED, and the tombstone must still be readable afterwards. (No caller
+    // reaches this today — mcp.ts replays the tombstone before it could ever record
+    // again — which is exactly why the invariant is enforced here rather than argued.)
+    const logPath = join(tmp, 'permanent-immutable-log.jsonl');
+    await recordIdempotencyResult(
+      logPath,
+      'snapshot_now',
+      'tombstoned-key',
+      'fp-tomb',
+      { code: 'ERR_PUSH_OUTCOME_UNCERTAIN', check_identifier: 'tx-keep-me' },
+      86400,
+      Date.now(),
+      { disposition: 'error', retention: 'permanent' },
+    );
+    let overwriteThrew;
+    try {
+      await recordIdempotencyResult(logPath, 'snapshot_now', 'tombstoned-key', 'fp-tomb', { pushed: true }, 86400);
+    } catch (e) {
+      overwriteThrew = e;
+    }
+    check(
+      'a ttl-retention write for a key holding a PERMANENT record is refused (fail-closed)',
+      overwriteThrew instanceof IdempotencyStoreError,
+      overwriteThrew ? `${overwriteThrew.constructor.name}: ${overwriteThrew.message}` : 'the write succeeded (BUG)',
+    );
+    const survived = await lookupIdempotencyResult(logPath, 'snapshot_now', 'tombstoned-key', 86400);
+    check(
+      'the tombstone survived that refused write, unchanged',
+      survived?.retention === 'permanent' && survived?.result?.check_identifier === 'tx-keep-me',
+      JSON.stringify(survived),
+    );
+    // The control: another key's ordinary write is unaffected by the guard.
+    let unrelatedThrew;
+    try {
+      await recordIdempotencyResult(logPath, 'snapshot_now', 'unrelated-key', 'fp-unrelated', { pushed: true }, 86400);
+    } catch (e) {
+      unrelatedThrew = e;
+    }
+    check(
+      'control: an ordinary write for a DIFFERENT key still succeeds alongside the tombstone',
+      unrelatedThrew === undefined,
+      unrelatedThrew ? `${unrelatedThrew.constructor.name}: ${unrelatedThrew.message}` : undefined,
+    );
+  }
+
   // ---------- #818: a record written before these fields existed still reads ----------
   {
     // Backward compatibility on disk, exercised against a line written by hand in the

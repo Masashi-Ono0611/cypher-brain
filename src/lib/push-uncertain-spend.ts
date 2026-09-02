@@ -42,6 +42,20 @@ export class PushUncertainSpendError extends Error {
   readonly checkKind: UncertainSpendCheckKind;
   /** The identifier to look up: the signed Arweave tx id, or the TON contract address. */
   readonly checkIdentifier: string;
+  /** Backend-specific description of WHAT went ambiguous — retained so this error can be re-thrown with more context. */
+  readonly detail: string;
+  /** Optional backend-specific pointer to where the identifier can be looked up. */
+  readonly verifyHint: string | undefined;
+  /**
+   * Set ONLY when this error escaped from the ".minisig" sidecar's own upload, after the
+   * CIPHERTEXT's upload had already succeeded (multi-model review, Critical): that locator
+   * is confirmed and must not be lost, or the "verify, then use a new key" recovery
+   * re-uploads — and on a paid backend re-pays for — bytes that are already stored. It is
+   * NOT the uncertain upload's locator: the whole point of this class is that the
+   * ambiguous one has none, which is why this field is named for what it actually is and
+   * why nothing here ever sets a bare `locator`/`pushed`.
+   */
+  readonly confirmedCiphertextLocator: string | undefined;
   constructor(opts: {
     backend: string;
     checkKind: UncertainSpendCheckKind;
@@ -50,6 +64,8 @@ export class PushUncertainSpendError extends Error {
     detail: string;
     /** Optional backend-specific pointer to where the identifier can be looked up. */
     verifyHint?: string;
+    /** See confirmedCiphertextLocator above — set only by the sidecar re-throw in pushpull.ts. */
+    confirmedCiphertextLocator?: string;
     cause?: unknown;
   }) {
     // The literal "the outcome is UNCERTAIN" is load-bearing, not prose: errors.ts's
@@ -63,12 +79,38 @@ export class PushUncertainSpendError extends Error {
       `${opts.backend}: ${opts.detail} — the outcome is UNCERTAIN: the payment may already have happened. ` +
         `Check ${opts.checkKind === 'arweave_tx_id' ? 'Arweave transaction' : 'TON contract'} ` +
         `${opts.checkIdentifier}${opts.verifyHint ? ` (${opts.verifyHint})` : ''} BEFORE re-running push or ` +
-        'retrying with a new idempotency key: if the first attempt did land, a retry pays for a second one.',
+        'retrying with a new idempotency key: if the first attempt did land, a retry pays for a second one.' +
+        (opts.confirmedCiphertextLocator
+          ? ` Only the ".minisig" signature sidecar's own upload is in doubt — the CIPHERTEXT already uploaded ` +
+            `successfully (locator: ${opts.confirmedCiphertextLocator}). Record that locator: re-pushing the ` +
+            'artifact would pay for storing those bytes a second time.'
+          : ''),
       opts.cause === undefined ? undefined : { cause: opts.cause },
     );
     this.name = 'PushUncertainSpendError';
     this.backend = opts.backend;
     this.checkKind = opts.checkKind;
     this.checkIdentifier = opts.checkIdentifier;
+    this.detail = opts.detail;
+    this.verifyHint = opts.verifyHint;
+    this.confirmedCiphertextLocator = opts.confirmedCiphertextLocator;
+  }
+
+  /**
+   * The same uncertain outcome, re-thrown from pushpull.ts's ".minisig" catch with the
+   * CIPHERTEXT's already-confirmed locator attached. A copy rather than a mutation so the
+   * class stays immutable, and `cause` chains to the original so nothing about where it
+   * came from is lost.
+   */
+  withConfirmedCiphertextLocator(locator: string): PushUncertainSpendError {
+    return new PushUncertainSpendError({
+      backend: this.backend,
+      checkKind: this.checkKind,
+      checkIdentifier: this.checkIdentifier,
+      detail: this.detail,
+      verifyHint: this.verifyHint,
+      confirmedCiphertextLocator: locator,
+      cause: this,
+    });
   }
 }

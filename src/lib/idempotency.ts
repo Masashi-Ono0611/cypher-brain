@@ -468,11 +468,27 @@ export async function recordIdempotencyResult(
     // payment was never settled.
     //
     // The SAME (tool, key) is still superseded, exactly as before (that is what the
-    // partial-success path needs). Superseding a PERMANENT record is unreachable rather
-    // than allowed: a later call under that key finds the tombstone on lookup — which
-    // isLive() keeps returning regardless of age — and replays it before any work, so no
-    // second record for that key is ever written. Enforcing it here as well would mean a
-    // throw on a path that cannot be taken, with no way to test the guard firing.
+    // partial-success path needs) — EXCEPT when what is being superseded is a live
+    // permanent record and the incoming one is not (multi-model review, Suggestion).
+    // Reaching that needs a caller bug: a later call under such a key finds the tombstone
+    // on lookup — which isLive() returns regardless of age — and replays it before doing
+    // any work, so no second record for it is ever written today. Enforced here anyway
+    // rather than argued: "the tombstone is never overwritten" is the invariant the whole
+    // double-spend guard rests on, and leaving it to every present and future caller to
+    // preserve is how it eventually stops holding. Fail closed — the caller (mcp.ts)
+    // treats a record-write failure as grounds to RETAIN the claim, so a bug here wedges
+    // the key rather than freeing it.
+    const supersededPermanent = existing.find(
+      (r) => r.tool === tool && r.key === key && r.retention === 'permanent' && isLive(r, ttlSeconds, now),
+    );
+    if (supersededPermanent && retention !== 'permanent') {
+      throw new IdempotencyStoreError(
+        `refusing to overwrite the PERMANENT idempotency record for (tool=${JSON.stringify(tool)}, ` +
+          `key=${JSON.stringify(key)}) in ${path} with a ${retention}-retention one: that record exists because a ` +
+          'paid operation under this key had an outcome nothing could confirm, and dropping it is exactly how a ' +
+          'retry ends up paying twice. Verify the outcome on-chain and use a NEW key.',
+      );
+    }
     const kept = existing.filter((r) => !(r.tool === tool && r.key === key) && isLive(r, ttlSeconds, now));
     const fresh: StoredLine = {
       key,

@@ -407,6 +407,51 @@ async function main() {
       JSON.stringify(claimLocks),
     );
 
+    // The SAME process must be refused too — dropping the in-process Set entry (so the
+    // documented "remove the lock file" recovery actually works, see below) must not open
+    // a hole: the file claim is what refuses both.
+    client.send({
+      jsonrpc: '2.0',
+      id: 13,
+      method: 'tools/call',
+      params: { name: 'snapshot_now', arguments: snapshotArgs(out2, key2) },
+    });
+    const sameProcess = await client.waitFor(13);
+    check(
+      'the SAME server process is refused for that key too, by the retained file claim',
+      sameProcess.result?.isError === true && sc(sameProcess)?.code === 'ERR_IDEMPOTENCY_IN_FLIGHT',
+      JSON.stringify(sameProcess.result).slice(0, 400),
+    );
+
+    // The operator's documented recovery: verify what happened, then remove the named lock
+    // file. That must genuinely unblock the key WITHOUT restarting the server.
+    for (const name of claimLocks) await rm(join(home, name), { force: true });
+    // The whole prior snapshot, sidecars included: snapshot() no-clobbers `.digest` and
+    // `.recipients-fingerprint` as well as the ciphertext itself.
+    for (const suffix of ['', '.digest', '.recipients-fingerprint', '.minisig']) {
+      await rm(`${out2}${suffix}`, { force: true });
+    }
+    client.send({
+      jsonrpc: '2.0',
+      id: 14,
+      method: 'tools/call',
+      params: { name: 'snapshot_now', arguments: snapshotArgs(out2, key2) },
+    });
+    const recovered = await client.waitFor(14);
+    const recoveredSc = sc(recovered);
+    check(
+      'removing the lock file unblocks that key on the ALREADY-RUNNING server (no restart needed)',
+      recovered.result?.isError === true &&
+        recoveredSc?.code === 'ERR_PUSH_OUTCOME_UNCERTAIN' &&
+        recoveredSc?.idempotent_replay === false,
+      JSON.stringify(recovered.result).slice(0, 400),
+    );
+    check(
+      'that recovered call really re-executed (the gateway counter moved to 3)',
+      gateway.state.submissions === 3,
+      `submissions=${gateway.state.submissions}`,
+    );
+
     // ---------- 5. a NEW key still executes ----------
     // The guard blocks a key whose outcome is unresolved, not the tool: an operator who
     // has checked the chain and wants to try again with a new key must be able to.
@@ -430,7 +475,7 @@ async function main() {
     );
     check(
       'that new key DID submit a transaction (counter moved) — the guard is per-key, not global',
-      gateway.state.submissions === 3,
+      gateway.state.submissions === 4,
       `submissions=${gateway.state.submissions}`,
     );
   } finally {

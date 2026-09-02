@@ -586,6 +586,80 @@ try {
     ? pass('#818: an unconfirmed spend writes no receipt-ledger entry (the control for the #802 case above)')
     : fail(`an unconfirmed spend was written to the receipt ledger: ${uncertainLedger.slice(0, 300)}`);
 
+  // #818 (multi-model review, Critical): the SIDECAR's own upload is the ambiguous
+  // one. A signed push is TWO paid transactions; when the ciphertext's lands and the
+  // ".minisig" sidecar's ends uncertain, the ciphertext's locator is CONFIRMED and
+  // must survive — otherwise the documented recovery ("verify, then use a new key")
+  // re-uploads and re-pays for bytes that are already stored. This proxy forwards the
+  // FIRST POST untouched and blinds only the second.
+  log('#818: an uncertain SIDECAR upload still carries the ciphertext locator that DID land');
+  const sidecarSrvFile = join(tmp, 'blind-second-post-proxy.mjs');
+  await writeFile(
+    sidecarSrvFile,
+    "import {createServer,request} from 'node:http';\n" +
+      'const UP=Number(process.argv[2]);\n' +
+      'let posts=0;\n' +
+      'const s=createServer((q,res)=>{\n' +
+      "  const isPost=q.method==='POST'&&/^\\/tx\\/?$/.test(q.url||'');\n" +
+      '  const drop=isPost&&++posts>1;\n' +
+      '  // Blind the probe only once the sidecar POST is the one in flight, so the\n' +
+      '  // ciphertext own upload stays a completely ordinary success.\n' +
+      "  if(posts>1&&/^\\/tx\\/[A-Za-z0-9_-]{43}\\/status$/.test(q.url||'')){res.writeHead(404);res.end('Not Found');return;}\n" +
+      "  const up=request({host:'127.0.0.1',port:UP,path:q.url,method:q.method,headers:q.headers},(r)=>{\n" +
+      "    if(drop){r.resume();r.on('end',()=>res.socket&&res.socket.destroy());return;}\n" +
+      '    res.writeHead(r.statusCode||502,r.headers);r.pipe(res);\n' +
+      '  });\n' +
+      "  up.on('error',()=>res.socket&&res.socket.destroy());\n" +
+      '  q.pipe(up);\n' +
+      '});\n' +
+      "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
+  );
+  const sidecarSrv = spawn('node', [sidecarSrvFile, String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const sidecarPort = await new Promise((res, rej) => {
+    const to = setTimeout(() => rej(new Error('sidecar proxy did not start')), 8000);
+    sidecarSrv.stdout.on('data', (d) => {
+      const m = String(d).match(/READY:(\d+)/);
+      if (m) {
+        clearTimeout(to);
+        res(m[1]);
+      }
+    });
+  });
+  const sidecarSnap = join(tmp, 'sidecar-uncertain.age');
+  cb('snapshot', '--dir', src, '--out', sidecarSnap, '--sign');
+  const sidecarPush = spawnSync('node', [...DEV_ARGS, BIN, 'push', '--in', sidecarSnap, '--backend', 'arweave'], {
+    env: {
+      ...env,
+      CYPHER_BRAIN_AR_HOST: '127.0.0.1',
+      CYPHER_BRAIN_AR_PORT: sidecarPort,
+      CYPHER_BRAIN_AR_HTTP_TIMEOUT: '4000',
+      CYPHER_BRAIN_RECEIPT_LEDGER: join(tmp, 'sidecar-ledger.jsonl'),
+    },
+    encoding: 'utf8',
+    timeout: 120_000,
+  });
+  sidecarSrv.kill('SIGKILL');
+  const ciphertextLocator = (sidecarPush.stderr.match(
+    /CIPHERTEXT already uploaded successfully \(locator: ([A-Za-z0-9_-]{43})\)/,
+  ) || [])[1];
+  sidecarPush.status !== 0 && /the outcome is UNCERTAIN/.test(sidecarPush.stderr) && TX_RE.test(ciphertextLocator ?? '')
+    ? pass('#818: an uncertain sidecar upload names the ciphertext locator that DID land (no need to re-pay for it)')
+    : fail(
+        `the uncertain sidecar upload lost the confirmed ciphertext locator: status=${sidecarPush.status} stderr=${(sidecarPush.stderr || '').slice(-700)}`,
+      );
+  // It really is the CIPHERTEXT's: push prints `pushed <in> -> <id>` for it, and that
+  // is the id the error carries — not the sidecar's own (which has none, being the
+  // upload whose outcome is unknown).
+  const pushedCiphertextLine = (sidecarPush.stderr || '')
+    .split('\n')
+    .find((l) => l.startsWith(`pushed ${sidecarSnap} ->`));
+  ciphertextLocator && pushedCiphertextLine?.includes(ciphertextLocator)
+    ? pass('#818: that locator is the one push assigned to the CIPHERTEXT, not the sidecar')
+    : fail(
+        `the reported locator is not the ciphertext's own (push line: ${pushedCiphertextLine ?? 'MISSING'}, ` +
+          `error named: ${ciphertextLocator ?? 'NONE'})`,
+      );
+
   // negative control: an unknown (but well-formed) tx id returns no bytes
   const badId = 'A'.repeat(43);
   const r = spawnSync(

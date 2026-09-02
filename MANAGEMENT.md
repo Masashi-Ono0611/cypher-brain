@@ -563,6 +563,18 @@ error and does no paid work, forever. Expiring it would not settle the ambiguity
 only postpone the retry that pays a second time. Settle it by checking
 `check_identifier` on-chain, then use a NEW key for whatever you decide to do next.
 
+One extra field appears when the ambiguous upload was the `.minisig` signature sidecar of
+a **signed** push, whose ciphertext had already uploaded successfully:
+`confirmed_ciphertext_locator`. That locator IS confirmed — record it, and do not re-push
+the artifact when you move to a new key, or you pay to store the same bytes twice. It is
+named separately from `locator` (and never accompanied by `pushed`) precisely so it cannot
+be read as "the push succeeded".
+
+A caveat on downgrades: a cypher-brain older than this release does not know what
+`retention: permanent` means and will treat such a record as an ordinary TTL one —
+replaying it as a success and eventually compacting it away. Do not roll back to an older
+version while an unresolved tombstone is live in the log.
+
 **A key that will not release.** If a call that may have spent cannot write its result
 record (a full disk, a read-only log), the server RETAINS the idempotency claim instead of
 releasing it (issue #809) — a freed claim plus a missing record is precisely the state in
