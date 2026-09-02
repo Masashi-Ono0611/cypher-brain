@@ -109,6 +109,20 @@ import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 import { PushFundingConfirmedButIncompleteError } from '../push-partial-success.js';
 import { PushUncertainSpendError } from '../push-uncertain-spend.js';
 import { spentSoFar, remainingSpendBudget, chargeSpendTracker } from '../spend-tracker.js';
+// #808/#665: the durable "a paid deploy is about to happen / has happened" sidecar, and
+// the receipt ledger it settles against. Both are leaf modules (config/util only), so
+// neither closes an import cycle back into this file — same reasoning as the
+// push-partial-success.ts import above.
+import {
+  recordSpendIntent,
+  advanceSpendIntent,
+  readSpendIntents,
+  unsettledIntentForContract,
+  recordedProviderForContract,
+  PENDING_SPENDS_LOG,
+  type SpendIntentRecord,
+} from '../pending-spend.js';
+import { readReceipts, type ReceiptEntry } from '../receipt.js';
 
 // Lazy loader for @ton/ton's VALUE exports (beginCell/Cell/Dictionary/Address/
 // contractAddress/storeStateInit) — mirrors wallet.ts's getArweave(). Cached after the
@@ -970,6 +984,71 @@ async function createLocalBag(apiUrl: string, bagDir: string): Promise<LocalBagI
   }
 }
 
+// ---------- #808: the receipt-ledger side of the pending-spend reconciliation ----------
+// The receipt ledger is the AUTHORITY on "has this contract's spend already been
+// recorded" — the pending-spend sidecar is only ever a hint about it. Both are consulted
+// because they can disagree in one direction that matters: a run can append the receipt
+// and die before advancing its intent to `settled`, and a later run that trusted the
+// intent alone would then write the SAME spend a second time. Matched on the contract
+// address inside `raw` (what ton-provider.ts's own onReceipt call writes, #484), not on
+// the locator: two DIFFERENT deploys of the same bag by different owners share a locator
+// but never share a contract address.
+async function ledgerReceiptForContract(contractAddrRaw: string): Promise<ReceiptEntry | null> {
+  const { receipts } = await readReceipts();
+  for (let i = receipts.length - 1; i >= 0; i--) {
+    const r = receipts[i];
+    if (r.backend !== 'ton-provider') continue;
+    const raw = r.raw as { contract_address?: unknown } | null;
+    if (raw && typeof raw === 'object' && raw.contract_address === contractAddrRaw) return r;
+  }
+  return null;
+}
+
+// The provider pubkey a #654/#484 receipt recorded for a contract — #665's authority (a)
+// fallback when no pending-spend intent covers it (a spend recorded by a cypher-brain
+// that predates the intent sidecar still has its receipt).
+function providerPubkeyFromReceipt(receipt: ReceiptEntry | null): string | null {
+  const raw = receipt?.raw as { provider_pubkey?: unknown } | null | undefined;
+  if (!raw || typeof raw !== 'object') return null;
+  return typeof raw.provider_pubkey === 'string' && raw.provider_pubkey ? raw.provider_pubkey : null;
+}
+
+// Advance an intent to `settled` ONLY once a receipt for its contract is verifiably on
+// disk. Deliberately not "onReceipt returned, therefore the receipt exists": pushpull.ts's
+// persistReceipt() CATCHES its own append failure and warns rather than throwing, so a
+// caller that settled on return alone would mark the ledger complete precisely when it is
+// not — reopening #808's gap with a record claiming it is closed. When the receipt is
+// absent (or cannot be checked), the intent is left where it is, which is what makes
+// `doctor`'s pending-spend-intents check report it.
+async function settleIntentAgainstLedger(intent: SpendIntentRecord, contractAddrRaw: string): Promise<void> {
+  let recorded: ReceiptEntry | null;
+  try {
+    recorded = await ledgerReceiptForContract(contractAddrRaw);
+  } catch (e) {
+    warn(
+      `ton-provider: could not confirm the receipt for contract ${contractAddrRaw} reached the receipt ledger ` +
+        `(${errMsg(e)}) — leaving its pending-spend record in ${PENDING_SPENDS_LOG} unsettled so 'cypher-brain ` +
+        "doctor' keeps reporting it",
+    );
+    return;
+  }
+  if (recorded === null) {
+    warn(
+      `ton-provider: the confirmed spend for contract ${contractAddrRaw} did NOT reach the receipt ledger — its ` +
+        `pending-spend record in ${PENDING_SPENDS_LOG} stays unsettled, 'cypher-brain doctor' reports it, and a ` +
+        'later push of the same artifact will write the missing receipt',
+    );
+    return;
+  }
+  try {
+    await advanceSpendIntent(intent, 'settled');
+  } catch (e) {
+    // Harmless in the direction that matters: the receipt IS on disk, so the ledger is
+    // correct and the only cost is a stale entry doctor will keep reporting.
+    warn(`ton-provider: could not mark the pending-spend record for ${contractAddrRaw} settled (${errMsg(e)})`);
+  }
+}
+
 // Calls notify() repeatedly (each call re-sends the RLDP request, safe/idempotent on the
 // provider side) until it reports having downloaded the FULL bag — only THEN is it safe
 // for put() to stop the local ephemeral seed, since until that point the provider's own
@@ -1386,6 +1465,107 @@ export function tonProviderBackend(): StorageBackend {
               'of relying on a second deploy.',
           );
         }
+
+        // ---------- #808/#665: reconcile with what an EARLIER run durably recorded ----------
+        // Keyed on the contract address for the same reason the #638 guard above is: it
+        // is stable across runs (bag id + owner + size + piece size + merkle hash — never
+        // which provider was picked), and it is the identifier an operator checks on an
+        // explorer.
+        const contractAddressRaw = deploy.contractAddress.toRawString();
+        // #665: which provider to notify. On a fresh deploy that is this run's own
+        // selection. On the already-active branch it must NOT be — the contract's
+        // on-chain `providers` dict was written by whichever run actually deployed it,
+        // and `modify_providers` REPLACES rather than merges (see
+        // scripts/go/storage-v1-client/updateproviders.go), so notifying a provider this
+        // run happened to pick from a fresher mytonprovider.org snapshot can address a
+        // provider that never held this bag at all.
+        let notifyPubkey = provider.pubkey;
+        // #808: an earlier run's confirmed-but-unrecorded spend, if there is one.
+        let resumable: SpendIntentRecord | null = null;
+        let priorReceipt: ReceiptEntry | null = null;
+        if (alreadyActive) {
+          // Read failures propagate rather than degrading to "nothing recorded": the two
+          // decisions below (write a missing receipt / notify the deployed provider) are
+          // both WRONG if taken on a log that could not be read, and this branch has
+          // moved no funds, so refusing costs nothing but a retry — the same fail-closed
+          // posture as the #805 guard above.
+          const { intents } = await readSpendIntents();
+          resumable = unsettledIntentForContract(intents, contractAddressRaw);
+          priorReceipt = await ledgerReceiptForContract(contractAddressRaw);
+          // Authority (a): this backend's own durable records — the intent written before
+          // the deploy that actually paid (#808), else the receipt written after it
+          // (#654/#484). Authority (b), reading the StorageV1 contract's own on-chain
+          // `providers` dict, is NOT implemented: neither @ton/ton as used here nor
+          // scripts/go/storage-v1-client exposes a call for it today, so it is new
+          // cross-language plumbing rather than a read of something already available.
+          // Tracked as the remaining half of issue #665.
+          const recordedPubkey =
+            recordedProviderForContract(intents, contractAddressRaw) ?? providerPubkeyFromReceipt(priorReceipt);
+          const haveSomeRecord =
+            intents.some((i) => i.contract_address === contractAddressRaw) || priorReceipt !== null;
+          if (recordedPubkey !== null) {
+            notifyPubkey = recordedPubkey;
+            if (recordedPubkey !== provider.pubkey) {
+              warn(
+                `ton-provider: contract ${contractAddressRaw} was deployed with provider ${recordedPubkey}, but this ` +
+                  `run's registry snapshot selected ${provider.pubkey} — notifying the RECORDED provider ` +
+                  `${recordedPubkey}, the one the contract's on-chain dict actually names (#665). To hand this bag ` +
+                  'to a DIFFERENT provider, register it deliberately with `update-providers` ' +
+                  '(scripts/go/storage-v1-client) — a retry must not do it by accident.',
+              );
+            }
+          } else if (haveSomeRecord) {
+            // A record for this exact contract exists but names no provider — a
+            // hand-edited or foreign line. Refusing beats guessing: notifying this run's
+            // freshly selected provider would address one that may never have held the
+            // bag, and no funds move either way on this branch.
+            throw new Error(
+              `ton-provider backend: contract ${contractAddressRaw} is already funded on-chain and this machine has ` +
+                'a record of that spend, but the record does not name the provider it was deployed with — refusing ' +
+                `to notify this run's freshly selected provider ${provider.pubkey}, which may never have held this ` +
+                `bag. Check ${PENDING_SPENDS_LOG} / the receipt ledger for the contract's own provider pubkey, or ` +
+                're-run `update-providers` (scripts/go/storage-v1-client) to register a provider deliberately (#665).',
+            );
+          } else {
+            warn(
+              `ton-provider: no local record names the provider contract ${contractAddressRaw} was deployed with ` +
+                `(no pending-spend intent, no receipt) — notifying this run's selected provider ${provider.pubkey}, ` +
+                'which may not be the one holding the bag. Reading the provider back from the contract itself is ' +
+                'issue #665.',
+            );
+          }
+        }
+
+        // #808: the durable record goes down BEFORE anything can move funds, so a
+        // SIGKILL/OOM/power loss anywhere after the broadcast leaves evidence that a
+        // spend was attempted. Refuses the push if it cannot be written, rather than
+        // broadcasting a transfer nothing would be able to account for: no funds have
+        // moved at this point, and the same artifact re-derives the same bag and contract
+        // on a later run, so nothing is lost by stopping here (same "fail closed while it
+        // is still free" reasoning as the #805 guard above).
+        let intent: SpendIntentRecord | null = null;
+        if (!alreadyActive) {
+          try {
+            intent = await recordSpendIntent({
+              backend: 'ton-provider',
+              contract_address: contractAddressRaw,
+              bag_id: bag.bagId,
+              provider_pubkey: provider.pubkey,
+              amount_nano: deploy.amountNano.toString(),
+              cost_nano: deploy.costNano.toString(),
+              deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
+              locator: tonProviderLocator(bag.bagId),
+            });
+          } catch (e) {
+            throw new Error(
+              `ton-provider backend: could not write the pending-spend record to ${PENDING_SPENDS_LOG} ` +
+                `(${errMsg(e)}) — refusing to broadcast a ${deploy.amountNano} nanoTON transfer that nothing would ` +
+                'be able to account for if this process died before the receipt reached disk (#808). No funds ' +
+                'moved. Fix the path (permissions, a full disk, or CYPHER_BRAIN_RECEIPT_LEDGER pointing somewhere ' +
+                'unwritable) and re-run push — the same ciphertext reuses the same bag, so nothing is lost.',
+            );
+          }
+        }
         // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
         // signer balance, #342) — WARN only, never abort, for BOTH signing paths: a
         // balance read has no freshness guarantee, so it must never be what blocks a
@@ -1545,11 +1725,21 @@ export function tonProviderBackend(): StorageBackend {
         // recorded — or never recorded at all — by whichever earlier run actually paid;
         // see issue #654's own follow-up issues for the residual gaps this does not
         // attempt to backfill).
+        //
+        // #808: the receipt write is STILL not instantaneous (persistReceipt hashes the
+        // whole ciphertext first), so the intent recorded before the broadcast is
+        // advanced to `confirmed` here — between the irreversible fact and the durable
+        // record of it — and only advanced to `settled` once the receipt is verifiably
+        // on disk. A crash in that window now leaves a `confirmed` record naming the
+        // contract, the provider and the exact amount, which is what lets the
+        // already-active branch below finish the job on a later run instead of skipping
+        // silently forever.
         if (!alreadyActive) {
+          if (intent) intent = await advanceSpendIntent(intent, 'confirmed');
           await opts.onReceipt?.({
             locator,
             raw: {
-              contract_address: deploy.contractAddress.toRawString(),
+              contract_address: contractAddressRaw,
               bag_id: bag.bagId,
               provider_pubkey: provider.pubkey,
               cost_nano: deploy.costNano.toString(),
@@ -1562,6 +1752,60 @@ export function tonProviderBackend(): StorageBackend {
             // own comments/errors, the Go client's own output).
             cost: { amount: deploy.amountNano.toString(), unit: 'nanoTON' },
           });
+          if (intent) await settleIntentAgainstLedger(intent, contractAddressRaw);
+        } else if (resumable !== null) {
+          // #808 recovery. This run moved no funds, so the #638 reasoning that forbids
+          // writing a receipt HERE from this run's own recomputed numbers still holds —
+          // and is not what happens: every figure below comes from the intent an EARLIER
+          // run wrote against the deploy that actually paid, so this is that run's
+          // receipt, written late, not a second record of one spend.
+          if (priorReceipt !== null) {
+            // The earlier run got further than its own record says (appended the receipt,
+            // died before marking the intent settled). Nothing is owed but the marker.
+            await advanceSpendIntent(resumable, 'settled');
+          } else {
+            if (resumable.state === 'pending') {
+              // The earlier run never observed confirmation — it died, or ended in a #822
+              // uncertain-spend refusal. What settles it is the same evidence #664 uses:
+              // this address is not `nonexist`. Attribution stays inferential (a
+              // concurrent push, or someone funding the address by hand, would look the
+              // same), and saying so is better than either silently recording it or
+              // silently dropping it.
+              warn(
+                `ton-provider: a pending-spend record for contract ${contractAddressRaw} was never confirmed by the ` +
+                  'run that wrote it, and the contract now shows on-chain activity — treating that spend as having ' +
+                  'landed and recording it now. If something else funded this exact address, the receipt is ' +
+                  'attributed to that earlier run in error (#808).',
+              );
+            }
+            warn(
+              `ton-provider: recording a receipt an earlier run confirmed but never wrote — contract ` +
+                `${contractAddressRaw}, ${resumable.amount_nano} nanoTON, provider ${resumable.provider_pubkey} ` +
+                `(recorded ${resumable.timestamp}). The spend was already made; the ledger was short by it until ` +
+                'now (#808).',
+            );
+            if (resumable.state !== 'confirmed') resumable = await advanceSpendIntent(resumable, 'confirmed');
+            await opts.onReceipt?.({
+              locator,
+              raw: {
+                contract_address: resumable.contract_address,
+                bag_id: resumable.bag_id,
+                provider_pubkey: resumable.provider_pubkey,
+                cost_nano: resumable.cost_nano,
+                deploy_buffer_nano: resumable.deploy_buffer_nano,
+                amount_nano: resumable.amount_nano,
+                // The one field that is NOT the earlier run's: this receipt is being
+                // appended now, by this run, on that run's behalf.
+                recorded_by_later_run: true,
+              },
+              // `null`, not an empty/garbage amount, when the record does not name one
+              // (a hand-edited line): ledger.ts counts a null-cost receipt as
+              // `unpriced_receipts` and says so, which is honest — a cost string it
+              // cannot parse would be counted the same way but reads like a bug.
+              cost: /^\d+$/.test(resumable.amount_nano) ? { amount: resumable.amount_nano, unit: 'nanoTON' } : null,
+            });
+            await settleIntentAgainstLedger(resumable, contractAddressRaw);
+          }
         }
 
         // issue #654: notify is the only remaining step, and by now the spend above is
@@ -1572,7 +1816,11 @@ export function tonProviderBackend(): StorageBackend {
         // PushFundingConfirmedButIncompleteError, not a plain Error, regardless of
         // alreadyActive: the on-chain funding fact is true either way by this point.
         try {
-          await notifyProviderWithRetry(provider.pubkey, deploy.contractAddress.toRawString(), bag.dataSizeBytes);
+          // #665: `notifyPubkey`, not `provider.pubkey` — on the already-active branch
+          // those differ whenever this run's registry snapshot picked someone other than
+          // the provider the contract was actually deployed with (see its resolution
+          // above).
+          await notifyProviderWithRetry(notifyPubkey, contractAddressRaw, bag.dataSizeBytes);
         } catch (e) {
           throw new PushFundingConfirmedButIncompleteError(locator, e);
         }
@@ -1580,7 +1828,7 @@ export function tonProviderBackend(): StorageBackend {
         // is the line an operator actually sees before their local seed stops — "safe"
         // is the provider's OWN claim, not a cryptographic proof this push verified.
         console.error(
-          `ton-provider: provider ${provider.pubkey} reports the full bag downloaded — stopping the local seed ` +
+          `ton-provider: provider ${notifyPubkey} reports the full bag downloaded — stopping the local seed ` +
             "(this is the provider's own self-report, not independently verified against a merkle proof or a " +
             'spot-check retrieval — see docs/ton-storage-status.md and issue #652 for the known gap)',
         );
