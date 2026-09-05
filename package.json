@@ -88,6 +88,7 @@
     "selftest:sdk-advice": "node scripts/selftest-sdk-advice.mjs",
     "selftest:turbo-dep": "node scripts/selftest-turbo-dep.mjs",
     "selftest:ans104-sizing": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-ans104-sizing.mjs",
+    "selftest:runbook": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-runbook.mjs",
     "selftest:error-codes": "node scripts/selftest-error-codes.mjs",
     "selftest:mcp-snapshot-policy": "node scripts/selftest-mcp-snapshot-policy.mjs",
     "selftest:progress": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-progress.mjs",

@@ -33,6 +33,7 @@ import { mkdir, writeFile, readFile, rm, readdir, chmod, stat, open } from 'node
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { realpathSync, type Stats } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { userInfo } from 'node:os';
 
 import { join, resolve, dirname, basename } from 'node:path';
 import {
@@ -603,10 +604,62 @@ function loadLaunchd(): void {
   }
 }
 
+// `crontab -l` exits non-zero for two very different reasons, and used to be treated the
+// same way: the user genuinely has no crontab yet OR a real failure (a corrupted crontab
+// file, a permission problem, a broken PATH shim, crontab itself missing a required
+// argument). Collapsing both into "" here made loadCron() below believe a still-existing,
+// merely-unreadable crontab was EMPTY and overwrite it outright via `crontab -` —
+// silently destroying every non-cypher-brain entry a real error should have refused to
+// touch instead of guessing. Two message shapes are recognized for the confirmed-empty
+// case, covering the two crontab implementations this codebase is checked against:
+// vixie-cron/cronie/macOS's own bsd cron (all derived from the same lineage) print
+// exactly "no crontab for <user>"; BusyBox's crontab (common on Alpine-based containers)
+// has no such dedicated message at all — verified against its source
+// (miscutils/crontab.c): `-l` does `xchdir(crontab_dir)` then `bb_cat({pw_name, NULL})`,
+// so a first-time install there fails with an ordinary applet-prefixed "No such file or
+// directory" whose FILENAME portion is the bare current username (not a path — the
+// chdir() already happened).
+//
+// A first Codex re-review round suggested matching "no such file or directory" plus a
+// bare "cron" substring; a second round correctly rejected that too — BusyBox's own
+// error is *itself* prefixed with its applet name ("crontab: <user>: No such file or
+// directory"), so an UNRELATED failure from a wrapper whose own path/name happens to
+// contain "cron" (e.g. a wrapper literally named /usr/local/bin/crontab hitting some
+// other missing internal dependency) would satisfy that same bare substring check just
+// as easily as the genuine case — reopening the exact silent-overwrite risk this whole
+// function exists to close. The one signal that actually distinguishes them is the
+// MISSING FILENAME itself: BusyBox's bb_cat() receives exactly `pw_name` — a bare
+// username with NO path, since `xchdir(crontab_dir)` already happened — so the message's
+// filename SEGMENT (not merely a substring anywhere in the line) must be EXACTLY the
+// current username. A sixth Codex re-review round found that a word-boundary substring
+// match still passed a path like "/home/<user>/bin/helper" (an unrelated failure whose
+// path merely CONTAINS the username as one of its own components, bounded by "/" on
+// both sides) — this parses out the actual filename segment between the last ": " and
+// the "No such file or directory" suffix and requires an EXACT match instead.
+function looksLikeNoCrontabYet(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  if (s.includes('no crontab for')) return true;
+  const m = /(.*):\s*no such file or directory\s*$/i.exec(stderr.trimEnd());
+  if (!m) return false;
+  const beforeSuffix = m[1];
+  const lastColon = beforeSuffix.lastIndexOf(':');
+  const filenameSegment = (lastColon === -1 ? beforeSuffix : beforeSuffix.slice(lastColon + 1)).trim();
+  let username: string;
+  try {
+    username = userInfo().username;
+  } catch {
+    return false; // cannot determine who we are — do not guess
+  }
+  if (!username) return false;
+  return filenameSegment === username;
+}
+
 function crontabText(): string {
   const r = sh('crontab', ['-l']);
   if (r.error) throw new Error(`crontab not available: ${r.error.message}`);
-  return r.status === 0 ? r.stdout : ''; // non-zero = no crontab for this user yet
+  if (r.status === 0) return r.stdout;
+  if (looksLikeNoCrontabYet(r.stderr || '')) return ''; // the one confirmed "genuinely empty" case
+  throw new Error(`crontab -l failed: ${(r.stderr || '').trim() || `exit ${r.status}`}`);
 }
 
 function loadCron(entry: string): void {
@@ -1538,7 +1591,16 @@ export async function scheduleStatusReport(): Promise<ScheduleStatusReport> {
     const needle = legacyEntry ?? CRON_MARKER;
     loadedYesNo = 'unknown';
     const r = sh('crontab', ['-l']);
-    if (!r.error) loadedYesNo = r.status === 0 && r.stdout.includes(needle) ? 'yes' : 'no';
+    // Same disambiguation as crontabText() above: a confirmed "no crontab for ..." means
+    // definitely not registered (there is nothing FOR it to be registered in), but any
+    // OTHER non-zero exit is a crontab -l failure this check genuinely could not read
+    // through — same "unknown, not a confident no" posture the launchd branch above
+    // already takes for its own bounded-away/errored case, applied here to the case a
+    // real crontab error is what made status()==0 false rather than an absent entry.
+    if (!r.error) {
+      if (r.status === 0) loadedYesNo = r.stdout.includes(needle) ? 'yes' : 'no';
+      else if (looksLikeNoCrontabYet(r.stderr || '')) loadedYesNo = 'no';
+    }
     triggerEntry = entryLine;
     if (legacyEntry) legacyNote = legacyCronNote(cronMarkerOf(legacyEntry));
   }

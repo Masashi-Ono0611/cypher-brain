@@ -395,6 +395,7 @@ async function pushCoreLocked(
     const result = validatePlan(plan, {
       backend: o.backend,
       artifactSha256,
+      sizeBytes,
       freshEstimate,
       payerAddress,
       remote,

@@ -148,6 +148,10 @@ const PARALLEL = [
   npmTest('selftest:mcp-uncertain-spend'),
   npmTest('selftest:turbo-dep'),
   npmTest('selftest:ans104-sizing'),
+  // Pure in-process unit test for extractSection() (src/lib/runbook.ts) — spawns nothing,
+  // writes nothing, reads only its own source (same shared-state findings as
+  // -ans104-sizing/-cctv-age/-error-codes/-import-quietly/-progress/-turbo-dep above).
+  npmTest('selftest:runbook'),
   npmTest('selftest:push-partial-failure'),
   npmTest('selftest:push-balance-report'),
   npmTest('selftest:arweave-nodeps'),

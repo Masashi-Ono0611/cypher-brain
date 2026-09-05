@@ -239,7 +239,12 @@ async function main() {
 // (the DEFAULT-TTL regression every other test in this file already depends on).
 async function runIdempotencyTtlValidationTest(tmp) {
   const home = join(tmp, 'home-ttl-validation');
-  const badValues = ['not-a-number', '0', '-5', 'Infinity', '1.5'];
+  // '999999999999' (~31700 years) is an ordinary finite integer — Number.isFinite/
+  // Number.isInteger both pass it — so it exercises the UPPER-bound check specifically,
+  // distinct from the NaN/zero/negative/Infinity cases above it: unbounded, it would
+  // function as "never expires" for any realistic operational timeframe, defeating the
+  // exact replay-window guarantee CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS's default exists for.
+  const badValues = ['not-a-number', '0', '-5', 'Infinity', '1.5', '999999999999'];
   for (const bad of badValues) {
     const res = spawnSync(process.execPath, [SERVER_PATH], {
       env: { ...process.env, CYPHER_BRAIN_HOME: home, CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS: bad },

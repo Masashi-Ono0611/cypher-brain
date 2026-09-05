@@ -1513,5 +1513,138 @@ else
   echo "[SKIP] (g3)/(g4) launchd-only checks — not macOS"
 fi
 
+echo "== (h) 'crontab -l' non-zero exit: a genuine failure is surfaced, not silently treated as an empty crontab =="
+# On Darwin, install() always registers via launchd (process.platform-derived — see
+# src/lib/schedule.ts), so the cron branch (crontabText()/loadCron()) is unreachable
+# regardless of what this host's real crontab binary does. On every other platform,
+# install()'s real (non --no-load) registration path DOES call it, so a stubbed `crontab`
+# ahead of PATH exercises the real code, real (fake) subprocess, real non-zero exit.
+if [ "$OS" = "Darwin" ]; then
+  echo "[SKIP] crontab -l disambiguation — this platform installs via launchd, not cron"
+else
+  CRONSTUB="$TMP/cronstub"; mkdir -p "$CRONSTUB"
+  cat > "$CRONSTUB/crontab" <<'EOF'
+#!/usr/bin/env bash
+# Fake crontab: `-l` behavior is controlled by CRONTAB_STUB_MODE so the test can pick
+# between the non-zero-exit cases schedule.ts must now tell apart. Any other invocation
+# (writing a new crontab via `crontab -`) trivially succeeds — this stub never actually
+# persists anything, so there is no real crontab state to corrupt.
+if [ "${1:-}" = "-l" ]; then
+  case "${CRONTAB_STUB_MODE:-}" in
+    real-error)
+      echo "crontab: temp file error" >&2
+      exit 1
+      ;;
+    busybox-missing)
+      # BusyBox's crontab -l does xchdir(spool_dir) then bb_cat({pw_name, NULL}) — no
+      # "no crontab for" message at all, just an applet-prefixed missing-file error whose
+      # filename portion is the bare current username (not a path — chdir() already
+      # happened). Verified against BusyBox's own miscutils/crontab.c.
+      echo "crontab: $(whoami): No such file or directory" >&2
+      exit 1
+      ;;
+    generic-missing-file)
+      # Codex re-review's exact adversarial example: an UNRELATED internal failure whose
+      # own wrapper happens to be literally named "crontab" (so both "no such file or
+      # directory" AND a bare "cron"/"crontab" substring are present) but the missing
+      # FILENAME is not the current user at all — this must still be read as a real
+      # failure, not "no crontab yet" (a first round of this fix matched on "cron"
+      # appearing anywhere, which this exact shape would have defeated).
+      echo "/usr/local/bin/crontab: line 3: /some/internal/helper: No such file or directory" >&2
+      exit 1
+      ;;
+    path-contains-username)
+      # Codex re-review round 6: an unrelated failure whose PATH merely CONTAINS the
+      # current username as one of its own path components (bounded by "/" on both
+      # sides) must still be a real failure — BusyBox's real bb_cat() argument is a BARE
+      # username with no path at all (chdir() already happened), so the missing-file
+      # SEGMENT must be an EXACT match, not merely "the username appears somewhere".
+      echo "/usr/local/bin/crontab: line 3: /home/$(whoami)/bin/helper: No such file or directory" >&2
+      exit 1
+      ;;
+    *)
+      echo "no crontab for $(whoami)" >&2
+      exit 1
+      ;;
+  esac
+fi
+exit 0
+EOF
+  chmod +x "$CRONSTUB/crontab"
+
+  CE_HOME="$TMP/cronerr-home"; CE_SRC="$CE_HOME/src"; mkdir -p "$CE_SRC"
+  echo x > "$CE_SRC/f.txt"
+
+  # positive control: a genuine crontab -l failure (anything other than "no crontab for
+  # ...") must REFUSE the install rather than silently treating the (still-existing,
+  # merely-unreadable) crontab as empty and overwriting it via `crontab -`.
+  #
+  # `RC=0; ERR="$(...)" || RC=$?` (not `ERR="$(...)"; RC=$?`, plain): under this script's
+  # `set -e`, a bare command-substitution assignment whose underlying command exits
+  # non-zero has that same non-zero exit status ITSELF — errexit takes it as a failing
+  # simple command and terminates the WHOLE script right there, before RC=$? is ever
+  # reached, on the exact positive control that expects (and needs to observe) a
+  # non-zero exit. The trailing `|| RC=$?` puts the assignment inside a list that
+  # errexit exempts (Codex review).
+  CE_SCHED1="$TMP/cronerr-sched1"
+  RC=0
+  ERR="$(CYPHER_BRAIN_HOME="$CE_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$CE_SCHED1" CYPHER_BRAIN_LAUNCHD_DIR="$TMP/cronerr-launchagents1" \
+    PATH="$CRONSTUB:$PATH" CRONTAB_STUB_MODE=real-error \
+    cb schedule install --backend file --dir "$CE_SRC" 2>&1)" || RC=$?
+  [ "$RC" -ne 0 ] || { echo "[FAIL] install succeeded despite a genuine 'crontab -l' failure"; echo "$ERR"; exit 1; }
+  printf '%s' "$ERR" | grep -q "crontab -l failed" || { echo "[FAIL] wrong message for a genuine crontab -l failure"; echo "$ERR"; exit 1; }
+  echo "[PASS] a genuine 'crontab -l' failure (not \"no crontab for ...\") refuses the install instead of silently overwriting"
+
+  # negative control: the ordinary "no crontab for ..." case still installs cleanly —
+  # the disambiguation must not turn EVERY non-zero exit into a refusal. Same
+  # errexit-safe capture pattern as above, even though this call is expected to
+  # succeed — consistency, and safety against a future regression that makes it fail.
+  CE_SCHED2="$TMP/cronerr-sched2"
+  RC2=0
+  OUT2="$(CYPHER_BRAIN_HOME="$CE_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$CE_SCHED2" CYPHER_BRAIN_LAUNCHD_DIR="$TMP/cronerr-launchagents2" \
+    PATH="$CRONSTUB:$PATH" \
+    cb schedule install --backend file --dir "$CE_SRC" 2>&1)" || RC2=$?
+  [ "$RC2" -eq 0 ] || { echo "[FAIL] install failed even though 'crontab -l' only reported the ordinary \"no crontab yet\" case"; echo "$OUT2"; exit 1; }
+  echo "[PASS] the ordinary \"no crontab for ...\" case still installs cleanly"
+
+  # negative control (BusyBox compatibility, Codex review): BusyBox's crontab has no
+  # dedicated "no crontab for ..." message — a first-time install there fails closed with
+  # an ordinary "No such file or directory" instead, and that must ALSO still install
+  # cleanly rather than being mistaken for a genuine crontab -l failure.
+  CE_SCHED3="$TMP/cronerr-sched3"
+  RC3=0
+  OUT3="$(CYPHER_BRAIN_HOME="$CE_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$CE_SCHED3" CYPHER_BRAIN_LAUNCHD_DIR="$TMP/cronerr-launchagents3" \
+    PATH="$CRONSTUB:$PATH" CRONTAB_STUB_MODE=busybox-missing \
+    cb schedule install --backend file --dir "$CE_SRC" 2>&1)" || RC3=$?
+  [ "$RC3" -eq 0 ] || { echo "[FAIL] install failed on BusyBox's \"No such file or directory\" first-time-install shape"; echo "$OUT3"; exit 1; }
+  echo "[PASS] BusyBox's \"No such file or directory\" first-time-install shape also installs cleanly"
+
+  # negative control (Codex re-review, round 2 — this exact example): an unrelated
+  # internal failure whose OWN wrapper happens to be named "crontab" (so a bare "cron"
+  # substring check would be fooled) must still REFUSE — the missing FILENAME here is not
+  # the current user, so this is not BusyBox's "no crontab yet" shape at all.
+  CE_SCHED4="$TMP/cronerr-sched4"
+  RC4=0
+  ERR4="$(CYPHER_BRAIN_HOME="$CE_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$CE_SCHED4" CYPHER_BRAIN_LAUNCHD_DIR="$TMP/cronerr-launchagents4" \
+    PATH="$CRONSTUB:$PATH" CRONTAB_STUB_MODE=generic-missing-file \
+    cb schedule install --backend file --dir "$CE_SRC" 2>&1)" || RC4=$?
+  [ "$RC4" -ne 0 ] || { echo "[FAIL] install succeeded despite a generic (non-cron) \"No such file or directory\" crontab -l failure"; echo "$ERR4"; exit 1; }
+  printf '%s' "$ERR4" | grep -q "crontab -l failed" || { echo "[FAIL] wrong message for a generic missing-file crontab -l failure"; echo "$ERR4"; exit 1; }
+  echo "[PASS] a generic (non-cron) \"No such file or directory\" is still refused, not mistaken for an empty crontab"
+
+  # negative control (Codex re-review round 6): an unrelated failure whose PATH merely
+  # CONTAINS the current username as one of its own path components must still REFUSE —
+  # a word-boundary substring match on the username (a prior round of this fix) is
+  # fooled by this shape; only an EXACT match of the missing-file segment is safe.
+  CE_SCHED5="$TMP/cronerr-sched5"
+  RC5=0
+  ERR5="$(CYPHER_BRAIN_HOME="$CE_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$CE_SCHED5" CYPHER_BRAIN_LAUNCHD_DIR="$TMP/cronerr-launchagents5" \
+    PATH="$CRONSTUB:$PATH" CRONTAB_STUB_MODE=path-contains-username \
+    cb schedule install --backend file --dir "$CE_SRC" 2>&1)" || RC5=$?
+  [ "$RC5" -ne 0 ] || { echo "[FAIL] install succeeded despite a failure whose path merely contains the current username"; echo "$ERR5"; exit 1; }
+  printf '%s' "$ERR5" | grep -q "crontab -l failed" || { echo "[FAIL] wrong message for a path-contains-username crontab -l failure"; echo "$ERR5"; exit 1; }
+  echo "[PASS] a failure whose path merely contains the current username (not the bare missing-file segment) is still refused"
+fi
+
 echo
 echo "SCHEDULE SELFTEST PASS"

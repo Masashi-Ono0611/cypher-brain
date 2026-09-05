@@ -200,4 +200,15 @@ CYPHER_BRAIN_TON_HTTP_TIMEOUT='not-a-number' cb estimate --in "$TMP/got.age" --b
 grep -q 'CYPHER_BRAIN_TON_HTTP_TIMEOUT must be a positive integer' "$TMP/timeout.err" || { echo "[FAIL] invalid timeout did not warn"; exit 1; }
 echo "[PASS] invalid timeout value warned instead of silently degrading pulls"
 
+echo "== positive control: an out-of-range (too large) CYPHER_BRAIN_TON_HTTP_TIMEOUT warns and falls back too =="
+# 3000000000 (3e9 ms, ~34.7 days) is an ordinary finite positive integer — unlike the
+# 'not-a-number' case above, this exercises the UPPER-bound check specifically: every
+# ms-denominated override here eventually reaches AbortSignal.timeout()/setTimeout(),
+# which share a hard ~24.8-day (2^31-1 ms) delay ceiling — a LARGER value is not rejected
+# by those APIs, it is silently clamped to ~1ms instead, which would make every local
+# daemon call fail almost immediately rather than after the intended budget.
+CYPHER_BRAIN_TON_HTTP_TIMEOUT='3000000000' cb estimate --in "$TMP/got.age" --backend ton >/dev/null 2>"$TMP/timeout-toolarge.err"
+grep -q 'CYPHER_BRAIN_TON_HTTP_TIMEOUT must be a positive integer' "$TMP/timeout-toolarge.err" || { echo "[FAIL] out-of-range timeout did not warn"; cat "$TMP/timeout-toolarge.err"; exit 1; }
+echo "[PASS] out-of-range (too large) timeout value warned instead of silently clamping to ~1ms"
+
 echo "== ton selftest: ALL PASS =="

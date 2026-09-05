@@ -34,9 +34,15 @@ export const RUNBOOK_HEADING = '## Restore runbook';
  * cannot be sliced differently.
  */
 export function extractSection(markdown: string, heading: string): string {
-  const start = markdown.indexOf(`${heading}\n`);
+  // Normalize CRLF -> LF FIRST: `indexOf(`${heading}\n`)` requires the byte right after
+  // the heading to be a bare LF, which a CRLF-terminated line never is (the byte right
+  // after it is CR) — on CRLF input this used to make the whole section vanish (this
+  // function returns '', and restoreRunbook() then throws "no restore runbook section
+  // found") rather than merely leaving stray \r characters in the extracted text.
+  const normalized = markdown.replace(/\r\n/g, '\n');
+  const start = normalized.indexOf(`${heading}\n`);
   if (start === -1) return '';
-  const rest = markdown.slice(start + heading.length);
+  const rest = normalized.slice(start + heading.length);
   const nextIdx = rest.search(/\n## /);
   return (heading + (nextIdx === -1 ? rest : rest.slice(0, nextIdx))).trim();
 }

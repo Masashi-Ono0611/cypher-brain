@@ -62,6 +62,17 @@ export const PLAN_DEFAULT_TTL_MS = 15 * 60 * 1000; // 15 minutes
 // numbers from the SAME backend (the plan/current backend match is checked first).
 export const PLAN_DRIFT_TOLERANCE = 0.1; // 10%
 
+// A hand-edited (or genuinely bogus) plan.json could set created_at to some point in the
+// future. Without a check, a plan built that way would sail past the expiry guard below
+// too: expires_at is defined as created_at + PLAN_DEFAULT_TTL_MS, so pushing created_at
+// forward pushes the "not yet expired" window forward by exactly the same amount — the
+// short-lived-consent-window guarantee PLAN_DEFAULT_TTL_MS's own comment describes would
+// otherwise be defeatable by simply dating a plan into the future instead of tampering
+// with expires_at alone (which the created_at/expires_at consistency check already catches
+// on its own). A small tolerance, not zero, so an estimate/push pair run back-to-back on
+// two machines with ordinary clock drift is not refused for skew neither party caused.
+const PLAN_FUTURE_CLOCK_SKEW_TOLERANCE_MS = 60 * 1000; // 1 minute
+
 export interface PushPlan {
   cypher_brain_plan_version: typeof PLAN_VERSION;
   backend: string;
@@ -207,6 +218,12 @@ export async function readPlanFile(path: string): Promise<PushPlan> {
         `this plan was not produced by "estimate --out" or has been edited, re-run "estimate --out" for a fresh one`,
     );
   }
+  if (createdAtMs > Date.now() + PLAN_FUTURE_CLOCK_SKEW_TOLERANCE_MS) {
+    throw new Error(
+      `--plan ${path}: created_at (${p.created_at}) is in the future — ` +
+        `this plan was not produced by "estimate --out" or has been edited, re-run "estimate --out" for a fresh one`,
+    );
+  }
   const expectedExpiry = new Date(createdAtMs + PLAN_DEFAULT_TTL_MS).toISOString();
   if (p.expires_at !== expectedExpiry) {
     throw new Error(
@@ -281,6 +298,7 @@ export function validatePlan(
   current: {
     backend: string;
     artifactSha256: string;
+    sizeBytes: number;
     freshEstimate: CostEstimate;
     payerAddress: string | null;
     remote: string | null;
@@ -298,6 +316,21 @@ export function validatePlan(
     return {
       ok: false,
       reason: `plan was built for a different artifact (sha256 ${plan.artifact_sha256}), --in now hashes to ${current.artifactSha256} — re-run "estimate --out" against the artifact you are actually pushing`,
+    };
+  }
+  // size_bytes was, like recipients_fingerprint below (#469), write-only: recorded in the
+  // plan at build time but never read back here — so a hand-edited (or corrupted)
+  // size_bytes went completely unchecked even though every printed field of a consent
+  // artifact is reasonably expected to be part of the guarantee. A sha256 match makes a
+  // GENUINE mismatch here extremely unlikely (identical bytes imply identical length), but
+  // that is exactly why this is cheap insurance rather than a redundant check: it costs
+  // nothing extra (the caller already stat()s --in for the fresh cost estimate) and closes
+  // the one path a plan.json's OWN two fields could still disagree with each other despite
+  // both individually validating fine.
+  if (plan.size_bytes !== current.sizeBytes) {
+    return {
+      ok: false,
+      reason: `plan records size_bytes ${plan.size_bytes}, --in is currently ${current.sizeBytes} bytes — re-run "estimate --out" against the artifact you are actually pushing`,
     };
   }
   // #469: recipients_fingerprint used to be write-only — recorded in the plan but
