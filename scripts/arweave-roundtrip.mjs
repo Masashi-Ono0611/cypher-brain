@@ -12,7 +12,6 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
-import { createServer } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
 import { createHash, randomBytes } from 'node:crypto';
 import { DEV_ARGS } from './dev-node-flags.mjs';
@@ -41,6 +40,13 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const BIN = join(HERE, '..', 'bin', 'cypher-brain.mjs');
 const sha = (buf) => createHash('sha256').update(buf).digest('hex');
 const TX_RE = /^[A-Za-z0-9_-]{43}$/; // base64url Arweave tx id
+
+// Every SEPARATE-process gateway/redirect/UA stub this file spawns is pushed here right
+// after spawn() so the top-level `finally` below can reap it even on a path that never
+// reaches that stub's own `.kill()` call — a startup timeout, a thrown assertion, or any
+// other exception between spawn and kill would otherwise leak it running past this
+// script's own exit (Codex review).
+const stubProcs = [];
 
 const log = (m) => console.error(`· ${m}`);
 // arlocal runs in a SEPARATE process (scripts/arlocal-server.mjs) so the cb()
@@ -290,9 +296,18 @@ try {
     ? pass('verify VERDICT PASS on pulled')
     : fail('verify did not pass');
   cb('restore', '--in', join(tmp, 'got.age'), '--out-dir', join(tmp, 'out'));
-  spawnSync('tar', ['-xzf', join(tmp, 'out', 'brain.tar.gz'), '-C', join(tmp, 'out')]);
-  const restored = await readFile(join(tmp, 'out', 'brain', 'note.txt'), 'utf8');
-  restored.includes(marker) ? pass('decrypt(pulled) == original plaintext') : fail('decrypted content mismatch');
+  // exit status checked (Codex review): a tar that extracts note.txt fine but fails
+  // LATER in the archive (a truncated/corrupt tarball) would otherwise still let the
+  // narrow readFile below succeed and report PASS over a genuinely broken extraction.
+  const untar = spawnSync('tar', ['-xzf', join(tmp, 'out', 'brain.tar.gz'), '-C', join(tmp, 'out')], {
+    encoding: 'utf8',
+  });
+  if (untar.status !== 0) {
+    fail(`tar -xzf failed extracting the restored archive: ${untar.stderr || untar.status}`);
+  } else {
+    const restored = await readFile(join(tmp, 'out', 'brain', 'note.txt'), 'utf8');
+    restored.includes(marker) ? pass('decrypt(pulled) == original plaintext') : fail('decrypted content mismatch');
+  }
 
   // #318: the SIGNED round trip, on this backend. push --sign parks a detached *.minisig
   // beside the ciphertext and records its locator in field 6 of the save-locator file;
@@ -457,8 +472,13 @@ try {
       "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
   );
   const dropSrv = spawn('node', [dropSrvFile, String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  stubProcs.push(dropSrv);
   const dropPort = await new Promise((res, rej) => {
     const to = setTimeout(() => rej(new Error('drop proxy did not start')), 8000);
+    dropSrv.once('error', (e) => {
+      clearTimeout(to);
+      rej(e);
+    });
     dropSrv.stdout.on('data', (d) => {
       const m = String(d).match(/READY:(\d+)/);
       if (m) {
@@ -529,8 +549,13 @@ try {
       "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
   );
   const blindSrv = spawn('node', [blindSrvFile, String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  stubProcs.push(blindSrv);
   const blindPort = await new Promise((res, rej) => {
     const to = setTimeout(() => rej(new Error('blind-probe proxy did not start')), 8000);
+    blindSrv.once('error', (e) => {
+      clearTimeout(to);
+      rej(e);
+    });
     blindSrv.stdout.on('data', (d) => {
       const m = String(d).match(/READY:(\d+)/);
       if (m) {
@@ -618,8 +643,13 @@ try {
       "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
   );
   const sidecarSrv = spawn('node', [sidecarSrvFile, String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  stubProcs.push(sidecarSrv);
   const sidecarPort = await new Promise((res, rej) => {
     const to = setTimeout(() => rej(new Error('sidecar proxy did not start')), 8000);
+    sidecarSrv.once('error', (e) => {
+      clearTimeout(to);
+      rej(e);
+    });
     sidecarSrv.stdout.on('data', (d) => {
       const m = String(d).match(/READY:(\d+)/);
       if (m) {
@@ -744,8 +774,13 @@ try {
       "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
   );
   const l1SsrfSrv = spawn('node', [l1SsrfSrvFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+  stubProcs.push(l1SsrfSrv);
   const l1SsrfPort = await new Promise((res, rej) => {
     const to = setTimeout(() => rej(new Error('L1 ssrf stub did not start')), 8000);
+    l1SsrfSrv.once('error', (e) => {
+      clearTimeout(to);
+      rej(e);
+    });
     l1SsrfSrv.stdout.on('data', (d) => {
       const m = String(d).match(/READY:(\d+)/);
       if (m) {
@@ -778,9 +813,20 @@ try {
     /* not written = good */
   }
   l1SsrfSrv.kill('SIGKILL');
-  l1ssrf.status !== 0 && !l1SsrfWrote
+  // signal === null required (Codex review, same reasoning the stall test below already
+  // applies): the 169.254.169.254 redirect target is a REAL address, not a controllable
+  // stub, so if the SSRF guard regressed and the redirect were actually followed, the
+  // request could hang until this spawnSync's own 15s `timeout` kills it — status!==0
+  // and !l1SsrfWrote would ALSO hold in that case (killed, nothing written), and this
+  // assertion would report PASS having proven only "eventually gave up", not "the guard
+  // fired". Requiring no signal rules out a harness-timeout kill masquerading as refusal.
+  l1ssrf.status !== 0 && l1ssrf.signal === null && !l1SsrfWrote
     ? pass('L1 fallback: a redirect from the configured host is refused, never silently followed')
-    : fail(`L1 SSRF redirect was not refused: status=${l1ssrf.status} wrote=${l1SsrfWrote}`);
+    : fail(
+        l1ssrf.signal !== null
+          ? `L1 SSRF redirect check inconclusive: killed by ${l1ssrf.signal} (the harness's own 15s safety timeout) instead of exiting on its own — cannot tell the SSRF guard fired from a followed-then-hung redirect`
+          : `L1 SSRF redirect was not refused: status=${l1ssrf.status} wrote=${l1SsrfWrote}`,
+      );
 
   log('L1 fallback: a stalled chunk-read host is bounded by a timeout, not hung forever (#116)');
   const stallSrvFile = join(tmp, 'stall-stub.mjs');
@@ -791,8 +837,13 @@ try {
       "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
   );
   const stallSrv = spawn('node', [stallSrvFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+  stubProcs.push(stallSrv);
   const stallPort = await new Promise((res, rej) => {
     const to = setTimeout(() => rej(new Error('stall stub did not start')), 8000);
+    stallSrv.once('error', (e) => {
+      clearTimeout(to);
+      rej(e);
+    });
     stallSrv.stdout.on('data', (d) => {
       const m = String(d).match(/READY:(\d+)/);
       if (m) {
@@ -906,12 +957,37 @@ try {
   // page / "tx pending" placeholder / CDN interstitial) must NOT be promoted to --out.
   // (1) bad-200 the ONLY gateway, L1 dead-ended (AR_PORT=1): pull must FAIL and leave
   //     no garbage at --out (the old code wrote the bad body and "succeeded").
-  const badGw = createServer((_q, res) => {
-    res.writeHead(200, { 'content-type': 'text/html' });
-    res.end('<html>tx pending — not ciphertext</html>');
+  //
+  // SEPARATE process (Codex review), same reasoning the UA/SSRF stubs below already
+  // apply: the pull below is spawnSync (blocking) — an in-process createServer() shares
+  // this script's own event loop, which spawnSync blocks for the whole duration of the
+  // child, so it could never actually accept/answer the child's request. Measured: the
+  // in-process version of this stub only ever "passed" because the child's connection
+  // stalled/reset (no response ever sent), not because the AGE_MAGIC check rejected a
+  // bad-200 body — a regressed/removed AGE_MAGIC check would have kept passing too.
+  const badGwFile = join(tmp, 'badgw-stub.mjs');
+  await writeFile(
+    badGwFile,
+    "import {createServer} from 'node:http';\n" +
+      "const s=createServer((_q,res)=>{res.writeHead(200,{'content-type':'text/html'});res.end('<html>tx pending — not ciphertext</html>');});\n" +
+      "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
+  );
+  const badGw = spawn('node', [badGwFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+  stubProcs.push(badGw);
+  const badPort = await new Promise((res, rej) => {
+    const to = setTimeout(() => rej(new Error('badgw stub did not start')), 8000);
+    badGw.once('error', (e) => {
+      clearTimeout(to);
+      rej(e);
+    });
+    badGw.stdout.on('data', (d) => {
+      const m = String(d).match(/READY:(\d+)/);
+      if (m) {
+        clearTimeout(to);
+        res(m[1]);
+      }
+    });
   });
-  await new Promise((r) => badGw.listen(0, '127.0.0.1', r));
-  const badPort = badGw.address().port;
   const bgOut = join(tmp, 'badgate.age');
   const bg = spawnSync('node', [...DEV_ARGS, BIN, 'pull', '--locator', loc, '--backend', 'arweave', '--out', bgOut], {
     env: { ...env, CYPHER_BRAIN_AR_PORT: '1', CYPHER_BRAIN_AR_GATEWAYS: `http://127.0.0.1:${badPort}` },
@@ -927,15 +1003,33 @@ try {
   bg.status !== 0 && !bgWrote
     ? pass('AGE_MAGIC gate: a non-ciphertext 200 is not promoted (pull fails, no garbage at --out)')
     : fail(`bad-200 body was promoted to --out (status=${bg.status}, wrote=${bgWrote})`);
-  badGw.close();
+  badGw.kill('SIGKILL');
   // (2) bad-200 first, healthy arlocal second: the read must FALL THROUGH to the good
-  //     gateway and produce the real, byte-identical ciphertext.
-  const badGw2 = createServer((_q, res) => {
-    res.writeHead(200);
-    res.end('not ciphertext');
+  //     gateway and produce the real, byte-identical ciphertext. Same separate-process
+  //     reasoning as badGw above.
+  const badGw2File = join(tmp, 'badgw2-stub.mjs');
+  await writeFile(
+    badGw2File,
+    "import {createServer} from 'node:http';\n" +
+      "const s=createServer((_q,res)=>{res.writeHead(200);res.end('not ciphertext');});\n" +
+      "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
+  );
+  const badGw2 = spawn('node', [badGw2File], { stdio: ['ignore', 'pipe', 'pipe'] });
+  stubProcs.push(badGw2);
+  const badPort2 = await new Promise((res, rej) => {
+    const to = setTimeout(() => rej(new Error('badgw2 stub did not start')), 8000);
+    badGw2.once('error', (e) => {
+      clearTimeout(to);
+      rej(e);
+    });
+    badGw2.stdout.on('data', (d) => {
+      const m = String(d).match(/READY:(\d+)/);
+      if (m) {
+        clearTimeout(to);
+        res(m[1]);
+      }
+    });
   });
-  await new Promise((r) => badGw2.listen(0, '127.0.0.1', r));
-  const badPort2 = badGw2.address().port;
   const ft = spawnSync(
     'node',
     [...DEV_ARGS, BIN, 'pull', '--locator', loc, '--backend', 'arweave', '--out', join(tmp, 'ft.age')],
@@ -951,7 +1045,7 @@ try {
   ft.status === 0 && sha(await readFile(join(tmp, 'ft.age'))) === cipherSha
     ? pass('AGE_MAGIC gate: read falls through a non-ciphertext 200 to a healthy gateway')
     : fail(`did not fall through bad-200 to a healthy gateway: ${ft.stderr || 'bytes differ'}`);
-  badGw2.close();
+  badGw2.kill('SIGKILL');
 
   // User-Agent header: arweave.net redirects a bundled-item read to a sandbox subdomain
   // that 403s a header-less request (node:http.get sends no default UA, unlike the fetch
@@ -968,8 +1062,13 @@ try {
       "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
   );
   const uaSrv = spawn('node', [uaSrvFile, join(tmp, 'snap.age')], { stdio: ['ignore', 'pipe', 'pipe'] });
+  stubProcs.push(uaSrv);
   const uaPort = await new Promise((res, rej) => {
     const to = setTimeout(() => rej(new Error('ua stub did not start')), 8000);
+    uaSrv.once('error', (e) => {
+      clearTimeout(to);
+      rej(e);
+    });
     uaSrv.stdout.on('data', (d) => {
       const m = String(d).match(/READY:(\d+)/);
       if (m) {
@@ -1018,8 +1117,13 @@ try {
   ];
   for (const c of ssrfCases) {
     const ssrfSrv = spawn('node', [ssrfSrvFile, c.target], { stdio: ['ignore', 'pipe', 'pipe'] });
+    stubProcs.push(ssrfSrv);
     const ssrfPort = await new Promise((res, rej) => {
       const to = setTimeout(() => rej(new Error('ssrf stub did not start')), 8000);
+      ssrfSrv.once('error', (e) => {
+        clearTimeout(to);
+        rej(e);
+      });
       ssrfSrv.stdout.on('data', (d) => {
         const m = String(d).match(/READY:(\d+)/);
         if (m) {
@@ -1082,8 +1186,48 @@ try {
   );
   console.error(e?.stack ?? String(e));
 } finally {
-  await rm(tmp, { recursive: true, force: true });
-  arproc.kill('SIGTERM');
+  // Its own try/catch (Codex review, second re-review pass): a rejection here (e.g. a
+  // permission error `force: true` does not suppress) must not skip the process
+  // cleanup below it — that would leave arlocal and every stub running.
+  try {
+    await rm(tmp, { recursive: true, force: true });
+  } catch (e) {
+    // Recorded as a real failure (Codex review, third re-review pass), not just logged —
+    // a leftover $tmp is a genuine test-infra defect, and this run must not report PASS
+    // over it.
+    fail(`failed to remove ${tmp}: ${e?.message ?? String(e)}`);
+  }
+  // A bare SIGTERM does not ESTABLISH termination (Codex review) — this script exits
+  // right after sending it, so a slow/ignoring arlocal would survive as exactly the
+  // orphaned-server failure mode the freePort()/#351 comment at the top of this file
+  // warns about. Wait (bounded) for the exit event, escalating to SIGKILL if it
+  // doesn't land, instead of firing SIGTERM and immediately walking away.
+  if (arproc.exitCode === null && arproc.signalCode === null) {
+    await new Promise((resolveDone) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(escalate);
+        resolveDone();
+      };
+      arproc.once('exit', finish);
+      arproc.kill('SIGTERM');
+      const escalate = setTimeout(() => {
+        arproc.kill('SIGKILL');
+        setTimeout(finish, 1000); // one more grace period, then stop waiting either way
+      }, 3000);
+    });
+  }
+  // Every gateway/redirect/UA stub is killed here too (Codex review, this diff's own
+  // re-review): each call site already kills its OWN stub right after using it on the
+  // normal path, but a startup timeout or a thrown assertion anywhere before that point
+  // would skip it — this catches whatever is still alive regardless of which path this
+  // run took. SIGKILL only: these are short-lived, single-purpose mock servers with
+  // nothing to flush or shut down gracefully.
+  for (const p of stubProcs) {
+    if (p.exitCode === null && p.signalCode === null) p.kill('SIGKILL');
+  }
 }
 
 console.log('');

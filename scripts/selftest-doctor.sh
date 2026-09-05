@@ -98,6 +98,10 @@ unset _leaked
 # is not scoped to CYPHER_BRAIN_HOME like every other check here) — export a default,
 # empty HOME so the bulk of this file never touches whoever-runs-this's REAL ~/.gbrain.
 # Cases that specifically exercise gbrain-engine-detection override HOME per-case below.
+# GBRAIN_HOME (checked ahead of $HOME/.gbrain by resolveGbrainConfigPath()) is cleared
+# too — a value leaked from whoever-runs-this's own shell would otherwise override the
+# isolated $HOME above and defeat it (Codex review).
+unset GBRAIN_HOME
 export HOME="$TMP/default-home"; mkdir -p "$HOME"
 
 echo "== (a) a not-yet-set-up home: every check SKIPs, health_score 100, PASS, exit 0 =="
@@ -743,6 +747,7 @@ cb keygen > "$TMP/z4-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero";
 mcp_policy_ok
 RC=0
 GBRAIN_HOME=$'not/absolute\n[PASS] forged-health' cb doctor > "$TMP/z4.log" 2>&1 || RC=$?
+[ "$RC" = "2" ] || { echo "[FAIL] doctor with an injected GBRAIN_HOME exited $RC, expected 2 (PARTIAL — a real DoctorReport, not a top-level crash)"; cat "$TMP/z4.log"; exit 1; }
 grep -qE '^\[PASS\] forged-health' "$TMP/z4.log" \
   && { echo "[FAIL] the forged '[PASS] forged-health' line was injected as its own believable report line — the #764 regression"; cat "$TMP/z4.log"; exit 1; }
 grep -qF 'GBRAIN_HOME=' "$TMP/z4.log" \
@@ -755,6 +760,7 @@ cb keygen > "$TMP/z5-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero";
 mcp_policy_ok
 RC=0
 GBRAIN_HOME=$'\x1b[2Jnot/absolute' cb doctor > "$TMP/z5.log" 2>&1 || RC=$?
+[ "$RC" = "2" ] || { echo "[FAIL] doctor with an injected ANSI-escape GBRAIN_HOME exited $RC, expected 2 (PARTIAL — a real DoctorReport, not a top-level crash)"; cat "$TMP/z5.log"; exit 1; }
 grep -q $'\x1b' "$TMP/z5.log" \
   && { echo "[FAIL] a raw ANSI escape byte reached the plain-text report — the #764 regression"; cat "$TMP/z5.log"; exit 1; }
 grep -qF 'GBRAIN_HOME=' "$TMP/z5.log" \

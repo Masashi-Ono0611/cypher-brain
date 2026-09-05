@@ -672,25 +672,40 @@ awk '/run summary/{found=1} found' "$TMP/snap-pglite.log" | grep -qF "$WARN_MARK
 echo "[PASS] the CLI's end-of-run relay-me summary carries it"
 
 MCP_OUT="$TMP/mcp-out.jsonl"
+# CYPHER_BRAIN_PIN_RECIPIENTS / CYPHER_BRAIN_MCP_SOURCE_ROOTS (#800): snapshot_now is
+# fail-closed over MCP and refuses unless the operator has pinned the recipients and
+# declared the authorized source roots. Set to this test's OWN recipient and its own
+# fixture tree, so the PGLite warning-relay assertion below is what the call exercises.
+#
+# with_stdin_timeout (not a bare `node` + `|| true`, Codex review): the polling loop
+# below only closes stdin once it sees the id:2 response — it cannot make a genuinely
+# wedged server exit, so an unbounded invocation could hang this selftest forever.
+# with_stdin_timeout kills the server's whole process group after 60s if it hasn't
+# exited by then, so that failure mode becomes a bounded, diagnosable [FAIL] below
+# instead of a silent hang. `|| true` also swallowed a crash AFTER a valid response —
+# MCP_RC is now checked for exactly that (a clean stdin-EOF shutdown exits 0, verified
+# by hand against this same $MCP_BIN).
+MCP_RC=0
 {
   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"selftest","version":"0"}}}'
   printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
   printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"snapshot_now\",\"arguments\":{\"dirs\":[\"$FIX_PGLITE\"],\"out\":\"$TMP/mcp.age\",\"recipients\":[\"$SNAP_CB_HOME/recipient.txt\"]}}}"
   # Hold stdin open until the id:2 response lands (the server exits at EOF, and a
   # fixed sleep would either race the snapshot or pad every run). Bounded: 60 * 0.5s,
-  # after which the loop gives up and the assertion below reports what was missing.
+  # after which the loop gives up and the assertion below reports what was missing
+  # (with_stdin_timeout below is the OUTER bound, for a server that ignores EOF too).
   for _ in $(seq 1 60); do
     grep -q '"id":2' "$MCP_OUT" 2>/dev/null && break
     sleep 0.5
   done
-# CYPHER_BRAIN_PIN_RECIPIENTS / CYPHER_BRAIN_MCP_SOURCE_ROOTS (#800): snapshot_now is
-# fail-closed over MCP and refuses unless the operator has pinned the recipients and
-# declared the authorized source roots. Set to this test's OWN recipient and its own
-# fixture tree, so the PGLite warning-relay assertion below is what the call exercises.
 } | CYPHER_BRAIN_HOME="$SNAP_CB_HOME" \
   CYPHER_BRAIN_PIN_RECIPIENTS="$SNAP_CB_HOME/recipient.txt" \
   CYPHER_BRAIN_MCP_SOURCE_ROOTS="[\"$FIX_PGLITE\"]" \
-  node "${BIN_DEV_ARGS[@]}" "$MCP_BIN" > "$MCP_OUT" 2> "$TMP/mcp-err.log" || true
+  with_stdin_timeout 60 node "${BIN_DEV_ARGS[@]}" "$MCP_BIN" > "$MCP_OUT" 2> "$TMP/mcp-err.log" || MCP_RC=$?
+[ "$MCP_RC" != "137" ] \
+  || { echo "[FAIL] the MCP server did not exit within 60s of stdin closing — treat as wedged, not a hang the harness should wait out"; cat "$MCP_OUT"; tail -20 "$TMP/mcp-err.log"; exit 1; }
+[ "$MCP_RC" = "0" ] \
+  || { echo "[FAIL] the MCP server exited $MCP_RC (expected 0 on a clean stdin-EOF shutdown) — a crash after answering would otherwise be masked"; cat "$MCP_OUT"; tail -20 "$TMP/mcp-err.log"; exit 1; }
 grep -q '"id":2' "$MCP_OUT" || { echo "[FAIL] the MCP server never answered the snapshot_now call"; cat "$MCP_OUT"; tail -20 "$TMP/mcp-err.log"; exit 1; }
 if grep -q '"isError":true' "$MCP_OUT"; then echo "[FAIL] snapshot_now on a PGLite store returned an error — this must be a warning, not a refusal"; cat "$MCP_OUT"; exit 1; fi
 # Read the structured field, not the whole line: `log` echoes stderr verbatim, so a

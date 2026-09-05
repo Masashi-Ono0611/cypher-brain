@@ -14,7 +14,12 @@ source "$ROOT/scripts/dev-node-flags.sh"
 # cb/sha/with_timeout: shared across scripts/selftest-*.sh, see scripts/selftest-lib.sh
 # (#569, #572).
 source "$ROOT/scripts/selftest-lib.sh"
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# The trap also reaps any background job this script itself started (snapshot/push
+# races, the "sleep 120 &" stand-ins for a live lock holder) that is still running when
+# the script exits — an assertion failing partway through one of those scenarios would
+# otherwise leave it orphaned for up to two minutes after this script has already
+# exited (Codex review: `rm -rf "$TMP"` alone does not touch running processes).
+TMP="$(mktemp -d)"; trap 'for _leftover_job in $(jobs -p); do kill -9 "$_leftover_job" 2>/dev/null || true; done; rm -rf "$TMP"' EXIT
 export CYPHER_BRAIN_HOME="$TMP/keys"
 export CYPHER_BRAIN_FILE_DIR="$TMP/store"
 
@@ -89,8 +94,13 @@ fi
 echo "[PASS] a --sha256 mismatch leaves a pre-existing --out completely untouched"
 
 echo "== issue #107: no stray pull .part temp files are left behind =="
-if find "$TMP" -maxdepth 1 -name '*.part' | grep -q .; then
-  echo "[FAIL] a stray pull .part temp file was left in \$TMP"; find "$TMP" -maxdepth 1 -name '*.part'; exit 1
+# A separately-captured find (not `find | grep -q .`, Codex review): under pipefail,
+# `find`'s own exit status is discarded either way once `grep` runs — a find failure
+# unrelated to a match (e.g. failing to read an entry) would otherwise be
+# indistinguishable from "no .part files exist" and this would silently report PASS.
+PART_FILES="$(find "$TMP" -maxdepth 1 -name '*.part')"
+if [ -n "$PART_FILES" ]; then
+  echo "[FAIL] a stray pull .part temp file was left in \$TMP"; printf '%s\n' "$PART_FILES"; exit 1
 fi
 echo "[PASS] no stray pull .part temp files left behind"
 
@@ -131,28 +141,40 @@ fi
 echo "[PASS] no --wait warning when --wait is explicitly 0"
 
 echo "== issue #93: a locator outside FILE_DIR must be rejected (path traversal / arbitrary local file read) =="
-touch "$TMP/outside.age"
+# Correctly <sha256>.age SHAPED (reusing $ORIG, already a real sha256 from the snapshot
+# above), not a name like "outside.age" that the shape check would ALSO reject on its
+# own (Codex review): if the containment check ("locator is outside FILE_DIR") were
+# ever removed, an improperly-shaped name would still be refused by the shape check,
+# both under the same CB-E010 code, and this test would keep reporting [PASS] without
+# ever having exercised containment. A properly-shaped name outside the store can only
+# be refused by containment, so the message assertion below can name it specifically.
+touch "$TMP/$ORIG.age"
 set +e
-TRAVERSAL_ERR=$(cb pull --locator "$TMP/outside.age" --backend file --out "$TMP/leak1.age" 2>&1); TRAVERSAL_RC=$?
+TRAVERSAL_ERR=$(cb pull --locator "$TMP/$ORIG.age" --backend file --out "$TMP/leak1.age" 2>&1); TRAVERSAL_RC=$?
 set -e
 if [ "$TRAVERSAL_RC" = "0" ]; then echo "[FAIL] locator outside FILE_DIR was read"; exit 1; fi
 test ! -f "$TMP/leak1.age"
 echo "[PASS] locator outside FILE_DIR is rejected"
+printf '%s' "$TRAVERSAL_ERR" | grep -q 'locator is outside FILE_DIR' \
+  || { echo "[FAIL] path-traversal error was not the containment refusal (a properly-shaped locator should only be able to fail this way)"; echo "$TRAVERSAL_ERR"; exit 1; }
 printf '%s' "$TRAVERSAL_ERR" | grep -q '\[CB-E010\]' || { echo "[FAIL] path-traversal error lacks the CB-E010 code"; echo "$TRAVERSAL_ERR"; exit 1; }
 echo "[PASS] path-traversal error carries [CB-E010]"
 
 set +e
-REL_TRAVERSAL_ERR=$(cb pull --locator "$CYPHER_BRAIN_FILE_DIR/../outside.age" --backend file --out "$TMP/leak2.age" 2>&1); REL_TRAVERSAL_RC=$?
+REL_TRAVERSAL_ERR=$(cb pull --locator "$CYPHER_BRAIN_FILE_DIR/../$ORIG.age" --backend file --out "$TMP/leak2.age" 2>&1); REL_TRAVERSAL_RC=$?
 set -e
 if [ "$REL_TRAVERSAL_RC" = "0" ]; then echo "[FAIL] relative traversal out of FILE_DIR was read"; exit 1; fi
 test ! -f "$TMP/leak2.age"
 # same reason-check as the absolute case above: any non-zero exit (a crash on this
-# path, say) must not be mistaken for the traversal guard firing
+# path, say) must not be mistaken for the traversal guard firing — and, as above, the
+# locator is properly shaped so only the containment check can be what fired.
+printf '%s' "$REL_TRAVERSAL_ERR" | grep -q 'locator is outside FILE_DIR' \
+  || { echo "[FAIL] relative-traversal error was not the containment refusal (a properly-shaped locator should only be able to fail this way)"; echo "$REL_TRAVERSAL_ERR"; exit 1; }
 printf '%s' "$REL_TRAVERSAL_ERR" | grep -q '\[CB-E010\]' || { echo "[FAIL] relative-traversal error lacks the CB-E010 code"; echo "$REL_TRAVERSAL_ERR"; exit 1; }
 echo "[PASS] relative traversal (../) out of FILE_DIR is rejected with [CB-E010]"
 
 echo "== issue #93: a locator inside FILE_DIR with the wrong shape (not <sha256>.age) must be rejected =="
-cp "$TMP/outside.age" "$CYPHER_BRAIN_FILE_DIR/notasha.age"
+cp "$TMP/$ORIG.age" "$CYPHER_BRAIN_FILE_DIR/notasha.age"
 set +e
 SHAPE_ERR=$(cb pull --locator "$CYPHER_BRAIN_FILE_DIR/notasha.age" --backend file --out "$TMP/leak3.age" 2>&1); SHAPE_RC=$?
 set -e
