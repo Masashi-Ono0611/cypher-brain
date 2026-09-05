@@ -76,9 +76,14 @@ export async function backendFor(name: string | undefined): Promise<StorageBacke
   // BACKEND_FACTORIES' literal-union key type above — the cast is the one place
   // that boundary is crossed, deliberately narrow rather than loosening the map's
   // own type back to `Record<string, ...>` (which would reopen the drift #501 fixed).
-  const factory = name
-    ? (BACKEND_FACTORIES as Record<string, () => StorageBackend | Promise<StorageBackend>>)[name]
-    : undefined;
+  // Object.hasOwn, not a bare index (Codex review) — same reasoning as mcp.ts's/
+  // cli.ts's own `Object.hasOwn(FLAG_IRRELEVANT, ...)` guards: `name` is untrusted
+  // input, and a bare `map[name]` resolves an Object.prototype member for a name like
+  // "constructor"/"toString"/"hasOwnProperty" instead of `undefined` — silently
+  // returning `{}` (a non-functional "backend") or throwing a confusing internal
+  // TypeError, rather than this function's own clean "unknown backend" UsageError.
+  const map = BACKEND_FACTORIES as Record<string, () => StorageBackend | Promise<StorageBackend>>;
+  const factory = name && Object.hasOwn(map, name) ? map[name] : undefined;
   if (factory) return factory();
   // #779: UsageError — an enum-valued flag's bad value is a parser-level refusal
   // (exit 2), not the generic-failure 1.

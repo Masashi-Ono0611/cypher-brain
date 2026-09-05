@@ -41,6 +41,7 @@ import {
 import { run } from '../proc.js';
 import { sha256, sleep, readHead, rmrf, errMsg, makeBagLocator } from '../util.js';
 import { progressReporter } from '../progress.js';
+import { warn } from '../warn.js';
 import { tonAdd, tonDetails, startLocalTonDaemon, type TonBagDetails } from './ton-client.js';
 import { installStageSignalGuard, addActiveTonTmpDir, removeActiveTonTmpDir } from '../signal-guard.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
@@ -496,8 +497,14 @@ export function tonBackend(): StorageBackend {
             `ton backend: P2P fetch failed (${errMsg(p2pErr)}) and no CYPHER_BRAIN_TON_SSH_HOST is configured for the seeder fallback`,
           );
         }
-        console.error(
-          `ton: WARNING — P2P fetch failed (${errMsg(p2pErr)}); falling back to a direct copy from the seeder. ` +
+        // warn(), not a raw console.error (#347's relay contract, the same convention
+        // arweave.ts/turbo.ts/ton-provider.ts already use for safety-relevant caveats):
+        // this is the one line that tells the operator/agent this pull's availability
+        // was NOT P2P-proven — a raw console.error is invisible to the CLI's end-of-run
+        // summary and to an MCP tool result's `warnings[]` array, so an agent relaying
+        // this run could silently drop the exact caveat it exists to surface.
+        warn(
+          `ton: P2P fetch failed (${errMsg(p2pErr)}); falling back to a direct copy from the seeder. ` +
             'P2P availability of this bag is NOT proven by this pull.',
         );
         await seederFetch(bagId, expect, out);
