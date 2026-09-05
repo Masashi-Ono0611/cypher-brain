@@ -687,7 +687,10 @@ cat > "$FAKE_GITLEAKS_DIR/gitleaks" <<'SHIM'
 REPORT=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --report-path) REPORT="$2"; shift 2 ;;
+    # A dangling --report-path (no value following) must not leave $1 unshifted:
+    # without this guard, `shift 2` fails and returns $# unchanged, so the loop
+    # spins forever on the same $1 instead of erroring out.
+    --report-path) [ $# -ge 2 ] || { echo "fake gitleaks: --report-path requires a value" >&2; exit 3; }; REPORT="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -749,7 +752,10 @@ cat > "$SHADOW_DIR/gitleaks" <<'SHIM'
 REPORT=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --report-path) REPORT="$2"; shift 2 ;;
+    # A dangling --report-path (no value following) must not leave $1 unshifted:
+    # without this guard, `shift 2` fails and returns $# unchanged, so the loop
+    # spins forever on the same $1 instead of erroring out.
+    --report-path) [ $# -ge 2 ] || { echo "fake gitleaks: --report-path requires a value" >&2; exit 3; }; REPORT="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -1340,15 +1346,18 @@ CYPHER_BRAIN_HOME="$LEGACY_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$LEGACY_SCHED" CYPHE
   || { echo "[FAIL] legacy-fixture install exited non-zero"; cat "$TMP/legacy-install.log"; exit 1; }
 if [ "$OS" = "Darwin" ]; then
   LEGACY_PLIST_PATH="$LEGACY_LAUNCHD/dev.cipher-brain.nightly.plist"
-  NEW_PLIST_PATH="$(node -e "console.log(JSON.parse(require('fs').readFileSync('$LEGACY_SCHED/schedule.json','utf8')).trigger.path)")"
+  # Paths are passed as argv, not interpolated into the JS source string: a $TMP
+  # (mktemp-derived, but not otherwise sanitized) containing a quote or backslash
+  # would otherwise produce broken/injected JS rather than a clean argument.
+  NEW_PLIST_PATH="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).trigger.path)" "$LEGACY_SCHED/schedule.json")"
   mv "$NEW_PLIST_PATH" "$LEGACY_PLIST_PATH"
   node -e "
     const fs = require('fs');
-    const p = '$LEGACY_SCHED/schedule.json';
+    const p = process.argv[1];
     const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-    cfg.trigger.path = '$LEGACY_PLIST_PATH';
+    cfg.trigger.path = process.argv[2];
     fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + '\n');
-  "
+  " "$LEGACY_SCHED/schedule.json" "$LEGACY_PLIST_PATH"
   CYPHER_BRAIN_HOME="$LEGACY_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$LEGACY_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$LEGACY_LAUNCHD" \
     cb schedule status > "$TMP/legacy-status.log" 2>&1 || { echo "[FAIL] status on a legacy-format schedule exited non-zero"; cat "$TMP/legacy-status.log"; exit 1; }
   # A bare `grep -qi 'legacy'` would trivially match here regardless of whether
@@ -1389,18 +1398,18 @@ CYPHER_BRAIN_HOME="$RN_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$RN_SCHED" CYPHER_BRAIN_
   cb schedule install --backend file --dir "$RN_SRC" --no-load > "$TMP/rename-install.log" 2>&1 \
   || { echo "[FAIL] rename-fixture install exited non-zero"; cat "$TMP/rename-install.log"; exit 1; }
 if [ "$OS" = "Darwin" ]; then
-  RN_NEW_PLIST="$(node -e "console.log(JSON.parse(require('fs').readFileSync('$RN_SCHED/schedule.json','utf8')).trigger.path)")"
+  RN_NEW_PLIST="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).trigger.path)" "$RN_SCHED/schedule.json")"
   # what the same install would have been called before the rename: same hash, old brand
   RN_OLD_PLIST="$(printf '%s' "$RN_NEW_PLIST" | sed 's/dev\.cypher-brain\.nightly\./dev.cipher-brain.nightly./')"
   [ "$RN_OLD_PLIST" != "$RN_NEW_PLIST" ] || { echo "[FAIL] fixture: could not derive the pre-rename plist name from $RN_NEW_PLIST"; exit 1; }
   mv "$RN_NEW_PLIST" "$RN_OLD_PLIST"
   node -e "
     const fs = require('fs');
-    const p = '$RN_SCHED/schedule.json';
+    const p = process.argv[1];
     const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-    cfg.trigger.path = '$RN_OLD_PLIST';
+    cfg.trigger.path = process.argv[2];
     fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + '\n');
-  "
+  " "$RN_SCHED/schedule.json" "$RN_OLD_PLIST"
   CYPHER_BRAIN_HOME="$RN_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$RN_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$RN_LAUNCHD" \
     cb schedule status > "$TMP/rename-status.log" 2>&1 || { echo "[FAIL] status on a pre-rename schedule exited non-zero"; cat "$TMP/rename-status.log"; exit 1; }
   grep -q 'legacy launchd label (dev.cipher-brain.nightly.' "$TMP/rename-status.log" || { echo "[FAIL] status did not flag the pre-rename (cipher-brain) launchd label"; cat "$TMP/rename-status.log"; exit 1; }
@@ -1436,16 +1445,16 @@ CYPHER_BRAIN_HOME="$OT_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$OT_SCHED" CYPHER_BRAIN_
   cb schedule install --backend file --dir "$OT_SRC" --no-load > "$TMP/other-install.log" 2>&1 \
   || { echo "[FAIL] other-home fixture install exited non-zero"; cat "$TMP/other-install.log"; exit 1; }
 if [ "$OS" = "Darwin" ]; then
-  OT_NEW_PLIST="$(node -e "console.log(JSON.parse(require('fs').readFileSync('$OT_SCHED/schedule.json','utf8')).trigger.path)")"
+  OT_NEW_PLIST="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).trigger.path)" "$OT_SCHED/schedule.json")"
   OT_OLD_PLIST="$(printf '%s' "$OT_NEW_PLIST" | sed 's/dev\.cypher-brain\.nightly\./dev.cipher-brain.nightly./')"
   mv "$OT_NEW_PLIST" "$OT_OLD_PLIST"
   node -e "
     const fs = require('fs');
-    const p = '$OT_SCHED/schedule.json';
+    const p = process.argv[1];
     const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-    cfg.trigger.path = '$OT_OLD_PLIST';
+    cfg.trigger.path = process.argv[2];
     fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + '\n');
-  "
+  " "$OT_SCHED/schedule.json" "$OT_OLD_PLIST"
   # Now read that same SCHEDULE_DIR from a DIFFERENT home.
   ME_HOME="$TMP/me-home"; mkdir -p "$ME_HOME"
   CYPHER_BRAIN_HOME="$ME_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$OT_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$OT_LAUNCHD" \
@@ -1470,7 +1479,7 @@ if [ "$OS" = "Darwin" ]; then
   CYPHER_BRAIN_HOME="$MV_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$MV_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$MV_L1" \
     cb schedule install --backend file --dir "$MV_SRC" --no-load > "$TMP/mv-install-1.log" 2>&1 \
     || { echo "[FAIL] moved-plist fixture install (dir 1) exited non-zero"; cat "$TMP/mv-install-1.log"; exit 1; }
-  MV_P1="$(node -e "console.log(JSON.parse(require('fs').readFileSync('$MV_SCHED/schedule.json','utf8')).trigger.path)")"
+  MV_P1="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).trigger.path)" "$MV_SCHED/schedule.json")"
   CYPHER_BRAIN_HOME="$MV_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$MV_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$MV_L2" \
     cb schedule install --backend file --dir "$MV_SRC" --no-load > "$TMP/mv-install-2.log" 2>&1 \
     || { echo "[FAIL] moved-plist fixture install (dir 2) exited non-zero"; cat "$TMP/mv-install-2.log"; exit 1; }
@@ -1479,21 +1488,21 @@ if [ "$OS" = "Darwin" ]; then
   # while LAUNCHD_DIR is dir 2 (exactly the state right after the operator changed the dir).
   node -e "
     const fs = require('fs');
-    const p = '$MV_SCHED/schedule.json';
+    const p = process.argv[1];
     const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-    cfg.trigger.path = '$MV_P1';
+    cfg.trigger.path = process.argv[2];
     fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + '\n');
-  "
+  " "$MV_SCHED/schedule.json" "$MV_P1"
   CYPHER_BRAIN_HOME="$MV_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$MV_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$MV_L2" \
     cb schedule uninstall --no-load > "$TMP/mv-uninstall-noload.log" 2>&1 || true
   grep -q "legacy launchd plist $MV_P1" "$TMP/mv-uninstall-noload.log" || { echo "[FAIL] uninstall --no-load did not report the moved (stale) plist file"; cat "$TMP/mv-uninstall-noload.log"; exit 1; }
   CYPHER_BRAIN_HOME="$MV_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$MV_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$MV_L2" \
     cb schedule status --json > "$TMP/mv-status.json" 2>/dev/null || true
   node -e "
-    const o = JSON.parse(require('fs').readFileSync('$TMP/mv-status.json','utf8'));
+    const o = JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));
     const note = (o.trigger && o.trigger.legacy_note) || '';
     if (!/legacy launchd label \(dev\.cypher-brain\.nightly\./.test(note)) throw new Error('status did not describe the moved plist under its (current) label: ' + JSON.stringify(o.trigger));
-  " || { echo "[FAIL] status --json did not describe the moved plist"; cat "$TMP/mv-status.json"; exit 1; }
+  " "$TMP/mv-status.json" || { echo "[FAIL] status --json did not describe the moved plist"; cat "$TMP/mv-status.json"; exit 1; }
   echo "[PASS] a moved plist under the current label is reported as a stale file, and its label is the current one"
 else
   echo "[SKIP] (g3)/(g4) launchd-only checks — not macOS"

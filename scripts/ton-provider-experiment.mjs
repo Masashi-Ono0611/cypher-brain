@@ -283,8 +283,18 @@ function selectCheapestProvider(providers) {
 }
 
 function storageCostNano(sizeBytes, ratePerMbDay, spanDays) {
-  const sizeMb = Math.max(sizeBytes / 1_000_000, 0.1); // docs/provider-contract.md floor
-  return BigInt(Math.ceil(sizeMb * ratePerMbDay * spanDays));
+  // Exact integer (BigInt) math throughout — no Number multiplication or division.
+  // The previous `Math.ceil(sizeMb * ratePerMbDay * spanDays)` routed the whole
+  // computation through Number: at reachable inputs (multi-GB bags x a rate up to
+  // MAX_REASONABLE_RATE_NANO_PER_MB_DAY x a multi-year span) the product can exceed
+  // 2^53 and silently lose precision, feeding a wrong amount into the real on-chain
+  // payment this script builds. This mirrors sizeMb = max(sizeBytes/1e6, 0.1) and
+  // ceil(sizeMb * rate * days) exactly, via numerator/denominator ceil-division —
+  // docs/provider-contract.md's 0.1 MB floor is the same 100_000-byte floor below.
+  const sizeBytesFloored = BigInt(Math.max(sizeBytes, 100_000));
+  const numerator = sizeBytesFloored * BigInt(ratePerMbDay) * BigInt(spanDays);
+  const denominator = 1_000_000n;
+  return (numerator + denominator - 1n) / denominator;
 }
 
 // -----------------------------------------------------------------------
@@ -763,6 +773,16 @@ async function cmdStatus(args) {
   const deadline = startedAt + watchSeconds * 1000; // explicit deadline, not an open-ended loop
   let lastStatus;
   for (;;) {
+    // Check the deadline BEFORE issuing another poll, not only before sleeping
+    // afterwards: sleeping the remaining time wakes up right AT the deadline, and
+    // without this check the loop would still issue one more fetchAccountState()
+    // call (bounded only by HTTP_TIMEOUT_MS, not by --watch) before the
+    // post-fetch check below ever gets a chance to stop it.
+    const beforePoll = Date.now();
+    if (watchSeconds > 0 && beforePoll >= deadline) {
+      console.log(`  [watch] deadline reached after ${Math.round((beforePoll - startedAt) / 1000)}s — stopping.`);
+      break;
+    }
     try {
       const acc = await fetchAccountState(addr, testnet);
       if (lastStatus !== undefined && acc.status !== lastStatus) {

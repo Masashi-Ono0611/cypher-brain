@@ -333,7 +333,10 @@ if [ "\$SUB" = "providers" ]; then
   ADDR=""
   while [ "\$#" -gt 0 ]; do
     case "\$1" in
-      --address) ADDR="\$2"; shift 2 ;;
+      # A dangling --address (no value following) must not leave \$1 unshifted:
+      # without this guard, \`shift 2\` fails and returns \$# unchanged, so the
+      # loop spins forever on the same \$1 instead of erroring out.
+      --address) [ "\$#" -ge 2 ] || { echo "fake storage-v1-client: --address requires a value" >&2; exit 1; }; ADDR="\$2"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -1152,11 +1155,22 @@ echo "$I808_SIZE" > "$TMP/notify-downloaded"
 
 mkfifo "$I808_LEDGER"
 : > "$BROADCAST_LOG"
+# A DEDICATED tmp root for this push's own process (via TMPDIR, which
+# mkdtempSync(join(tmpdir(), ...)) in ton-provider.ts reads through os.tmpdir()) —
+# not a shared name-pattern sweep of the real $TMPDIR. This is race-free by
+# construction: no other process can ever create anything under this exact
+# directory, so cleanup below can safely `rm -rf` the whole thing unconditionally
+# (Codex re-review: a before/after snapshot-diff sweep still raced against
+# whatever ELSE might create a same-named dir under the shared $TMPDIR between
+# the snapshot and the cleanup).
+I808_OWN_TMPROOT="$TMP/issue808-tmproot"
+mkdir -p "$I808_OWN_TMPROOT"
 # `set -m` so the backgrounded push gets its OWN process group: kill -9 on the group
 # takes the ephemeral tonutils-storage daemon with it, where killing the direct child
 # alone would orphan it (the same reasoning selftest-lib.sh's with_timeout documents).
 set -m
 CYPHER_BRAIN_RECEIPT_LEDGER="$I808_LEDGER" CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  TMPDIR="$I808_OWN_TMPROOT" \
   cb push --in "$TMP/issue808.age" --backend ton-provider >"$TMP/issue808-run1.out" 2>"$TMP/issue808-run1.err" &
 I808_PID=$!
 set +m
@@ -1171,9 +1185,10 @@ wait "$I808_PID" 2>/dev/null || true
 [ "$I808_CONFIRMED" = 1 ] \
   || { echo "[FAIL] issue #808: the push never recorded a CONFIRMED pending spend before the receipt write (no intent to recover from)"; cat "$TMP/issue808-run1.err"; cat "$I808_PENDING" 2>/dev/null; exit 1; }
 # A SIGKILL runs no finally block, so put()'s own temp tree survives — and run-selftests.mjs
-# fails any test that leaves something in its TMPDIR. Sweeping it here is part of staging
-# the crash, not incidental cleanup.
-find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'cypher-brain-ton-provider-*' -exec rm -rf {} + 2>/dev/null || true
+# fails any test that leaves something in its TMPDIR. Removing THIS push's own
+# dedicated tmp root (set up above) is part of staging the crash, not incidental
+# cleanup — and is safe unconditionally since nothing else ever writes there.
+rm -rf "$I808_OWN_TMPROOT"
 grep -q '"state":"settled"' "$I808_PENDING" \
   && { echo "[FAIL] issue #808: the intent was marked settled even though the receipt write never completed"; cat "$I808_PENDING"; exit 1; }
 [ -p "$I808_LEDGER" ] || { echo "[FAIL] issue #808 setup: the receipt ledger is no longer the FIFO the test created"; exit 1; }
