@@ -726,6 +726,13 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       in the target database — an irreversible operation — so it requires --yes or
       CYPHER_BRAIN_YES=1 to confirm, same as push's paid-backend guard below. Bounded by
       the same pipe timeout as the decrypt/extract step (CYPHER_BRAIN_PIPE_TIMEOUT).
+      #859: before pg_restore ever runs, --pg is also refused if this snapshot's OWN
+      manifest does not declare a pg component — db.dump existing in --out-dir is not
+      enough by itself, since it can be a leftover from an unrelated prior run that the
+      no-clobber behavior above left untouched. This is the one exception to "a
+      mismatched manifest.json, db.dump, etc. keeps the plain no-clobber behavior"
+      just above: only --pg's own db.dump gets this additional manifest cross-check,
+      and only to refuse (never to overwrite it).
       --sha256 <hex> pins --in to an expected hash, checked FIRST — before authenticity
       and before any decryption. A mismatch refuses the restore outright (#645); this is
       the same out-of-band integrity pin pull() and verify() already fail-closed on.

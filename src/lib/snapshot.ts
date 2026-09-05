@@ -759,7 +759,37 @@ export async function snapshot(o: CliOptions): Promise<void> {
         // plain (no ignore file) branch below has always guarded this same class of
         // issue for its OWN positional `basename(abs)` argument via `--`; this is the
         // equivalent guard for the -T list's first line, which `--` does not reach.
-        const listFile = join(stage, `.tarlist-${name}`);
+        // #860: this scratch list file's name used to be derived SOLELY from `name`
+        // (this component's own archive filename, e.g. `foo.tar.gz` — see the
+        // `archivePath = join(stage, name)` line above) — `.tarlist-<name>`. A
+        // --dir/--profile source whose basename happens to produce that exact literal
+        // (e.g. a directory named `.tarlist-<some-other-component's-name>`, so its own
+        // `name` becomes `.tarlist-<other>.tar.gz`) collides with that OTHER
+        // component's archive output path in this same `stage` directory — this
+        // component's own `finally` block below (`rm(listFile, { force: true })`) would
+        // then delete whatever the other component just tar'd there, or (depending on
+        // ordering) this tar call would overwrite it instead — a component silently
+        // missing from the finished snapshot with no error raised anywhere.
+        //
+        // Fixed by dropping `name` from this filename entirely (multi-model review
+        // finding on an earlier draft, which folded `name` in alongside a pid+random
+        // suffix): every component archive path ends in `.tar.gz` while this one ends in
+        // random hex, so no caller-controlled `name` can ever collide with an archivePath
+        // on that structural difference alone — `name` bought nothing beyond
+        // readability, and readability is not the point of a file this `finally` block
+        // deletes moments later. It DID cost something: `name` is caller-controlled (a
+        // --dir/--profile source's basename, plus this file's own fixed suffixes) and can
+        // run right up against common filesystem filename limits (255 bytes on most POSIX
+        // filesystems) — a `-<pid>-<8 hex chars>` suffix folded in on top of it pushed a
+        // basename that used to fit exactly at that limit past it (verified: ENAMETOOLONG
+        // where the pre-#860 `.tarlist-<name>` scheme fit — a snapshot that worked before
+        // this fix would have started failing on such a source). The pid + a random
+        // suffix alone (the same collision-proofing this file's own `.part` staging
+        // suffix further below already uses) is what actually keeps two DIFFERENT
+        // components' own scratch files from colliding with EACH OTHER in the same
+        // `stage` directory — a fixed-length name that owes nothing to any
+        // caller-controlled input.
+        const listFile = join(stage, `.tarlist-${process.pid}-${randomBytes(8).toString('hex')}`);
         const base = basename(abs);
         await writeFile(listFile, `${[base, ...tarEntries.map((r) => `${base}/${r}`)].join('\0')}\0`);
         try {

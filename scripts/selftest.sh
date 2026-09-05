@@ -1473,6 +1473,115 @@ elif [ "$rc" -ne 1 ]; then
 fi
 echo "[PASS] omitting --pg-filter/--pg-exclude-table-data leaves pg_dump's argv exactly as before (no filtering)"
 
+echo "== #859 regression: restore --pg refuses a stale db.dump when the current snapshot's manifest has no pg component =="
+# $TMP/snap.age (the very first snapshot this script made, "== snapshot ==" above) was
+# captured with --dir "$SRC" only -- its manifest has no pg component at all. Simulate
+# the dangerous scenario the issue describes: a db.dump left over in --out-dir from some
+# unrelated prior run (restore's own no-clobber promise is exactly why such a file can
+# survive there untouched). A fake pg_restore that only touches a marker file proves
+# whether it ran at all -- no real Postgres needed for a refusal that must happen BEFORE
+# pg_restore is ever invoked. Explicit CYPHER_BRAIN_HOME="$TMP/keys" throughout: the
+# ambient export was repointed to "$TMP/keys2" earlier (line ~549), but snap.age was
+# encrypted to the "$TMP/keys" identity.
+PG859_OUT="$TMP/pg859-stale-out"
+mkdir -p "$PG859_OUT"
+printf 'STALE-DB-DUMP-FROM-UNRELATED-RUN\n' > "$PG859_OUT/db.dump"
+FAKE_PGBIN_859="$TMP/fake-pgbin-859"; mkdir -p "$FAKE_PGBIN_859"
+cat > "$FAKE_PGBIN_859/pg_restore" <<'SHIM'
+#!/usr/bin/env bash
+set -eu
+: "${PG_RESTORE_MARKER:?PG_RESTORE_MARKER not set}"
+printf 'pg_restore ran\n' > "$PG_RESTORE_MARKER"
+SHIM
+chmod +x "$FAKE_PGBIN_859/pg_restore"
+PG859_MARKER="$TMP/pg859-marker"
+rm -f "$PG859_MARKER"
+set +e
+OUT859=$(CYPHER_BRAIN_HOME="$TMP/keys" CYPHER_BRAIN_PG_BIN="$FAKE_PGBIN_859" PG_RESTORE_MARKER="$PG859_MARKER" \
+  cb restore --in "$TMP/snap.age" --out-dir "$PG859_OUT" --pg "postgres://x/y" --yes 2>&1); RC859=$?
+set -e
+[ "$RC859" != "0" ] || { echo "[FAIL] restore --pg against a manifest with no pg component but a stale db.dump exited 0"; echo "$OUT859"; exit 1; }
+printf '%s' "$OUT859" | grep -qi "does not declare" \
+  || { echo "[FAIL] refusal error does not explain the manifest/pg-component mismatch"; echo "$OUT859"; exit 1; }
+test ! -e "$PG859_MARKER" || { echo "[FAIL] pg_restore ran against a stale db.dump despite the manifest declaring no pg component"; exit 1; }
+[ "$(cat "$PG859_OUT/db.dump")" = "STALE-DB-DUMP-FROM-UNRELATED-RUN" ] \
+  || { echo "[FAIL] the stale db.dump's content changed"; exit 1; }
+echo "[PASS] restore --pg refuses to pg_restore a stale db.dump when the current snapshot's manifest declares no pg component"
+
+echo "== #859: restore --pg still runs pg_restore when the current snapshot's manifest DOES declare a pg component =="
+# The legitimate case this fix must not break: a snapshot that genuinely carries a pg
+# component still reaches pg_restore exactly as before.
+FAKE_PGBIN_859_OK="$TMP/fake-pgbin-859-ok"; mkdir -p "$FAKE_PGBIN_859_OK"
+cat > "$FAKE_PGBIN_859_OK/pg_dump" <<'SHIM'
+#!/usr/bin/env bash
+set -eu
+out=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "-f" ]; then out="$a"; fi
+  prev="$a"
+done
+: "${out:?fake pg_dump: no -f <path> found in argv}"
+printf 'real-pg-dump-content\n' > "$out"
+SHIM
+chmod +x "$FAKE_PGBIN_859_OK/pg_dump"
+cat > "$FAKE_PGBIN_859_OK/pg_restore" <<'SHIM'
+#!/usr/bin/env bash
+set -eu
+: "${PG_RESTORE_MARKER:?PG_RESTORE_MARKER not set}"
+printf 'pg_restore ran\n' > "$PG_RESTORE_MARKER"
+SHIM
+chmod +x "$FAKE_PGBIN_859_OK/pg_restore"
+PG859_OK_SNAP="$TMP/pg859-ok-snap.age"
+CYPHER_BRAIN_HOME="$TMP/keys" CYPHER_BRAIN_PG_BIN="$FAKE_PGBIN_859_OK" \
+  cb snapshot --dir "$SRC" --pg "postgres://fake/conn" --out "$PG859_OK_SNAP" >/dev/null
+PG859_OK_OUT="$TMP/pg859-ok-out"
+PG859_OK_MARKER="$TMP/pg859-ok-marker"
+rm -f "$PG859_OK_MARKER"
+CYPHER_BRAIN_HOME="$TMP/keys" CYPHER_BRAIN_PG_BIN="$FAKE_PGBIN_859_OK" PG_RESTORE_MARKER="$PG859_OK_MARKER" \
+  cb restore --in "$PG859_OK_SNAP" --out-dir "$PG859_OK_OUT" --pg "postgres://x/y" --yes >/dev/null
+test -f "$PG859_OK_MARKER" || { echo "[FAIL] pg_restore did not run even though the manifest declares a pg component"; exit 1; }
+echo "[PASS] restore --pg still runs pg_restore when the current snapshot's manifest declares a pg component"
+
+echo "== #860 regression: a --dir source named to collide with another component's tarlist scratch file no longer drops that component =="
+# Reproduces the exact collision the issue describes: the OLD scratch tar-list filename
+# was ".tarlist-<name>", where <name> is a component's OWN archive filename
+# ("<basename>.tar.gz") -- entirely predictable from a --dir source's basename. A SECOND
+# --dir source whose basename is literally ".tarlist-<first component's name (no
+# .tar.gz)>" produces an archive filename that collides with the FIRST component's
+# scratch list-file path in the same staging directory. Order matters for the OLD bug to
+# manifest: the collider (no .cypherbrainignore, so it archives straight to its final
+# path) must run BEFORE the ignore-filtered component (whose list-file write then
+# clobbers, and whose later `rm(listFile, ...)` cleanup then deletes, the collider's
+# already-finished archive).
+COLLIDE_TARGET="$TMP/collide-target"
+mkdir -p "$COLLIDE_TARGET"
+printf 'target-file-content\n' > "$COLLIDE_TARGET/keep.txt"
+cat > "$COLLIDE_TARGET/.cypherbrainignore" <<'EOF'
+*.ignored
+EOF
+printf 'ignored-content\n' > "$COLLIDE_TARGET/x.ignored"
+# collide-target's own component name is "collide-target.tar.gz", so the OLD listFile
+# literal was ".tarlist-collide-target.tar.gz" -- craft a second --dir source whose own
+# basename+".tar.gz" equals exactly that.
+COLLIDER="$TMP/.tarlist-collide-target"
+mkdir -p "$COLLIDER"
+printf 'collider-file-content\n' > "$COLLIDER/collider.txt"
+COLLIDE_SNAP="$TMP/collide-860.age"
+CYPHER_BRAIN_HOME="$TMP/keys" cb snapshot --dir "$COLLIDER" --dir "$COLLIDE_TARGET" --out "$COLLIDE_SNAP" >/dev/null
+COLLIDE_OUT="$TMP/collide-860-out"
+CYPHER_BRAIN_HOME="$TMP/keys" cb restore --in "$COLLIDE_SNAP" --out-dir "$COLLIDE_OUT" --no-expand-components >/dev/null
+test -f "$COLLIDE_OUT/.tarlist-collide-target.tar.gz" \
+  || { echo "[FAIL] the collider component's archive is missing -- #860 tarlist filename collision dropped it"; ls -la "$COLLIDE_OUT"; exit 1; }
+test -f "$COLLIDE_OUT/collide-target.tar.gz" \
+  || { echo "[FAIL] the ignore-filtered component's archive is missing"; ls -la "$COLLIDE_OUT"; exit 1; }
+tar -tzf "$COLLIDE_OUT/.tarlist-collide-target.tar.gz" | grep -q 'collider.txt' \
+  || { echo "[FAIL] the collider archive does not contain its own file (corrupted by the collision)"; exit 1; }
+tar -tzf "$COLLIDE_OUT/collide-target.tar.gz" | grep -q 'keep.txt' \
+  || { echo "[FAIL] the ignore-filtered component archive is missing its kept file"; exit 1; }
+tar -tzf "$COLLIDE_OUT/collide-target.tar.gz" | grep -q 'ignored' \
+  && { echo "[FAIL] the ignore-filtered component archive still contains an ignored file"; exit 1; }
+echo "[PASS] two --dir sources whose names collide under the old .tarlist-<name> scheme both archive correctly with no dropped entries"
+
 echo "== #215: --scan-secrets warn|deny (gitleaks) =="
 # This whole section is deliberately explicit about CYPHER_BRAIN_HOME="$TMP/keys" on
 # EVERY invocation (snapshot AND restore) rather than relying on the ambient exported
