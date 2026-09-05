@@ -1575,8 +1575,13 @@ if CYPHER_BRAIN_HOME="$O4_CB_HOME" HOME="$O4_HOME" CYPHER_BRAIN_INIT_ALLOW_NONIN
   -- node "${BIN_DEV_ARGS[@]}" "$BIN" init; then
   echo "[FAIL] declining the spend-consent prompt should still abort (unchanged existing behavior)"; cat "$TMP/wallet-precheck-defaultpath.log"; exit 1
 fi
-if grep -qF 'needs a funded wallet to push' "$TMP/wallet-precheck-defaultpath.log"; then echo "[FAIL] issue #735: the wallet-precheck guidance fired despite a wallet existing at the default path with no CYPHER_BRAIN_AR_WALLET set"; cat "$TMP/wallet-precheck-defaultpath.log"; exit 1; fi
 grep -qF 'PAID, PERMANENT store' "$TMP/wallet-precheck-defaultpath.log" || { echo "[FAIL] the spend-consent prompt was never reached despite a wallet at the default path"; cat "$TMP/wallet-precheck-defaultpath.log"; exit 1; }
+if grep -qF 'needs a funded wallet to push' "$TMP/wallet-precheck-defaultpath.log"; then rc=0; else rc=$?; fi
+if [ "$rc" -eq 0 ]; then
+  echo "[FAIL] issue #735: the wallet-precheck guidance fired despite a wallet existing at the default path with no CYPHER_BRAIN_AR_WALLET set"; cat "$TMP/wallet-precheck-defaultpath.log"; exit 1
+elif [ "$rc" -ne 1 ]; then
+  echo "[FAIL] could not read $TMP/wallet-precheck-defaultpath.log to confirm the wallet-precheck guidance did not fire (grep rc=$rc)"; exit 1
+fi
 echo "[PASS] a wallet at the default path (CYPHER_BRAIN_HOME/wallet.json), with no CYPHER_BRAIN_AR_WALLET set, is recognized by the paid-backend precheck — matching 'wallet create's own documented default (issue #735)"
 
 echo "== (p) CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 with FILE-redirected (non-pipe) stdin surfaces the real cancellation, not a masking TypeError (P2 fix) =="

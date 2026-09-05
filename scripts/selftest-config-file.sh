@@ -141,8 +141,11 @@ export CYPHER_BRAIN_HOME="$H"
 node "$CLI" keygen >/dev/null 2>&1
 node "$CLI" schedule install --dir "$SRC" --backend file --no-load >/dev/null 2>&1 \
   || { echo "[FAIL] schedule install failed with a foreign key in the config file"; exit 1; }
-if grep -q "export TMPDIR='$TMP/foreign-tmp'" "$H/sched/nightly.sh"; then
+if grep -q "export TMPDIR='$TMP/foreign-tmp'" "$H/sched/nightly.sh"; then rc=0; else rc=$?; fi
+if [ "$rc" -eq 0 ]; then
   echo "[FAIL] a foreign key (TMPDIR) from the config file was applied to the environment"; exit 1
+elif [ "$rc" -ne 1 ]; then
+  echo "[FAIL] could not read $H/sched/nightly.sh to confirm TMPDIR was not baked in (grep rc=$rc)"; exit 1
 fi
 echo "[PASS] a foreign key is parsed, reported as not ours, and never applied"
 
