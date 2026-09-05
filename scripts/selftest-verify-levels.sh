@@ -105,12 +105,17 @@ grep -q 'full restore' "$TMP/drill.out" \
   || { echo "[FAIL] --level drill missing full-restore line"; cat "$TMP/drill.out"; exit 1; }
 
 echo "== --level drill: the scratch pull/restore directory is not left behind =="
-BEFORE=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cypher-brain-verify-*' 2>/dev/null | wc -l | tr -d ' ')
-cb verify --level drill --locator "$LOC" --backend file --sha256 "$ORIG" >/dev/null 2>&1
-AFTER=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cypher-brain-verify-*' 2>/dev/null | wc -l | tr -d ' ')
-[ "$BEFORE" = "$AFTER" ] \
+# A private TMPDIR (Codex review), not the shared ${TMPDIR:-/tmp}: a before/after COUNT
+# on a directory other processes (a parallel CI shard, a stray leftover from an earlier
+# run) also create and remove in can mask a real leak (one appears, one disappears, net
+# unchanged) just as easily as it can produce a false failure. Same idiom the SIGTERM
+# check below already uses its own scoped TMPDIR for.
+LEAK_TMPDIR="$TMP/drill-leak-tmpdir"; mkdir -p "$LEAK_TMPDIR"
+TMPDIR="$LEAK_TMPDIR" cb verify --level drill --locator "$LOC" --backend file --sha256 "$ORIG" >/dev/null 2>&1
+LEFTOVER=$(find "$LEAK_TMPDIR" -maxdepth 1 -name 'cypher-brain-verify-*' 2>/dev/null | wc -l | tr -d ' ')
+[ "$LEFTOVER" = "0" ] \
   && echo "[PASS] --level drill leaves no cypher-brain-verify-* scratch dir behind" \
-  || { echo "[FAIL] --level drill leaked a scratch dir (before=$BEFORE after=$AFTER)"; exit 1; }
+  || { echo "[FAIL] --level drill leaked $LEFTOVER scratch dir(s)"; exit 1; }
 
 echo "== --level drill --json: exactly one JSON line, includes full_restore:true =="
 DJ=$(cb verify --level drill --locator "$LOC" --backend file --json); DRC=$?
@@ -140,9 +145,15 @@ echo "== --level drill --json --verbose: --verbose has no effect on --json's sin
 DJV=$(cb verify --level drill --locator "$LOC" --backend file --json --verbose); DJVRC=$?
 [ "$DJVRC" = "0" ] || { echo "[FAIL] --level drill --json --verbose exited $DJVRC"; echo "$DJV"; exit 1; }
 DJVLINES=$(printf '%s\n' "$DJV" | wc -l | tr -d ' ')
-[ "$DJVLINES" = "1" ] \
-  && echo "[PASS] --level drill --json --verbose still prints exactly one JSON line" \
-  || { echo "[FAIL] --level drill --json --verbose printed $DJVLINES stdout line(s), expected 1"; echo "$DJV"; exit 1; }
+[ "$DJVLINES" = "1" ] || { echo "[FAIL] --level drill --json --verbose printed $DJVLINES stdout line(s), expected 1"; echo "$DJV"; exit 1; }
+# A trailing '\n' alone also makes `wc -l` report 1 line for an EMPTY $DJV — unlike the
+# --level remote/drill --json checks above, this block had no follow-up content
+# assertion (Codex review), so a regression that silently emptied stdout here would
+# still print [PASS]. full_restore:true is the same field the plain --level drill
+# --json check above already requires.
+printf '%s' "$DJV" | grep -q '"full_restore":true' \
+  && echo "[PASS] --level drill --json --verbose: one line, includes full_restore:true" \
+  || { echo "[FAIL] --level drill --json --verbose missing full_restore:true"; echo "$DJV"; exit 1; }
 
 echo "== --level drill refuses --pg (a drill must never touch a live database) =="
 set +e
@@ -257,10 +268,17 @@ printf '%s' "$SIGJ" | grep -q 'could not fetch the authenticity signature' \
 
 echo "== --level remote --json: a failed fetch still carries sha256_pin (consistent pulled{} shape across outcomes) =="
 set +e
-FAILJ=$(cb verify --level remote --locator "0000000000000000000000000000000000000000000000000000000000000000.age" --backend file --sha256 "$ORIG" --json)
+FAILJ=$(cb verify --level remote --locator "0000000000000000000000000000000000000000000000000000000000000000.age" --backend file --sha256 "$ORIG" --json); FAILJ_RC=$?
 set -e
+# The exit code and verdict were never asserted here (Codex review) — only the presence
+# of pulled.sha256_pin. A regression that made this locator resolve successfully (a
+# false PASS on the fetch itself) would still have printed [PASS] as long as sha256_pin
+# happened to still be echoed back, same as the "missing store object" check above.
+[ "$FAILJ_RC" = "1" ] || { echo "[FAIL] --level remote --json on a missing store object exited $FAILJ_RC, expected 1"; echo "$FAILJ"; exit 1; }
+printf '%s' "$FAILJ" | grep -q '"verdict":"FAIL"' \
+  || { echo "[FAIL] --level remote --json on a missing store object did not report verdict FAIL"; echo "$FAILJ"; exit 1; }
 printf '%s' "$FAILJ" | grep -q '"sha256_pin":"'"$ORIG"'"' \
-  && echo "[PASS] a failed-fetch --json still includes pulled.sha256_pin (same field, every outcome)" \
+  && echo "[PASS] a failed-fetch --json exits 1, reports verdict FAIL, and still includes pulled.sha256_pin (same field, every outcome)" \
   || { echo "[FAIL] failed-fetch --json is missing pulled.sha256_pin"; echo "$FAILJ"; exit 1; }
 
 echo "== --level drill: SIGTERM during component auto-expand leaves no scratch dir or plaintext behind (#332 review) =="
@@ -294,7 +312,14 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 if [ "$APPEARED" != "1" ]; then
-  echo "[FAIL] drill never reached component auto-expand (test setup)"; kill "$DRILL_PID" 2>/dev/null || true; exit 1
+  # kill without reaping (Codex review) would exit this script (and its `trap ... EXIT`
+  # rm -rf "$TMP") while $DRILL_PID — and the tar/sleep stub it may have spawned under
+  # this same $TMPDIR — could still be alive; `wait` here gives the signal a chance to
+  # land and the process to exit before teardown removes the directory tree under it.
+  echo "[FAIL] drill never reached component auto-expand (test setup)"
+  kill "$DRILL_PID" 2>/dev/null || true
+  wait "$DRILL_PID" 2>/dev/null || true
+  exit 1
 fi
 kill -TERM "$DRILL_PID"
 wait "$DRILL_PID" 2>/dev/null || true   # signal exit is non-zero — expected

@@ -327,6 +327,19 @@ node -e '
   }
   fs.writeFileSync(process.argv[1], lines.join("\n") + "\n");
 ' "$CYPHER_BRAIN_HOME/receipt-ledger.jsonl"
+# Confirm the UNPIPED payload actually is all 2500 receipts, comfortably past a typical
+# 64 KiB pipe buffer, BEFORE trusting the piped run below (Codex review): "no EPIPE
+# error, exit 0" also describes a regression that silently truncated/rejected most of
+# the 2500 fixture receipts — a payload small enough to fit inside one pipe buffer read
+# would never trigger the async EPIPE this test exists to guard against, so it would
+# report [PASS] for having nothing to prove instead of for surviving the real hazard.
+cb ledger --json > "$TMP/epipe-full.json"
+grep -q '"total_receipts":2500' "$TMP/epipe-full.json" \
+  || { echo "[FAIL] ledger --json (unpiped) did not report all 2500 fixture receipts — the EPIPE check below would prove nothing"; exit 1; }
+EPIPE_FULL_SIZE=$(wc -c < "$TMP/epipe-full.json" | tr -d ' ')
+[ "$EPIPE_FULL_SIZE" -gt 100000 ] \
+  || { echo "[FAIL] ledger --json (unpiped) payload is only $EPIPE_FULL_SIZE bytes — too small to reliably exercise the EPIPE this test exists to guard"; exit 1; }
+echo "[PASS] ledger --json emits all 2500 fixture receipts ($EPIPE_FULL_SIZE bytes) before the piped EPIPE check"
 set +e
 set +o pipefail
 cb ledger --json 2> "$TMP/epipe-err.log" | head -c 1 > /dev/null

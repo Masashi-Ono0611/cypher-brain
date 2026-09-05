@@ -39,12 +39,19 @@ const BIN = join(ROOT, 'bin', 'cypher-brain.mjs');
 const tmpA = await mkdtemp(join(tmpdir(), 'cb-audit-unit-'));
 try {
   // Set BEFORE importing audit.ts, and via a DYNAMIC import ordered after the env
-  // override — a static top-of-file import would pull in config.ts's env-derived
+  // override — a static top-of-file import would pull in config.ts's own env-derived
   // AUDIT_LOG constant at module-load time, BEFORE this override takes effect,
   // silently writing synthetic test data into the REAL default $CYPHER_BRAIN_HOME
   // (the exact bug selftest-receipt.mjs's own header comment documents hitting and
   // fixing in #232 — avoided here from the start).
+  //
+  // CYPHER_BRAIN_AUDIT_LOG must ALSO be cleared here (Codex review): config.ts's
+  // AUDIT_LOG constant is `readEnv('CYPHER_BRAIN_AUDIT_LOG') || join(HOME, ...)` — an
+  // operator running this selftest with that override already set in their shell would
+  // otherwise have this test's synthetic entries AND its deliberate tampering appended
+  // to their REAL audit log, isolation from CYPHER_BRAIN_HOME notwithstanding.
   process.env.CYPHER_BRAIN_HOME = tmpA;
+  delete process.env.CYPHER_BRAIN_AUDIT_LOG;
   const { appendAuditEntry, readAuditLog, verifyAuditChain, computeHash } = await import('../src/lib/audit.ts');
 
   // ENOENT case FIRST, before anything is ever appended: a pristine tmpA has no
@@ -182,6 +189,7 @@ try {
   );
 } finally {
   delete process.env.CYPHER_BRAIN_HOME;
+  delete process.env.CYPHER_BRAIN_AUDIT_LOG;
   await rm(tmpA, { recursive: true, force: true });
 }
 
@@ -351,7 +359,15 @@ try {
     entries.length === 4,
     `got ${entries.length}`,
   );
-  check('the failed entry has a non-zero exit_code', entries[3]?.exit_code !== 0, entries[3]?.exit_code);
+  // typeof ... === 'number', not just `!== 0` (Codex review): the prior check above
+  // already fails when entries.length !== 4, but `entries[3]?.exit_code !== 0` on its
+  // own would ALSO read true (and silently pass) if entries[3] did not exist at all —
+  // undefined !== 0 is true. Requiring a number closes that.
+  check(
+    'the failed entry has a non-zero exit_code',
+    typeof entries[3]?.exit_code === 'number' && entries[3].exit_code !== 0,
+    entries[3]?.exit_code,
+  );
   check(
     'the failed entry is still correctly chained',
     entries[3]?.prev_hash === entries[2]?.hash,
@@ -395,13 +411,18 @@ try {
     `status=${corruptedCheck.status} stdout=${corruptedCheck.stdout}`,
   );
   // audit --json also exits 1 on a broken chain, so read the run via cb() not cbOk()
-  // (cbOk() would throw on the non-zero exit).
+  // (cbOk() would throw on the non-zero exit). The exit status itself is asserted below
+  // (Codex review) — sibling to the chain-truncation check above, which already checks
+  // `truncatedJsonRun.status === 1` alongside its parsed fields; without it, a regression
+  // that made `audit --json` exit 0 on a broken chain would still pass here.
   const corruptedJsonRun = cb({}, 'audit', '--json');
   const corruptedJsonParsed = JSON.parse(corruptedJsonRun.stdout);
   check(
-    'cypher-brain audit --json reports chain_valid=false and broken_at_index=0',
-    corruptedJsonParsed.chain_valid === false && corruptedJsonParsed.broken_at_index === 0,
-    JSON.stringify(corruptedJsonParsed),
+    'cypher-brain audit --json reports chain_valid=false and broken_at_index=0, and exits non-zero',
+    corruptedJsonRun.status === 1 &&
+      corruptedJsonParsed.chain_valid === false &&
+      corruptedJsonParsed.broken_at_index === 0,
+    `status=${corruptedJsonRun.status} ${JSON.stringify(corruptedJsonParsed)}`,
   );
 
   console.log('== audit selftest: end-to-end checks complete ==');

@@ -120,7 +120,15 @@ const entries = [...src.matchAll(entryRe)].map((m) => ({
 
 // The table is the source of truth for how many codes exist; if the regex above stops
 // matching the file's shape, that must FAIL rather than silently check nothing.
-const declared = (src.match(/code: 'CB-E\d+',/g) ?? []).length;
+//
+// Deliberately WIDER than entryRe's single-quote-only `code: '...'` (Codex review): if
+// this count used the exact same single-quote assumption, an entry reformatted to
+// `code: "CB-E999",` would vanish from BOTH counts together — entries.length and
+// declared would still agree, silently skipping that code's coverage instead of
+// tripping the mismatch check below. Counting either quote style here means a
+// single-quote-only entryRe miss now shows up as entries.length !== declared, exactly
+// the "FAIL rather than silently check nothing" this comment already promises.
+const declared = (src.match(/code: ["']CB-E\d+["'],/g) ?? []).length;
 if (declared === 0) fail(`no CB-E### entries found in ${ERRORS_TS} — has the table's shape changed?`);
 if (entries.length !== declared) {
   fail(
@@ -149,11 +157,19 @@ for (const { code, pattern, origin, assertLiterals } of entries) {
     // Each asserted literal must actually BE one of the pattern's alternatives.
     // Without this an entry could list any string that happens to exist in src/ and
     // pass while asserting nothing about the pattern (multi-model review finding).
+    //
+    // Exact match, not `.trim()`'d (Codex review): trimming both sides before comparing
+    // reintroduces the exact whitespace false-PASS literals() itself is documented above
+    // (CB-E014) to guard against — an assertLiterals entry missing an alternative's
+    // required trailing/leading whitespace would still be accepted as "not bogus" here,
+    // and the shortened, incorrect string it names would then go on to inSrc() below,
+    // which can find that shorter prefix in src/ even where the FULL (correctly-spaced)
+    // alternative the pattern actually requires is not there.
     const alternatives = literals(pattern);
     if (!alternatives) {
       fail(`${code}: cannot extract literals from /${pattern}/ to validate assertLiterals against`);
     }
-    const bogus = assertLiterals.filter((l) => !alternatives.some((a) => a.trim() === l.trim()));
+    const bogus = assertLiterals.filter((l) => !alternatives.some((a) => a === l));
     if (bogus.length) {
       fail(
         `${code} (origin: mixed) lists ${JSON.stringify(bogus)} in assertLiterals, but that is not an alternative of /${pattern}/.\n` +

@@ -174,16 +174,43 @@ function cleanupRemoteBag(sha, bagId) {
 
   // Positive confirmation the daemon actually forgot it, not just that the call
   // returned 2xx: re-list and assert the bag id no longer appears anywhere in it.
-  const stillListedCount = sshRun(
-    `curl -sS --fail -m 30 'http://${api}/api/v1/list' | grep -c -- '${safeBag}' || true`,
+  //
+  // The count is done LOCALLY, not via a remote `| grep -c ... || true` (Codex review):
+  // piping curl into grep on the remote side makes the remote command's own exit status
+  // (what sshRun() checks) grep's, not curl's — and the trailing `|| true` was there only
+  // to stop a genuine 0-match grep (bag really gone) from being treated as a failure by
+  // sshRun(). That same `|| true` also swallowed a FAILED curl (daemon unreachable, 5xx,
+  // timeout): with no stdin, `grep -c` on nothing prints "0", which then read as "bag
+  // confirmed gone" — the exact opposite of what a failed query means. A distinct sentinel
+  // for "the query itself did not complete" keeps this best-effort (never throws — see
+  // this function's own "Best-effort" comment above) while no longer confusing "could not
+  // check" with "checked, and it is gone".
+  // `.includes()`, not exact equality (Codex review, 2nd pass): a curl that fails
+  // mid-transfer (connection reset, timeout after partial body) can still have written
+  // some stdout before the `||` fallback's sentinel prints — exact equality would then
+  // miss the failure entirely and fall through to treating that partial garbage as a
+  // real (and likely bag-id-free) listing, "confirming" removal on a query that never
+  // actually completed. This sentinel is unlikely to ever appear inside real seeder
+  // JSON (a hex bag id list), so a substring match stays safe against false positives.
+  const QUERY_FAILED = 'CLEANUP_LIST_QUERY_FAILED';
+  const listOutput = sshRun(
+    `curl -sS --fail -m 30 'http://${api}/api/v1/list' || printf '${QUERY_FAILED}\\n'`,
     60_000,
   ).trim();
-  if (stillListedCount !== '0') {
+  if (listOutput.includes(QUERY_FAILED)) {
     console.log(
-      `[WARN] cleanup: bag ${safeBag} still appears in the seeder's /api/v1/list after /api/v1/remove ` +
-        `(match count=${stillListedCount}) — it may still be finishing removal; check manually on ` +
-        `${process.env.CYPHER_BRAIN_TON_SSH_HOST} if it persists.`,
+      `[WARN] cleanup: could not query the seeder's /api/v1/list to confirm bag ${safeBag} was removed after ` +
+        `/api/v1/remove — check manually on ${process.env.CYPHER_BRAIN_TON_SSH_HOST} if unsure.`,
     );
+  } else {
+    const stillListedCount = (listOutput.match(new RegExp(safeBag, 'g')) || []).length;
+    if (stillListedCount !== 0) {
+      console.log(
+        `[WARN] cleanup: bag ${safeBag} still appears in the seeder's /api/v1/list after /api/v1/remove ` +
+          `(match count=${stillListedCount}) — it may still be finishing removal; check manually on ` +
+          `${process.env.CYPHER_BRAIN_TON_SSH_HOST} if it persists.`,
+      );
+    }
   }
 
   sshRun(`rm -rf -- '${base}/bags/${safeSha}' '${base}/inventory/${safeSha}.locator'`);
