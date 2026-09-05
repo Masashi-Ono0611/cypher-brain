@@ -323,8 +323,19 @@ await property(
 // never exercises the reject-and-rewrap-the-error branch at all. `age1` is the native
 // recipient prefix (see crypt.ts's own comment on this function); excluding it keeps
 // this property from accidentally generating something that happens to parse.
+//
+// Elevated-caution review: a caller who mixes up flags (or a recipients file that
+// accidentally contains a private identity line) can pass a SECRET key here instead of
+// a public recipient — this test used to assert the rejected value appears VERBATIM in
+// the thrown error, which would echo a full secret key back into whatever reads that
+// error (a log, a CI transcript, a bug report). crypt.ts's describeRejectedRecipient()
+// now redacts it to structural info only (the value's length + a short, FIXED-length
+// prefix, mirrored here as PREFIX_CHARS) — this asserts BOTH halves of that fix: the
+// masked description is present (still identifying enough for debugging) AND, once the
+// value is longer than the prefix cutoff, the full value never appears verbatim
+// anywhere in the message (a regression back to embedding it in full).
 await property(
-  "newEncrypter: rejects a non-age recipient with an error naming it, doesn't just crash opaquely",
+  'newEncrypter: rejects a non-age recipient with a REDACTED description (length + short prefix), never the full value verbatim',
   fc.property(
     wideString().filter((s) => !s.startsWith('age1')),
     (bogus) => {
@@ -332,14 +343,19 @@ await property(
         newEncrypter([bogus]);
         return false; // must not have been accepted as a recipient
       } catch (e) {
-        // crypt.ts's rejection throws `invalid recipient ${JSON.stringify(r)}: ...` --
-        // check the REJECTED VALUE actually appears (JSON.stringify'd, so control
-        // characters/quotes in `bogus` are escaped the same way), not just the generic
-        // phrase every rejection shares. A prior version of this test only checked the
-        // phrase, which would still pass if the value were silently dropped.
-        return (
-          e instanceof Error && e.message.includes('invalid recipient') && e.message.includes(JSON.stringify(bogus))
-        );
+        if (!(e instanceof Error) || !e.message.includes('invalid recipient')) return false;
+        // Mirrors crypt.ts's own describeRejectedRecipient() exactly, so this fails the
+        // instant the two drift apart rather than passing on a coincidental substring
+        // match.
+        const PREFIX_CHARS = 12;
+        const prefix = bogus.slice(0, PREFIX_CHARS);
+        const more = bogus.length > PREFIX_CHARS ? '…' : '';
+        const expectedDescription = `${bogus.length} char(s), starting ${JSON.stringify(prefix)}${more}`;
+        if (!e.message.includes(expectedDescription)) return false;
+        // The masking must actually mask: once truncation actually occurred, the FULL
+        // JSON-stringified value must never appear verbatim in the error.
+        if (bogus.length > PREFIX_CHARS && e.message.includes(JSON.stringify(bogus))) return false;
+        return true;
       }
     },
   ),

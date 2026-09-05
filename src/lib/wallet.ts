@@ -76,6 +76,7 @@ export const WALLET_DEFAULT_PATH = join(HOME, 'wallet.json');
 interface TonSigningModule {
   mnemonicNew(wordCount?: number): Promise<string[]>;
   mnemonicToPrivateKey(mnemonic: string[]): Promise<{ publicKey: Buffer; secretKey: Buffer }>;
+  mnemonicValidate(mnemonic: string[]): Promise<boolean>;
   WalletContractV4: {
     create(args: { workchain: number; publicKey: Buffer }): TonWalletContractV4;
   };
@@ -85,6 +86,7 @@ async function getTonSigning(): Promise<TonSigningModule> {
   let crypto: {
     mnemonicNew: TonSigningModule['mnemonicNew'];
     mnemonicToPrivateKey: TonSigningModule['mnemonicToPrivateKey'];
+    mnemonicValidate: TonSigningModule['mnemonicValidate'];
   };
   let ton: { WalletContractV4: TonSigningModule['WalletContractV4'] };
   try {
@@ -100,6 +102,7 @@ async function getTonSigning(): Promise<TonSigningModule> {
   return {
     mnemonicNew: crypto.mnemonicNew,
     mnemonicToPrivateKey: crypto.mnemonicToPrivateKey,
+    mnemonicValidate: crypto.mnemonicValidate,
     WalletContractV4: ton.WalletContractV4,
   };
 }
@@ -196,18 +199,47 @@ export async function loadTonWallet(
   } catch (e) {
     // ENOENT specifically means "not created yet" — the same fact doctor's SKIP
     // message already handles gracefully (#437) — so name the fix ('wallet create
-    // --chain ton') instead of surfacing a raw errno string. Any OTHER failure
-    // (EACCES, corrupt/non-JSON file, …) is a genuine problem the operator needs the
-    // real error to debug, so that keeps the raw errMsg(e) detail untouched.
+    // --chain ton') instead of surfacing a raw errno string.
     if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') {
       throw new Error(`${what}: no TON wallet at ${walletPath} — run 'cypher-brain wallet create --chain ton' first`);
     }
+    if (e instanceof SyntaxError) {
+      // Elevated-caution review: a JSON.parse failure's OWN message can echo a
+      // fragment of the file's actual bytes back (e.g. a snippet of the surrounding
+      // text around the failure position) — this file holds a secret mnemonic, and
+      // that fragment must never end up quoted into a log/terminal a caller wasn't
+      // expecting it to appear in. Report only that the JSON was malformed, never
+      // the parser's own message.
+      throw new Error(`${what}: ${walletPath} does not contain valid JSON`);
+    }
+    // Any OTHER failure (EACCES, a directory sitting where the file should be, …) is
+    // a genuine I/O problem the operator needs the real error to debug — that keeps
+    // the raw errMsg(e) detail untouched; it cannot echo file CONTENT the way a
+    // JSON.parse SyntaxError can.
     throw new Error(`${what}: cannot read TON wallet at ${walletPath}: ${errMsg(e)}`);
   }
   if (!Array.isArray(parsed.mnemonic) || parsed.mnemonic.length === 0) {
     throw new Error(`${what}: TON wallet at ${walletPath} has no mnemonic array`);
   }
   const ton = await getTonSigning();
+  // #<elevated-caution review>: without this, a malformed/typo'd mnemonic (a hand-
+  // edited file, a corrupted backup restore, a bit flip) silently derives a
+  // DIFFERENT, still-valid-LOOKING wallet — mnemonicToPrivateKey() never rejects an
+  // input that merely fails TON's own checksum, it just deterministically produces
+  // whatever keypair those (wrong) words happen to hash to. That wallet's address is
+  // fully guessable by anyone who can brute-force the same near-miss mnemonic, and
+  // ton-provider.ts's autoSignAndBroadcastDeploy() would go on to sign/broadcast
+  // spends from it with no warning that the "wallet" it just loaded is not the one
+  // the operator actually backed up. mnemonicValidate() runs the SAME checksum TON's
+  // own tooling (and mnemonicNew()'s own generation) enforces, so a malformed
+  // mnemonic is rejected here instead of quietly resolving to a different account.
+  if (!(await ton.mnemonicValidate(parsed.mnemonic))) {
+    throw new Error(
+      `${what}: TON wallet mnemonic at ${walletPath} failed validation (wrong word, wrong order, or a corrupted ` +
+        'file) — refusing to derive a wallet from it, since a malformed mnemonic silently derives a DIFFERENT, ' +
+        'guessable wallet rather than erroring. Restore the mnemonic from a trusted backup.',
+    );
+  }
   const keyPair = await ton.mnemonicToPrivateKey(parsed.mnemonic);
   const wallet = ton.WalletContractV4.create({ workchain: 0, publicKey: keyPair.publicKey });
   return { wallet, secretKey: keyPair.secretKey };
@@ -316,12 +348,22 @@ async function addressFromWallet(o: CliOptions, what: string): Promise<string> {
   } catch (e) {
     // ENOENT specifically means "not created yet" — the same fact doctor's SKIP
     // message already handles gracefully (#437) — so name the fix ('wallet create')
-    // instead of surfacing a raw errno string. Any OTHER failure (EACCES,
-    // corrupt/non-JSON file, …) is a genuine problem the operator needs the real
-    // error to debug, so that keeps the raw errMsg(e) detail untouched.
+    // instead of surfacing a raw errno string.
     if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') {
       throw new Error(`${what}: no wallet at ${walletPath} — run 'cypher-brain wallet create' first`);
     }
+    if (e instanceof SyntaxError) {
+      // Elevated-caution review: a JSON.parse failure's OWN message can echo a
+      // fragment of the file's actual bytes back — this file holds a spend-capable
+      // JWK, and that fragment must never end up quoted into a log/terminal a caller
+      // wasn't expecting it to appear in. Report only that the JSON was malformed,
+      // never the parser's own message.
+      throw new Error(`${what}: ${walletPath} does not contain valid JSON`);
+    }
+    // Any OTHER failure (EACCES, a directory sitting where the file should be, …) is
+    // a genuine I/O problem the operator needs the real error to debug — that keeps
+    // the raw errMsg(e) detail untouched; it cannot echo file CONTENT the way a
+    // JSON.parse SyntaxError can.
     throw new Error(`${what}: cannot read JWK wallet at ${walletPath}: ${errMsg(e)}`);
   }
   // A syntactically-valid-JSON file that isn't shaped like a JWK (`{}`, a JSON blob that

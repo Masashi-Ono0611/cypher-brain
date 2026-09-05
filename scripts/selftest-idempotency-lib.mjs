@@ -537,6 +537,105 @@ try {
       bogusThrew ? `${bogusThrew.constructor.name}: ${bogusThrew.message}` : 'lookup returned normally (BUG)',
     );
   }
+
+  // ---------- elevated-caution review: a malformed recordedAt is CORRUPT, not "expired" ----------
+  {
+    // Before this fix, Date.parse() on an unparseable recordedAt returned NaN, which
+    // isFresh() read as "not fresh" — i.e. silently as an ordinary EXPIRED ttl record,
+    // never as evidence the line itself might be unreliable. That is the wrong answer
+    // for a record whose CONTENTS cannot even be dated: it could just as easily have
+    // been a `retention: 'permanent'` tombstone for a payment whose outcome was never
+    // confirmed. This proves a malformed recordedAt now fails the shape check instead —
+    // routed through the exact same fail-closed `corrupted` machinery a truncated line
+    // already gets — rather than quietly reading as "no prior call, safe to redo".
+    const badTimestamp = JSON.stringify({
+      key: 'bad-timestamp-key',
+      tool: 'snapshot_now',
+      recordedAt: 'not-a-real-date',
+      fingerprint: 'fp-bad-ts',
+      result: { pushed: true },
+    });
+    const badTimestampPath = join(tmp, 'bad-timestamp-log.jsonl');
+    await writeFile(badTimestampPath, `${badTimestamp}\n`, { flag: 'w' });
+
+    // (a) a lookup for a DIFFERENT key must fail closed, not silently report a miss —
+    // the exact same posture the "corrupted line" and "bogus disposition" checks above
+    // assert, now for this specific field.
+    let lookupThrew;
+    try {
+      await lookupIdempotencyResult(badTimestampPath, 'snapshot_now', 'some-other-key', 86400);
+    } catch (e) {
+      lookupThrew = e;
+    }
+    check(
+      'a malformed recordedAt makes the log read as CORRUPT (fail-closed on a lookup miss), not silently expired',
+      lookupThrew instanceof IdempotencyStoreError,
+      lookupThrew ? `${lookupThrew.constructor.name}: ${lookupThrew.message}` : 'lookup returned normally (BUG)',
+    );
+
+    // (b) a lookup for the SAME key must also fail closed — pre-fix, this exact case
+    // was the worst outcome: isFresh(NaN) computed false, isLive() (for a 'ttl'
+    // record) then also returned false, and the record was silently treated as if it
+    // had never matched at all, letting a caller believe "no prior call" for a key
+    // whose actual prior result is sitting right there, just undated.
+    let sameKeyThrew;
+    try {
+      await lookupIdempotencyResult(badTimestampPath, 'snapshot_now', 'bad-timestamp-key', 86400);
+    } catch (e) {
+      sameKeyThrew = e;
+    }
+    check(
+      'a malformed recordedAt fails closed even when queried with its OWN key (not silently read as a miss)',
+      sameKeyThrew instanceof IdempotencyStoreError,
+      sameKeyThrew ? `${sameKeyThrew.constructor.name}: ${sameKeyThrew.message}` : 'lookup returned normally (BUG)',
+    );
+
+    // (c) recordIdempotencyResult must refuse to REWRITE (and thereby silently drop)
+    // the corrupted line too — same "a write has strictly more to lose" posture the
+    // existing "a write against a log with an unparseable line is refused" check above
+    // already asserts for a plain JSON-parse failure.
+    let recordThrew;
+    try {
+      await recordIdempotencyResult(badTimestampPath, 'snapshot_now', 'yet-another-key', 'fp', { ok: true }, 86400);
+    } catch (e) {
+      recordThrew = e;
+    }
+    check(
+      'recordIdempotencyResult refuses to rewrite a log containing a malformed-recordedAt line',
+      recordThrew instanceof IdempotencyStoreError,
+      recordThrew ? `${recordThrew.constructor.name}: ${recordThrew.message}` : 'write returned normally (BUG)',
+    );
+    const stillThere = await readFile(badTimestampPath, 'utf8');
+    check(
+      'the malformed-recordedAt line survived that refused write, unchanged',
+      stillThere.trim() === badTimestamp,
+      stillThere,
+    );
+
+    // Negative control: a well-formed, genuinely PARSEABLE recordedAt that is merely
+    // old enough to be expired must still read as an ordinary cache miss (no throw) —
+    // this fix must not turn EVERY absent match into a false fail-closed refusal.
+    const staleButParseable = JSON.stringify({
+      key: 'genuinely-expired-key',
+      tool: 'snapshot_now',
+      recordedAt: new Date(Date.now() - 365 * 86400 * 1000).toISOString(),
+      fingerprint: 'fp-stale',
+      result: { pushed: true },
+    });
+    const staleButParseablePath = join(tmp, 'stale-but-parseable-log.jsonl');
+    await writeFile(staleButParseablePath, `${staleButParseable}\n`, { flag: 'w' });
+    const staleResult = await lookupIdempotencyResult(
+      staleButParseablePath,
+      'snapshot_now',
+      'genuinely-expired-key',
+      1, // 1s TTL — the record above is ~a year old, so it is genuinely expired
+    );
+    check(
+      'control: a genuinely expired but well-formed record is still a plain cache miss (no throw)',
+      staleResult === undefined,
+      JSON.stringify(staleResult),
+    );
+  }
 } finally {
   await rm(tmp, { recursive: true, force: true });
 }

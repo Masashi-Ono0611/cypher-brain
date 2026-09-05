@@ -1,8 +1,8 @@
 // ---------- utils ----------
-import { access, chmod, lstat, readdir, rm, stat } from 'node:fs/promises';
+import { access, chmod, lstat, open, readdir, rm, stat } from 'node:fs/promises';
 import { createReadStream, statSync, constants as FS, type Dirent } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { warn } from './warn.js';
 
@@ -11,6 +11,61 @@ export const exists = (p: string): Promise<boolean> =>
     .then(() => true)
     .catch(() => false);
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// ---------- durability (fsync) ----------
+//
+// Shared by every write in this codebase that must survive a crash the instant after it
+// returns, not merely reach the kernel page cache: pending-spend.ts's spend-intent log
+// (#808) needed this first, and the same two primitives now back keys.ts's identity/
+// backup writes, minisign.ts's signing-identity writes (via keys.ts's writeKeyFile),
+// idempotency.ts's claim/result files, and receipt.ts's receipt ledger — rather than
+// each hand-rolling its own copy of "open, write, fsync the fd, close" and "walk up the
+// directories mkdir(recursive) just created and fsync each one".
+//
+// fsync a single path (a file OR a directory — a directory can be opened read-only and
+// fsync'd on POSIX, which is what makes a new directory ENTRY durable). Skipped only at
+// the call site on win32, where a directory cannot be opened as a file handle at all and
+// there is no equivalent call to make — this helper itself does not special-case the
+// platform, since a caller syncing a known-regular FILE (identity.age, a lock file, the
+// receipt ledger) still needs this to run everywhere.
+export async function fsyncPath(path: string): Promise<void> {
+  const fh = await open(path, 'r');
+  try {
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+}
+
+// fsync `dir` itself, plus the parent of every directory `mkdir(recursive: true)` just
+// created on the way down to it (walking up from the deepest) — `firstCreated` is
+// `mkdir`'s own return value (the FIRST path component it created, or undefined if
+// nothing was). An fsync'd file whose CREATION is still only in the page cache can come
+// back missing entirely after a crash, which is the same "the durable write vanished" gap
+// fsyncPath alone leaves open for a directory entry that did not exist a moment ago.
+// Skipped on win32, where a directory cannot be opened as a file handle at all.
+export async function syncDirectoryChain(dir: string, firstCreated: string | undefined): Promise<void> {
+  if (process.platform === 'win32') return;
+  const toSync = [dir];
+  if (firstCreated) {
+    for (let d = dir; d !== firstCreated; d = dirname(d)) {
+      const parent = dirname(d);
+      if (parent === d) break; // reached the filesystem root
+      toSync.push(parent);
+    }
+    // `firstCreated` is itself a newly-created directory (mkdir's own contract: "the
+    // first directory path created"), and its own directory ENTRY lives in its parent,
+    // exactly like every other level the loop above already walks — the loop stops the
+    // instant `d === firstCreated`, one level short of syncing that parent. Without this,
+    // the topmost newly-created directory's own entry (e.g. `dir` === `firstCreated`,
+    // when only ONE new directory was created and the loop above never runs at all) is
+    // never durably recorded in ITS parent, which can leave that directory — and
+    // whatever was just fsync'd inside it — missing entirely after a crash.
+    const parentOfFirstCreated = dirname(firstCreated);
+    if (parentOfFirstCreated !== firstCreated) toSync.push(parentOfFirstCreated);
+  }
+  for (const d of toSync) await fsyncPath(d);
+}
 
 // fs.rm({recursive: true, force: true}) only swallows ENOENT (already gone) — a
 // directory that itself (or a descendant) landed with no owner-write bit (a --dir

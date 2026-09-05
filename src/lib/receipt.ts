@@ -19,10 +19,10 @@
 // buffer actually locked into the on-chain transfer, confirmed by the time put()
 // returns via waitForContractActive()) as an AUTHORITATIVE figure, same posture as
 // arweave's signed tx.reward — not a pre-flight estimate like turbo's.
-import { appendFile, mkdir } from 'node:fs/promises';
+import { mkdir, open } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { RECEIPT_LEDGER } from './config.js';
-import { readJsonlLog } from './util.js';
+import { readJsonlLog, syncDirectoryChain } from './util.js';
 
 export const RECEIPT_VERSION = 1;
 
@@ -57,18 +57,35 @@ export interface ReceiptEntry {
 // syscall (no lost-update race between two processes each doing their own
 // open+seek+write) — NOT the PIPE_BUF pipe-atomicity guarantee, a distinct, unrelated
 // POSIX contract that applies to pipes/FIFOs, not regular files (an earlier version of
-// this comment incorrectly invoked it — Codex review). In practice Node's
-// fs.appendFile() issues one write() syscall for a buffer this small (a receipt line is
-// typically well under a few KB), so concurrent appends land as separate,
-// non-interleaved lines on a POSIX-compliant filesystem — but this is not a hardened
-// guarantee against an arbitrarily large `raw` payload spanning multiple write()
-// syscalls, nor against a non-POSIX filesystem. No lock/read-modify-write is used
-// regardless (unlike idempotency.ts's log, which must detect REPLAYS — a fundamentally
-// different consistency requirement).
+// this comment incorrectly invoked it — Codex review). In practice Node's fs append
+// issues one write() syscall for a buffer this small (a receipt line is typically well
+// under a few KB), so concurrent appends land as separate, non-interleaved lines on a
+// POSIX-compliant filesystem — but this is not a hardened guarantee against an
+// arbitrarily large `raw` payload spanning multiple write() syscalls, nor against a
+// non-POSIX filesystem. No lock/read-modify-write is used regardless (unlike
+// idempotency.ts's log, which must detect REPLAYS — a fundamentally different
+// consistency requirement).
+//
+// fsync'd (util.ts's fsyncPath/syncDirectoryChain), for durability consistency with the
+// rest of this cluster (pending-spend.ts's own append; keys.ts/minisign.ts's identity
+// writes; idempotency.ts's claim/result files) — an appendFile() that has returned has
+// only reached the kernel page cache, not the disk, and this ledger is the ONE place
+// backends/ton-provider.ts's settleIntent() can point a pending-spend record's
+// `settled` transition at as "verified durable" (see that file's own fsyncPath(
+// RECEIPT_LEDGER) call, kept as a second, point-in-time confirmation immediately before
+// that transition rather than removed now that every ordinary append also syncs).
 export async function appendReceipt(entry: Omit<ReceiptEntry, 'cypher_brain_receipt_version'>): Promise<void> {
   const full: ReceiptEntry = { cypher_brain_receipt_version: RECEIPT_VERSION, ...entry };
-  await mkdir(dirname(RECEIPT_LEDGER), { recursive: true });
-  await appendFile(RECEIPT_LEDGER, `${JSON.stringify(full)}\n`, { flag: 'a' });
+  const dir = dirname(RECEIPT_LEDGER);
+  const firstCreated = await mkdir(dir, { recursive: true });
+  const fh = await open(RECEIPT_LEDGER, 'a');
+  try {
+    await fh.writeFile(`${JSON.stringify(full)}\n`, 'utf8');
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+  await syncDirectoryChain(dir, firstCreated);
 }
 
 export interface ReadReceiptsResult {

@@ -35,7 +35,13 @@ import { mkdir, open } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { RECEIPT_LEDGER } from './config.js';
-import { readJsonlLog } from './util.js';
+import { fsyncPath, readJsonlLog, syncDirectoryChain } from './util.js';
+
+// fsyncPath is re-exported here (unchanged name/signature) for ton-provider.ts's
+// existing `import { fsyncPath } from './pending-spend.js'` — the implementation moved
+// to util.ts so keys.ts/minisign.ts/idempotency.ts/receipt.ts can share it too, instead
+// of each hand-rolling their own copy of this same durability primitive.
+export { fsyncPath };
 
 export const SPEND_INTENT_VERSION = 1;
 
@@ -108,55 +114,20 @@ export type NewSpendIntent = Omit<
 
 const STATES: readonly SpendIntentState[] = ['pending', 'confirmed', 'settled', 'abandoned'];
 
-// fsync'd, unlike receipt.ts's appendReceipt() (multi-model review, Critical). That
-// difference is the whole point of this file: a receipt is written AFTER the fact, so
-// losing an un-flushed one costs a ledger line, while THIS record is written before an
-// irreversible transfer and is the only thing that can account for it afterwards. An
-// appendFile() that has returned has reached the kernel page cache, not the disk — a
-// power loss between the broadcast and the next flush would discard exactly the record
-// this file exists to guarantee, recreating #808 in a form no retry can repair.
+// fsync'd (util.ts's fsyncPath/syncDirectoryChain, re-exported/imported above): this
+// record is written BEFORE an irreversible transfer and is the only thing that can
+// account for it afterwards, so an appendFile() that has merely returned — reaching the
+// kernel page cache, not the disk — is not durable enough. A power loss between the
+// broadcast and the next flush would discard exactly the record this file exists to
+// guarantee, recreating #808 in a form no retry can repair. (receipt.ts's own
+// appendReceipt() now applies the same fsync discipline too, for consistency across
+// this cluster — the two files started at different durability postures because a
+// receipt used to be considered recoverable from a re-push where an intent is not, but
+// both are cheap enough to sync unconditionally.)
 //
-// Every directory the write depends on is fsync'd too, and that half FAILS CLOSED rather
-// than being best-effort (second review pass): an fsync'd file whose CREATION is still
-// only in the page cache can come back missing entirely after a crash, which is the same
-// unrecorded spend with extra steps. `mkdir(recursive)` reports the FIRST path component
-// it created, so every directory created on the way down gets its own parent synced, not
-// just the immediate one. Skipped only on win32, where a directory cannot be opened as a
-// file handle at all and there is no equivalent call to make.
-export async function fsyncPath(path: string): Promise<void> {
-  const fh = await open(path, 'r');
-  try {
-    await fh.sync();
-  } finally {
-    await fh.close();
-  }
-}
-
-async function syncDirectories(dir: string, firstCreated: string | undefined): Promise<void> {
-  if (process.platform === 'win32') return;
-  // Always the directory holding the file (its entry may be new); plus the parent of
-  // every directory `mkdir` just created, walking up from the deepest.
-  const toSync = [dir];
-  if (firstCreated) {
-    for (let d = dir; d !== firstCreated; d = dirname(d)) {
-      const parent = dirname(d);
-      if (parent === d) break; // reached the filesystem root
-      toSync.push(parent);
-    }
-    // `firstCreated` is itself a newly-created directory (mkdir's own contract: "the
-    // first directory path created"), and its own directory ENTRY lives in its
-    // parent, exactly like every other level the loop above already walks — the loop
-    // stops the instant `d === firstCreated`, one level short of syncing that parent.
-    // Without this, the topmost newly-created directory's own entry (e.g. `dir` ===
-    // `firstCreated`, when only ONE new directory was created and the loop above never
-    // runs at all) is never durably recorded in ITS parent, which can leave that
-    // directory — and the fsync'd record inside it — missing entirely after a crash.
-    const parentOfFirstCreated = dirname(firstCreated);
-    if (parentOfFirstCreated !== firstCreated) toSync.push(parentOfFirstCreated);
-  }
-  for (const d of toSync) await fsyncPath(d);
-}
-
+// The directory half of that is not best-effort either (second review pass): an
+// fsync'd file whose CREATION is still only in the page cache can come back missing
+// entirely after a crash, which is the same unrecorded spend with extra steps.
 async function appendLine(record: SpendIntentRecord): Promise<void> {
   const dir = dirname(PENDING_SPENDS_LOG);
   const firstCreated = await mkdir(dir, { recursive: true });
@@ -171,7 +142,7 @@ async function appendLine(record: SpendIntentRecord): Promise<void> {
   } finally {
     await fh.close();
   }
-  await syncDirectories(dir, firstCreated);
+  await syncDirectoryChain(dir, firstCreated);
 }
 
 /**
