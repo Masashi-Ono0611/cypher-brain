@@ -109,6 +109,182 @@ printf '%s' "$MOUT" | grep -q 'unknown setting' \
   || { echo "[FAIL] the MCP server started despite a config file it could not accept: $MOUT"; exit 1; }
 echo "[PASS] an unknown key is refused on the CLI (error: + --json) and by the MCP server"
 
+echo "== (f1) a malformed CYPHER_BRAIN_* line (missing '=') is refused, not silently dropped =="
+# node:util's parseEnv is deliberately permissive (dotenv-style): a line it cannot parse
+# as KEY=VALUE is simply DROPPED with no signal at all — this is fine for lines that are
+# not ours, but for a line that visibly starts with our prefix, silently vanishing an
+# operator's intended setting (a spend cap, a timeout override) is exactly the failure
+# mode the "unknown setting" refusal above exists to prevent for a well-FORMED typo.
+H="$(new_home malformed)"
+write_cfg "$H" "CYPHER_BRAIN_MAX_SPEND 100"
+if CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1; then
+  echo "[FAIL] a malformed CYPHER_BRAIN_* line (missing '=') was silently accepted"; exit 1
+fi
+OUT="$(CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null || true)"
+printf '%s' "$OUT" | grep -q '^error: config file .*malformed setting' \
+  || { echo "[FAIL] the malformed-line refusal did not use the CLI's 'error: …' form: $OUT"; exit 1; }
+printf '%s' "$OUT" | grep -q 'CYPHER_BRAIN_MAX_SPEND' \
+  || { echo "[FAIL] the malformed-line refusal did not name the offending key: $OUT"; exit 1; }
+echo "[PASS] a malformed CYPHER_BRAIN_* line is refused and names the offending key"
+
+echo "== (f1b) a malformed line naming CYPHER_BRAIN_PASSPHRASE never echoes the value (Codex review: secrets must not leak into a startup error) =="
+H="$(new_home malformed-secret)"
+write_cfg "$H" "CYPHER_BRAIN_PASSPHRASE this-is-the-secret-value"
+if CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1; then
+  echo "[FAIL] a malformed CYPHER_BRAIN_PASSPHRASE line was silently accepted"; exit 1
+fi
+OUT="$(CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null || true)"
+printf '%s' "$OUT" | grep -q 'CYPHER_BRAIN_PASSPHRASE' \
+  || { echo "[FAIL] the refusal did not name CYPHER_BRAIN_PASSPHRASE: $OUT"; exit 1; }
+printf '%s' "$OUT" | grep -q 'this-is-the-secret-value' \
+  && { echo "[FAIL] the secret VALUE leaked into the error message: $OUT"; exit 1; }
+echo "[PASS] a malformed CYPHER_BRAIN_PASSPHRASE line names the key but never echoes its value"
+
+echo "== (f1c) a FOREIGN key's legitimate multi-line quoted value is not mistaken for a malformed CYPHER_BRAIN_* line (Codex review) =="
+# parseEnv supports a value that spans multiple physical lines inside quotes. The middle
+# body line here happens to LOOK like a botched CYPHER_BRAIN_MAX_SPEND assignment, but it
+# is just quoted text belonging to an unrelated foreign key — this must not refuse.
+H="$(new_home multiline-foreign)"
+write_cfg "$H" 'SOME_FOREIGN_KEY="line one' 'CYPHER_BRAIN_MAX_SPEND 100' 'line three"' "CYPHER_BRAIN_AR_HOST=example.invalid"
+CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1 \
+  || { echo "[FAIL] a foreign key's legitimate multi-line quoted value was mistaken for a malformed CYPHER_BRAIN_* line"; \
+       CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null; exit 1; }
+echo "[PASS] a foreign key's multi-line quoted value whose body text resembles our prefix is left alone"
+
+echo "== (f1d) a concatenated (no-separator) malformed CYPHER_BRAIN_PASSPHRASE line never echoes anything from the line (Codex review round 2) =="
+# LEADING_IDENTIFIER_RE alone would greedily match the WHOLE token here (identifier
+# characters run straight from the key name into the secret with no separator at all) —
+# the fix must refuse to name anything unless it EXACTLY matches a known setting name.
+H="$(new_home malformed-secret-concat)"
+write_cfg "$H" "CYPHER_BRAIN_PASSPHRASEmysecret123"
+if CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1; then
+  echo "[FAIL] a concatenated malformed CYPHER_BRAIN_PASSPHRASE line was silently accepted"; exit 1
+fi
+OUT="$(CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null || true)"
+printf '%s' "$OUT" | grep -q 'mysecret123' \
+  && { echo "[FAIL] the secret leaked via a greedily-matched identifier: $OUT"; exit 1; }
+printf '%s' "$OUT" | grep -q 'unrecognized malformed line' \
+  || { echo "[FAIL] expected the generic 'unrecognized malformed line' placeholder: $OUT"; exit 1; }
+echo "[PASS] a concatenated (no-separator) malformed line never echoes any part of itself"
+
+echo "== (f1e) a multi-line value's CLOSING line (CYPHER_BRAIN_-looking body text plus the closing quote on the SAME line) is not mistaken for malformed (Codex review round 2) =="
+# The exact Codex repro: the physical closing line carries the trailing quote character,
+# which the DECODED value does not — an exact-string comparison against decoded output
+# misses this case; the fix must track quote-open/close state against the raw text itself.
+H="$(new_home multiline-closing-line)"
+write_cfg "$H" 'FOREIGN="one' 'CYPHER_BRAIN_MAX_SPEND 100"' "CYPHER_BRAIN_AR_HOST=example.invalid"
+CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1 \
+  || { echo "[FAIL] a multi-line value's closing line was mistaken for a malformed CYPHER_BRAIN_* line"; \
+       CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null; exit 1; }
+echo "[PASS] a multi-line value's closing line (body text + closing quote on one line) is left alone"
+
+echo "== (f1f) a LATER re-assignment of a foreign key does not un-exempt an earlier multi-line value's body lines (Codex review round 2) =="
+# A version that cross-referenced parsed's DECODED values broke here: the later FOREIGN=x
+# assignment overwrites parsed.FOREIGN, so the earlier multi-line value's body lines are
+# no longer found in `parsed` and get wrongly flagged. Raw-text quote tracking is immune.
+H="$(new_home multiline-reassigned)"
+write_cfg "$H" 'FOREIGN="one' 'CYPHER_BRAIN_MAX_SPEND 100' 'line three"' 'FOREIGN=final-value' "CYPHER_BRAIN_AR_HOST=example.invalid"
+CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1 \
+  || { echo "[FAIL] a later re-assignment of an unrelated foreign key broke multi-line detection for an earlier value"; \
+       CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null; exit 1; }
+echo "[PASS] a later re-assignment of a foreign key does not affect an earlier multi-line value's body-line detection"
+
+echo "== (f1g) a genuine STANDALONE malformed line is still caught even when identical text ALSO appears inside an unrelated quoted value (Codex review round 2: no bypass) =="
+# The bug this guards against: matching against DECODED text let a real malformed line
+# skip detection merely because coincidentally identical text sat inside some quoted
+# value elsewhere in the file — silently dropping a real spend cap. Must NOT bypass.
+H="$(new_home multiline-no-bypass)"
+write_cfg "$H" 'FOREIGN="one' 'CYPHER_BRAIN_MAX_SPEND 100' 'line three"' 'CYPHER_BRAIN_MAX_SPEND 100'
+if CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1; then
+  echo "[FAIL] a genuine standalone malformed line was bypassed because identical text appeared inside a quoted value"; exit 1
+fi
+OUT="$(CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null || true)"
+printf '%s' "$OUT" | grep -q 'CYPHER_BRAIN_MAX_SPEND' \
+  || { echo "[FAIL] the standalone malformed line was not named: $OUT"; exit 1; }
+echo "[PASS] a genuine standalone malformed line is caught, not bypassed by coincidentally-matching quoted text elsewhere"
+
+echo "== (f1h) a BACKTICK-delimited multi-line foreign value does not bypass detection of a genuine malformed line inside it (Codex review round 3) =="
+# parseEnv accepts a backtick as a third quote delimiter, not just \" and '. An
+# identifier-anchored KEY=<quote> opener regex (round 2's fix) does not look for a
+# backtick at all, so it never opens tracking for this span — the malformed line inside
+# it then falls through to the normal per-line check un-suppressed, which happens to
+# still catch it here, but only by accident (see f1i for where that accident stops
+# working). The real requirement is architectural: opener detection must not be anchored
+# to the quote CHARACTER either.
+H="$(new_home multiline-backtick)"
+write_cfg "$H" 'FOREIGN=`one' 'A="two' 'three`' 'CYPHER_BRAIN_MAX_SPEND 100' 'OTHER="done"'
+if CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1; then
+  echo "[FAIL] a genuine standalone malformed line was bypassed via a backtick-delimited multi-line value"; exit 1
+fi
+OUT="$(CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null || true)"
+printf '%s' "$OUT" | grep -q 'CYPHER_BRAIN_MAX_SPEND' \
+  || { echo "[FAIL] the standalone malformed line (after a backtick multi-line value) was not named: $OUT"; exit 1; }
+echo "[PASS] a genuine standalone malformed line is caught even after a backtick-delimited multi-line value"
+
+echo "== (f1i) a HYPHENATED foreign key's multi-line quoted value is not mistaken for a malformed CYPHER_BRAIN_* line (Codex review round 3) =="
+# parseEnv's key grammar accepts a hyphen (and more) — not just [A-Za-z_][A-Za-z0-9_]*.
+# An identifier-anchored opener regex never recognizes 'FOREIGN-KEY=' as opening a value
+# at all, so this multi-line value's own body line gets wrongly evaluated as a fresh
+# top-level CYPHER_BRAIN_ assignment attempt and refused — a false positive on a
+# perfectly valid file.
+H="$(new_home multiline-hyphenated-key)"
+write_cfg "$H" 'FOREIGN-KEY="one' 'CYPHER_BRAIN_MAX_SPEND 100' 'line three"' "CYPHER_BRAIN_AR_HOST=example.invalid"
+CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1 \
+  || { echo "[FAIL] a hyphenated foreign key's multi-line quoted value was mistaken for a malformed CYPHER_BRAIN_* line"; \
+       CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null; exit 1; }
+echo "[PASS] a hyphenated foreign key's multi-line quoted value is left alone"
+
+echo "== (f1j) a quoted, missing-'=' CYPHER_BRAIN_PASSPHRASE whose value itself contains a literal '=' (a realistic base64 secret) does not leak via the OLDER 'unknown setting' path (Codex review round 4) =="
+# A genuinely common real-world shape: an operator forgets the '=' between the key and a
+# QUOTED base64-encoded secret, and base64 padding ends in a literal '='. The scan's
+# opener-detection found that stray '=' (base64 padding, not a real separator) and
+# treated the WHOLE preceding text — including "CYPHER_BRAIN_PASSPHRASE " and the base64
+# payload — as a harmless "<key>=<quote>" shape to skip. That let the line fall through
+# entirely unflagged to the OLDER, pre-existing "unknown setting(s)" refusal further down
+# (which echoes parsed's raw keys verbatim, no redaction) — and parseEnv itself folds
+# everything before that stray '=' into ONE giant key, which is most of the secret. The
+# fix requires the "key" portion before a candidate '=' to itself be quote-free before
+# treating it as an opener.
+H="$(new_home malformed-secret-quoted-base64)"
+write_cfg "$H" 'CYPHER_BRAIN_PASSPHRASE "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="'
+if CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1; then
+  echo "[FAIL] a quoted, missing-'=' CYPHER_BRAIN_PASSPHRASE line (base64 value) was silently accepted"; exit 1
+fi
+OUT="$(CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null || true)"
+printf '%s' "$OUT" | grep -q '^error: config file .*malformed setting' \
+  || { echo "[FAIL] this did not take the malformed-setting refusal path (may have leaked via 'unknown setting' instead): $OUT"; exit 1; }
+printf '%s' "$OUT" | grep -q 'CYPHER_BRAIN_PASSPHRASE' \
+  || { echo "[FAIL] the refusal did not name CYPHER_BRAIN_PASSPHRASE: $OUT"; exit 1; }
+printf '%s' "$OUT" | grep -q 'MDEy' \
+  && { echo "[FAIL] the base64 secret payload leaked into the error message: $OUT"; exit 1; }
+echo "[PASS] a quoted, missing-'=' base64 CYPHER_BRAIN_PASSPHRASE line is refused via the malformed-setting path, naming the key but never the secret"
+
+echo "== (f1k) an UNQUOTED, missing-'=' CYPHER_BRAIN_PASSPHRASE base64 value leaks nothing via the 'unknown setting' path either (Codex review round 5) =="
+# A single deleted '=' from an ordinary, perfectly valid assignment
+# (CYPHER_BRAIN_PASSPHRASE=YWJjZA==) produces CYPHER_BRAIN_PASSPHRASEYWJjZA== — no quote
+# character anywhere on the line, so the opener-detection fix above never even applies.
+# parseEnv itself splits on the base64 padding's OWN '=' as if it were the real
+# separator, so KEY_ASSIGNMENT_RE matches and `m[1] in parsed` is TRUE (parseEnv really
+# did produce that merged string as a key) — this scan's own malformed check correctly
+# stays silent, but the key it lets through, "CYPHER_BRAIN_PASSPHRASEYWJjZA", carries
+# most of the secret and previously reached the OLDER "unknown setting(s)" diagnostic
+# verbatim. The fix lives at THAT diagnostic: it must not echo an "unknown" key that has
+# one of our SECRET-bearing setting names as a strict prefix with extra characters
+# glued on — that shape only arises from exactly this kind of missing-separator merge.
+H="$(new_home malformed-secret-unquoted-base64)"
+write_cfg "$H" 'CYPHER_BRAIN_PASSPHRASEYWJjZA=='
+if CYPHER_BRAIN_HOME="$H" node "$CLI" --version >/dev/null 2>&1; then
+  echo "[FAIL] an unquoted, missing-'=' CYPHER_BRAIN_PASSPHRASE base64 line was silently accepted"; exit 1
+fi
+OUT="$(CYPHER_BRAIN_HOME="$H" node "$CLI" --version 2>&1 >/dev/null || true)"
+printf '%s' "$OUT" | grep -q '^error: config file .*unknown setting' \
+  || { echo "[FAIL] expected this to take the (redacted) 'unknown setting' refusal path: $OUT"; exit 1; }
+printf '%s' "$OUT" | grep -q 'YWJjZA' \
+  && { echo "[FAIL] the base64 secret payload leaked into the 'unknown setting' error message: $OUT"; exit 1; }
+printf '%s' "$OUT" | grep -q 'absorbed part of a secret value' \
+  || { echo "[FAIL] the redacted-key placeholder text was not used: $OUT"; exit 1; }
+echo "[PASS] an unquoted, missing-'=' base64 CYPHER_BRAIN_PASSPHRASE line is refused via 'unknown setting', with the secret-absorbing key redacted"
+
 echo "== (f2) a key outside the CYPHER_BRAIN_ namespace is left alone =="
 H="$(new_home foreign)"
 write_cfg "$H" "EDITOR=vim" "CYPHER_BRAIN_AR_HOST=example.invalid"

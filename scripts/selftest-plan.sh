@@ -200,6 +200,44 @@ fi
 grep -q "plan was built with no recipients fingerprint recorded" "$TMP/nullfp.err" || { echo "[FAIL] wrong null-fingerprint-crossing message"; cat "$TMP/nullfp.err"; exit 1; }
 echo "[PASS] recipients-fingerprint null->value crossing guard fired (#469)"
 
+# positive control: created_at in the future is refused. A hand-edited plan could move
+# BOTH created_at and expires_at into the future, consistently (expires_at = created_at +
+# PLAN_DEFAULT_TTL_MS, the same relationship a genuine plan always has) — which would
+# otherwise sail past the expiry check too, since "not yet expired" also moves forward by
+# the same amount. Distinct from the "tampered plan" positive control above, which only
+# bumps expires_at and is caught by the created_at/expires_at consistency check instead.
+python3 -c "
+import json
+from datetime import datetime, timedelta, timezone
+p = json.load(open('$TMP/plan.json'))
+created = datetime.now(timezone.utc) + timedelta(days=365)
+p['created_at'] = created.strftime('%Y-%m-%dT%H:%M:%S.') + f'{created.microsecond // 1000:03d}Z'
+expires = created + timedelta(milliseconds=900000)
+p['expires_at'] = expires.strftime('%Y-%m-%dT%H:%M:%S.') + f'{expires.microsecond // 1000:03d}Z'
+json.dump(p, open('$TMP/plan-future-created.json', 'w'))
+"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan-future-created.json" >"$TMP/futurecreated.out" 2>"$TMP/futurecreated.err"; then
+  echo "[FAIL] push --plan accepted a plan whose created_at is in the future"; exit 1
+fi
+grep -q "is in the future" "$TMP/futurecreated.err" || { echo "[FAIL] wrong future-created_at message"; cat "$TMP/futurecreated.err"; exit 1; }
+echo "[PASS] future-created_at guard fired (a plan dated into the future is refused, not silently treated as freshly issued)"
+
+# positive control (size_bytes cross-validation): plan.json's own recorded size_bytes
+# disagreeing with what --in actually is now is refused, not silently accepted. Like
+# recipients_fingerprint (#469) above, size_bytes was write-only — recorded at build time
+# but never read back — so a hand-edited (or corrupted) value went completely unchecked.
+python3 -c "
+import json
+p = json.load(open('$TMP/plan.json'))
+p['size_bytes'] = p['size_bytes'] + 12345
+json.dump(p, open('$TMP/plan-bad-size.json', 'w'))
+"
+if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/plan-bad-size.json" >"$TMP/badsize.out" 2>"$TMP/badsize.err"; then
+  echo "[FAIL] push --plan accepted a plan with a mismatched size_bytes"; exit 1
+fi
+grep -q "plan records size_bytes" "$TMP/badsize.err" || { echo "[FAIL] wrong size_bytes-mismatch message"; cat "$TMP/badsize.err"; exit 1; }
+echo "[PASS] size_bytes cross-validation guard fired"
+
 # positive control: nonexistent plan file
 if CYPHER_BRAIN_FILE_DIR="$TMP/store" cb push --in "$TMP/snap.age" --backend file --plan "$TMP/no-such-plan.json" >"$TMP/noexist.out" 2>"$TMP/noexist.err"; then
   echo "[FAIL] push --plan accepted a nonexistent plan path"; exit 1

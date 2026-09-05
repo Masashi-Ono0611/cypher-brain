@@ -78,6 +78,15 @@ const ENV_NAMES = [
 
 export type EnvName = (typeof ENV_NAMES)[number];
 
+// Of ENV_NAMES above, the subset whose VALUE (not just its presence) is itself a secret
+// an operator would type directly into config.env — today, only the decrypt passphrase.
+// (CYPHER_BRAIN_AR_WALLET/CYPHER_BRAIN_TON_WALLET name a PATH to a credential file, not
+// the credential itself, so a path leaking into a diagnostic is a much smaller concern
+// than the literal secret value leaking.) loadConfigFile()'s "unknown setting(s)"
+// diagnostic below uses this list to decide when an "unknown" key is too risky to name
+// verbatim (Codex re-review, round 5).
+const SECRET_ENV_NAMES: readonly EnvName[] = ['CYPHER_BRAIN_PASSPHRASE'];
+
 // The project was renamed cipher-brain -> cypher-brain. Every variable keeps working
 // under its old CIPHER_BRAIN_* spelling: the canonical name wins when both are set,
 // otherwise the legacy one is read. Derived from the canonical list so there is still
@@ -146,11 +155,144 @@ function loadConfigFile(home: string): { file: LoadedConfigFile | null; error: E
   // applies the WHOLE file — a stray TMPDIR or HTTP_PROXY in it would silently reach
   // every child process we spawn, and an in-file CYPHER_BRAIN_HOME would land in the
   // environment despite the warning saying it is ignored (multi-model review findings).
+  let text: string;
   let parsed: Record<string, string>;
   try {
-    parsed = parseEnv(readFileSync(path, 'utf8')) as Record<string, string>;
+    text = readFileSync(path, 'utf8');
+    parsed = parseEnv(text) as Record<string, string>;
   } catch (e) {
     return { file: null, error: new Error(`config file ${path} could not be parsed: ${errMsg(e)}`) };
+  }
+
+  // node:util's parseEnv is deliberately permissive, dotenv-style: a line it cannot read
+  // as a KEY=VALUE assignment is not an error, it is simply DROPPED from the returned
+  // object with no signal of any kind (verified against this Node's own parseEnv — e.g.
+  // "CYPHER_BRAIN_MAX_SPEND 100" with a missing "=", or "CYPHER_BRAIN_MAX_SPEND100" with
+  // no "=" at all, both parse to {}). That silence is fine for a foreign/unrelated line —
+  // this file is not the config.env's owner and has no business policing it — but it is
+  // exactly the failure mode the "unknown setting" refusal above exists to prevent for a
+  // line that WAS meant to set one of ours: a single typo'd "=" would silently vanish an
+  // operator's spend cap or timeout override with the file otherwise reporting success.
+  //
+  // This is a raw-text, line-oriented scan — it does NOT re-implement parseEnv's full
+  // grammar — with ONE piece of state carried across lines: whether we are currently
+  // inside a value that opened an unclosed quote on an earlier line (parseEnv supports a
+  // value spanning multiple physical lines this way, e.g. `SOME_KEY="line one
+  // CYPHER_BRAIN_MAX_SPEND 100
+  // line three"`). A prior version instead cross-referenced physical lines against
+  // parseEnv's own DECODED values, which a Codex re-review found breaks three ways: (1)
+  // the physical closing line of a multi-line value still carries its closing quote
+  // character, which the decoded value does not, so an exact-string match missed it; (2)
+  // a LATER re-assignment of the same key overwrites `parsed`'s record of an earlier
+  // multi-line value, un-exempting its now-orphaned body lines; (3) worse, matching
+  // against decoded text let a genuinely malformed STANDALONE line skip detection merely
+  // because identical text happened to appear inside some unrelated quoted value
+  // elsewhere in the file — an actual bypass of the check. Tracking quote-open/close
+  // state directly against the raw text, once, top to bottom, has none of those three
+  // problems: it never looks at `parsed` to decide whether a line is "inside a quote".
+  //
+  // Opener detection deliberately does NOT anchor the key portion to an identifier shape
+  // (a second Codex re-review round found two more gaps that an identifier-anchored
+  // `KEY=<quote>` opener regex missed): (a) parseEnv also accepts a backtick as a quote
+  // delimiter, not just `"`/`'` (verified: `` A=`one\ntwo` `` decodes to a real multi-line
+  // value); (b) parseEnv's own key grammar is far more permissive than an identifier — it
+  // accepts a hyphen, a dot, effectively anything before the first `=` (verified:
+  // `FOREIGN-KEY='value'` and `FOREIGN.KEY=value` both decode as their own keys). Anchoring
+  // the opener check to `[A-Za-z_][A-Za-z0-9_]*` missed a REAL multi-line value opened by
+  // either shape, which then let its own body lines (including a genuinely malformed
+  // CYPHER_BRAIN_ line coincidentally inside it) fall through to the normal per-line
+  // checks and be evaluated as fresh top-level assignment attempts — the wrong outcome
+  // either way it went. Instead: find the first `=` on the line (however permissive a key
+  // parseEnv would accept in front of it), and check ONLY whether a quote character
+  // immediately follows it — this needs no model of the key grammar at all, since the
+  // question this state exists to answer ("is the REST of this line, and however many
+  // lines after it, raw value content rather than a new assignment") does not depend on
+  // whose key opened the value.
+  const rawLines = text.split(/\r\n|\r|\n/);
+  const KEY_ASSIGNMENT_RE = /^([A-Za-z_][A-Za-z0-9_]*)\s*=/;
+  const QUOTE_CHARS = ['"', "'", '`'] as const;
+  const LEADING_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*/;
+  const malformed: string[] = [];
+  let openQuote: string | null = null; // the quote char ( " / ' / ` ) a still-open multi-line value started with, else null
+  for (let i = 0; i < rawLines.length; i++) {
+    const rawLine = rawLines[i];
+    if (openQuote !== null) {
+      // Inside a multi-line quoted value opened on an earlier line: this ENTIRE line is
+      // value content, never a new assignment attempt, whoever's key it belongs to. A
+      // single occurrence of the SAME quote character closes it — parseEnv does not
+      // support backslash-escaping a quote character out of closing the string (verified:
+      // `A="has \" escaped"` decodes A to `has \` — the backslash is kept literally and
+      // the immediately-following quote still ends the value).
+      if (rawLine.includes(openQuote)) openQuote = null;
+      continue;
+    }
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    // parseEnv itself tolerates (and strips) a leading "export " before the key, dotenv-style.
+    const withoutExport = trimmed.startsWith('export ') ? trimmed.slice('export '.length).trimStart() : trimmed;
+    const eqIdx = withoutExport.indexOf('=');
+    if (eqIdx !== -1) {
+      const keyPart = withoutExport.slice(0, eqIdx);
+      const afterEq = withoutExport.slice(eqIdx + 1).trimStart();
+      const firstChar = afterEq[0];
+      // The "key" portion itself must not contain a quote character (Codex re-review,
+      // round 4): a genuinely missing "=" before an intentionally-quoted value — e.g.
+      // `CYPHER_BRAIN_PASSPHRASE "<base64 ending in a literal "=" padding char>"` (a very
+      // real shape for a base64-encoded secret with the "=" typo'd away entirely) — means
+      // the FIRST "=" this scan finds is actually the base64 payload's OWN padding
+      // character, not a real key/value separator at all: parseEnv itself then folds the
+      // whole "CYPHER_BRAIN_PASSPHRASE \"<payload>" text in front of that "=" into ONE
+      // giant key. Treating that shape as a normal opener made this scan `continue` past
+      // it — leaving it unflagged here, which let it reach the OLDER "unknown setting(s)"
+      // refusal further below (which echoes `parsed`'s raw keys with no redaction at all)
+      // and print most of the secret. Requiring a clean, quote-free key portion routes
+      // this shape to the normal per-line check below instead, where it IS caught (its
+      // `withoutExport` does not match `KEY_ASSIGNMENT_RE` either, since the stray quote
+      // sits before any "=" it could shape-match on) and reported by name only.
+      const keyPartHasStrayQuote = (QUOTE_CHARS as readonly string[]).some((q) => keyPart.includes(q));
+      if (!keyPartHasStrayQuote && firstChar !== undefined && (QUOTE_CHARS as readonly string[]).includes(firstChar)) {
+        const afterOpeningQuote = afterEq.slice(1);
+        // An opening quote that never closes ANYWHERE later in the file is not treated as
+        // a multi-line opener by parseEnv either (verified: an unterminated `A="foo` with
+        // no other matching quote char in the whole document decodes A to the literal,
+        // unstripped text `"foo` on that ONE line only — it does not swallow the rest of
+        // the file waiting for a close that will never come).
+        if (!afterOpeningQuote.includes(firstChar) && rawLines.slice(i + 1).some((l) => l.includes(firstChar))) {
+          openQuote = firstChar;
+        }
+        // Either way, this line has a clean "<key>=<quote>" shape — never a malformed-line
+        // candidate itself, whoever's key it is.
+        continue;
+      }
+    }
+    if (!withoutExport.startsWith(ENV_PREFIX) && !withoutExport.startsWith(LEGACY_ENV_PREFIX)) continue;
+    const m = KEY_ASSIGNMENT_RE.exec(withoutExport);
+    // Ground truth is "did parseEnv actually capture this key", not just the regex shape
+    // above — that only catches the common "missing =" typo; anything else parseEnv's own
+    // tokenizer silently declined to parse falls through to the same `!(m[1] in parsed)` check.
+    if (!m || !(m[1] in parsed)) {
+      // Report a key ONLY when it EXACTLY matches one of our own known setting names
+      // (Codex review): a malformed line has no validated "=" boundary this function can
+      // trust, so blindly echoing "whatever identifier-looking prefix we found" is not
+      // safe — e.g. "CYPHER_BRAIN_PASSPHRASEmysecret123" (no separator at all) greedily
+      // matches as ONE identifier token, which would put the secret straight into the
+      // error. Only a name independently verified against ENV_NAMES is safe to name;
+      // anything else gets a generic placeholder with NOTHING from the line echoed.
+      const keyCandidate = LEADING_IDENTIFIER_RE.exec(withoutExport)?.[0];
+      const isKnownName =
+        keyCandidate !== undefined && (ENV_NAMES as readonly string[]).includes(canonicalEnvName(keyCandidate));
+      malformed.push(isKnownName ? (keyCandidate as string) : '(unrecognized malformed line, value not shown)');
+    }
+  }
+  if (malformed.length) {
+    return {
+      file: null,
+      error: new Error(
+        `config file ${path}: malformed setting line(s), silently ignored otherwise — key(s): ${malformed.join(', ')} ` +
+          `(value not shown, in case it is a secret). Expected KEY=VALUE (e.g. CYPHER_BRAIN_MAX_SPEND=1000000000000). ` +
+          `Check for a missing "=" or other typo.`,
+      ),
+    };
   }
 
   // Both spellings are ours; the legacy CIPHER_BRAIN_* keys are validated and applied
@@ -158,10 +300,34 @@ function loadConfigFile(home: string): { file: LoadedConfigFile | null; error: E
   const ours = Object.keys(parsed).filter((k) => k.startsWith(ENV_PREFIX) || k.startsWith(LEGACY_ENV_PREFIX));
   const unknown = ours.filter((k) => !(ENV_NAMES as readonly string[]).includes(canonicalEnvName(k)));
   if (unknown.length) {
+    // A THIRD Codex re-review round found a shape the malformed-line scan above cannot
+    // reach at all: `CYPHER_BRAIN_PASSPHRASEYWJjZA==` (a real setting name with NO
+    // separator, directly concatenated with a base64 value whose own padding supplies
+    // the only "=" on the line). parseEnv's tokenizer splits at THAT "=" — the SAME thing
+    // KEY_ASSIGNMENT_RE matches — so this key is genuinely present in `parsed` (not
+    // dropped, not "malformed" by any test this scan runs), and reaches this
+    // pre-existing "unknown setting" path with most of the secret fused into the key
+    // STRING itself. This is not a shape another quote-tracking exception up there can
+    // catch — it never touches a quote character at all — so the fix belongs at THIS
+    // output point instead: an unknown key is safe to name verbatim when it is plausibly
+    // just a MISSPELLING of one of our own names (the whole point of naming it here is
+    // to help find that typo), but not when it has one of our SECRET-BEARING names as a
+    // strict prefix with extra characters glued directly on — that shape only arises
+    // from exactly this kind of missing-separator merge, never from an honest typo.
+    const displayUnknown = unknown.map((k) => {
+      const absorbedIntoSecretName = SECRET_ENV_NAMES.some(
+        (n) =>
+          (k.length > n.length && k.startsWith(n)) ||
+          (k.length > legacyEnvName(n).length && k.startsWith(legacyEnvName(n))),
+      );
+      return absorbedIntoSecretName
+        ? '(unrecognized setting name, value not shown — it may have absorbed part of a secret value)'
+        : k;
+    });
     return {
       file: null,
       error: new Error(
-        `config file ${path}: unknown setting(s) ${unknown.join(', ')} — ` +
+        `config file ${path}: unknown setting(s) ${displayUnknown.join(', ')} — ` +
           `cypher-brain reads no such variable, so this would have no effect (a typo in e.g. ` +
           `CYPHER_BRAIN_MAX_SPEND would silently remove your spend cap). Run 'cypher-brain --help' ` +
           `for the settings it does read. Keys outside the CYPHER_BRAIN_ (or legacy CIPHER_BRAIN_) ` +
@@ -293,17 +459,28 @@ export const IDEMPOTENCY_LOG = join(HOME, 'idempotency-log.jsonl');
 // body, before either entry point's own error formatting is available, and the CLI never
 // reads or writes the idempotency log at all, so only mcp.ts's own startup (the sole
 // actual consumer of this value) decides whether and when to surface it.
+// An explicit "Infinity" is already rejected by the Number.isFinite() check below, but a
+// large ordinary finite value (e.g. a stray extra zero, or someone deliberately trying to
+// approximate "never expires" without typing the word) is not — and functions exactly like
+// Infinity would for any realistic operational timeframe, defeating the very guarantee the
+// comment above this function's call site says the default exists for ("a deliberate
+// re-run days later ... is never silently skipped forever"). Bounded at 30 days: an order
+// of magnitude past the 24h default, generous for a genuinely long-lived replay window,
+// while still being a window a human would notice and question rather than one that is
+// effectively permanent.
+const MAX_IDEMPOTENCY_TTL_SECONDS = 30 * 24 * 60 * 60;
 function parseIdempotencyTtlSeconds(raw: string | undefined): { seconds: number; error: Error | null } {
   const DEFAULT_SECONDS = 24 * 60 * 60;
   if (raw === undefined) return { seconds: DEFAULT_SECONDS, error: null };
   const n = Number(raw);
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0 || n > MAX_IDEMPOTENCY_TTL_SECONDS) {
     return {
       seconds: DEFAULT_SECONDS,
       error: new Error(
-        `CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS must be a positive finite integer (seconds) — got ${JSON.stringify(raw)}. ` +
+        `CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS must be a positive finite integer (seconds), at most ${MAX_IDEMPOTENCY_TTL_SECONDS} (30 days) — got ${JSON.stringify(raw)}. ` +
           'A NaN/zero/negative value would disable idempotency-key replay entirely (every lookup reads as already ' +
-          'expired); an Infinity value would never expire a key, keeping a stale result replayable forever.',
+          'expired); an Infinity (or effectively-Infinity) value would never expire a key, keeping a stale result ' +
+          'replayable forever.',
       ),
     };
   }
@@ -484,6 +661,18 @@ export const TON_SSH_KEY = readEnv('CYPHER_BRAIN_TON_SSH_KEY') || ''; // optiona
 export const TON_REMOTE_DIR = readEnv('CYPHER_BRAIN_TON_REMOTE_DIR') || 'cypher-brain-ton'; // seeder-side layout root: plain relative (lands in the SSH user's home) or absolute — a literal `~` is refused (ssh quoting vs scp expansion diverge, backends/ton.ts)
 export const TON_REMOTE_API = readEnv('CYPHER_BRAIN_TON_REMOTE_API') || '127.0.0.1:9955'; // tonutils-storage API addr AS SEEN FROM the seeder itself
 export const TON_BIN = readEnv('CYPHER_BRAIN_TON_BIN') || 'tonutils-storage'; // local binary for the ephemeral P2P download daemon
+// Every ms-denominated override validated by parsePositiveIntOverride/parsePositiveMsOverride
+// below eventually reaches a real timer API (AbortSignal.timeout/setTimeout/setInterval),
+// and those share a hard ~24.8-day delay ceiling (2^31-1 ms, a 32-bit signed int) — Node's
+// own docs: a LARGER delay is not rejected, it is silently clamped to ~1ms instead ("If
+// delay is larger than 2147483647 ... the timeout will be set to 1"). An unbounded override
+// could therefore turn an intended multi-minute/multi-hour wait into a near-instant one
+// with no warning — the same "a config typo silently changes what a check actually proves"
+// failure class the NaN/negative validation these functions already do exists to prevent,
+// just arriving from the too-large side instead of too-small. Declared before its first use
+// (TON_HTTP_TIMEOUT_MS just below) since it is a `const`, not hoisted like the two
+// functions that consume it.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 // Validated, unlike the older Number() timeouts above (multi-model review W5): an
 // invalid value here would make EVERY local daemon API call throw (AbortSignal.timeout
 // rejects NaN/negative), which get() would read as "P2P failed" and silently steer
@@ -605,20 +794,33 @@ export const TON_PROVIDER_MYTONPROVIDER_URL =
 // override there silently produced NaN, which makes every `size > limit` comparison
 // false and defeats the size-cap check silently rather than warning and using the
 // documented default).
-function parsePositiveIntOverride(raw: string | undefined, defaultVal: number, name: string, unit = 'ms'): number {
+//
+// `maxVal` (optional): an unbounded override is exactly as silently dangerous as an
+// unbounded-below one when the value ultimately reaches a real timer API — see
+// MAX_TIMER_DELAY_MS's comment above. Left undefined for a byte-size cap like
+// AR_L1_MAX_BYTES, which never reaches a timer and has no comparable ceiling to enforce.
+function parsePositiveIntOverride(
+  raw: string | undefined,
+  defaultVal: number,
+  name: string,
+  unit = 'ms',
+  maxVal?: number,
+): number {
   if (raw === undefined) return defaultVal;
   const n = Number(raw);
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+  const withinBounds = Number.isFinite(n) && Number.isInteger(n) && n > 0 && (maxVal === undefined || n <= maxVal);
+  if (!withinBounds) {
     const suffix = unit === 'ms' ? 'ms' : ` ${unit}`;
+    const bound = maxVal !== undefined ? `, at most ${maxVal}` : '';
     warn(
-      `${name} must be a positive integer (${unit}) — got ${JSON.stringify(raw)}; using the ${defaultVal}${suffix} default`,
+      `${name} must be a positive integer (${unit}${bound}) — got ${JSON.stringify(raw)}; using the ${defaultVal}${suffix} default`,
     );
     return defaultVal;
   }
   return n;
 }
 function parsePositiveMsOverride(raw: string | undefined, defaultMs: number, name: string): number {
-  return parsePositiveIntOverride(raw, defaultMs, name, 'ms');
+  return parsePositiveIntOverride(raw, defaultMs, name, 'ms', MAX_TIMER_DELAY_MS);
 }
 export const TON_PROVIDER_NOTIFY_RETRY_MS = parsePositiveMsOverride(
   readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS'),
@@ -675,6 +877,8 @@ export const AR_HTTP_TIMEOUT_MS = parsePositiveIntOverride(
   readEnv('CYPHER_BRAIN_AR_HTTP_TIMEOUT') || undefined,
   60000,
   'CYPHER_BRAIN_AR_HTTP_TIMEOUT',
+  'ms',
+  MAX_TIMER_DELAY_MS,
 ); // bound the gateway read so a stall falls through to the L1 chunk fallback
 // Public, unauthenticated USD/AR rate endpoint (ArDrive Turbo's payment service) — a
 // plain JSON GET, no SDK or auth required (#170). arUsdRate() (src/lib/estimate.ts)
@@ -757,4 +961,6 @@ export const PIPE_TIMEOUT_MS = parsePositiveIntOverride(
   readEnv('CYPHER_BRAIN_PIPE_TIMEOUT') || undefined,
   60 * 60 * 1000,
   'CYPHER_BRAIN_PIPE_TIMEOUT',
+  'ms',
+  MAX_TIMER_DELAY_MS,
 );
