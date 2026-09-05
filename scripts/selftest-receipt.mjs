@@ -264,6 +264,21 @@ try {
       entry.raw?.reward === entry.cost,
       JSON.stringify(entry.raw),
     );
+    // The check above only proves internal consistency BETWEEN two fields on the SAME
+    // receipt object — both were set from the same in-process `tx.reward` variable at
+    // the exact same call site (backends/arweave.ts's onReceipt call), so a bug that
+    // corrupts that one variable before persisting (a swap, a truncation, a hardcoded
+    // fallback) would leave raw.reward and cost agreeing with EACH OTHER while both
+    // silently disagree with what arlocal actually recorded for this tx on the wire.
+    // Cross-check against an INDEPENDENTLY fetched source instead — arlocal's own /tx/
+    // route, queried fresh over HTTP, never touching the receipt file or anything else
+    // this process already computed.
+    const independentReward = await fetchArlocalReward(PORT, loc);
+    check(
+      'receipt cost matches the reward arlocal itself recorded for this tx (independently fetched via GET /tx/:id, not derived from the receipt)',
+      independentReward === entry.cost && independentReward === entry.raw?.reward,
+      `arlocal reward=${independentReward} vs entry.cost=${entry.cost} vs entry.raw.reward=${entry.raw?.reward}`,
+    );
     check(
       'receipt payer_address matches the funded signer wallet',
       entry.payer_address === addr,
@@ -436,6 +451,27 @@ try {
   );
 } finally {
   await rm(tmpC, { recursive: true, force: true });
+}
+
+// arlocal's own GET /tx/:id — the `reward` field off the transaction metadata arlocal
+// actually stored, fetched fresh over HTTP. An independent source: it never reads the
+// receipt ledger file, and it does not reuse any value this process already computed
+// from `tx.reward` in memory — it re-derives it from arlocal's own DB.
+//
+// NOT /tx/:id/reward (arlocal's per-field route): that route returns the literal string
+// "Pending" instead of the field's value for any tx that has not yet been mined into a
+// block (arlocal/bin/routes/transaction.js's txFieldRoute), and this suite never mines —
+// pushing to a paid backend only posts the tx. The bare /tx/:id route has no such gate:
+// it returns the full metadata unconditionally, mined or not.
+async function fetchArlocalReward(port, txid) {
+  // Bounded (Codex review): an arlocal that hangs instead of answering must not hang this
+  // suite indefinitely — fail loud within a few seconds instead.
+  const res = await fetch(`http://localhost:${port}/tx/${txid}`, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw new Error(`arlocal did not return transaction metadata for tx ${txid}: HTTP ${res.status}`);
+  const body = await res.json();
+  if (typeof body?.reward !== 'string')
+    throw new Error(`arlocal's /tx/${txid} response had no string reward field: ${JSON.stringify(body).slice(0, 300)}`);
+  return body.reward;
 }
 
 async function readReceiptsAt(path) {

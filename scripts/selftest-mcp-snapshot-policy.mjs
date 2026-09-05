@@ -619,10 +619,37 @@ async function run(tmp) {
   // ── a pinned pg-only call needs no roots at all ───────────────────────────
   // It cannot SUCCEED here (there is no Postgres to dump), and it is not this test's job
   // to stand one up. What it must not be is denied by the policy: the assertion is that
-  // the refusal comes from the pg attempt, NOT from ERR_POLICY_DENIED / CB-E025.
+  // the refusal comes from the pg attempt, NOT from ERR_POLICY_DENIED / CB-E025 — and
+  // that is a CAUSATION claim, not merely "the code isn't literally this one". A call
+  // that got short-circuited by some OTHER bug before ever touching pg_dump (silently
+  // skipped and returning success with an empty manifest, say, or failing a totally
+  // unrelated validation whose message happens to mention "pg_dump" in passing) would
+  // ALSO clear a check that only inspects sc.code/message text — inferring invocation
+  // from a substring in an error string proves nothing about whether a child process was
+  // ever actually spawned (multi-model review). A STUB pg_dump binary closes that gap:
+  // it writes a marker file the instant it runs and fails with a distinctive, freshly
+  // generated string no other code path could ever produce, so passing this check
+  // requires (a) that some process actually wrote the marker AND (b) that the reported
+  // failure carries that exact fresh string — together, real spawn + real attribution,
+  // not an inference from prose.
   {
     const out = nextOut();
-    const env = { ...pinned };
+    const pgBinDir = join(tmp, 'pg-bin-stub');
+    await mkdir(pgBinDir, { recursive: true });
+    const pgInvokedMarker = join(tmp, 'pg-dump-invoked.marker');
+    const pgStubFailText = `pg-dump-stub-failure-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    await writeFile(
+      join(pgBinDir, 'pg_dump'),
+      [
+        '#!/usr/bin/env bash',
+        `printf 'invoked\\n' > ${JSON.stringify(pgInvokedMarker)}`,
+        `echo ${JSON.stringify(pgStubFailText)} >&2`,
+        'exit 7',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const env = { ...pinned, CYPHER_BRAIN_PG_BIN: pgBinDir };
     delete env.CYPHER_BRAIN_MCP_SOURCE_ROOTS;
     const frame = await callSnapshotNow(env, {
       pg: 'postgres://nobody@127.0.0.1:1/nope',
@@ -633,7 +660,33 @@ async function run(tmp) {
     const sc = structured(frame);
     if (sc.code === 'ERR_POLICY_DENIED' || sc.cb_code === 'CB-E025')
       fail(`pg-only call with no roots was denied by the policy: ${JSON.stringify(sc.message).slice(0, 400)}`);
-    console.log('  [PASS] pinned pg-only call with NO roots configured — the policy lets it through');
+    if (!frame.result?.isError)
+      fail(
+        `pg-only call with no roots reported SUCCESS instead of a pg connection failure — this proves nothing ` +
+          `about pg_dump actually having been attempted: ${JSON.stringify(frame.result).slice(0, 400)}`,
+      );
+    if (sc.code !== 'ERR_INTERNAL')
+      fail(
+        `pg-only call with no roots failed with code ${JSON.stringify(sc.code)}, not the raw ERR_INTERNAL a ` +
+          `pg_dump spawn/exit failure produces — cannot confirm pg_dump (rather than some other check) caused ` +
+          `this failure: ${JSON.stringify(sc.message).slice(0, 400)}`,
+      );
+    if (!existsSync(pgInvokedMarker))
+      fail(
+        `pg-only call with no roots failed WITHOUT ever invoking the stub pg_dump binary (its invocation marker ` +
+          `was never written) — the failure cannot be attributed to an actual pg_dump spawn: ${JSON.stringify(sc.message).slice(0, 400)}`,
+      );
+    if (!(sc.message ?? '').includes(pgStubFailText))
+      fail(
+        `pg-only call with no roots failed for a reason that does not carry the stub pg_dump's own freshly ` +
+          `generated failure text (${JSON.stringify(pgStubFailText)}) — the marker proves SOME process ran, but ` +
+          `not that THIS reported failure is the one it produced: ${JSON.stringify(sc.message).slice(0, 400)}`,
+      );
+    console.log(
+      '  [PASS] pinned pg-only call with NO roots configured — not denied by the policy, AND the failure it ' +
+        'hits instead is confirmed to be a REAL invocation of pg_dump (marker file written, and the error carries ' +
+        "the stub binary's own freshly-generated failure text), not a masked bug or a text-inference false positive",
+    );
   }
 
   // ── the CLI is unchanged ──────────────────────────────────────────────────

@@ -124,17 +124,27 @@ grep -qF "$MARKER" "$TMP/restored/brain-src/note.txt" && echo "[PASS] restored c
 
 echo "== tamper detection: a corrupted .minisig makes verify FAIL and restore REFUSE (before decrypt) =="
 cp "$TMP/snap.age.minisig" "$TMP/snap.age.minisig.orig"
-# Flip one base64 character in the signature-blob line (line 2) — corrupts the sig
-# bytes (or, depending on which byte, the embedded key id — either way the artifact
-# must be rejected either way).
+# The signature-blob line (line 2) base64-decodes to a fixed 74-byte layout: 2 bytes
+# sig-alg + 8 bytes key id + 64 bytes the raw Ed25519 signature (src/lib/minisign.ts's
+# SIG_BLOB_BYTES/KEY_ID_BYTES). Flip byte offset 10 specifically — the FIRST byte of the
+# 64-byte signature, unambiguously past both the 2-byte sig-alg and the 8-byte key id —
+# so this exercises one deterministic failure mode, not "whichever field the flipped
+# base64 character happened to land in": verifyDetached() checks the global signature
+# (which covers these exact signature bytes, concatenated with the trusted comment)
+# BEFORE it ever hashes/checks the message itself, so a corrupted signature byte here
+# always surfaces as the specific "global signature ... does not verify" reason, checked
+# below — never a key-id mismatch or a content-hash mismatch.
 python3 - "$TMP/snap.age.minisig" <<'PYEOF'
-import sys
+import base64, sys
 p = sys.argv[1]
 with open(p) as f:
     lines = f.readlines()
-line = lines[1]
-c = "A" if line[5] != "A" else "B"
-lines[1] = line[:5] + c + line[6:]
+sig_line = lines[1].rstrip("\n")
+blob = bytearray(base64.b64decode(sig_line))
+assert len(blob) == 74, f"unexpected sigBlob length {len(blob)}, expected 74 (2 sig-alg + 8 key-id + 64 signature)"
+SIG_OFFSET = 10  # first byte of the 64-byte raw Ed25519 signature (sig-alg=[0:2], key-id=[2:10], signature=[10:74])
+blob[SIG_OFFSET] ^= 0xFF
+lines[1] = base64.b64encode(bytes(blob)).decode() + "\n"
 with open(p, "w") as f:
     f.writelines(lines)
 PYEOF
@@ -144,6 +154,9 @@ fi
 grep -q '\[FAIL\] minisign authenticity signature verified' "$TMP/verify-tampered.out" \
   && echo "[PASS] verify reports the signature check as FAIL" \
   || { echo "[FAIL] verify did not report a FAIL signature check"; cat "$TMP/verify-tampered.out"; exit 1; }
+grep -qF 'global signature (over the trusted comment) does not verify' "$TMP/verify-tampered.out" \
+  && echo "[PASS] the failure is unambiguously a corrupted SIGNATURE (byte offset 10 of 74 — inside the 64-byte Ed25519 signature, not the 8-byte key id or the 2-byte sig-alg), not a generic/different tamper" \
+  || { echo "[FAIL] verify did not report the expected signature-corruption reason (global signature check)"; cat "$TMP/verify-tampered.out"; exit 1; }
 grep -q 'VERDICT: FAIL' "$TMP/verify-tampered.out" && echo "[PASS] verify VERDICT: FAIL" \
   || { echo "[FAIL] verify did not reach VERDICT: FAIL"; cat "$TMP/verify-tampered.out"; exit 1; }
 cb verify --in "$TMP/snap.age" --json >"$TMP/verify-tampered.json" 2>/dev/null || true
@@ -156,8 +169,57 @@ if cb restore --in "$TMP/snap.age" --out-dir "$TMP/restored-tampered" >"$TMP/res
 fi
 grep -q 'CB-E016' "$TMP/restore-tampered.out" && echo "[PASS] restore refuses with the CB-E016 error code" \
   || { echo "[FAIL] restore did not refuse with CB-E016"; cat "$TMP/restore-tampered.out"; exit 1; }
+grep -qF 'global signature (over the trusted comment) does not verify' "$TMP/restore-tampered.out" \
+  && echo "[PASS] restore's refusal names the same unambiguous signature-corruption reason as verify" \
+  || { echo "[FAIL] restore did not name the signature-corruption reason"; cat "$TMP/restore-tampered.out"; exit 1; }
 [ ! -d "$TMP/restored-tampered" ] && echo "[PASS] restore wrote nothing to --out-dir before refusing" \
   || { echo "[FAIL] restore created --out-dir despite refusing (decrypted before checking the signature?)"; exit 1; }
+
+echo "== tamper detection: the signature check runs BEFORE decryption even starts, not merely before extraction =="
+# The check above only proves restore never wrote plaintext to --out-dir — consistent
+# with "checked first" but ALSO consistent with "decryption was attempted and failed on
+# its own, coincidentally leaving no output". Instrument the actual decrypt boundary by
+# making the identity file UNREADABLE (chmod 000) rather than merely malformed: a
+# malformed-but-readable identity (e.g. plain garbage text) is a WEAKER fixture than it
+# looks — src/lib/crypt.ts's loadIdentities() happily reads and returns garbage text as
+# an "identity" without validating it at all; only the LATER newDecrypter()/addIdentity()
+# call rejects it (Codex review, multi-model). A regression that hoists JUST
+# loadIdentities() ahead of the signature check (leaving newDecrypter() and the actual
+# decrypt call in their normal, later position) would silently succeed at that hoisted
+# call and produce no error at all — passing a malformed-text-based check even though the
+# identity file WAS read before the signature check ran. chmod 000 closes that gap
+# structurally: ANY attempt to read the file's bytes at all (loadIdentities() calls
+# readFile() with no fallback) throws EACCES immediately, so there is no code path that
+# can touch this file even partially without an immediate, loud failure — unlike a
+# malformed-content fixture, permission enforcement does not depend on which downstream
+# function happens to validate the content. Skipped when this sandbox cannot actually
+# deny access (running as root) — same posture as scripts/selftest.sh's own EACCES check.
+cp "$HOME_DIR/identity.age" "$HOME_DIR/identity.age.orig"
+chmod 000 "$HOME_DIR/identity.age"
+if cat "$HOME_DIR/identity.age" >/dev/null 2>&1; then
+  chmod 600 "$HOME_DIR/identity.age"
+  echo "[SKIP] decrypt-order check: this user can read a 0000 file (running as root?) — cannot deny access to test it"
+else
+  rm -rf "$TMP/restored-tampered-decrypt-order"
+  if cb restore --in "$TMP/snap.age" --out-dir "$TMP/restored-tampered-decrypt-order" >"$TMP/restore-tampered-decrypt-order.out" 2>&1; then
+    echo "[FAIL] restore exited 0 against a tampered .minisig + an unreadable identity"; cat "$TMP/restore-tampered-decrypt-order.out"
+    chmod 600 "$HOME_DIR/identity.age"; cp "$HOME_DIR/identity.age.orig" "$HOME_DIR/identity.age"; exit 1
+  fi
+  grep -qF 'global signature (over the trusted comment) does not verify' "$TMP/restore-tampered-decrypt-order.out" \
+    && echo "[PASS] restore's refusal still names the signature failure with the identity unreadable — the check ran before it ever needed (or reached) the identity/decrypt step" \
+    || { echo "[FAIL] restore did not name the signature failure — cannot confirm the check ran before decryption"; cat "$TMP/restore-tampered-decrypt-order.out"; chmod 600 "$HOME_DIR/identity.age"; cp "$HOME_DIR/identity.age.orig" "$HOME_DIR/identity.age"; exit 1; }
+  if grep -qiE 'eacces|permission denied|identity|decrypt' "$TMP/restore-tampered-decrypt-order.out"; then
+    echo "[FAIL] restore's output also mentions a permission/identity/decrypt failure — the identity file may have been read before the signature check"
+    cat "$TMP/restore-tampered-decrypt-order.out"; chmod 600 "$HOME_DIR/identity.age"; cp "$HOME_DIR/identity.age.orig" "$HOME_DIR/identity.age"; exit 1
+  fi
+  echo "[PASS] restore's output names no permission/identity/decrypt failure at all — the identity file was never even opened for reading"
+  [ ! -d "$TMP/restored-tampered-decrypt-order" ] \
+    && echo "[PASS] restore wrote nothing to --out-dir (decryption never started, let alone got far enough to produce plaintext)" \
+    || { echo "[FAIL] restore created --out-dir despite refusing"; chmod 600 "$HOME_DIR/identity.age"; cp "$HOME_DIR/identity.age.orig" "$HOME_DIR/identity.age"; exit 1; }
+  chmod 600 "$HOME_DIR/identity.age"
+  cp "$HOME_DIR/identity.age.orig" "$HOME_DIR/identity.age"
+fi
+
 cp "$TMP/snap.age.minisig.orig" "$TMP/snap.age.minisig"
 
 echo "== snapshot --no-sign opts out even when a signing identity exists =="
