@@ -406,15 +406,20 @@ export async function findPgDataDirs(
     } catch {
       return []; // not a directory, or unreadable — nothing to advise about
     }
+    // Root and each immediate child are checked independently — NOT else-if (Codex
+    // review): matching marker NAMES at the root only makes it a CANDIDATE, and
+    // confirmDataDir below is what actually confirms one. A root that merely looks like a
+    // store by name (e.g. a plain directory named `pg_wal` next to an unrelated file named
+    // `PG_VERSION`) must not suppress the child scan — that would hide a real store one
+    // level down, the exact "store one level down" layout this function's own doc comment
+    // says it covers.
     if (marksDataDir(top.map((e) => e.name))) candidates.push('');
-    else {
-      for (const e of top) {
-        if (!e.isDirectory()) continue;
-        try {
-          if (marksDataDir(await readdir(join(rootAbs, e.name)))) candidates.push(e.name);
-        } catch {
-          /* unreadable subdirectory — skip it, this is advisory only */
-        }
+    for (const e of top) {
+      if (!e.isDirectory()) continue;
+      try {
+        if (marksDataDir(await readdir(join(rootAbs, e.name)))) candidates.push(e.name);
+      } catch {
+        /* unreadable subdirectory — skip it, this is advisory only */
       }
     }
   }
@@ -438,8 +443,23 @@ export async function findPgDataDirs(
   return findings;
 }
 
+/**
+ * Strip ASCII control bytes (0x00-0x1F, 0x7F — newlines, carriage returns, ANSI escapes)
+ * before a path fragment goes into a warning string (Codex review). Both `sourceLabel`
+ * (the operator's own --dir argument) and `rel` (a name this project's own scan found
+ * under it) end up in a message that reaches a human two ways: printed straight to stderr,
+ * and copied verbatim into MCP's `warnings` array, which warn.ts's own doc comment says
+ * exists specifically so an agent can relay it — an untrusted --dir source (this project's
+ * own snapshot.ts comments already anticipate "an extracted archive, a cloned repo, an
+ * untrusted download") could otherwise smuggle a forged log line or terminal escape via a
+ * crafted file/directory name. Only control bytes are stripped; the printable path itself
+ * is untouched.
+ */
+const sanitizeForWarning = (s: string): string => s.replace(/[\x00-\x1f\x7f]/g, '');
+
 /** How a finding is named to the operator: the --dir they passed, plus where inside it. */
-const storeLabel = (sourceLabel: string, rel: string): string => (rel ? `${sourceLabel}/${rel}` : sourceLabel);
+const storeLabel = (sourceLabel: string, rel: string): string =>
+  rel ? `${sanitizeForWarning(sourceLabel)}/${sanitizeForWarning(rel)}` : sanitizeForWarning(sourceLabel);
 
 /**
  * The warning for a source that carries a PostgreSQL data directory. Exported so the

@@ -161,9 +161,25 @@ export async function startLocalTonDaemon(
     const genChild = spawnDaemon(bin, ['--db', dbDir, ...netArgs]);
     let spawnErr: unknown = null;
     genChild.on('error', (e) => (spawnErr = e));
+    // Existence alone does not prove the write finished (Codex review): upstream writes
+    // this file directly, and this loop's own SIGKILL below (via killAndWait, in finally)
+    // fires the instant the condition below flips — killing a generator still mid-write
+    // would leave a truncated file for the JSON.parse right after this try/finally.
+    // Requiring a successful parse, not just existence, before breaking out is a cheap
+    // completion barrier: a partially-written file fails to parse and is treated the same
+    // as "not there yet", not as a fatal error.
+    const configReady = async (): Promise<boolean> => {
+      if (!(await exists(configPath))) return false;
+      try {
+        JSON.parse(await readFile(configPath, 'utf8'));
+        return true;
+      } catch {
+        return false; // exists but still being written — keep polling
+      }
+    };
     try {
       const deadline = Date.now() + CONFIG_GEN_TIMEOUT_MS;
-      while (!(await exists(configPath))) {
+      while (!(await configReady())) {
         if (spawnErr !== null) {
           throw enoent(spawnErr) ? new Error(`ton backend: ${installAdvice(bin)}`) : (spawnErr as Error);
         }
@@ -209,7 +225,16 @@ export async function startLocalTonDaemon(
       // A bare per-probe timeout, shorter than TON_HTTP_TIMEOUT_MS: the daemon is on
       // loopback, so a slow answer here just means "not listening yet".
       const r = await fetch(`${apiUrl}/api/v1/list`, { signal: AbortSignal.timeout(1500) });
-      if (r.ok) return { apiUrl, stop };
+      // `r.ok` alone only proves SOMETHING answered on this loopback port (Codex review):
+      // freeTcpPort()'s allocation is inherently racy by its own doc comment, so another
+      // process could win the freed port before this daemon binds it. Requiring the
+      // documented `/api/v1/list` shape (`{bags: [...]}`, per this file's own API-contract
+      // comment above) before trusting the probe is a cheap way to confirm it is actually
+      // tonutils-storage answering, not just any HTTP 200.
+      const body: unknown = r.ok ? await r.json().catch(() => null) : null;
+      if (body !== null && typeof body === 'object' && Array.isArray((body as { bags?: unknown }).bags)) {
+        return { apiUrl, stop };
+      }
     } catch {
       /* not ready yet */
     }
