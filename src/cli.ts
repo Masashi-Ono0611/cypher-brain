@@ -146,6 +146,52 @@ const KNOWN_FLAG_NAMES: string[] = [
 // its own o._ slot is allowed to hold — see the positional-argument check below.
 const POSITIONAL_COMMANDS = new Set(['schedule', 'wallet']);
 
+// The four repeatable array flags parseArgs()'s loop below consumes a following value
+// for in their own branches (before VALUE_FLAGS/BOOL_FLAGS is ever consulted) — pulled
+// out to a Set (rather than left as the four `a === '--dir'`-style literals below) so
+// isValueConsumingFlag() just below can recognize them too, without parseArgs()'s own
+// per-flag branches needing to change at all.
+const ARRAY_VALUE_FLAGS = new Set(['--dir', '--pg-table', '--pg-exclude-table-data', '--recipient']);
+
+// Does `token` consume the argv slot right after it as a VALUE (as opposed to a
+// standalone bool flag, an unrecognized flag, or a bare positional)? Mirrors — but is
+// NOT called by — parseArgs()'s own recognition of a value-taking flag (its array-flag
+// branches above, plus `!BOOL_FLAGS.has(key) && VALUE_FLAGS.has(key)` before valueAt()
+// consumes/validates the value): parseArgs() itself is left untouched, and this
+// intentionally duplicates just that recognition step so the raw pre-parseArgs
+// --help/-h scan below (issue #171's own comment on that scan) can ask the same
+// question for a different reason — a value that happens to be spelled "-h"/"--help"
+// (e.g. `--dir -h` naming a directory literally called "-h") is DATA handed to that
+// flag, not a help request, and the scan must not treat it as one.
+function isValueConsumingFlag(token: string): boolean {
+  if (ARRAY_VALUE_FLAGS.has(token)) return true;
+  if (!token.startsWith('--')) return false;
+  return VALUE_FLAGS.has(token.slice(2).replace(/-/g, '_'));
+}
+
+// Walks argv the same left-to-right way parseArgs()'s loop does and returns the set of
+// indices that will be CONSUMED as another flag's value — so the raw help scan below can
+// skip those positions rather than testing them for "-h"/"--help" as if they were
+// standalone tokens. Deliberately narrower than parseArgs()'s own valueAt(): a value
+// token that itself starts with "--" is NOT marked consumed here, because valueAt()
+// would reject it (the #307 "looks like another flag" refusal) rather than accept it as
+// the value — so it stays live for the scan too, and a literal "--help" there is still
+// caught (rather than being silently swallowed as some other flag's mistyped value,
+// something #253's own unknown-flag refusal exists to catch, just later, inside
+// parseArgs()).
+function valueConsumedIndices(argv: string[]): Set<number> {
+  const consumed = new Set<number>();
+  for (let i = 0; i < argv.length; i++) {
+    if (!isValueConsumingFlag(argv[i])) continue;
+    const next = i + 1;
+    if (next < argv.length && !argv[next].startsWith('--')) {
+      consumed.add(next);
+      i = next; // the value itself can't also be read as a flag token
+    }
+  }
+  return consumed;
+}
+
 function parseArgs(argv: string[], cmd: string | undefined): CliOptions {
   const o: CliOptions = { dirs: [], tables: [], recipients: [] };
   const rec = o as unknown as Record<string, string | boolean | undefined>;
@@ -1813,9 +1859,17 @@ async function main(): Promise<void> {
   // subcommand (issue #171) — checked on the raw args, BEFORE parseArgs(),
   // so it applies uniformly to every subcommand (not just the bare
   // `cypher-brain --help` handled by the switch below) and keeps working
-  // even if parseArgs() is ever changed to validate/throw on bad input
-  //.
-  if (rest.includes('--help') || rest.includes('-h')) {
+  // even if parseArgs() is ever changed to validate/throw on bad input.
+  //
+  // A bare "-h"/"--help" token is skipped if valueConsumedIndices() says
+  // parseArgs() will consume it as some OTHER flag's value instead — e.g.
+  // `--dir -h` names a directory literally called "-h"; it is not a request
+  // for help, even though the token "-h" appears in argv (a directory named
+  // "-h" being mistaken for a help request was reported after #171 shipped;
+  // fixed without duplicating parseArgs()'s own value-consumption logic —
+  // see isValueConsumingFlag()/valueConsumedIndices() above).
+  const helpScanSkip = valueConsumedIndices(rest);
+  if (rest.some((tok, i) => (tok === '--help' || tok === '-h') && !helpScanSkip.has(i))) {
     // Deliberately outside tracing's scope (Codex review, #226 part 3): --help/-h never
     // reaches dispatchCommand() and has no side effects to observe, the same reason
     // the audit trail (#419, part 2 of this same issue) also only records

@@ -1504,6 +1504,73 @@ CYPHER_BRAIN_HOME="$TMP/keys" cb snapshot --dir "$SRC" --out "$TMP/./--really-a-
 test -f "$TMP/--really-a-path.age" || { echo "[FAIL] the ./-escaped --out value did not produce its file"; exit 1; }
 echo "[PASS] a value flag is refused when its value is missing OR looks like a flag (recognized or mistyped), while a ./-escaped dash-leading path still works"
 
+echo "== issue: the raw pre-parseArgs --help/-h scan (#171) must not mistake a flag's VALUE for a help request =="
+# The scan used to test raw argv for a bare "-h"/"--help" token independently of
+# parseArgs()'s own value-consumption logic — so `--dir -h` (a directory literally named
+# "-h") printed the help screen instead of snapshotting that directory.
+HDIRNAME="-h"
+mkdir -p "$TMP/$HDIRNAME"
+printf 'dash-named-dir content\n' > "$TMP/$HDIRNAME/note.txt"
+HFLAG_OUT=$(cd "$TMP" && CYPHER_BRAIN_HOME="$TMP/keys" cb snapshot --dir "$HDIRNAME" --out "$TMP/dashdir.age" 2>&1); HFLAG_RC=$?
+[ "$HFLAG_RC" = "0" ] || { echo "[FAIL] 'snapshot --dir -h --out ...' was refused/failed instead of treating -h as a directory name"; echo "$HFLAG_OUT"; exit 1; }
+test -f "$TMP/dashdir.age" || { echo "[FAIL] 'snapshot --dir -h' did not produce the snapshot"; echo "$HFLAG_OUT"; exit 1; }
+printf '%s' "$HFLAG_OUT" | grep -q "cypher-brain — encrypt a gbrain snapshot" && { echo "[FAIL] '--dir -h' printed the help screen instead of snapshotting"; echo "$HFLAG_OUT"; exit 1; }
+mkdir -p "$TMP/dashdir-restore"
+CYPHER_BRAIN_HOME="$TMP/keys" cb restore --in "$TMP/dashdir.age" --out-dir "$TMP/dashdir-restore" >/dev/null
+# `find ... -exec grep ...` alone would be a false-PASS trap here: find's own exit code
+# reflects whether the TRAVERSAL succeeded, not whether -exec's command matched anything —
+# it stays 0 even if note.txt is missing entirely (restore silently dropped it) or grep
+# found no matching content in it (round-trip corrupted it), so the `||` fallback below
+# would never fire. Find the restored file explicitly, assert exactly one exists, THEN
+# grep its content as its own separate, exit-code-checked step.
+RESTORED_NOTE=$(find "$TMP/dashdir-restore" -name note.txt)
+[ "$(printf '%s\n' "$RESTORED_NOTE" | grep -c .)" = "1" ] \
+  || { echo "[FAIL] restoring the -h-named directory's snapshot did not produce exactly one note.txt (got: '$RESTORED_NOTE')"; exit 1; }
+grep -q "dash-named-dir content" "$RESTORED_NOTE" \
+  || { echo "[FAIL] the -h-named directory's content did not round-trip through snapshot/restore"; exit 1; }
+echo "[PASS] '--dir -h' snapshots a directory literally named \"-h\" (its VALUE) instead of printing help"
+# A standalone "-h"/"--help" — NOT consumed as any flag's value — must still show help,
+# including right after a command that just proved -h can be a real value elsewhere on
+# the same command line. Redirected straight to a FILE (not captured into a shell
+# variable and re-piped into grep, the way the short error-message checks above do it):
+# the full ~900-line help text is large enough that a shell-variable round-trip through
+# this environment's grep is unreliable, the same reason cli-smoke.sh redirects --help's
+# output to a file rather than a variable.
+STANDALONE_H_LOG="$TMP/standalone-h.log"
+cb snapshot --dir "$SRC" -h > "$STANDALONE_H_LOG" 2>&1
+grep -q "cypher-brain — encrypt a gbrain snapshot" "$STANDALONE_H_LOG" \
+  || { echo "[FAIL] a genuine standalone -h after --dir <realdir> stopped showing help"; cat "$STANDALONE_H_LOG"; exit 1; }
+BARE_HELP_LOG="$TMP/bare-help.log"
+cb --help > "$BARE_HELP_LOG" 2>&1
+grep -q "cypher-brain — encrypt a gbrain snapshot" "$BARE_HELP_LOG" \
+  || { echo "[FAIL] bare --help regressed"; cat "$BARE_HELP_LOG"; exit 1; }
+echo "[PASS] a standalone -h/--help (not consumed as a value) still shows help"
+# Two more of an ARRAY value flag's own value being "-h", immediately followed by a
+# SECOND, genuinely standalone -h — the array-flag branch must consume only the ONE
+# argv slot right after --dir, leaving the next token live for the scan.
+DOUBLE_H_LOG="$TMP/double-h.log"
+(cd "$TMP" && cb snapshot --dir -h -h > "$DOUBLE_H_LOG" 2>&1)
+grep -q "cypher-brain — encrypt a gbrain snapshot" "$DOUBLE_H_LOG" \
+  || { echo "[FAIL] 'snapshot --dir -h -h' (a real -h directory value, then a genuine standalone -h) stopped showing help"; cat "$DOUBLE_H_LOG"; exit 1; }
+# A value that ITSELF starts with "--" (here, literally "--help") is never marked
+# consumed (parseArgs()'s own valueAt() would refuse it as looking like another flag —
+# see the #307 comment on valueAt() above) — it stays a live token, so the scan still
+# catches it and shows help before parseArgs() is ever reached to throw that refusal.
+DIR_HELP_LOG="$TMP/dir-help.log"
+cb snapshot --dir --help > "$DIR_HELP_LOG" 2>&1
+grep -q "cypher-brain — encrypt a gbrain snapshot" "$DIR_HELP_LOG" \
+  || { echo "[FAIL] 'snapshot --dir --help' stopped showing help"; cat "$DIR_HELP_LOG"; exit 1; }
+# A SCALAR (non-array) VALUE_FLAGS member's value being "-h" — --out, not one of the
+# four array flags, exercises the OTHER branch of isValueConsumingFlag(). Run in its
+# own fresh subdirectory: "$TMP/-h" already exists as a DIRECTORY (the --dir source
+# from the array-flag case above), and would collide with writing a FILE named "-h" here.
+SCALAR_H_DIR="$TMP/scalar-h-test"; mkdir -p "$SCALAR_H_DIR"
+SCALAR_H_OUT=$(cd "$SCALAR_H_DIR" && CYPHER_BRAIN_HOME="$TMP/keys" cb snapshot --dir "$SRC" --out -h 2>&1); SCALAR_H_RC=$?
+[ "$SCALAR_H_RC" = "0" ] || { echo "[FAIL] 'snapshot --dir <realdir> --out -h' was refused instead of treating -h as --out's value"; echo "$SCALAR_H_OUT"; exit 1; }
+test -f "$SCALAR_H_DIR/-h" || { echo "[FAIL] 'snapshot --out -h' did not write a file literally named -h"; echo "$SCALAR_H_OUT"; exit 1; }
+printf '%s' "$SCALAR_H_OUT" | grep -q "cypher-brain — encrypt a gbrain snapshot" && { echo "[FAIL] 'snapshot --out -h' printed the help screen instead of writing to -h"; echo "$SCALAR_H_OUT"; exit 1; }
+echo "[PASS] '--dir -h -h', '--dir --help', and a scalar '--out -h' all match parseArgs()'s own value-consumption rules"
+
 if ! command -v gitleaks >/dev/null 2>&1; then
   echo "[SKIP] --scan-secrets warn/deny tests: no \`gitleaks\` binary on PATH (install it — https://github.com/gitleaks/gitleaks — to exercise this; CI installs it via the .github/workflows/ci.yml step, see #215)"
 else
