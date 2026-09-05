@@ -194,7 +194,10 @@ start_ton_seeder() {
 #!/usr/bin/env bash
 # selftest shim: run the remote command line in the fake seeder home.
 while [ \$# -gt 0 ] && [ "\$1" != "--" ]; do
-  case "\$1" in -o|-i) shift 2;; *) shift;; esac
+  # A dangling -o/-i (no value following) must not leave \$1 unshifted:
+  # without this guard, \`shift 2\` fails and returns \$# unchanged, so the
+  # loop spins forever on the same \$1 instead of erroring out.
+  case "\$1" in -o|-i) [ \$# -ge 2 ] || { echo "selftest ssh/scp shim: \$1 requires a value" >&2; exit 1; }; shift 2;; *) shift;; esac
 done
 [ "\${1:-}" = "--" ] && shift
 shift # host
@@ -205,7 +208,10 @@ EOF
 #!/usr/bin/env bash
 # selftest shim: host:path means a path under the fake seeder home.
 while [ \$# -gt 0 ] && [ "\$1" != "--" ]; do
-  case "\$1" in -o|-i) shift 2;; *) shift;; esac
+  # A dangling -o/-i (no value following) must not leave \$1 unshifted:
+  # without this guard, \`shift 2\` fails and returns \$# unchanged, so the
+  # loop spins forever on the same \$1 instead of erroring out.
+  case "\$1" in -o|-i) [ \$# -ge 2 ] || { echo "selftest ssh/scp shim: \$1 requires a value" >&2; exit 1; }; shift 2;; *) shift;; esac
 done
 [ "\${1:-}" = "--" ] && shift
 resolve() {
