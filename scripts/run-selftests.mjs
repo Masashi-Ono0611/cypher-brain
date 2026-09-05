@@ -96,6 +96,9 @@ const PARALLEL = [
   npmTest('selftest:schedule'),
   npmTest('selftest:ton-dns'),
   npmTest('selftest:arweave-gateway-cap'),
+  // Same isolation shape as selftest:arweave-gateway-cap right above: its own arlocal on
+  // a freePort()-picked port, its own mkdtemp tree, no CYPHER_BRAIN_HOME, no LaunchAgent.
+  npmTest('selftest:onreceipt-guard'),
   npmTest('selftest:init'),
   npmTest('selftest:plan'),
   npmTest('selftest:recovery'),

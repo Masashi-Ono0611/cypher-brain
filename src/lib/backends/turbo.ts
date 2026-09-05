@@ -30,6 +30,7 @@ import {
   signerLengthsOrDefaults,
 } from './ans104.js';
 import { remainingSpendBudget, chargeSpendTracker, spentSoFar, budgetExhaustedMessage } from '../spend-tracker.js';
+import { PushUncertainSpendError } from '../push-uncertain-spend.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 export function turboBackend(): StorageBackend {
@@ -328,13 +329,111 @@ export function turboBackend(): StorageBackend {
         }
         r.report(processedBytes, totalBytes);
       };
-      const res = await turbo.uploadFile({
-        fileStreamFactory: () => createReadStream(abs),
-        fileSizeFactory: () => size,
-        dataItemOpts,
-        events: { onProgress },
-      });
-      if (!res?.id) throw new Error(`turbo upload returned no data item id: ${JSON.stringify(res).slice(0, 200)}`);
+      // #818 (turbo mirror of arweave.ts's confirmAmbiguousPost/#802): once uploadFile()
+      // starts streaming the signed data item to Turbo's upload service, any failure to
+      // get back a well-formed response is ambiguous — the service may already have
+      // accepted and billed for the item before the answer was lost (a network reset
+      // mid-response, a stalled connection the SDK's own retry logic gave up on) or the
+      // response came back malformed (the `!res?.id` case below). Unlike arweave.ts's L1
+      // path, there is no per-call probe available here: the SDK signs the ANS-104 data
+      // item and computes its id INTERNALLY, only ever revealing it in the (possibly-
+      // lost/malformed) response, and Arweave/RSA-PSS signatures are randomized — a
+      // locally re-signed copy would not necessarily carry the id the service actually
+      // received, so there is nothing to probe BY. The one stable fact this process
+      // still holds is the signer's OWN address (a local hash of its public key, no
+      // network round-trip — see UncertainSpendCheckKind's own doc comment) — the
+      // identifier an operator resolves the ambiguity WITH, via Turbo's own upload
+      // history / credit balance, instead of a single data item id.
+      const uncertainTurboSpend = async (detail: string, cause: unknown): Promise<PushUncertainSpendError> => {
+        // `turbo.signer` (a `TurboDataItemSigner`) is a real, public field of
+        // @ardrive/turbo-sdk's `TurboAuthenticatedClient` class (its own
+        // common/turbo.ts source assigns it in the constructor and declares it
+        // un-prefixed, i.e. public) — but this project's pinned typescript@7.0.2 does
+        // not resolve that field through the package's multi-file `.d.ts` re-export
+        // chain (node/index.d.ts -> common/index.d.ts -> common/turbo.d.ts): an
+        // isolated repro against a bare `TurboAuthenticatedClient` type with none of
+        // this file's own code involved reproduces the identical TS2339, while a
+        // METHOD declared on the exact same class (`getBalance()`) resolves fine —
+        // narrowly cast to the one method this file actually calls, nothing wider
+        // asserted about the SDK's shape.
+        // try/catch, not just a `.catch()` on the call: `.catch()` alone only handles a
+        // REJECTED promise — a synchronous throw (e.g. if some future SDK version made
+        // `.signer` itself throw on access, or `getNativeAddress` threw before ever
+        // returning a promise) would otherwise escape uncaught and replace this
+        // already-in-flight uncertain-spend classification with an unrelated crash
+        // (Codex review).
+        let address: string | null;
+        try {
+          const signer = (turbo as unknown as { signer: { getNativeAddress(): Promise<string> } }).signer;
+          address = await signer.getNativeAddress();
+        } catch {
+          address = null;
+        }
+        return new PushUncertainSpendError({
+          backend: 'turbo',
+          checkKind: 'turbo_wallet_address',
+          checkIdentifier: address ?? '(could not derive the signer address locally)',
+          detail,
+          verifyHint: address
+            ? `cypher-brain wallet balance --address ${address} (Turbo Credit balance), or https://app.ardrive.io upload history for this wallet`
+            : 'https://app.ardrive.io upload history / Turbo Credit balance for this wallet',
+          cause,
+        });
+      };
+      let res: Awaited<ReturnType<typeof turbo.uploadFile>>;
+      try {
+        res = await turbo.uploadFile({
+          fileStreamFactory: () => createReadStream(abs),
+          fileSizeFactory: () => size,
+          dataItemOpts,
+          events: { onProgress },
+        });
+      } catch (e) {
+        // Deliberately conservative (Codex review): this catches EVERY rejection of
+        // uploadFile(), including one the SDK's own error surfaces as unambiguously
+        // local/pre-network (e.g. `fileStreamFactory` failing to open `abs`) — which
+        // this codebase's own established idiom for this class of problem already
+        // accepts (`probeArweaveTxAccepted()` above takes the same "only a POSITIVE
+        // observation is proof" stance). The SDK does not expose a stable way from
+        // here to tell "definitely never left this process" apart from "reached the
+        // service and the answer was lost", and getting that distinction wrong in the
+        // OTHER direction — reporting a real ambiguous spend as an ordinary, safely-
+        // retryable failure — is the more expensive mistake on a paid, irreversible
+        // upload. Uncertain-but-safe is the intended failure mode here, not a gap.
+        throw await uncertainTurboSpend(
+          `the upload response was lost (${errMsg(e)}) — the signed data item may or may not have reached and been billed by the upload service`,
+          e,
+        );
+      }
+      if (!res?.id) {
+        // The round trip DID complete here (unlike the throw above) — the service
+        // answered, just not with the shape this code expects. That is not proof the
+        // upload was refused (a malformed/truncated body from a proxy in front of the
+        // upload service can follow a request it already persisted, the same "an
+        // answer that isn't a clean accept is still ambiguous" reasoning arweave.ts's
+        // own #802 comment gives for its non-2xx branch) — so this is reported the same
+        // uncertain way, not as an ordinary Error that discards whatever billing may
+        // already have happened.
+        //
+        // `res` can itself be `undefined` here (that is exactly what `!res?.id` is
+        // guarding against) — `JSON.stringify(undefined)` returns `undefined`, not a
+        // string, so an unguarded `.slice(0, 200)` on it throws a plain TypeError that
+        // escapes BEFORE `uncertainTurboSpend()` ever constructs the classified error
+        // (Codex review: this would have defeated the whole point of this branch,
+        // reporting an ambiguous outcome as an ordinary unclassified crash instead).
+        // Mirrors describeArweavePostError()'s own defensive try/catch around
+        // JSON.stringify for the identical reason.
+        let resDescription: string;
+        try {
+          resDescription = res === undefined ? 'undefined' : (JSON.stringify(res)?.slice(0, 200) ?? String(res));
+        } catch {
+          resDescription = '(response could not be stringified)';
+        }
+        throw await uncertainTurboSpend(
+          `the upload service returned a response with no data item id: ${resDescription}`,
+          undefined,
+        );
+      }
       // #232: persist Turbo's own upload response AS-IS (its official receipt-
       // persistence recommendation — the SDK does not separately restate a
       // "final amount charged" field). `uploadWinc` is the pre-flight estimate that
@@ -342,11 +441,25 @@ export function turboBackend(): StorageBackend {
       // moments before signing) — the closest thing to "actual cost" this response
       // surfaces; null only if that estimate itself could not be obtained (an
       // uncapped push proceeding despite a failed pre-flight query).
-      await opts.onReceipt?.({
-        locator: res.id,
-        raw: res,
-        cost: uploadWinc !== null ? { amount: String(uploadWinc), unit: 'winc' } : null,
-      });
+      //
+      // A failure INSIDE onReceipt itself must never be allowed to turn this CONFIRMED
+      // upload (res.id is a real, accepted data item id) into what put() throws as an
+      // ordinary, unclassified Error — discarding res.id and reporting the whole push()
+      // as failed when the ciphertext is already durably stored and billed. Mirrors
+      // arweave.ts's own onReceipt guards for the same reasoning: pushpull.ts's
+      // persistReceipt() (the one real caller today) already never throws, but that
+      // safety must not live ONLY in the caller.
+      try {
+        await opts.onReceipt?.({
+          locator: res.id,
+          raw: res,
+          cost: uploadWinc !== null ? { amount: String(uploadWinc), unit: 'winc' } : null,
+        });
+      } catch (receiptErr) {
+        warn(
+          `turbo: onReceipt callback failed for confirmed upload ${res.id} (${errMsg(receiptErr)}); the upload itself succeeded — proceeding to report it as such`,
+        );
+      }
       return res.id; // 43-char data item id — retrievable like any bundled item
     },
     // reads are identical to the arweave backend (Turbo items are bundled). Pure

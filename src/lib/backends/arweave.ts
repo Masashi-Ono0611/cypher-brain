@@ -739,11 +739,29 @@ export async function arweaveBackend(): Promise<StorageBackend> {
           // then raise the TYPED partial-success error so an MCP idempotency caller
           // remembers this key as spent instead of retrying it (mcp.ts's
           // PushPartialSuccessError branch).
-          await opts.onReceipt?.({
-            locator: tx.id,
-            raw: { tx_id: tx.id, reward: tx.reward, post_status: why },
-            cost: { amount: tx.reward, unit: 'winston' },
-          });
+          //
+          // A failure INSIDE onReceipt itself must never be allowed to escape this
+          // try/catch and propagate instead of the classification below: pushpull.ts's
+          // persistReceipt() (the one real caller today) already never throws — it
+          // catches its own failure and warn()s, per its own header comment ("a
+          // receipt-write failure must NEVER retroactively fail an already-irreversible
+          // spend") — but that safety currently lives entirely in the CALLER. A future
+          // or different onReceipt that isn't as careful would otherwise turn a
+          // CONFIRMED, already-spent upload into what put() throws as an ordinary,
+          // unclassified Error — discarding tx.id and reporting "nothing happened" for
+          // a spend that definitely did (the exact partial-success collapse this
+          // function's whole probe-then-classify design exists to prevent).
+          try {
+            await opts.onReceipt?.({
+              locator: tx.id,
+              raw: { tx_id: tx.id, reward: tx.reward, post_status: why },
+              cost: { amount: tx.reward, unit: 'winston' },
+            });
+          } catch (receiptErr) {
+            warn(
+              `arweave: onReceipt callback failed for confirmed tx ${tx.id} (${errMsg(receiptErr)}); the spend already happened — proceeding to report it as such`,
+            );
+          }
           throw new PushUploadConfirmedResponseLostError(tx.id, cause);
         }
         // #818: a TYPED error, not a plain one. The prose said "UNCERTAIN" and named the
@@ -783,11 +801,25 @@ export async function arweaveBackend(): Promise<StorageBackend> {
       // a tx cannot be validly signed without one). Never the pre-flight estimate
       // variable directly: if that fetch failed, `reward` is undefined here, but tx.reward
       // is still the real, signed figure either way.
-      await opts.onReceipt?.({
-        locator: tx.id,
-        raw: { tx_id: tx.id, reward: tx.reward, post_status: res.status },
-        cost: { amount: tx.reward, unit: 'winston' },
-      });
+      //
+      // This is the CLEANEST success case in this function — res.status is 200/208, an
+      // unambiguous gateway accept, not merely a probe-confirmed one — so a failure
+      // INSIDE onReceipt here would be the most severe version of the collapse guarded
+      // against above: a definitely-successful, already-paid-for upload turning into an
+      // unclassified thrown Error with tx.id discarded entirely, reporting the whole
+      // push() as having failed when the ciphertext is durably stored. Same guard,
+      // same reasoning as confirmAmbiguousPost()'s own onReceipt call above.
+      try {
+        await opts.onReceipt?.({
+          locator: tx.id,
+          raw: { tx_id: tx.id, reward: tx.reward, post_status: res.status },
+          cost: { amount: tx.reward, unit: 'winston' },
+        });
+      } catch (receiptErr) {
+        warn(
+          `arweave: onReceipt callback failed for confirmed tx ${tx.id} (${errMsg(receiptErr)}); the upload itself succeeded — proceeding to report it as such`,
+        );
+      }
       return tx.id; // 43-char base64url tx id
     },
     async get(locator: string, out: string, expect: FetchShape = 'age'): Promise<void> {

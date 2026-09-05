@@ -8,8 +8,19 @@
  * Which kind of identifier the operator has to look up to settle whether the money
  * actually moved. Not free text: mcp.ts persists it in the idempotency log and an agent
  * branches on it, so the set of values is closed and each names exactly one lookup.
+ *
+ * `turbo_wallet_address` is coarser than the other two: unlike arweave.ts's L1 path
+ * (which can probe the SIGNED tx id directly, per #802) or ton-provider's contract
+ * address (derived locally before the deploy even broadcasts), Turbo's ANS-104 data
+ * item id is only ever revealed in the (possibly-lost) upload response — the SDK signs
+ * it internally and Arweave/RSA-PSS signatures are randomized, so recomputing it
+ * locally would need to re-sign and would not necessarily match whatever the service
+ * may already hold. The signer's own address is the one stable identifier this process
+ * still has (a local hash of its public key, no network call) — the operator resolves
+ * the ambiguity by checking that wallet's Turbo Credit balance/upload history instead
+ * of a single transaction (see backends/turbo.ts's own throw site).
  */
-export type UncertainSpendCheckKind = 'arweave_tx_id' | 'ton_contract_address';
+export type UncertainSpendCheckKind = 'arweave_tx_id' | 'ton_contract_address' | 'turbo_wallet_address';
 
 /**
  * Issue #818: the paid work MAY have happened and nothing available to this process can
@@ -75,9 +86,15 @@ export class PushUncertainSpendError extends Error {
     // sync — the arweave and ton-provider wordings that preceded this class had drifted
     // apart already (one of them split across a template concatenation, which is exactly
     // the shape a substring pattern cannot match).
+    const checkLabel =
+      opts.checkKind === 'arweave_tx_id'
+        ? 'Arweave transaction'
+        : opts.checkKind === 'ton_contract_address'
+          ? 'TON contract'
+          : 'Turbo wallet'; // turbo_wallet_address — see UncertainSpendCheckKind's doc comment for why this is a wallet, not a per-upload id
     super(
       `${opts.backend}: ${opts.detail} — the outcome is UNCERTAIN: the payment may already have happened. ` +
-        `Check ${opts.checkKind === 'arweave_tx_id' ? 'Arweave transaction' : 'TON contract'} ` +
+        `Check ${checkLabel} ` +
         `${opts.checkIdentifier}${opts.verifyHint ? ` (${opts.verifyHint})` : ''} BEFORE re-running push or ` +
         'retrying with a new idempotency key: if the first attempt did land, a retry pays for a second one.' +
         (opts.confirmedCiphertextLocator
