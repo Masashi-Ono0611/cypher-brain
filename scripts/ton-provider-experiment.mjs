@@ -213,13 +213,19 @@ function getBagSizeBytesFromSeeder(bagId) {
   if (parsed && typeof parsed.error === 'string') {
     throw new Error(`seeder /api/v1/details failed for bag ${safeBag}: ${parsed.error}`);
   }
-  const size = Number(parsed?.size);
-  if (!Number.isFinite(size) || size <= 0) {
+  const rawSize = parsed?.size;
+  // Same positive-safe-integer contract --size-bytes enforces below (line ~588):
+  // checking the RAW value's type first (not `Number(rawSize)`) rejects
+  // fractions, unsafe (> 2^53) integers, and coercible values like `true`
+  // (Number(true) === 1, which would otherwise slip past Number.isSafeInteger
+  // after coercion) — silently feeding a bogus size into the cost/eligibility
+  // math this script uses to pay a real provider.
+  if (typeof rawSize !== 'number' || !Number.isSafeInteger(rawSize) || rawSize <= 0) {
     throw new Error(
       `seeder returned no positive size for bag ${safeBag} — is it actually seeded there? Pass --size-bytes to override.`,
     );
   }
-  return size;
+  return rawSize;
 }
 
 // -----------------------------------------------------------------------
@@ -629,7 +635,13 @@ async function cmdOffer(args) {
     }
     console.log('');
 
-    if (eligible.length === 0) {
+    // Only exits early for AUTOMATIC selection: an explicit --provider is a
+    // deliberate request to probe one specific (possibly currently-ineligible)
+    // address — see fetchAllProviders()'s own header comment on why the eligible
+    // list is deliberately unfiltered for that case ("we want to SEE dormancy,
+    // not have it filtered away silently"). Exiting here unconditionally used to
+    // defeat that override whenever the eligible list happened to be empty.
+    if (eligible.length === 0 && !flags['--provider']) {
       // W4: this reflects THIS run's filter result only — not a dormancy verdict.
       // Whether that means "the market is dormant" is for the operator/report to
       // judge, with more than one data point.

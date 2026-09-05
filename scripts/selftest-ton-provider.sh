@@ -27,8 +27,13 @@ TMP="$(mktemp -d)"
 MYTONPROVIDER_PID=""
 TONAPI_PID=""
 cleanup() {
-  [ -n "$MYTONPROVIDER_PID" ] && kill "$MYTONPROVIDER_PID" 2>/dev/null
-  [ -n "$TONAPI_PID" ] && kill "$TONAPI_PID" 2>/dev/null
+  # `|| true` on each line, not just on the whole function: under `set -e`, a
+  # non-empty PID whose `kill` fails (process already gone) is the LAST command
+  # in that line's `&&` list, so its non-zero status would abort this EXIT trap
+  # right there — skipping the second kill AND `rm -rf "$TMP"` below, leaking
+  # both the still-running mock server and the temp dir on that failure path.
+  [ -n "$MYTONPROVIDER_PID" ] && { kill "$MYTONPROVIDER_PID" 2>/dev/null || true; }
+  [ -n "$TONAPI_PID" ] && { kill "$TONAPI_PID" 2>/dev/null || true; }
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -270,7 +275,9 @@ export CYPHER_BRAIN_TON_TONAPI_URL="http://127.0.0.1:$TONAPI_PORT"
 
 READY=0
 for _ in $(seq 1 50); do
-  if curl -s "http://127.0.0.1:$MYTONPROVIDER_PORT" >/dev/null 2>&1 && curl -s "http://127.0.0.1:$TONAPI_PORT" >/dev/null 2>&1; then
+  # --max-time bounds each probe: without it, a stalled mock server could hang
+  # this curl indefinitely, defeating the 50-iteration cap on the loop itself.
+  if curl -s --max-time 1 "http://127.0.0.1:$MYTONPROVIDER_PORT" >/dev/null 2>&1 && curl -s --max-time 1 "http://127.0.0.1:$TONAPI_PORT" >/dev/null 2>&1; then
     READY=1
     break
   fi
@@ -469,7 +476,7 @@ node -e '
     console.error("ledger --json by_backend[\"ton-provider\"] missing/malformed: " + JSON.stringify(tp));
     process.exit(1);
   }
-  if (tp.count < 1) { console.error("ledger --json ton-provider count is " + tp.count + ", expected >= 1"); process.exit(1); }
+  if (!Number.isInteger(tp.count) || tp.count < 1) { console.error("ledger --json ton-provider count is " + JSON.stringify(tp.count) + ", expected a positive integer >= 1"); process.exit(1); }
 ' "$LEDGER_JSON_TP" || { echo "[FAIL] ledger --json by_backend.ton-provider is missing or malformed"; echo "$LEDGER_JSON_TP"; exit 1; }
 echo "[PASS] ledger --json by_backend.ton-provider reports a real nanoTON cost, consistently cased with estimate --json (#484, #751)"
 

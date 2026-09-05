@@ -903,8 +903,12 @@ bash "$RUNNER" || { echo "[FAIL] third runner invocation (changed \$SRC content)
 STORE_COUNT_3="$(find "$CYPHER_BRAIN_FILE_DIR" -maxdepth 1 -name '*.age' 2>/dev/null | wc -l | tr -d ' ')"
 [ "$STORE_COUNT_3" = "$((STORE_COUNT_2 + 1))" ] || { echo "[FAIL] #100: changed \$SRC content did not add exactly 1 new object to the file backend store (expected $((STORE_COUNT_2 + 1)), got $STORE_COUNT_3) — skip-unchanged must never suppress a real content change"; exit 1; }
 RUN3_LOG="$(tail -n "+$((LOG_LINES_BEFORE_RUN3 + 1))" "$LOG")"
-if echo "$RUN3_LOG" | grep -q 'SKIPPED:'; then echo "[FAIL] #100: the 3rd run (changed content) was wrongly SKIPPED"; echo "$RUN3_LOG"; exit 1; fi
-echo "$RUN3_LOG" | grep -q '^pushed -> file:' || { echo "[FAIL] 3rd run log lacks the pushed confirmation line"; echo "$RUN3_LOG"; exit 1; }
+# Here-strings, not `echo ... | grep -q`: under `pipefail`, grep -q's early exit
+# on a match can SIGPIPE the still-writing `echo`, and pipefail then reports the
+# pipeline's status as echo's non-zero (not grep's real, successful match) —
+# turning a genuine "SKIPPED: found" into a silently-false negative here.
+if grep -q 'SKIPPED:' <<< "$RUN3_LOG"; then echo "[FAIL] #100: the 3rd run (changed content) was wrongly SKIPPED"; echo "$RUN3_LOG"; exit 1; fi
+grep -q '^pushed -> file:' <<< "$RUN3_LOG" || { echo "[FAIL] 3rd run log lacks the pushed confirmation line"; echo "$RUN3_LOG"; exit 1; }
 # Same single-default-identity reasoning as the 2nd run above: pin N=1, not just "some
 # digit" — and specifically NOT 2, proving LOG_START_LINES correctly excludes the prior
 # 2 runs' own "1 warning(s)..." header lines already sitting earlier in this same log.
@@ -957,6 +961,7 @@ if cb schedule status > "$TMP/status-missing-field.log" 2>&1; then
   echo "[FAIL] status on a schedule.json missing required fields unexpectedly exited 0"; cat "$TMP/status-missing-field.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1
 fi
 grep -q 'schedule config is corrupt' "$TMP/status-missing-field.log" || { echo "[FAIL] missing-field status error lacks 'schedule config is corrupt'"; cat "$TMP/status-missing-field.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1; }
+grep -q 'CB-E017' "$TMP/status-missing-field.log" || { echo "[FAIL] missing-field status error lacks the CB-E017 code"; cat "$TMP/status-missing-field.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1; }
 grep -q 'missing required field' "$TMP/status-missing-field.log" || { echo "[FAIL] missing-field status error lacks 'missing required field'"; cat "$TMP/status-missing-field.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1; }
 if grep -qi 'Cannot read propert' "$TMP/status-missing-field.log"; then echo "[FAIL] missing-field status leaked a generic property-access crash"; cat "$TMP/status-missing-field.log"; cp "$TMP/schedule.json.bak" "$CONFIG"; exit 1; fi
 cp "$TMP/schedule.json.bak" "$CONFIG"
@@ -1278,16 +1283,43 @@ else
     launchctl print "gui/$(id -u)/dev.cypher-brain.nightly.$MH1" > /dev/null 2>&1 \
       || { echo "[FAIL] #114: uninstalling home2 unregistered home1's launchd job"; exit 1; }
   else
-    crontab -l 2>/dev/null | grep -q "# cypher-brain-nightly:$MH1" \
+    # Captured to a variable + here-string, not `crontab -l | grep -q` directly:
+    # under `pipefail`, grep -q's early exit on a match can SIGPIPE the still-
+    # writing `crontab -l`, and pipefail then reports the pipeline's status as
+    # crontab's non-zero (not grep's real, successful match) — turning a genuine
+    # "entry present" into a silently-false negative (same class as #100 above).
+    CRONTAB_NOW="$(crontab -l 2>/dev/null || true)"
+    grep -q "# cypher-brain-nightly:$MH1" <<< "$CRONTAB_NOW" \
       || { echo "[FAIL] home1's crontab entry missing after both installs"; exit 1; }
-    crontab -l 2>/dev/null | grep -q "# cypher-brain-nightly:$MH2" \
+    grep -q "# cypher-brain-nightly:$MH2" <<< "$CRONTAB_NOW" \
       || { echo "[FAIL] #114: home2's crontab entry missing after both installs (did it overwrite home1's line?)"; exit 1; }
     CYPHER_BRAIN_HOME="$MHOME2" CYPHER_BRAIN_SCHEDULE_DIR="$MSCHED2" CYPHER_BRAIN_LAUNCHD_DIR="$MLAUNCHD" \
       cb schedule uninstall > "$TMP/multi-uninstall2.log" 2>&1 || { echo "[FAIL] home2 uninstall exited non-zero"; cat "$TMP/multi-uninstall2.log"; exit 1; }
-    crontab -l 2>/dev/null | grep -q "# cypher-brain-nightly:$MH1" \
+    grep -q "# cypher-brain-nightly:$MH1" <<< "$(crontab -l 2>/dev/null || true)" \
       || { echo "[FAIL] #114: uninstalling home2 removed home1's crontab entry"; exit 1; }
   fi
   cleanup_multi_home
+  # cleanup_multi_home() swallows each uninstall's own exit status (`|| true`) so
+  # it stays safe to call from the EXIT trap even mid-failure — but that means its
+  # own success is never checked here. Without an explicit check, a REAL
+  # uninstall failure would leave home1's real launchd job / crontab entry
+  # registered (pointing at the $TMP dir this script is about to delete — exactly
+  # the #113 orphan bug this file's header says it guards against) while this
+  # block still prints [PASS].
+  if [ "$OS" = "Darwin" ]; then
+    launchctl print "gui/$(id -u)/dev.cypher-brain.nightly.$MH1" > /dev/null 2>&1 \
+      && { echo "[FAIL] #113: home1's real launchd job survived cleanup_multi_home (orphaned registration)"; exit 1; }
+    launchctl print "gui/$(id -u)/dev.cypher-brain.nightly.$MH2" > /dev/null 2>&1 \
+      && { echo "[FAIL] #113: home2's real launchd job survived cleanup_multi_home (orphaned registration)"; exit 1; }
+  else
+    # Same here-string reasoning as the crontab checks above (SIGPIPE/pipefail
+    # can turn a genuine match into a silently-false negative via `| grep -q`).
+    CRONTAB_AFTER_CLEANUP="$(crontab -l 2>/dev/null || true)"
+    grep -q "# cypher-brain-nightly:$MH1" <<< "$CRONTAB_AFTER_CLEANUP" \
+      && { echo "[FAIL] #113: home1's real crontab entry survived cleanup_multi_home (orphaned registration)"; exit 1; }
+    grep -q "# cypher-brain-nightly:$MH2" <<< "$CRONTAB_AFTER_CLEANUP" \
+      && { echo "[FAIL] #113: home2's real crontab entry survived cleanup_multi_home (orphaned registration)"; exit 1; }
+  fi
   trap 'rm -rf "$TMP"' EXIT
   echo "[PASS] two different CYPHER_BRAIN_HOME schedules use distinct LABEL/CRON_MARKER; installing/uninstalling one never touches the other's real registration"
 fi
@@ -1319,7 +1351,12 @@ if [ "$OS" = "Darwin" ]; then
   "
   CYPHER_BRAIN_HOME="$LEGACY_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$LEGACY_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$LEGACY_LAUNCHD" \
     cb schedule status > "$TMP/legacy-status.log" 2>&1 || { echo "[FAIL] status on a legacy-format schedule exited non-zero"; cat "$TMP/legacy-status.log"; exit 1; }
-  grep -qi 'legacy' "$TMP/legacy-status.log" || { echo "[FAIL] status did not flag the legacy unscoped launchd label"; cat "$TMP/legacy-status.log"; exit 1; }
+  # A bare `grep -qi 'legacy'` would trivially match here regardless of whether
+  # detection actually ran: this test's own fixture paths (LEGACY_SCHED/LEGACY_HOME)
+  # contain the substring "legacy", and status always echoes the runner/schedule
+  # paths back — so a broken legacy-migration check could still pass this
+  # assertion on path-name coincidence alone. Match the specific diagnostic instead.
+  grep -q 'legacy launchd label' "$TMP/legacy-status.log" || { echo "[FAIL] status did not flag the legacy unscoped launchd label"; cat "$TMP/legacy-status.log"; exit 1; }
   CYPHER_BRAIN_HOME="$LEGACY_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$LEGACY_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$LEGACY_LAUNCHD" \
     cb schedule uninstall --no-load > "$TMP/legacy-uninstall-noload.log" 2>&1 || { echo "[FAIL] uninstall --no-load on a legacy-format schedule exited non-zero"; cat "$TMP/legacy-uninstall-noload.log"; exit 1; }
   grep -q "legacy launchd plist" "$TMP/legacy-uninstall-noload.log" || { echo "[FAIL] uninstall --no-load did not report the legacy plist as present"; cat "$TMP/legacy-uninstall-noload.log"; exit 1; }
@@ -1332,7 +1369,9 @@ else
     printf '30 3 * * * /bin/bash "%s" # cipher-brain-nightly\n' "$LEGACY_SCHED/nightly.sh" > "$LEGACY_SCHED/cron.entry"
     CYPHER_BRAIN_HOME="$LEGACY_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$LEGACY_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$LEGACY_LAUNCHD" \
       cb schedule status > "$TMP/legacy-status.log" 2>&1 || { echo "[FAIL] status on a legacy-format schedule exited non-zero"; cat "$TMP/legacy-status.log"; exit 1; }
-    grep -qi 'legacy' "$TMP/legacy-status.log" || { echo "[FAIL] status did not flag the legacy unscoped crontab marker"; cat "$TMP/legacy-status.log"; exit 1; }
+    # Same reasoning as the Darwin branch above: match the specific diagnostic,
+    # not a bare 'legacy' that this fixture's own path names would also satisfy.
+    grep -q 'legacy crontab marker' "$TMP/legacy-status.log" || { echo "[FAIL] status did not flag the legacy unscoped crontab marker"; cat "$TMP/legacy-status.log"; exit 1; }
     echo "[PASS] legacy-format cron.entry: status flags the unscoped crontab marker"
   fi
 fi
@@ -1410,10 +1449,12 @@ if [ "$OS" = "Darwin" ]; then
   # Now read that same SCHEDULE_DIR from a DIFFERENT home.
   ME_HOME="$TMP/me-home"; mkdir -p "$ME_HOME"
   CYPHER_BRAIN_HOME="$ME_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$OT_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$OT_LAUNCHD" \
-    cb schedule status > "$TMP/other-status.log" 2>&1 || true
+    cb schedule status > "$TMP/other-status.log" 2>&1 \
+    || { echo "[FAIL] status on another home's registration exited non-zero"; cat "$TMP/other-status.log"; exit 1; }
   grep -qi 'legacy' "$TMP/other-status.log" && { echo "[FAIL] status flagged another home's registration as this home's legacy job"; cat "$TMP/other-status.log"; exit 1; }
   CYPHER_BRAIN_HOME="$ME_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$OT_SCHED" CYPHER_BRAIN_LAUNCHD_DIR="$OT_LAUNCHD" \
-    cb schedule uninstall --no-load > "$TMP/other-uninstall-noload.log" 2>&1 || true
+    cb schedule uninstall --no-load > "$TMP/other-uninstall-noload.log" 2>&1 \
+    || { echo "[FAIL] uninstall --no-load on another home's registration exited non-zero"; cat "$TMP/other-uninstall-noload.log"; exit 1; }
   grep -q "legacy launchd plist" "$TMP/other-uninstall-noload.log" && { echo "[FAIL] uninstall --no-load listed another home's plist as a legacy plist to remove"; cat "$TMP/other-uninstall-noload.log"; exit 1; }
   [ -f "$OT_OLD_PLIST" ] || { echo "[FAIL] another home's plist vanished"; exit 1; }
   echo "[PASS] a registration recorded by a different home is not treated as this home's legacy job"
