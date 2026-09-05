@@ -14,7 +14,13 @@ BIN="$ROOT/bin/cypher-brain.mjs"
 source "$ROOT/scripts/dev-node-flags.sh"
 source "$ROOT/scripts/selftest-lib.sh" # cb(), see scripts/selftest-lib.sh (#572)
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Several tests below deliberately lock down permissions/flags inside $TMP (a 0500 source
+# dir for #782, a chflags-uchg CYPHER_BRAIN_HOME for #119) and restore them along their own
+# normal-completion path -- but interruption (Ctrl-C) or a failure before that restoring
+# line runs would leave a fixture the plain `rm -rf "$TMP"` below cannot remove (EACCES on
+# a 0500 dir; EPERM on an immutable one), leaking it on disk past this script's own exit.
+# Repair broadly here too so cleanup itself never depends on every such test's happy path.
+trap 'chflags -R nouchg "$TMP" 2>/dev/null || true; chmod -R u+rwX "$TMP" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 export CYPHER_BRAIN_HOME="$TMP/keys"
 # Mirrors src/lib/restore.ts's sourceDigest() EXACTLY (delegates to node rather than
 # re-deriving it in bash) — the FULL, un-truncated 64-hex-char sha256 of the argument
@@ -609,17 +615,23 @@ echo "== tar dying mid-stream must fail the snapshot (no valid-looking truncated
 # With in-process encryption (typage), a tar that dies after emitting some bytes just
 # EOFs its stdout — which the encrypter would happily finalize into VALID ciphertext
 # of a TRUNCATED archive. encryptToFile gates success on tar's exit code; prove it.
-# The stub tar intercepts ONLY the snapshot pipeline invocation (`tar -cf - …`) and
+# The stub tar intercepts ONLY the snapshot pipeline invocation (\`tar -cf - …\`) and
 # dispatches on TAR_STUB_MODE; every other tar call passes through to the real tar.
 REALTAR="$(command -v tar)"
 STUBBIN="$TMP/stubbin"; mkdir -p "$STUBBIN"
+# NOTE: this heredoc is deliberately UNQUOTED (<<EOF, not <<'EOF') so $TMP below can be
+# baked into the generated stub as a literal path -- every OTHER '$' is escaped as '\$' to
+# stay literal too. Backticks are just as live in an unquoted heredoc as '$' is: an
+# un-escaped backtick pair in a comment below would run as real command substitution while
+# this heredoc is being written (three did, harmlessly by luck -- see git history), so they
+# must be escaped here the same way '$' already is.
 cat > "$STUBBIN/tar" <<EOF
 #!/usr/bin/env bash
 # block-* modes announce that a named snapshot phase has been REACHED and then park there,
 # so the SIGINT test far below can pin its signal to that exact phase instead of racing a
 # poll loop (see the P1 regression block). Every other invocation falls through to the real
-# tar, so these modes are invisible to the cases above. `exec sleep` rather than a bare
-# `sleep`: the guard SIGKILLs the process it spawned, which is THIS shell — a bare sleep
+# tar, so these modes are invisible to the cases above. \`exec sleep\` rather than a bare
+# \`sleep\`: the guard SIGKILLs the process it spawned, which is THIS shell — a bare sleep
 # would be a grandchild and survive it, leaving a stray process per phase (measured).
 case "\${TAR_STUB_MODE:-}" in
   block-staging-tar)                                 # per-component "tar -czf <stage>/x.tar.gz"
@@ -715,7 +727,14 @@ sigint_at_phase() {
     sleep 0.1; waited=$((waited + 1))
     if [ "$waited" -ge 300 ]; then
       echo "FAIL: phase '$phase' not reached within 30s — BLOCKED, refusing to report a pass"
-      kill "$pid" 2>/dev/null || true; exit 1
+      # A bare TERM here neither waits for nor escalates on a stub that ignores it — the
+      # EXIT trap only removes $TMP, it does not reap background jobs, so a TERM-ignoring
+      # child would otherwise outlive this script. Escalate to KILL and reap before exiting.
+      kill "$pid" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      exit 1
     fi
   done
   # Not `|| true`: a kill that cannot land means the run under test is already gone, so the
@@ -1020,8 +1039,16 @@ echo "== issue #677 control: pull --backend file WITHOUT --remote is not refused
 # locator" reason) — guard the substitution with set +e like the refusal test above,
 # so that expected non-zero exit doesn't trip set -euo pipefail and abort the suite.
 set +e
-PULL_FILE_NO_REMOTE_ERR=$(cb pull --locator "doesnotexist" --backend file --out "$TMP/pull-remote-refuse.age" 2>&1 >/dev/null)
+PULL_FILE_NO_REMOTE_ERR=$(cb pull --locator "doesnotexist" --backend file --out "$TMP/pull-remote-refuse.age" 2>&1 >/dev/null); PULL_FILE_NO_REMOTE_RC=$?
 set -e
+# Negative control: proving the --remote message is ABSENT is only meaningful if
+# execution actually reached the file backend's own locator handling -- an unrelated
+# early crash would also produce output without that message and pass silently. Assert
+# the expected failure (non-zero, mentioning the bogus locator) actually happened first.
+[ "$PULL_FILE_NO_REMOTE_RC" != "0" ] \
+  || { echo "[FAIL] pull with a bogus --locator unexpectedly exited 0 -- this control no longer proves anything reached the file backend"; echo "$PULL_FILE_NO_REMOTE_ERR"; exit 1; }
+printf '%s' "$PULL_FILE_NO_REMOTE_ERR" | grep -qF "doesnotexist" \
+  || { echo "[FAIL] pull's failure did not mention the bogus locator -- an unrelated crash before the file backend could pass this control silently"; echo "$PULL_FILE_NO_REMOTE_ERR"; exit 1; }
 if printf '%s' "$PULL_FILE_NO_REMOTE_ERR" | grep -q -- '--remote <name>:<path> only applies to'; then
   echo "[FAIL] the --remote refusal fired despite --remote not being given"; echo "$PULL_FILE_NO_REMOTE_ERR"; exit 1
 fi
@@ -1036,7 +1063,13 @@ echo "== pipeline timeout: a wedged, SIGTERM-IGNORING tar can't hang the CLI (#3
 # would block on the stub's full 30s.
 printf 'process.on("SIGTERM",()=>{});\nsetTimeout(()=>process.exit(0),30000);\nprocess.stdout.write("wedged");\n' > "$TMP/tar-ignore-term.mjs"
 TOUT="$TMP/timeout-snap.age"
+# a reference-file marker, not -newermt "@epoch" -- BSD find (macOS) rejects the
+# "@<epoch>" time spec for -newermt ("Can't parse date/time"), which the 2>/dev/null
+# below would otherwise silently swallow, turning the leftover check a few lines down
+# into a permanent, unconditional [PASS] on macOS regardless of what's actually left
+# behind. `-newer <file>` is understood by both GNU and BSD find.
 START=$(date +%s)
+START_MARKER="$TMP/timeout-start-marker"; touch "$START_MARKER"
 set +e
 TERR=$(PATH="$STUBBIN:$PATH" TAR_STUB_MODE=wedge CYPHER_BRAIN_PIPE_TIMEOUT=600 node "${BIN_DEV_ARGS[@]}" "$BIN" snapshot --dir "$SRC" --out "$TOUT" 2>&1); TRC=$?
 set -e
@@ -1049,7 +1082,7 @@ printf '%s' "$TERR" | grep -qi "timed out" || { echo "[FAIL] no timeout error su
 test ! -f "$TOUT"                                       # no finished output
 [ -z "$(find "$TMP" -name '*.part' 2>/dev/null)" ] || { echo "[FAIL] a .part lingered after timeout"; exit 1; }
 # the staged plaintext dir must be erased by snapshot's finally on the timeout path
-[ -z "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cypher-brain-*' -newermt "@$START" 2>/dev/null)" ] \
+[ -z "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cypher-brain-*' -newer "$START_MARKER")" ] \
   || { echo "[FAIL] a staged-plaintext cypher-brain-* dir lingered after timeout"; exit 1; }
 echo "[PASS] SIGTERM-ignoring tar killed via SIGKILL escalation in ${ELAPSED}s; no output / .part / staged plaintext"
 
@@ -1060,9 +1093,21 @@ keygen2() { CYPHER_BRAIN_HOME="$1" node "${BIN_DEV_ARGS[@]}" "$BIN" keygen >/dev
 keygen2 "$TMP/k-a"; keygen2 "$TMP/k-b"
 MULTIREC="$TMP/multi-recipient.txt"
 cat "$TMP/k-a/recipient.txt" "$TMP/k-b/recipient.txt" > "$MULTIREC"
-W1=$(cb snapshot --dir "$SRC" --recipient "$MULTIREC" --out "$TMP/mk.age" 2>&1 | grep -ic "SINGLE recipient" || true)
+# Capture each snapshot's own exit code BEFORE grepping its output for the warning:
+# `cmd | grep ... || true` alone would let a snapshot CRASH (unrelated reason, zero
+# output) pass silently as "no warning" -- the `|| true` exists only to tolerate
+# grep's own no-match exit status, but it also swallowed a failed snapshot underneath.
+set +e
+SNAP1_OUT=$(cb snapshot --dir "$SRC" --recipient "$MULTIREC" --out "$TMP/mk.age" 2>&1); SNAP1_RC=$?
+set -e
+[ "$SNAP1_RC" = "0" ] || { echo "[FAIL] snapshot with a 2-key recipient FILE failed unexpectedly (rc=$SNAP1_RC)"; echo "$SNAP1_OUT"; exit 1; }
+W1=$(printf '%s' "$SNAP1_OUT" | grep -ic "SINGLE recipient" || true)
 [ "$W1" = "0" ] || { echo "[FAIL] warned on a 2-key recipient FILE"; exit 1; }
-W2=$(cb snapshot --dir "$SRC" --recipient "$TMP/k-a/recipient.txt" --recipient "$TMP/k-a/recipient.txt" --out "$TMP/dup.age" 2>&1 | grep -ic "SINGLE recipient" || true)
+set +e
+SNAP2_OUT=$(cb snapshot --dir "$SRC" --recipient "$TMP/k-a/recipient.txt" --recipient "$TMP/k-a/recipient.txt" --out "$TMP/dup.age" 2>&1); SNAP2_RC=$?
+set -e
+[ "$SNAP2_RC" = "0" ] || { echo "[FAIL] snapshot with a duplicate-key recipient arg failed unexpectedly (rc=$SNAP2_RC)"; echo "$SNAP2_OUT"; exit 1; }
+W2=$(printf '%s' "$SNAP2_OUT" | grep -ic "SINGLE recipient" || true)
 [ "$W2" != "0" ] || { echo "[FAIL] did NOT warn on two args naming the SAME key"; exit 1; }
 echo "[PASS] single-key warning is by distinct key, not arg count (2-key file silent; dup-arg warns)"
 
@@ -1263,13 +1308,14 @@ echo "== #106 regression: pg_restore is bounded by a timeout (a wedged pg_restor
 FAKE_PGBIN_R="$TMP/fake-pgbin-restore-timeout"; mkdir -p "$FAKE_PGBIN_R"
 cat > "$FAKE_PGBIN_R/pg_dump" <<'SHIM'
 #!/usr/bin/env bash
+set -eu
 out=""; prev=""
 for a in "$@"; do
   if [ "$prev" = "-f" ]; then out="$a"; fi
   prev="$a"
 done
+: "${out:?fake pg_dump: no -f <path> found in argv}"
 printf 'fake-pg-dump-content\n' > "$out"
-exit 0
 SHIM
 chmod +x "$FAKE_PGBIN_R/pg_dump"
 cat > "$FAKE_PGBIN_R/pg_restore" <<'SHIM'
@@ -1302,11 +1348,13 @@ echo "== #235: --pg-filter / --pg-exclude-table-data are a literal pass-through 
 FAKE_PGBIN_F="$TMP/fake-pgbin-filter"; mkdir -p "$FAKE_PGBIN_F"
 cat > "$FAKE_PGBIN_F/pg_dump" <<'SHIM'
 #!/usr/bin/env bash
+set -eu
 out=""; prev=""
 for a in "$@"; do
   if [ "$prev" = "-f" ]; then out="$a"; fi
   prev="$a"
 done
+: "${out:?fake pg_dump: no -f <path> found in argv}"
 printf 'fake-pg-dump-content\n' > "$out"
 : "${PG_DUMP_ARGV_LOG:?PG_DUMP_ARGV_LOG not set}"
 printf '%s\n' "$@" > "$PG_DUMP_ARGV_LOG"
@@ -1389,8 +1437,15 @@ test ! -e "$TMP/nosrc.age" || { echo "[FAIL] --scan-secrets with no scannable so
 # as far as pg_dump and fails there for its own unrelated reason — an unreachable test
 # DSN — which is exactly the point: the new check fires only when the flag is present).
 set +e
-PGONLY_ERR=$(CYPHER_BRAIN_HOME="$TMP/keys" cb snapshot --pg "postgres://x/y" --out "$TMP/nosrc-noflag.age" 2>&1)
+PGONLY_ERR=$(CYPHER_BRAIN_HOME="$TMP/keys" cb snapshot --pg "postgres://x/y" --out "$TMP/nosrc-noflag.age" 2>&1); PGONLY_RC=$?
 set -e
+# Negative control: proving "nothing to scan" is ABSENT only means something if execution
+# actually got as far as pg_dump (this comment's own claim) -- an unrelated early crash
+# would also lack that string and pass silently. Assert the expected downstream failure
+# (non-zero, mentioning pg_dump) before trusting the absence check.
+[ "$PGONLY_RC" != "0" ] || { echo "[FAIL] a --pg-only snapshot with an unreachable test DSN unexpectedly exited 0"; echo "$PGONLY_ERR"; exit 1; }
+printf '%s' "$PGONLY_ERR" | grep -q 'pg_dump' \
+  || { echo "[FAIL] the failure did not mention pg_dump -- an unrelated crash before reaching it could pass this control silently"; echo "$PGONLY_ERR"; exit 1; }
 if printf '%s' "$PGONLY_ERR" | grep -q 'nothing to scan'; then echo "[FAIL] a --pg-only snapshot WITHOUT --scan-secrets was refused by the new check"; echo "$PGONLY_ERR"; exit 1; fi
 echo "[PASS] --scan-secrets is refused when no --dir/--profile source would be scanned, without needing gitleaks, and only when the flag is present"
 
@@ -1477,8 +1532,14 @@ else
   # `off` asks for NO scan, so the "nothing to scan" refusal that guards warn/deny must not
   # fire for it: refusing to not-scan a --pg-only snapshot would be nonsense.
   set +e
-  OFFPG_ERR=$(CYPHER_BRAIN_HOME="$TMP/keys" cb snapshot --pg "postgres://x/y" --out "$TMP/offpg.age" --scan-secrets off 2>&1)
+  OFFPG_ERR=$(CYPHER_BRAIN_HOME="$TMP/keys" cb snapshot --pg "postgres://x/y" --out "$TMP/offpg.age" --scan-secrets off 2>&1); OFFPG_RC=$?
   set -e
+  # Same negative-control gap as the PGONLY_ERR check above: an unrelated early crash
+  # would also lack "nothing to scan" and pass silently. Prove execution actually reached
+  # pg_dump (the expected, unrelated failure this unreachable test DSN causes) first.
+  [ "$OFFPG_RC" != "0" ] || { echo "[FAIL] a --pg-only snapshot with an unreachable test DSN unexpectedly exited 0"; echo "$OFFPG_ERR"; exit 1; }
+  printf '%s' "$OFFPG_ERR" | grep -q 'pg_dump' \
+    || { echo "[FAIL] the failure did not mention pg_dump -- an unrelated crash before reaching it could pass this control silently"; echo "$OFFPG_ERR"; exit 1; }
   printf '%s' "$OFFPG_ERR" | grep -q 'nothing to scan' && { echo "[FAIL] --scan-secrets off with no scannable source hit the warn/deny 'nothing to scan' refusal"; echo "$OFFPG_ERR"; exit 1; }
   echo "[PASS] --scan-secrets off skips the scan, and is not subject to the refusals that only make sense for warn/deny"
 
@@ -1527,7 +1588,10 @@ else
   printf '%s' "$DENY_ERR" | grep -qi "refusing to snapshot" || { echo "[FAIL] --scan-secrets deny did not explain the refusal"; echo "$DENY_ERR"; exit 1; }
   printf '%s' "$DENY_ERR" | grep -q "AKIAABCDEFGHIJKLMNOP" && { echo "[FAIL] the actual dummy secret value leaked into --scan-secrets deny output"; echo "$DENY_ERR"; exit 1; }
   test ! -e "$DENY_SNAP" || { echo "[FAIL] --scan-secrets deny still produced an output file"; exit 1; }
-  test ! -e "$DENY_SNAP.part" || { echo "[FAIL] --scan-secrets deny left a .part file behind"; exit 1; }
+  # partial files are per-run-randomized ("<out>.<pid>.<hex>.part", see npart() above
+  # at line 569) -- the literal "$DENY_SNAP.part" name this used to check for can never
+  # exist, making this assertion a permanent no-op regardless of an actual leak.
+  [ "$(npart "$TMP" "$DENY_SNAP")" = "0" ] || { echo "[FAIL] --scan-secrets deny left a .part file behind"; exit 1; }
   echo "[PASS] --scan-secrets deny aborts the snapshot before any ciphertext is written, without leaking the secret value"
 
   echo "== #215: --scan-secrets deny still succeeds on a source with no findings =="
@@ -1602,8 +1666,8 @@ for arg in "$@"; do
   if [ "$prev" = "--report-path" ]; then report="$arg"; fi
   prev="$arg"
 done
+: "${report:?fake gitleaks: no --report-path <path> found in argv}"
 printf '%s' "$GITLEAKS_BADREPORT_BODY" > "$report"
-exit 0
 EOF
 chmod +x "$STUBBIN/gitleaks-badreport"
 
