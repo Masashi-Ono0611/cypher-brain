@@ -196,8 +196,19 @@ export async function readPlanFile(path: string): Promise<PushPlan> {
   // real trust boundary): expires_at must be exactly created_at + PLAN_DEFAULT_TTL_MS,
   // the same relationship buildPlan() always produces. This catches a naive edit (only
   // expires_at bumped to push the deadline out) without requiring signing — Codex review.
-  const expectedExpiry = new Date(new Date(p.created_at).getTime() + PLAN_DEFAULT_TTL_MS).toISOString();
-  if (Number.isNaN(new Date(p.created_at).getTime()) || p.expires_at !== expectedExpiry) {
+  // The NaN check runs FIRST and short-circuits before expectedExpiry is computed: an
+  // invalid created_at makes `new Date(NaN).toISOString()` throw an uncaught RangeError
+  // (Codex review) — exactly the raw, unfriendly crash this function's own validation
+  // exists to replace with the structured "--plan ..." error below.
+  const createdAtMs = new Date(p.created_at).getTime();
+  if (Number.isNaN(createdAtMs)) {
+    throw new Error(
+      `--plan ${path}: created_at (${JSON.stringify(p.created_at)}) is not a valid date — ` +
+        `this plan was not produced by "estimate --out" or has been edited, re-run "estimate --out" for a fresh one`,
+    );
+  }
+  const expectedExpiry = new Date(createdAtMs + PLAN_DEFAULT_TTL_MS).toISOString();
+  if (p.expires_at !== expectedExpiry) {
     throw new Error(
       `--plan ${path}: created_at/expires_at are inconsistent (expected expires_at = created_at + ${PLAN_DEFAULT_TTL_MS}ms) — ` +
         `this plan was not produced by "estimate --out" or has been edited, re-run "estimate --out" for a fresh one`,
@@ -219,6 +230,21 @@ export async function readPlanFile(path: string): Promise<PushPlan> {
     if (value !== undefined && value !== null && typeof value !== 'string') {
       throw new Error(`--plan ${path}: ${field} must be a string or null, got ${typeof value}`);
     }
+  }
+  // estimate.cost/estimate.unit are read straight from the parsed JSON with no shape
+  // check of their own (only `typeof p.estimate === 'object'` above) — validatePlan()
+  // below calls COST_PATTERN.test(plan.estimate.cost) on this value, and a malformed
+  // plan.json (a hand edit, or an unexpected shape from an SDK quirk) can make that
+  // throw an uncaught TypeError instead of the clean refusal this file's header
+  // comment promises (Codex review: an array coerces "through" the regex test
+  // silently, and an object without a callable toString/valueOf throws when RegExp
+  // coerces it to a string).
+  const est = p.estimate as { cost?: unknown; unit?: unknown };
+  if (est.cost !== null && typeof est.cost !== 'string') {
+    throw new Error(`--plan ${path}: estimate.cost must be a string or null, got ${typeof est.cost}`);
+  }
+  if (est.unit !== undefined && est.unit !== null && typeof est.unit !== 'string') {
+    throw new Error(`--plan ${path}: estimate.unit must be a string or null, got ${typeof est.unit}`);
   }
   return {
     cypher_brain_plan_version: PLAN_VERSION,

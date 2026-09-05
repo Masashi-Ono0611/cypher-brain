@@ -566,7 +566,12 @@ async function checkOfflineBackupDisk(): Promise<DoctorCheck> {
   let homeStat: Stats | null;
   let backupStat: Stats | null;
   try {
-    [homeStat, backupStat] = await Promise.all([statOrNotFound(HOME), statOrNotFound(backupIdentity)]);
+    // Stat IDENTITY itself, not HOME: the message below (and the whole point of this
+    // check) is comparing the PRIMARY IDENTITY's disk against the backup's, and while
+    // identity.age normally sits directly under HOME (same device either way), a HOME
+    // whose identity.age is itself a symlink onto another filesystem would make the
+    // two diverge — stat'ing HOME would then compare the wrong device (Codex review).
+    [homeStat, backupStat] = await Promise.all([statOrNotFound(IDENTITY), statOrNotFound(backupIdentity)]);
   } catch (e) {
     return { id, status: 'fail', message: `could not check ${backupIdentity} against ${HOME}: ${errMsg(e)}` };
   }
@@ -1304,8 +1309,15 @@ export async function computeDoctorReport(): Promise<DoctorReport> {
     if (c.status === 'warn' || c.status === 'fail') {
       const priorEntry = prior?.non_passing[c.id];
       const since = priorEntry?.since ?? nowIso;
+      // A WARN that escalated to FAIL is treated as 'new', not 'carryover' — the health
+      // score below charges carryover FAILs less than a brand-new one (10 vs. 30), and
+      // this check's OWN severity genuinely got worse, which is exactly what this
+      // module's scoring exists to surface (see the file header: "did anything get
+      // WORSE since I last looked"). Leaving it 'carryover' would silently discount a
+      // real deterioration as if it were the same already-known issue (Codex review).
+      const escalated = priorEntry?.status === 'warn' && c.status === 'fail';
       nextNonPassing[c.id] = { status: c.status, since };
-      results.push({ ...c, marker: priorEntry ? 'carryover' : 'new', since });
+      results.push({ ...c, marker: priorEntry && !escalated ? 'carryover' : 'new', since });
     } else {
       results.push({ ...c, marker: null });
     }

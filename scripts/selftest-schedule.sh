@@ -619,8 +619,8 @@ cb schedule install --backend file --dir "$SRC" --ping-url "$PING_BASE" --no-loa
   || { echo "[FAIL] install (--ping-url) exited non-zero"; cat "$TMP/ping-install.log"; exit 1; }
 grep -qF "PING_URL='$PING_BASE'" "$RUNNER" || { echo "[FAIL] runner does not bake PING_URL"; cat "$RUNNER"; exit 1; }
 grep -qF "PING_URL_FAIL='$PING_BASE/fail'" "$RUNNER" || { echo "[FAIL] runner does not default PING_URL_FAIL to \${ping_url}/fail"; cat "$RUNNER"; exit 1; }
-grep -qF 'curl -fsS -m 10 "$PING_URL" >/dev/null 2>&1 || true' "$RUNNER" || { echo "[FAIL] runner trap lacks the success ping curl"; cat "$RUNNER"; exit 1; }
-grep -qF 'curl -fsS -m 10 "$PING_URL_FAIL" >/dev/null 2>&1 || true' "$RUNNER" || { echo "[FAIL] runner trap lacks the failure ping curl"; cat "$RUNNER"; exit 1; }
+grep -qF 'curl -fsS -m 10 --url "$PING_URL" >/dev/null 2>&1 || true' "$RUNNER" || { echo "[FAIL] runner trap lacks the success ping curl"; cat "$RUNNER"; exit 1; }
+grep -qF 'curl -fsS -m 10 --url "$PING_URL_FAIL" >/dev/null 2>&1 || true' "$RUNNER" || { echo "[FAIL] runner trap lacks the failure ping curl"; cat "$RUNNER"; exit 1; }
 grep -qF "dead man's switch enabled: success -> $PING_BASE, failure -> $PING_BASE/fail" "$TMP/ping-install.log" || { echo "[FAIL] install did not report the ping config"; cat "$TMP/ping-install.log"; exit 1; }
 cb schedule status > "$TMP/ping-status.log" 2>&1 || { echo "[FAIL] status exited non-zero"; cat "$TMP/ping-status.log"; exit 1; }
 grep -qF "ping: $PING_BASE (fail: $PING_BASE/fail)" "$TMP/ping-status.log" || { echo "[FAIL] status does not report the configured ping url"; cat "$TMP/ping-status.log"; exit 1; }

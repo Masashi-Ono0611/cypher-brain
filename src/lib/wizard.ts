@@ -445,20 +445,26 @@ export async function init(_o: CliOptions): Promise<boolean> {
       // #720: two `cypher-brain init` (or a concurrent `keygen`) processes racing
       // against the SAME empty CYPHER_BRAIN_HOME can both pass the exists()-based
       // refusal above before either has written anything, then both call keygenAt()
-      // (keys.ts), which writes IDENTITY first via an EXCLUSIVE create ('wx' flag) —
+      // (keys.ts), which writes RECIPIENT first via an EXCLUSIVE create ('wx' flag) —
       // the OS itself lets exactly one of the two writes win; the LOSER's write
       // throws EEXIST. Before this fix, the loser unconditionally deleted IDENTITY
       // here, which can delete the WINNER's just-written (or about-to-be-written)
       // identity out from under it, corrupting a concurrent init that would
-      // otherwise have succeeded. keygenAt() writes IDENTITY strictly before
-      // RECIPIENT (keys.ts), so an EEXIST on IDENTITY specifically means THIS
+      // otherwise have succeeded. keygenAt() writes RECIPIENT strictly before
+      // IDENTITY (keys.ts, #786 — see the "recipient, then identity" comment a few
+      // lines above this try), so an EEXIST on RECIPIENT specifically means THIS
       // process's own keygenAt() call never got past its very first write — it
-      // created nothing at all, and has nothing of its own to roll back. Back off
-      // cleanly instead: touch neither IDENTITY nor RECIPIENT, and let the operator
-      // re-run once the winning process finishes (it will then either see "an
-      // identity already exists", if the winner succeeded, or a fresh, writable
+      // created nothing at all, and has nothing of its own to roll back. (Codex
+      // review: this check originally tested IDENTITY, which was correct when #720
+      // was written but went stale the moment #786 reordered keygenAt()'s two writes
+      // — checking the wrong path meant a genuine race here fell through to the
+      // unconditional `rm(IDENTITY, ...)` below instead of backing off, silently
+      // reopening the exact corruption #720 exists to prevent.) Back off cleanly
+      // instead: touch neither IDENTITY nor RECIPIENT, and let the operator re-run
+      // once the winning process finishes (it will then either see "an identity
+      // already exists", if the winner succeeded, or a fresh, writable
       // CYPHER_BRAIN_HOME again, if the winner itself failed later).
-      const raced = (e as NodeJS.ErrnoException)?.code === 'EEXIST' && (e as NodeJS.ErrnoException)?.path === IDENTITY;
+      const raced = (e as NodeJS.ErrnoException)?.code === 'EEXIST' && (e as NodeJS.ErrnoException)?.path === RECIPIENT;
       if (raced) {
         throw new Error(
           `another "cypher-brain init" (or "keygen") process just won a race to create the identity at ${IDENTITY} ` +
@@ -752,6 +758,19 @@ export async function init(_o: CliOptions): Promise<boolean> {
         try {
           ({ recipient } = await keygenAt({ home: backupHome, identityPath, recipientPath }));
         } catch (e) {
+          // Same #720/#786 race this function's primary-identity keygen above now
+          // guards against (Codex review): keygenAt() writes recipientPath first via
+          // an exclusive create, so a concurrent process racing THIS SAME backupHome
+          // throws EEXIST on recipientPath specifically when it loses — meaning this
+          // call created nothing and must not delete whatever the winner wrote.
+          const raced =
+            (e as NodeJS.ErrnoException)?.code === 'EEXIST' && (e as NodeJS.ErrnoException)?.path === recipientPath;
+          if (raced) {
+            throw new Error(
+              `another process just won a race to create the backup identity at ${identityPath} — this run is ` +
+                'backing off WITHOUT touching anything the other process wrote. Re-run this step once it finishes.',
+            );
+          }
           if (!identityPreExisted) await rm(identityPath, { force: true });
           if (!recipientPreExisted) await rm(recipientPath, { force: true });
           throw e;
@@ -830,6 +849,20 @@ export async function init(_o: CliOptions): Promise<boolean> {
             recipientPath: SIGN_RECIPIENT,
           }));
         } catch (e) {
+          // Same #720/#786 race the primary-identity keygen above guards against
+          // (Codex review): keygenSignAt() (minisign.ts) also writes recipientPath
+          // first via an exclusive create, so a concurrent "keygen --sign" racing
+          // this SAME CYPHER_BRAIN_HOME throws EEXIST on SIGN_RECIPIENT specifically
+          // when it loses — meaning this call created nothing and must not delete
+          // whatever the winner wrote.
+          const raced =
+            (e as NodeJS.ErrnoException)?.code === 'EEXIST' && (e as NodeJS.ErrnoException)?.path === SIGN_RECIPIENT;
+          if (raced) {
+            throw new Error(
+              `another process just won a race to create the signing identity at ${SIGN_IDENTITY} — this run is ` +
+                'backing off WITHOUT touching anything the other process wrote. Re-run this step once it finishes.',
+            );
+          }
           if (!signIdentityPreExisted) await rm(SIGN_IDENTITY, { force: true });
           if (!signRecipientPreExisted) await rm(SIGN_RECIPIENT, { force: true });
           throw e;
@@ -1497,10 +1530,39 @@ export async function init(_o: CliOptions): Promise<boolean> {
       // (promoteNoClobber, recoverykit.ts), which fails closed on that same race
       // instead of racing it.
       let kitClobberApproved = false;
+      // Codex review: without this, choosing IDENTITY (or another of this run's own
+      // key files) as the kit path and answering "Overwrite it?" yes below would
+      // silently replace that secret key with the recovery kit's plaintext — and
+      // since `primaryInline` just below is always null for `init` (the kit only ever
+      // references IDENTITY by path, never inlines it), overwriting IDENTITY this way
+      // destroys the only copy of the key that decrypts the snapshot just pushed,
+      // with no recovery kit content that could reconstruct it. Refused outright,
+      // before the exists()/overwrite prompt even runs — this is not a "confirm
+      // before overwriting" case, these paths are never valid kit destinations.
+      // realpath (falling back to a lexical resolve() for a not-yet-existing
+      // candidate) so a symlink alias of one of these paths is caught too, same
+      // idiom as the backup-home collision check earlier in this function.
+      const protectedKeyPaths = [
+        IDENTITY,
+        RECIPIENT,
+        ...(signing ? [signing.identityPath, signing.recipientPath] : []),
+        ...(backup ? [backup.identityPath, backup.recipientPath] : []),
+      ];
+      const protectedKeyPathsReal = new Set(
+        await Promise.all(protectedKeyPaths.map((p) => realpath(p).catch(() => resolve(p)))),
+      );
       for (;;) {
         const candidate = expandHome(
           await askLine(`Path to write the recovery kit [${defaultKitPath}]`, defaultKitPath),
         );
+        const candidateReal = await realpath(candidate).catch(() => resolve(candidate));
+        if (protectedKeyPathsReal.has(candidateReal)) {
+          console.log(
+            `⚠  ${candidate} is one of this run's own key files — refusing to write the recovery kit there ` +
+              "(it would overwrite a secret key with the kit's plaintext). Choose a different path.",
+          );
+          continue;
+        }
         if (await exists(candidate)) {
           console.log(`⚠  A file already exists at ${candidate} — writing the new kit here would overwrite it.`);
           if (await askYesNo('Overwrite it?', false)) {
