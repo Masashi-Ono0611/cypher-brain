@@ -925,6 +925,50 @@ function assertSupportedManifestSchema(manifestText: string, manifestPath: strin
   }
 }
 
+// #859: `--pg` used to trigger pg_restore off ONLY `${outDir}/db.dump` existing, with no
+// check that the snapshot actually HAS a pg component. A prior restore into the same
+// --out-dir (or a partial/aborted run) can leave a db.dump sitting there — restore's own
+// no-clobber promise (see findStaleComponentArchives()/mergeNoClobber() above) means an
+// unrelated leftover file is exactly the kind of thing that survives untouched — and a
+// LATER `restore --pg` against a DIFFERENT snapshot that never captured pg at all would
+// silently pg_restore that stale dump into the target database: the caller believes --pg
+// restored the snapshot they just pointed at, when it actually replayed unrelated old data.
+// Same fail-closed posture as assertSupportedManifestSchema just above and
+// findStaleComponentArchives()'s own "something already at this exact name cannot be
+// verified as belonging to THIS restore" stance: refuse outright rather than guess.
+//
+// `manifestText === null` (no manifest.json in the snapshot at all — every pre-manifest
+// archive predates the #181 manifest feature entirely) is deliberately let through
+// unchecked, same as assertSupportedManifestSchema's "no schema field" case above: there is
+// nothing to cross-check a total absence of manifest against, and refusing every legacy,
+// manifest-less --pg restore that has always worked would be a behavior change well outside
+// this issue's scope. Likewise a manifest that fails to parse as JSON — not this guard's
+// concern, consistent with every other manifest-parsing guard in this file (see
+// assertSupportedManifestSchema, expandComponents, findStaleComponentArchives above).
+function assertManifestDeclaresPgComponent(manifestText: string | null, outDir: string): void {
+  if (manifestText === null) return; // no manifest to cross-check against — legacy/pre-#181 snapshot
+  let components: RestoreManifestComponent[];
+  try {
+    const parsed: unknown = JSON.parse(manifestText);
+    const raw = (parsed as { components?: unknown })?.components;
+    components = Array.isArray(raw) ? raw : [];
+  } catch {
+    return; // unparsable manifest — not this guard's concern, see above
+  }
+  // snapshot.ts's `if (o.pg)` block is the ONLY writer of a 'pg_dump:custom' component
+  // (see this file's own RestoreManifestComponent doc comment, and snapshot.ts's matching
+  // ManifestComponent one) — no `source` field, unlike every --dir/--profile component.
+  const declaresPg = components.some((c) => c.kind === 'pg_dump:custom');
+  if (declaresPg) return;
+  throw new Error(
+    `--pg was given and ${join(outDir, 'db.dump')} exists, but the current snapshot's manifest does not declare ` +
+      'a pg component — that db.dump is not part of this snapshot (most likely a leftover from an unrelated prior ' +
+      "run, preserved by --out-dir's no-clobber promise). Restoring it now would apply unrelated/stale data to " +
+      'the target database. Re-run snapshot with --pg to actually capture a pg component, or restore into an ' +
+      'empty/different --out-dir and confirm the correct db.dump is the one being restored.',
+  );
+}
+
 // Auto-expand every --dir/--profile component's staged tarball under
 // <out-dir>/expanded/<NNN>-<short source label>-<digest>/, keyed to the component's
 // ORIGINAL absolute source path (manifest.components[].source) rather than its on-disk
@@ -1618,6 +1662,11 @@ async function restoreImpl(
     if (o.pg) {
       const dump = join(o.out_dir, 'db.dump');
       if (!(await exists(dump))) throw new Error(`--pg given but no db.dump in snapshot`);
+      // #859: db.dump existing is not enough — it can be a stale leftover from an
+      // unrelated prior run that --out-dir's no-clobber promise left in place. Cross-check
+      // that THIS restore's own manifest (freshManifestText, captured above) actually
+      // declares a pg component before handing it to pg_restore.
+      assertManifestDeclaresPgComponent(freshManifestText, o.out_dir);
       // --single-transaction (audit finding): without it, `--clean --if-exists` drops each
       // object right before recreating it, one DDL statement at a time outside any wrapping
       // transaction. A pg_restore that dies partway through (timeout, killed connection,
