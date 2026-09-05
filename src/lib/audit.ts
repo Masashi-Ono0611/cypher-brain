@@ -221,7 +221,13 @@ async function removeOwnedLock(lockPath: string, token: string): Promise<void> {
   }
 }
 
-async function withAuditLogLock<T>(fn: () => Promise<T>): Promise<T> {
+// Exported (not just internal) for scripts/selftest-audit.mjs's cross-process lock
+// proof (Codex review) — the same "export a pure/internal primitive so a test can
+// exercise it directly" precedent this file already sets with computeHash() above.
+// Without a direct hold-then-wait test, a test relying only on "two processes racing
+// realistic appendAuditEntry() calls happen not to fork the chain" cannot distinguish
+// genuine mutual exclusion from two runs that merely never actually collided.
+export async function withAuditLogLock<T>(fn: () => Promise<T>): Promise<T> {
   const lockPath = `${AUDIT_LOG}.lock`;
   await mkdir(dirname(AUDIT_LOG), { recursive: true });
   // Pid+timestamp+128-bit-random, same shape claimIdempotencyKey's own token uses —

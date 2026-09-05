@@ -52,6 +52,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SpanStatusCode } from '@opentelemetry/api';
 import { DEV_ARGS } from './dev-node-flags.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -69,11 +70,11 @@ function isoHome() {
   return mkdtempSync(join(tmpdir(), 'cb-otel-selftest-'));
 }
 
-// Runs `cypher-brain doctor` (read-only, no setup required) as a real child process —
-// spawn(), never spawnSync(): the receiver below lives in THIS process, and spawnSync
-// would block this process's event loop for the child's entire lifetime, starving the
-// receiver of the chance to service any request until after the child already exited
-// (see header comment — the exact mistake the first draft of this test made).
+// Runs `cypher-brain <args>` as a real child process — spawn(), never spawnSync(): the
+// receiver below lives in THIS process, and spawnSync would block this process's event
+// loop for the child's entire lifetime, starving the receiver of the chance to service
+// any request until after the child already exited (see header comment — the exact
+// mistake the first draft of this test made).
 //
 // Base env deliberately DROPS this runner's own OTEL_EXPORTER_OTLP_ENDPOINT (Codex
 // review, #226 part 3): a naive `{...process.env, ...env}` would let check 1's `{}`
@@ -81,12 +82,12 @@ function isoHome() {
 // a CI runner with org-wide tracing exported) and stop testing the unset/default-off
 // path at all — passing for the wrong reason. Callers that DO want it set pass it
 // explicitly via `env`, which still wins (spread order).
-function runDoctor(env, timeoutMs) {
+function runCli(args, env, timeoutMs) {
   const home = isoHome();
   const { OTEL_EXPORTER_OTLP_ENDPOINT: _unused, ...baseEnv } = process.env;
   return new Promise((resolve) => {
     const t0 = Date.now();
-    const child = spawn('node', [...DEV_ARGS, BIN, 'doctor'], {
+    const child = spawn('node', [...DEV_ARGS, BIN, ...args], {
       cwd: ROOT,
       env: { ...baseEnv, CYPHER_BRAIN_HOME: home, ...env },
     });
@@ -113,6 +114,13 @@ function runDoctor(env, timeoutMs) {
       resolve({ code: 'SPAWN_ERROR', stdout, stderr: String(err), elapsedMs: Date.now() - t0 });
     });
   });
+}
+
+// `cypher-brain doctor` (read-only, no setup required) is this file's primary probe
+// command — kept as its own name since every existing check below already calls it by
+// this name in its own comments/messages.
+function runDoctor(env, timeoutMs) {
+  return runCli(['doctor'], env, timeoutMs);
 }
 
 // check 1: default off — no OTEL_EXPORTER_OTLP_ENDPOINT set. Must succeed exactly as
@@ -188,6 +196,41 @@ function resourceAttr(payload, key) {
   return attrs.find((a) => a.key === key)?.value?.stringValue;
 }
 
+// Digs the FIRST actual span out of an OTLP/JSON export payload (this project's
+// withSpan() creates exactly one span per dispatched CLI command — see otel.ts).
+// Distinct from resourceAttr() above: that inspects the shared PROCESS-level
+// resource, this inspects the span object itself (name/kind/status) — checks below
+// that only asserted "a request arrived with the right resource attributes" would
+// still pass if withSpan() emitted a span with the wrong name, the wrong OTel
+// SpanKind, or the wrong status (e.g. always OK regardless of whether the wrapped
+// command actually threw) — none of which resourceAttr() alone can see.
+function firstSpan(payload) {
+  return payload?.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0];
+}
+
+// Flattens EVERY span across every resourceSpans/scopeSpans entry in a list of payloads
+// (Codex review): `receiver.getRequests() === 1` only counts HTTP POSTs, and
+// `firstSpan()` only ever looks at the very FIRST span of the FIRST resourceSpans entry
+// of ONE payload — neither actually proves there is exactly one span. A single OTLP/
+// JSON request can legitimately carry a BATCH of multiple spans (that is the whole
+// point of BatchSpanProcessor); a regression that made withSpan() create two spans for
+// one command (e.g. a duplicate startActiveSpan() call, or a stray span left open from
+// a previous call in a long-lived process) would still satisfy "exactly 1 request" and
+// "the first span looks right" while smuggling a second, unaudited span past both those
+// checks. Counting across every payload/resourceSpans/scopeSpans/spans level closes
+// that regardless of how the SDK happens to batch/shape the wire payload.
+function allSpans(payloads) {
+  const out = [];
+  for (const payload of payloads) {
+    for (const rs of payload?.resourceSpans ?? []) {
+      for (const ss of rs?.scopeSpans ?? []) {
+        for (const s of ss?.spans ?? []) out.push(s);
+      }
+    }
+  }
+  return out;
+}
+
 // check 2: endpoint set + reachable — the span must actually be exported, not merely
 // constructed. A real local OTLP/HTTP receiver counts the requests it gets AND decodes
 // the payload, so this also covers #476: the exported resource's service.name must
@@ -211,21 +254,58 @@ function resourceAttr(payload, key) {
   const port = receiver.server.address().port;
   const r = await runDoctor({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` }, 15000);
   receiver.server.close();
-  const serviceName = resourceAttr(receiver.getPayloads()[0], 'service.name');
-  if (r.code !== 0) fail(`check 2 (reachable endpoint): doctor exited ${r.code}: ${r.stderr.slice(0, 300)}`);
+  const payload = receiver.getPayloads()[0];
+  const serviceName = resourceAttr(payload, 'service.name');
+  const span = firstSpan(payload);
+  // r.code === null (Codex review): a 15000ms watchdog SIGKILL also produces this, and
+  // is NOT the same thing as "doctor exited 0" — falling through to the span-content
+  // checks below on a killed process would either fail for the wrong reason (no span
+  // ever flushed) or, worse, PASS on a stale payload from an earlier iteration of a
+  // reused receiver. Checked explicitly, before the generic "exited N" branch, so a
+  // watchdog kill is never silently read as any other failure mode.
+  if (r.code === null)
+    fail(`check 2 (reachable endpoint): doctor did not exit within 15000ms — watchdog killed it (SIGKILL)`);
+  else if (r.code !== 0) fail(`check 2 (reachable endpoint): doctor exited ${r.code}: ${r.stderr.slice(0, 300)}`);
   else if (receiver.getRequests() !== 1)
     fail(
       `check 2 (reachable endpoint): receiver got ${receiver.getRequests()} request(s) to exactly /v1/traces (auto-appended from a base endpoint), expected exactly 1`,
     );
   else if (receiver.getParseError())
     fail(`check 2 (reachable endpoint): request body was not valid OTLP/JSON: ${receiver.getParseError()}`);
+  else if (allSpans(receiver.getPayloads()).length !== 1)
+    fail(
+      `check 2 (reachable endpoint): received ${allSpans(receiver.getPayloads()).length} span(s) total across the payload, expected exactly 1 — a batch containing extras (e.g. a duplicate/leftover span) must not hide behind "1 request received"`,
+    );
   else if (serviceName !== 'cypher-brain')
     fail(
       `check 2 (reachable endpoint, #476): resource.attributes['service.name'] was ${JSON.stringify(serviceName)}, expected 'cypher-brain'`,
     );
+  // Span-content assertions (not just "a request arrived with the right resource"):
+  // proves the SPAN ITSELF — the thing withSpan() actually constructs — carries the
+  // command name and a successful status, not merely that SOME span-shaped payload
+  // reached the receiver. `span?.name` is the dispatched command name (cli.ts's own
+  // `withSpan(cmd ?? 'help', ...)` call — see its header comment): a wrong/missing
+  // name here would mean spans could not be told apart by which command produced
+  // them, defeating the entire point of collecting them.
+  else if (span?.name !== 'doctor')
+    fail(`check 2 (span content): span.name was ${JSON.stringify(span?.name)}, expected 'doctor'`);
+  // OTLP's WIRE-FORMAT SpanKind enum (this payload's `kind` field) reserves 0 for
+  // SPAN_KIND_UNSPECIFIED and starts INTERNAL at 1 — a full integer OFFSET from the
+  // OTel API's own in-process `SpanKind.INTERNAL` (which is 0, per
+  // `@opentelemetry/api`'s own enum). Asserted against the literal wire value (not
+  // the API enum) on purpose so this check reflects what a real collector actually
+  // receives, not this file's own in-process assumption about it.
+  else if (span?.kind !== 1)
+    fail(
+      `check 2 (span content): span.kind was ${JSON.stringify(span?.kind)}, expected 1 (OTLP wire-format SPAN_KIND_INTERNAL — startActiveSpan() is never given an explicit kind)`,
+    );
+  else if (span?.status?.code !== SpanStatusCode.OK)
+    fail(
+      `check 2 (span content): span.status.code was ${JSON.stringify(span?.status?.code)}, expected OK (${SpanStatusCode.OK}) — a successful doctor run must not record a non-OK span status`,
+    );
   else
     pass(
-      `check 2: a reachable base OTEL_EXPORTER_OTLP_ENDPOINT gets the /v1/traces path auto-appended, the span is received before the process exits, and its resource service.name defaults to 'cypher-brain'`,
+      `check 2: a reachable base OTEL_EXPORTER_OTLP_ENDPOINT gets the /v1/traces path auto-appended, the span is received before the process exits, its resource service.name defaults to 'cypher-brain', and the span itself is named 'doctor' with status OK`,
     );
 }
 
@@ -250,6 +330,63 @@ function resourceAttr(payload, key) {
       `check 2b (OTEL_SERVICE_NAME override, #476): resource.attributes['service.name'] was ${JSON.stringify(serviceName)}, expected the env var's value 'cypher-brain-selftest'`,
     );
   else pass(`check 2b: OTEL_SERVICE_NAME overrides the default resource service.name`);
+}
+
+// check 2c (span content, error path): a command REJECTED before it ever does any work
+// (cli.ts's `default:` case, an unrecognized subcommand) must still produce exactly one
+// span, and that span's own status must reflect the failure — not just that a request
+// arrived. cli.ts's withSpan(cmd ?? 'help', ...) call wraps arg parsing/validation TOO
+// (see its own header comment there), specifically so a rejected invocation is still
+// observed, not only a successfully dispatched one — this is the regression test for
+// that: without it, check 2's OK-status assertion alone could not catch a withSpan()
+// that always recorded OK regardless of what fn() actually did.
+{
+  const receiver = startTraceReceiver();
+  await new Promise((resolve) => receiver.server.listen(0, '127.0.0.1', resolve));
+  const port = receiver.server.address().port;
+  const BOGUS_CMD = 'cb-otel-selftest-bogus-command';
+  const r = await runCli([BOGUS_CMD], { OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` }, 15000);
+  receiver.server.close();
+  const span = firstSpan(receiver.getPayloads()[0]);
+  // Requires the EXACT usage-error exit code (2 — cli.ts's UsageError convention for an
+  // unknown command), not merely "not 0" (Codex review): a watchdog SIGKILL after 15000ms
+  // also produces a non-zero-ISH result (r.code === null, r.signal === 'SIGKILL') — if
+  // the CLI hung AFTER already flushing a correctly-shaped ERROR span (a real, if
+  // unlikely, regression: e.g. a bug that leaves some other resource open after the
+  // span-emitting error path), every check below it would still read as correct despite
+  // the run never actually completing on its own. Checked first, distinctly from a
+  // legitimate different exit code, so a hang is never silently folded into "some other
+  // non-zero exit" either.
+  if (r.code === null)
+    fail(
+      `check 2c (span content, error path): unknown command '${BOGUS_CMD}' did not exit within 15000ms — watchdog killed it (SIGKILL)`,
+    );
+  else if (r.code !== 2)
+    fail(
+      `check 2c (span content, error path): unknown command '${BOGUS_CMD}' exited ${r.code}, expected 2 (UsageError)`,
+    );
+  else if (receiver.getRequests() !== 1)
+    fail(`check 2c (span content, error path): receiver got ${receiver.getRequests()} request(s), expected exactly 1`);
+  else if (allSpans(receiver.getPayloads()).length !== 1)
+    fail(
+      `check 2c (span content, error path): received ${allSpans(receiver.getPayloads()).length} span(s) total, expected exactly 1`,
+    );
+  else if (span?.name !== BOGUS_CMD)
+    fail(
+      `check 2c (span content, error path): span.name was ${JSON.stringify(span?.name)}, expected ${JSON.stringify(BOGUS_CMD)} (the rejected command's own name — withSpan(cmd ?? 'help', ...) names the span before parsing/dispatch can fail)`,
+    );
+  else if (span?.status?.code !== SpanStatusCode.ERROR)
+    fail(
+      `check 2c (span content, error path): span.status.code was ${JSON.stringify(span?.status?.code)}, expected ERROR (${SpanStatusCode.ERROR}) — a rejected command must not record a successful span`,
+    );
+  else if (!/unknown command/.test(span?.status?.message ?? ''))
+    fail(
+      `check 2c (span content, error path): span.status.message was ${JSON.stringify(span?.status?.message)}, expected it to name the actual refusal reason ('unknown command')`,
+    );
+  else
+    pass(
+      `check 2c: a rejected command still produces exactly one span, named after the command itself, with status ERROR and a message naming the actual refusal reason`,
+    );
 }
 
 // check 3: endpoint set + unreachable (accepts the connection, never responds) — must

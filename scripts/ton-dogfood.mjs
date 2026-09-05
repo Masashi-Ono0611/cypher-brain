@@ -218,7 +218,7 @@ function cleanupRemoteBag(sha, bagId) {
 
 // ---------- main ----------
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) {
     process.stdout.write(HELP);
@@ -255,21 +255,71 @@ function main() {
   let bagId = null;
   let requiredOk = true;
 
-  // W2: SIGINT (Ctrl-C) must still try to remove a bag this run already created —
-  // the handler is a closure over the same bagId/origSha/keep the normal cleanup path
-  // uses, so it always sees the current values. Kept deliberately minimal: it attempts
-  // cleanup exactly once then exits; a SIGKILL (no JS runs at all) or a second Ctrl-C
-  // (something is already stuck) both skip it and leave the bag on the seeder — re-run
-  // with --keep to inspect it, or remove it by hand (see cleanupRemoteBag above).
-  let sigintHandled = false;
-  process.on('SIGINT', () => {
-    if (sigintHandled) {
-      console.log('\n[WARN] second interrupt — exiting immediately without further cleanup.');
-      process.exit(130);
+  // W2: an interrupt (Ctrl-C / a supervisor terminating this run) must still try to
+  // remove a bag this run already created — the handler is a closure over the same
+  // bagId/origSha/keep the normal cleanup path uses, so it always sees the current
+  // values. Kept deliberately minimal: it attempts cleanup exactly once then exits; a
+  // SIGKILL (no JS runs at all) or a second interrupt (something is already stuck) both
+  // skip it and leave the bag on the seeder — re-run with --keep to inspect it, or
+  // remove it by hand (see cleanupRemoteBag above).
+  //
+  // Reliability boundary (measured, not assumed — a signal-during-blocking-spawnSync
+  // probe against this exact pattern, TWICE: once for a signal arriving mid-spawnSync,
+  // once — Codex review — for the WORSE case of a signal arriving but this script's own
+  // remaining code running to process.exit() with no `await` in between at all, which
+  // reproduced the handler being skipped COMPLETELY, not merely delayed). Every
+  // `cb()`/`cbOk()` call in this file is spawnSync(), which blocks Node's own event
+  // loop for the child's ENTIRE lifetime — a JS `process.on(signal, ...)` callback is
+  // only ever DISPATCHED at an event-loop turn boundary, never mid-synchronous-call.
+  // runPhase() below now `await`s a setImmediate() after every phase specifically to
+  // give a QUEUED signal callback a turn to run between phases — before that fix, a
+  // signal arriving during any phase's own spawnSync() call could go completely
+  // unserviced for the rest of this script's ENTIRE remaining synchronous run (every
+  // later phase, cleanup, and this function's own process.exit() — measured directly:
+  // a two-spawnSync-phase probe reproduced exactly that, handler never invoked, exit 0)
+  // rather than merely being delayed until that one call returned. What the yield does
+  // NOT do: interrupt a spawnSync() call that is CURRENTLY blocking (that needs async
+  // spawn() throughout, a real architecture change to this whole file, out of this
+  // pass's surgical-fix scope) — so the residual boundary is:
+  //   - Interactive Ctrl-C (the common case): POSIX terminal job control delivers
+  //     SIGINT to the WHOLE foreground process group, so the in-flight CLI child
+  //     receives it directly too (same as any other terminal command) and typically
+  //     exits promptly on its own, which unblocks spawnSync() and lets this handler
+  //     run within roughly that child's own shutdown time — seconds, not minutes.
+  //   - A signal sent to ONLY this script's own PID (e.g. a supervising harness/CI job
+  //     killing just this process, not its whole group) never reaches the child at all:
+  //     this handler now reliably runs at the NEXT phase boundary (the yield above),
+  //     rather than never running until the whole script's own natural completion — but
+  //     if the signal arrives partway through one phase's own (possibly long, up to
+  //     CB_TIMEOUT_MS = 90 min) spawnSync() call, it still is not serviced until THAT
+  //     call itself returns. Cleanup in that scenario is delayed, not skipped, but
+  //     "attempting cleanup once before exiting" below can still be a long wait, not
+  //     the prompt reaction the log line implies.
+  //
+  // Registered for BOTH SIGINT and SIGTERM (Codex review — SIGTERM was unhandled
+  // entirely before this fix): `kill <pid>` (no flag) sends SIGTERM by default, not
+  // SIGINT, and is exactly the signal a supervising harness/CI job is most likely to
+  // use to stop a runaway process — before this, that path skipped this cleanup logic
+  // completely (Node's default SIGTERM action is immediate termination, no JS runs at
+  // all), silently abandoning the bag with none of the warnings SIGINT already gives.
+  let interruptHandled = false;
+  // Set once the outer try/finally's OWN cleanup has run (success or failure — either
+  // way, an attempt was made) — checked below so a signal that finally gets a chance to
+  // run (the new yield points this fix adds) does not repeat cleanupRemoteBag() a
+  // second time against a bag whose inventory record the first attempt may have already
+  // deleted (Codex review: harmless in practice — a second call just throws its own
+  // "refusing to delete" and prints a redundant warning, no double side effect, since
+  // TON push/pull cost nothing — but repeating it is still pointless noise this flag
+  // avoids for free).
+  let cleanupDone = false;
+  const handleInterrupt = (signalName, exitCode) => () => {
+    if (interruptHandled) {
+      console.log(`\n[WARN] second interrupt (${signalName}) — exiting immediately without further cleanup.`);
+      process.exit(exitCode);
     }
-    sigintHandled = true;
-    console.log('\n[WARN] interrupted (SIGINT) — attempting cleanup once before exiting.');
-    if (!keep && bagId && origSha) {
+    interruptHandled = true;
+    console.log(`\n[WARN] interrupted (${signalName}) — attempting cleanup once before exiting.`);
+    if (!keep && bagId && origSha && !cleanupDone) {
       try {
         cleanupRemoteBag(origSha, bagId);
         console.log('[INFO] cleanup: removed the test bag from the seeder');
@@ -277,18 +327,34 @@ function main() {
         console.log(
           `[WARN] cleanup failed — remove manually on the seeder (bag ${bagId}, sha ${origSha}): ${e.message}`,
         );
+      } finally {
+        cleanupDone = true;
       }
     }
-    process.exit(130);
-  });
+    process.exit(exitCode);
+  };
+  // Exit codes follow the standard 128+signal-number POSIX convention (SIGINT=2,
+  // SIGTERM=15) — matches this script's own pre-existing SIGINT=130 exit code.
+  process.on('SIGINT', handleInterrupt('SIGINT', 130));
+  process.on('SIGTERM', handleInterrupt('SIGTERM', 143));
 
   const REQUIRED_PHASES = ['setup', 'push', 'idempotent', 'p2p_pull', 'verify', 'restore'];
 
-  function runPhase(name, fn) {
+  // Hands control back to Node's event loop for one turn — see the long reliability-
+  // boundary comment above process.on('SIGINT', ...) for what this does and does not
+  // fix. setImmediate() (not setTimeout(0)) queues onto libuv's "check" phase, which
+  // runs strictly after any I/O callbacks (including a just-delivered signal's own
+  // dispatch) already queued for this turn.
+  function yieldToEventLoop() {
+    return new Promise((resolve) => setImmediate(resolve));
+  }
+
+  async function runPhase(name, fn) {
     if (!requiredOk) {
       phases[name] = 'BLOCKED';
       timings[name] = 0;
       console.log(`[BLOCKED] ${name}: skipped — an earlier required phase failed`);
+      await yieldToEventLoop();
       return;
     }
     const t0 = Date.now();
@@ -303,10 +369,11 @@ function main() {
     } finally {
       timings[name] = Date.now() - t0;
     }
+    await yieldToEventLoop();
   }
 
   try {
-    runPhase('setup', () => {
+    await runPhase('setup', () => {
       cbOk(['keygen']);
       // A few-KB text file (well under a "large file" scenario — this dogfood proves
       // P2P retrievability, not throughput) with a random marker, so restore's output
@@ -318,15 +385,60 @@ function main() {
       sizeBytes = statSync(snapPath).size;
     });
 
-    runPhase('push', () => {
-      const r = cbOk(['push', '--in', snapPath, '--backend', 'ton', '--save-locator', locFile]);
+    await runPhase('push', () => {
+      let r;
+      try {
+        r = cbOk(['push', '--in', snapPath, '--backend', 'ton', '--save-locator', locFile]);
+      } catch (e) {
+        // Partial-push cleanup edge case (Codex review): ton.ts's own push() creates the
+        // bag on the SEEDER first, then separately polls for it to finish seeding
+        // (CREATE_READY_TIMEOUT_MS, 10 min) BEFORE ever returning a locator — a failure
+        // in that second step (the seeder taking too long, an SSH hiccup mid-poll) means
+        // the remote bag genuinely exists (possibly still finishing) even though THIS
+        // `cbOk()` call throws and `bagId` below is never reached. Before this fix, that
+        // left `bagId`/`origSha` both null, so the outer `finally` cleanup's own
+        // `bagId && origSha` guard silently skipped cleanup entirely — no attempt, no
+        // warning, an orphaned bag on the seeder with zero indication one exists.
+        //
+        // ton.ts's own thrown message for exactly that case names the bag id it created
+        // (`seeder did not finish creating/seeding bag <64-hex> within ...`) — the ONLY
+        // failure mode this file can recover a bag id from without deeper access to the
+        // seeder or the backend's internals. Other push failures (e.g. the create call
+        // itself never getting a bag id at all) have no bag id to recover, and this
+        // salvage attempt correctly finds nothing for those — this narrows the fix to
+        // the one case that is actually recoverable rather than guessing.
+        // `origSha` is already set by 'setup' (a REQUIRED_PHASES predecessor this phase
+        // never runs without — see runPhase()'s own requiredOk gate) — only `bagId` is
+        // ever missing here, so only it needs recovering.
+        //
+        // This is ORPHAN REPORTING, not enabled deletion (Codex review — do not read the
+        // log line below as "cleanup will likely succeed"): ton.ts writes the inventory
+        // record cleanupRemoteBag()'s own ownership check (C1, above) requires ONLY
+        // AFTER the readiness wait succeeds — the exact step that just threw. So this
+        // salvaged bagId almost always has NO matching inventory record yet, and the
+        // finally block's cleanup attempt below will typically itself throw ("refusing
+        // to delete — seeder inventory ... does not match") rather than actually delete
+        // anything. That is fine, on purpose: cleanupRemoteBag()'s refusal is a real
+        // safety property (never delete off a bare bagId alone), not a bug to route
+        // around here. The net effect of this fix is turning TOTAL SILENCE (bagId/
+        // origSha both null, the pre-fix state) into a NAMED warning an operator can act
+        // on manually — not automated deletion.
+        const salvaged = /seeder did not finish creating\/seeding bag ([0-9a-f]{64})/.exec(e.message);
+        if (salvaged) {
+          bagId = salvaged[1];
+          console.log(
+            `[WARN] push failed but the seeder may already hold bag ${bagId} from this run — recorded for reporting; automated cleanup will likely still refuse it (no inventory record) and this bag may need manual removal`,
+          );
+        }
+        throw e;
+      }
       locator = r.stdout.trim();
       const m = /^ton:v1:([0-9a-f]{64})$/.exec(locator);
       if (!m) throw new Error(`locator does not match ^ton:v1:[0-9a-f]{64}$: ${JSON.stringify(locator)}`);
       bagId = m[1];
     });
 
-    runPhase('idempotent', () => {
+    await runPhase('idempotent', () => {
       const r = cbOk(['push', '--in', snapPath, '--backend', 'ton']);
       const loc2 = r.stdout.trim();
       if (loc2 !== locator)
@@ -336,7 +448,7 @@ function main() {
     // The core proof: strict mode means a success can ONLY have come from the real P2P
     // network (CYPHER_BRAIN_TON_NO_FALLBACK=1 forbids the SSH fallback outright) — no
     // silent retry through the seeder if P2P fails.
-    runPhase('p2p_pull', () => {
+    await runPhase('p2p_pull', () => {
       const r = cb(['pull', '--backend', 'ton', '--locator', locator, '--out', gotPath], {
         CYPHER_BRAIN_TON_NO_FALLBACK: '1',
       });
@@ -354,11 +466,11 @@ function main() {
       if (gotSha !== origSha) throw new Error(`pulled bytes differ from pushed bytes: ${gotSha} != ${origSha}`);
     });
 
-    runPhase('verify', () => {
+    await runPhase('verify', () => {
       cbOk(['verify', '--in', gotPath]);
     });
 
-    runPhase('restore', () => {
+    await runPhase('restore', () => {
       cbOk(['restore', '--in', gotPath, '--out-dir', restoreDir]);
       const found = findMarker(restoreDir, marker);
       if (!found) throw new Error(`restored tree under ${restoreDir} does not contain this run's marker (${marker})`);
@@ -413,11 +525,15 @@ function main() {
     } else {
       phases.fallback_probe = 'SKIP';
     }
+    // Same yield as runPhase() above (this block is not itself a runPhase() call, but
+    // is built from the exact same synchronous cb()-call shape) — the last chance for a
+    // queued signal callback to run before this function falls into its own cleanup.
+    await yieldToEventLoop();
   } finally {
     // W2: cleanup runs here — in the outer finally — so it still fires even if
     // something above throws an exception runPhase() did not catch (runPhase itself
     // never rethrows, so this is a belt-and-suspenders backstop, not the primary path).
-    if (!keep && bagId && origSha) {
+    if (!keep && bagId && origSha && !cleanupDone) {
       try {
         cleanupRemoteBag(origSha, bagId);
         console.log('[INFO] cleanup: removed the test bag from the seeder');
@@ -425,11 +541,21 @@ function main() {
         console.log(
           `[WARN] cleanup failed — remove manually on the seeder (bag ${bagId}, sha ${origSha}): ${e.message}`,
         );
+      } finally {
+        cleanupDone = true;
       }
     } else if (keep && bagId) {
       console.log(`[INFO] --keep: leaving bag ${bagId} on the seeder`);
     }
     rmSync(tmpRoot, { recursive: true, force: true });
+    // Codex review (2nd pass): this finally block's own cleanupRemoteBag() call is
+    // JUST as synchronous/spawnSync-shaped as any runPhase() — a signal arriving WHILE
+    // it runs is still only queued, not serviced, until this block itself returns. One
+    // more yield here, after the last piece of this function's own synchronous work,
+    // is the final chance for a queued signal callback to run before the plain
+    // console.log()+process.exit() tail below (which this function's own async nature
+    // makes safe to await from inside a `finally`).
+    await yieldToEventLoop();
   }
 
   console.log('== ton dogfood summary ==');
@@ -439,4 +565,7 @@ function main() {
   process.exit(ok ? 0 : 1);
 }
 
-main();
+main().catch((e) => {
+  console.error(`ton-dogfood: unhandled error: ${e instanceof Error ? e.stack : e}`);
+  process.exit(1);
+});

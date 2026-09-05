@@ -37,15 +37,34 @@ HOME="$FAKEHOME" cb snapshot --profile claude-code --out "$TMP/cc.age" > "$TMP/c
 cb restore --in "$TMP/cc.age" --out-dir "$TMP/cc-out" >/dev/null
 grep -q '"profile": "claude-code"' "$TMP/cc-out/manifest.json" \
   || { echo "[FAIL] manifest lacks profile claude-code"; cat "$TMP/cc-out/manifest.json"; exit 1; }
-N=0
-for t in "$TMP/cc-out"/*.tar.gz; do
-  X="$TMP/cc-x/$N"; mkdir -p "$X"; tar -xzf "$t" -C "$X"; N=$((N+1))
-done
+N=$(ls "$TMP/cc-out"/*.tar.gz 2>/dev/null | wc -l | tr -d ' ')
 [ "$N" = "3" ] || { echo "[FAIL] expected 3 components (memory x2 + CLAUDE.md), got $N"; exit 1; }
-grep -rq 'alpha memory' "$TMP/cc-x"        || { echo "[FAIL] proj-a memory missing from restore"; exit 1; }
-grep -rq 'beta memory' "$TMP/cc-x"         || { echo "[FAIL] proj-b memory missing from restore"; exit 1; }
-grep -rq 'global instructions' "$TMP/cc-x" || { echo "[FAIL] CLAUDE.md missing from restore"; exit 1; }
-echo "[PASS] claude-code profile round-trips 2 project memory dirs + CLAUDE.md (3 components)"
+# Full-content diffing, not substring grep (Codex review): a substring match (the prior
+# version of this check) cannot tell a truncated/corrupted restore apart from a correct
+# one — it would still pass if, say, only half of proj-a's memory dir survived, as long
+# as the one marker line happened to be in the surviving half. Uses restore's own
+# expanded/ tree (the "<3-digit index>-<label>-<64-hex digest>" naming scheme #181/#423
+# documents — see scripts/selftest-properties.mjs's own header comment) to diff each
+# restored component byte-for-byte against the REAL source it was archived from — the
+# same bar the obsidian/chatgpt-export/o2b profile checks below already hold themselves
+# to with diff -r / sha256. Globbed by the documented NAME SHAPE, not the exact digest
+# value (independently recomputing that here would just re-implement sourceDigest(),
+# which is properties.mjs's own job to verify). Index order (001=proj-a, 002=proj-b,
+# 003=CLAUDE.md) is not incidental to this one run — claudeCodePaths() (profiles.ts)
+# sorts project dirs by name before appending CLAUDE.md last, always.
+EXPANDED_A=$(ls -d "$TMP/cc-out/expanded/001-memory-"*/ 2>/dev/null | head -1)
+EXPANDED_B=$(ls -d "$TMP/cc-out/expanded/002-memory-"*/ 2>/dev/null | head -1)
+EXPANDED_CLAUDE=$(ls -d "$TMP/cc-out/expanded/003-CLAUDE.md-"*/ 2>/dev/null | head -1)
+[ -n "$EXPANDED_A" ] || { echo "[FAIL] restore's expanded/ tree is missing the 001-memory-* dir for proj-a"; ls "$TMP/cc-out/expanded"; exit 1; }
+[ -n "$EXPANDED_B" ] || { echo "[FAIL] restore's expanded/ tree is missing the 002-memory-* dir for proj-b"; ls "$TMP/cc-out/expanded"; exit 1; }
+[ -n "$EXPANDED_CLAUDE" ] || { echo "[FAIL] restore's expanded/ tree is missing the 003-CLAUDE.md-* dir"; ls "$TMP/cc-out/expanded"; exit 1; }
+diff -r "$FAKEHOME/.claude/projects/proj-a/memory" "${EXPANDED_A}memory" \
+  || { echo "[FAIL] restored proj-a memory differs from the source"; exit 1; }
+diff -r "$FAKEHOME/.claude/projects/proj-b/memory" "${EXPANDED_B}memory" \
+  || { echo "[FAIL] restored proj-b memory differs from the source"; exit 1; }
+diff "$FAKEHOME/.claude/CLAUDE.md" "${EXPANDED_CLAUDE}CLAUDE.md" \
+  || { echo "[FAIL] restored CLAUDE.md differs from the source"; exit 1; }
+echo "[PASS] claude-code profile round-trips 2 project memory dirs + CLAUDE.md byte-for-byte (3 components)"
 
 echo "== profile claude-code composes with --dir (extra dirs appended after) =="
 EXTRA="$TMP/extra"; mkdir -p "$EXTRA"; printf 'extra stuff\n' > "$EXTRA/e.txt"
