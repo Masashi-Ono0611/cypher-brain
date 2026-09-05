@@ -66,7 +66,14 @@ export CYPHER_BRAIN_HOME="$TMP/keys-pp"
 CYPHER_BRAIN_PASSPHRASE="$PASS" cb keygen --passphrase >/dev/null
 printf '%s\n' "$PASS" | with_pty age -d -o "$TMP/unwrapped.txt" "$CYPHER_BRAIN_HOME/identity.age" >/dev/null
 grep -q '^AGE-SECRET-KEY-1' "$TMP/unwrapped.txt" || { echo "[FAIL] binary unwrap did not yield an identity"; exit 1; }
-UNWRAPPED_PUB=$(age-keygen -y "$TMP/unwrapped.txt" 2>/dev/null || grep '^# public key: ' "$TMP/unwrapped.txt" | cut -d' ' -f4)
+# Derive the public key by actually re-deriving it from the secret key material
+# (age-keygen -y), not by trusting the file's own self-reported "# public key:"
+# comment line — a corrupted/truncated secret key can still carry a correct-looking
+# comment, which would make this assertion pass without the identity itself being
+# valid (the comment was previously accepted as a fallback whenever `age-keygen -y`
+# failed for any reason).
+UNWRAPPED_PUB=$(age-keygen -y "$TMP/unwrapped.txt" 2>"$TMP/unwrapped-pub.err") \
+  || { echo "[FAIL] age-keygen -y could not derive a public key from the binary-unwrapped identity"; cat "$TMP/unwrapped-pub.err"; exit 1; }
 [ "$UNWRAPPED_PUB" = "$(cat "$CYPHER_BRAIN_HOME/recipient.txt")" ] || { echo "[FAIL] unwrapped identity does not match the recipient"; exit 1; }
 echo "[PASS] the age binary unwrapped a typage-wrapped identity (matching recipient)"
 

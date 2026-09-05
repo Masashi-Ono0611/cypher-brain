@@ -121,11 +121,16 @@ try {
   if (server) server.kill('SIGKILL');
   // This one really does hold a working age private key — the suite runs `keygen` into it —
   // and it was left behind on every run, which is what #328 was filed on. Same posture
-  // snapshot() takes with its staged plaintext. Swallowed so a cleanup failure cannot
-  // replace the error the test was actually reporting.
+  // snapshot() takes with its staged plaintext. Reported through fail() (not swallowed)
+  // rather than thrown, so a cleanup failure cannot replace the error the test was actually
+  // reporting, but a standalone run of this script — `npm run verify`'s own TMPDIR hygiene
+  // check only inspects this directory when the suite runs through that wrapper — still
+  // fails instead of quietly leaving key material behind.
   try {
     await rm(tmp, { recursive: true, force: true });
-  } catch {}
+  } catch (e) {
+    fail(`could not remove ${tmp} (private key material may remain there): ${e.message}`);
+  }
 }
 
 console.log('');

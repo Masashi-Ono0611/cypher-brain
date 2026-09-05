@@ -77,6 +77,10 @@ echo "== snapshot -> push (file) -> pull -> verify -> restore, encrypted to the 
 cb "$PQ" snapshot --dir "$SRC" --out "$TMP/snap.age"
 LOC=$(cb "$PQ" push --in "$TMP/snap.age" --backend file)
 cb "$PQ" pull --locator "$LOC" --backend file --out "$TMP/got.age"
+# Explicit existence check first: sha()'s own pipeline (shasum | cut) can still exit 0
+# on a missing file (cut sees empty stdin), so without this a `pull` that exited 0 but
+# silently wrote nothing would compare "" = "" here and pass.
+test -f "$TMP/got.age" || { echo "[FAIL] pull exited 0 but wrote no output at $TMP/got.age"; exit 1; }
 [ "$(sha "$TMP/got.age")" = "$(sha "$TMP/snap.age")" ] && echo "[PASS] pulled ciphertext == pushed ciphertext" \
   || { echo "[FAIL] pulled/pushed ciphertext mismatch"; exit 1; }
 cb "$PQ" verify --in "$TMP/got.age" | grep -q "VERDICT: PASS" \

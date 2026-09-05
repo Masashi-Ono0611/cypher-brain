@@ -29,6 +29,16 @@ trap restore EXIT
 
 fail() { echo "[FAIL] $1"; exit 1; }
 
+# Prints everything OUTSIDE the HELP-START/HELP-END marker block: up to and including
+# the HELP-START line, then from the HELP-END line to EOF. Used below to prove --write
+# only touches the block it owns — a regenerator that clobbered the rest of the file
+# (or duplicated/dropped content around the markers) would still leave the marker block
+# itself matching `--help` and pass every other assertion in this script.
+outside_marker_block() {
+  sed -n '1,/HELP-START/p' "$1"
+  sed -n '/HELP-END/,$p' "$1"
+}
+
 # (0) sanity: the real, un-mutated tree must pass before we start mutating it —
 # otherwise every check below is meaningless (drift already present).
 node "$CHECK" >/dev/null 2>&1 || fail "checker fails on a clean tree (fix the drift first, or the marker block, before trusting this selftest)"
@@ -52,6 +62,9 @@ echo "[PASS] README-side drift: checker fails non-zero with a clear message"
 node "$CHECK" --write >/dev/null 2>&1 || fail "--write exited non-zero"
 node "$CHECK" >/dev/null 2>&1 || fail "checker still fails after --write"
 echo "[PASS] --write regenerates a passing README.md"
+diff <(outside_marker_block "$TMP/README.md.orig") <(outside_marker_block "$README") >/dev/null \
+  || fail "--write changed content OUTSIDE the HELP-START/HELP-END marker block"
+echo "[PASS] --write left everything outside the marker block untouched"
 
 # restore the pristine README before test (2), which mutates src/cli.ts instead
 cp "$TMP/README.md.orig" "$README"
