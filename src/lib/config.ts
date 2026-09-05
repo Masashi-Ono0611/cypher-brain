@@ -598,14 +598,27 @@ export const TON_PROVIDER_MYTONPROVIDER_URL =
 // notifyProviderWithRetry()'s `Date.now() > deadline` comparison never trip, silently
 // leaving the paid deploy's local ephemeral daemon (and the temp directory it seeds
 // from) retrying forever instead of the bounded failure this budget exists to guarantee.
-function parsePositiveMsOverride(raw: string | undefined, defaultMs: number, name: string): number {
-  if (raw === undefined) return defaultMs;
+// Generalized over parsePositiveMsOverride below (unit defaults to 'ms', preserving
+// every existing caller's exact message text) so the same validated, warn+default
+// behavior can also guard a non-ms positive integer (AR_L1_MAX_BYTES below) instead of
+// that value falling back to a bare, unvalidated Number() (Codex review: a malformed
+// override there silently produced NaN, which makes every `size > limit` comparison
+// false and defeats the size-cap check silently rather than warning and using the
+// documented default).
+function parsePositiveIntOverride(raw: string | undefined, defaultVal: number, name: string, unit = 'ms'): number {
+  if (raw === undefined) return defaultVal;
   const n = Number(raw);
   if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
-    warn(`${name} must be a positive integer (ms) — got ${JSON.stringify(raw)}; using the ${defaultMs}ms default`);
-    return defaultMs;
+    const suffix = unit === 'ms' ? 'ms' : ` ${unit}`;
+    warn(
+      `${name} must be a positive integer (${unit}) — got ${JSON.stringify(raw)}; using the ${defaultVal}${suffix} default`,
+    );
+    return defaultVal;
   }
   return n;
+}
+function parsePositiveMsOverride(raw: string | undefined, defaultMs: number, name: string): number {
+  return parsePositiveIntOverride(raw, defaultMs, name, 'ms');
 }
 export const TON_PROVIDER_NOTIFY_RETRY_MS = parsePositiveMsOverride(
   readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS'),
@@ -655,7 +668,14 @@ export const AR_PROTOCOL = readEnv('CYPHER_BRAIN_AR_PROTOCOL') || 'https';
 export const AR_WALLET = readEnv('CYPHER_BRAIN_AR_WALLET') || ''; // path to a JWK key file
 export const AR_PAID_BY = readEnv('CYPHER_BRAIN_AR_PAID_BY') || ''; // optional (turbo): an address that shared (delegated) Turbo Credits to the signer — passed as `paidBy` so the upload draws from that approval before the signer's own balance (the path for credits bought on a wallet we can't sign with, e.g. MetaMask, then shared to this JWK)
 export const AR_DEFAULT_EXTRA_GATEWAYS = ['https://permagate.io']; // public mirror(s) tried after the primary (override the whole list with CYPHER_BRAIN_AR_GATEWAYS)
-export const AR_HTTP_TIMEOUT_MS = Number(readEnv('CYPHER_BRAIN_AR_HTTP_TIMEOUT') || 60000); // bound the gateway read so a stall falls through to the L1 chunk fallback
+// Validated (Codex review): a malformed override used to reach a bare `Number()`, and
+// AbortSignal.timeout(NaN) throws synchronously — a config typo would crash every
+// arweave gateway read instead of falling back to the documented 60s default.
+export const AR_HTTP_TIMEOUT_MS = parsePositiveIntOverride(
+  readEnv('CYPHER_BRAIN_AR_HTTP_TIMEOUT') || undefined,
+  60000,
+  'CYPHER_BRAIN_AR_HTTP_TIMEOUT',
+); // bound the gateway read so a stall falls through to the L1 chunk fallback
 // Public, unauthenticated USD/AR rate endpoint (ArDrive Turbo's payment service) — a
 // plain JSON GET, no SDK or auth required (#170). arUsdRate() (src/lib/estimate.ts)
 // fetches this directly instead of going through @ardrive/turbo-sdk, so the USD line
@@ -708,7 +728,15 @@ export const SKIP_FUNDS_CHECK = readEnv('CYPHER_BRAIN_SKIP_FUNDS_CHECK') === '1'
 // The raw `arweave` backend posts one inline L1 tx; gateways reject single-tx bodies
 // past ~12 MiB. Guard at a conservative 10 MiB and redirect large uploads to `turbo`
 // (which streams + ANS-104-bundles). Override for a deliberate large L1 post.
-export const AR_L1_MAX_BYTES = Number(readEnv('CYPHER_BRAIN_AR_L1_MAX') || 10 * 1024 * 1024);
+// Validated (Codex review): a bare `Number()` turned a malformed override into NaN,
+// and `size > AR_L1_MAX_BYTES` is always false against NaN — silently defeating the
+// redirect-to-turbo guard instead of warning and falling back to the 10 MiB default.
+export const AR_L1_MAX_BYTES = parsePositiveIntOverride(
+  readEnv('CYPHER_BRAIN_AR_L1_MAX') || undefined,
+  10 * 1024 * 1024,
+  'CYPHER_BRAIN_AR_L1_MAX',
+  'bytes',
+);
 // Overall wall-clock cap for the tar|age / age|tar streaming pipelines, the pre-stage
 // tar, pg_restore, AND the rclone backend's copyto subprocess, so a wedged binary (or
 // a FIFO/special file under --dir, or a stalled remote transfer) can't hang the CLI
@@ -720,4 +748,13 @@ export const AR_L1_MAX_BYTES = Number(readEnv('CYPHER_BRAIN_AR_L1_MAX') || 10 * 
 // resetting ITS OWN per-chunk stall timeout by trickling bytes forever must still hit
 // this total cap, independent of that stall timer, or it could grow the pulled part
 // file until local disk is exhausted.
-export const PIPE_TIMEOUT_MS = Number(readEnv('CYPHER_BRAIN_PIPE_TIMEOUT') || 60 * 60 * 1000);
+// Validated (Codex review): a bare `Number()` turned a malformed override into NaN —
+// Node's setTimeout()/similar treat a NaN delay as ~0ms (a "TimeoutNaNWarning"), which
+// would make this stall guard fire almost immediately instead of after the intended
+// budget, silently breaking every long-running snapshot/restore/pull instead of
+// warning and falling back to the documented 1h default.
+export const PIPE_TIMEOUT_MS = parsePositiveIntOverride(
+  readEnv('CYPHER_BRAIN_PIPE_TIMEOUT') || undefined,
+  60 * 60 * 1000,
+  'CYPHER_BRAIN_PIPE_TIMEOUT',
+);

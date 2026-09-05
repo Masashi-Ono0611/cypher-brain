@@ -385,8 +385,11 @@ function runnerBody(cfg: ScheduleConfig): string {
   // fire time (not at `trap ...` set time), so $PING_URL there resolves to whatever this
   // script set it to earlier, not to an empty/unset value.
   const pingLines = cfg.ping_url ? [`PING_URL=${shq(cfg.ping_url)}`, `PING_URL_FAIL=${shq(cfg.ping_url_fail)}`] : [];
-  const pingOkCmd = cfg.ping_url ? 'curl -fsS -m 10 "$PING_URL" >/dev/null 2>&1 || true; ' : '';
-  const pingFailCmd = cfg.ping_url ? 'curl -fsS -m 10 "$PING_URL_FAIL" >/dev/null 2>&1 || true; ' : '';
+  // --url (rather than a bare positional) so a --ping-url value that happens to start
+  // with "-" (e.g. a copy-pasted "--config=/path" or "-o/some/file") is unambiguously
+  // read as the target URL, not parsed by curl as one of its own options (Codex review).
+  const pingOkCmd = cfg.ping_url ? 'curl -fsS -m 10 --url "$PING_URL" >/dev/null 2>&1 || true; ' : '';
+  const pingFailCmd = cfg.ping_url ? 'curl -fsS -m 10 --url "$PING_URL_FAIL" >/dev/null 2>&1 || true; ' : '';
   const snapshotArgs: string[] = [];
   if (cfg.profile) snapshotArgs.push('--profile', shq(cfg.profile));
   if (cfg.vault) snapshotArgs.push('--vault', shq(cfg.vault));
@@ -703,7 +706,16 @@ const cronMarkerOf = (entry: string): string => entry.slice(entry.lastIndexOf(' 
 // error.
 async function tryReadConfig(): Promise<ScheduleConfig | null> {
   try {
-    return JSON.parse(await readFile(CONFIG, 'utf8')) as ScheduleConfig;
+    const parsed: unknown = JSON.parse(await readFile(CONFIG, 'utf8'));
+    // Same shape check readConfig() below applies (assertScheduleConfigShape,
+    // hoisted — declared later in this file but callable here like every other
+    // hoisted validator in this codebase, e.g. config.ts's parsePositiveMsOverride).
+    // Without it, a corrupt-but-valid-JSON schedule.json (e.g. `{}`) used to reach
+    // legacyLaunchd()/legacyCronEntry() below, which read `cfg.trigger.type`
+    // unguarded and threw — the exact "must never treat [this] as an error"
+    // contract this function's own doc comment promises (Codex review).
+    assertScheduleConfigShape(parsed);
+    return parsed;
   } catch {
     return null;
   }
