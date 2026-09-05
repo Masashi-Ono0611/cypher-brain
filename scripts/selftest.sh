@@ -1402,9 +1402,12 @@ echo "[PASS] manifest.json records the --pg-filter path and --pg-exclude-table-d
 PLAIN_ARGV="$TMP/pg-dump-argv-plain.txt"
 CYPHER_BRAIN_HOME="$TMP/keys" CYPHER_BRAIN_PG_BIN="$FAKE_PGBIN_F" PG_DUMP_ARGV_LOG="$PLAIN_ARGV" \
   node "${BIN_DEV_ARGS[@]}" "$BIN" snapshot --pg "postgres://fake/conn" --out "$TMP/pg-plain-snap.age" >/dev/null
-if grep -q -- '--filter\|--exclude-table-data' "$PLAIN_ARGV"; then
+if grep -q -- '--filter\|--exclude-table-data' "$PLAIN_ARGV"; then rc=0; else rc=$?; fi
+if [ "$rc" -eq 0 ]; then
   echo "[FAIL] pg_dump argv carries --filter/--exclude-table-data even though neither flag was passed"
   cat "$PLAIN_ARGV"; exit 1
+elif [ "$rc" -ne 1 ]; then
+  echo "[FAIL] could not read $PLAIN_ARGV to confirm no filter flags were passed (grep rc=$rc) — was the fake pg_dump ever invoked?"; exit 1
 fi
 echo "[PASS] omitting --pg-filter/--pg-exclude-table-data leaves pg_dump's argv exactly as before (no filtering)"
 

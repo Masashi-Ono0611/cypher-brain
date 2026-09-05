@@ -33,7 +33,12 @@ cb restore --in "$TMP/plain.age" --out-dir "$TMP/plain-out" --no-expand-componen
 tar -tzf "$TMP/plain-out/plain.tar.gz" | sort > "$TMP/plain-list.txt"
 grep -qx 'plain/' "$TMP/plain-list.txt" || { echo "[FAIL] control archive missing top dir entry"; cat "$TMP/plain-list.txt"; exit 1; }
 grep -qx 'plain/x/f.txt' "$TMP/plain-list.txt" || { echo "[FAIL] control archive missing nested file"; cat "$TMP/plain-list.txt"; exit 1; }
-grep -q '"cypherbrainignore"' "$TMP/plain-out/manifest.json" && { echo "[FAIL] manifest records cypherbrainignore when no ignore file was present"; exit 1; }
+if grep -q '"cypherbrainignore"' "$TMP/plain-out/manifest.json"; then rc=0; else rc=$?; fi
+if [ "$rc" -eq 0 ]; then
+  echo "[FAIL] manifest records cypherbrainignore when no ignore file was present"; exit 1
+elif [ "$rc" -ne 1 ]; then
+  echo "[FAIL] could not read $TMP/plain-out/manifest.json to confirm cypherbrainignore is absent (grep rc=$rc)"; exit 1
+fi
 echo "[PASS] no .cypherbrainignore -> unchanged archive contents, no manifest field"
 
 echo "== .cypherbrainignore excludes node_modules/ and .git/, keeps everything else =="

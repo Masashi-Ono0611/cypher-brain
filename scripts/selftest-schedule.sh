@@ -305,7 +305,12 @@ CYPHER_BRAIN_HOME="$PINHOME" cb keygen > /dev/null 2>&1 || { echo "[FAIL] keygen
  CYPHER_BRAIN_HOME="$PINHOME" CYPHER_BRAIN_SCHEDULE_DIR="$PINSCHED" CYPHER_BRAIN_FILE_DIR="$PINSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$PINLAUNCHD" \
    cb schedule install --backend file --dir "$PINSRC" --no-load) > "$TMP/install-a3d-unset.log" 2>&1 \
   || { echo "[FAIL] install (pin unset) exited non-zero"; cat "$TMP/install-a3d-unset.log"; exit 1; }
-if grep -q '^export CYPHER_BRAIN_PIN_RECIPIENTS=' "$PINRUNNER"; then echo "[FAIL] runner baked a CYPHER_BRAIN_PIN_RECIPIENTS export even though the var was UNSET at install time"; cat "$PINRUNNER"; exit 1; fi
+if grep -q '^export CYPHER_BRAIN_PIN_RECIPIENTS=' "$PINRUNNER"; then rc=0; else rc=$?; fi
+if [ "$rc" -eq 0 ]; then
+  echo "[FAIL] runner baked a CYPHER_BRAIN_PIN_RECIPIENTS export even though the var was UNSET at install time"; cat "$PINRUNNER"; exit 1
+elif [ "$rc" -ne 1 ]; then
+  echo "[FAIL] could not read $PINRUNNER to confirm no PIN_RECIPIENTS export was baked (grep rc=$rc) — was the runner even written?"; exit 1
+fi
 CYPHER_BRAIN_HOME="$PINHOME" CYPHER_BRAIN_SCHEDULE_DIR="$PINSCHED" CYPHER_BRAIN_FILE_DIR="$PINSTORE" CYPHER_BRAIN_LAUNCHD_DIR="$PINLAUNCHD" CYPHER_BRAIN_PIN_RECIPIENTS="" \
   cb schedule install --backend file --dir "$PINSRC" --no-load > "$TMP/install-a3d.log" 2>&1 \
   || { echo "[FAIL] install (explicitly empty pin) exited non-zero"; cat "$TMP/install-a3d.log"; exit 1; }
