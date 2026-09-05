@@ -273,8 +273,27 @@ const REAL_STATS_LINE = JSON.stringify({
   // are logged at INFO and the default --log-level NOTICE filters them out, so the
   // feature would be wired end to end and still produce silence.
   const args = rcloneArgs('copyto', ['src', 'dst'], 30_000);
-  check('the stats interval is expressed in whole seconds', args.includes('30s'), args.join(' '));
-  check('stats are raised to a level the default log level shows', args.includes('NOTICE'), args.join(' '));
+  // Bare membership (Codex review) does not prove '30s'/'NOTICE' are each the VALUE of
+  // their own flag — a malformed args array missing --stats or --stats-log-level
+  // entirely (while '30s'/'NOTICE' still appear somewhere, e.g. as a stray positional)
+  // would still pass. Requiring each value to sit immediately after its own flag name
+  // is what actually pins statsFlags()'s pairing.
+  // indexOf(...) !== -1 guarded explicitly (Codex review, 2nd pass): without it, a
+  // missing --stats flag reads args[-1 + 1] === args[0] (the subcommand, 'copyto') —
+  // harmless today since 'copyto' !== '30s', but a coincidental future subcommand/value
+  // match would let a missing flag silently pass rather than fail on the missing flag.
+  const statsIdx = args.indexOf('--stats');
+  check(
+    "the stats interval is expressed in whole seconds, as --stats's own value",
+    statsIdx !== -1 && args[statsIdx + 1] === '30s',
+    args.join(' '),
+  );
+  const statsLogLevelIdx = args.indexOf('--stats-log-level');
+  check(
+    "stats are raised to a level the default log level shows, as --stats-log-level's own value",
+    statsLogLevelIdx !== -1 && args[statsLogLevelIdx + 1] === 'NOTICE',
+    args.join(' '),
+  );
   check('the machine-readable log format is requested', args.includes('--use-json-log'), args.join(' '));
   check(
     'a sub-second interval is floored to 1s rather than 0s',
@@ -369,11 +388,18 @@ const REAL_STATS_LINE = JSON.stringify({
 {
   // A child that never emits a newline must not grow the pending buffer for the whole
   // run — that would defeat the bound this streaming path exists to provide.
+  //
+  // 2000 iterations * 32 bytes = 64,000 bytes total (Codex review) — comfortably PAST
+  // the 16,384-byte assertion below, not just past proc.ts's own internal flush
+  // threshold. The original 400 iterations produced only 12,800 bytes total: even a
+  // fully unbounded pending buffer (the exact regression this test exists to catch)
+  // could never accumulate more than the child actually wrote, so `longest <= 16_384`
+  // passed trivially regardless of whether the bound worked at all.
   let delivered = 0;
   let longest = 0;
   await run(
     'sh',
-    ['-c', 'i=0; while [ $i -lt 400 ]; do printf "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" >&2; i=$((i+1)); done'],
+    ['-c', 'i=0; while [ $i -lt 2000 ]; do printf "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" >&2; i=$((i+1)); done'],
     {
       onStderrLine: (l) => {
         delivered++;

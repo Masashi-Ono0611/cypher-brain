@@ -69,10 +69,17 @@ const REAL_BODY = {
     bal.effective,
   );
 
-  const lines = balanceLines(bal, PAYER).join('\n');
+  const balanceLinesArr = balanceLines(bal, PAYER);
+  const lines = balanceLinesArr.join('\n');
+  // The label and amount must be on the SAME line (Codex review), not just both present
+  // somewhere in the joined report: the approval-detail line below independently prints
+  // "626476237410 winc left", so a regression that reintroduced #341's exact bug — the
+  // reachable line itself reporting 0 — would still satisfy `lines.includes(...)` for
+  // the amount via that OTHER line, and this check would still print [PASS].
+  const reachableLine = balanceLinesArr.find((l) => l.includes('reachable for this upload'));
   check(
     'report: the reachable line is present and carries the amount THIS upload can draw',
-    lines.includes('reachable for this upload') && lines.includes('626476237410 winc'),
+    reachableLine?.includes('626476237410 winc'),
     lines,
   );
   check(
