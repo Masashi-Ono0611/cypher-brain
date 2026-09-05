@@ -22,7 +22,7 @@ import { dirname } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { hostname } from 'node:os';
 import { AUDIT_LOG } from './config.js';
-import { errMsg, readJsonlLog, sha256 } from './util.js';
+import { errMsg, readJsonlLog } from './util.js';
 import { readRecipientsFingerprint } from './plan.js';
 import { printJson } from './ui.js';
 import { warn } from './warn.js';
@@ -339,34 +339,55 @@ export function verifyAuditChain(entries: AuditEntry[]): ChainVerifyResult {
 }
 
 // Shared helper push()/restore()/verify()'s own wrappers call — resolves
-// artifact_sha256/recipients_fingerprint best-effort, so a caller need only supply
-// what it definitely knows. The WHOLE body is wrapped in try/catch (Codex review,
-// Critical): appendAuditEntry() alone being advisory-only is not sufficient —
-// sha256()/readRecipientsFingerprint() ran OUTSIDE that protection in an earlier
-// version, so if either ever threw (both are documented never-throw today, but that
-// is an implementation detail of two OTHER modules this function does not control),
-// recordAudit() itself would reject, and push()/restore()/verify()'s own wrapper
-// would then either replace a real thrown error with this one, or turn an otherwise-
-// successful run into a reported failure. This function's own contract — advisory
-// only, NEVER throws — is now guaranteed at its own boundary, not borrowed from
-// callees.
+// recipients_fingerprint best-effort, so a caller need only supply what it definitely
+// knows. The WHOLE body is wrapped in try/catch (Codex review, Critical):
+// appendAuditEntry() alone being advisory-only is not sufficient —
+// readRecipientsFingerprint() ran OUTSIDE that protection in an earlier version, so if
+// it ever threw (documented never-throw today, but that is an implementation detail of
+// an OTHER module this function does not control), recordAudit() itself would reject,
+// and push()/restore()/verify()'s own wrapper would then either replace a real thrown
+// error with this one, or turn an otherwise-successful run into a reported failure.
+// This function's own contract — advisory only, NEVER throws — is now guaranteed at
+// its own boundary, not borrowed from callees.
+//
+// `artifactSha256` is CALLER-SUPPLIED, never derived here (multi-model review,
+// TOCTOU): an earlier version reopened `args.o.in` by path with a fresh sha256() call,
+// AFTER push()/restore()/verify()'s own wrapper had already awaited the entire
+// operation — for push specifically, that meant reopening only once the network
+// upload, the paid-backend consent gate, and receipt/locator bookkeeping had all
+// already settled, the widest possible window for the file at that path to have been
+// replaced or edited underneath the run. A digest computed THEN describes whatever
+// bytes happen to be at that path at record time, not necessarily the bytes the
+// command actually operated on — recording it as `artifact_sha256` overstated what was
+// verified. Every caller now passes through a digest it already computed from its OWN
+// read of the artifact (push(): a digest taken as late as pushpull.ts's pushCoreLocked()
+// can make it — immediately before backend.put(), the actual upload read, rather than
+// ahead of the lock wait / paid-backend price query / consent gate that can all still
+// run first (see pushCoreLocked's own comment at that read for why this narrows, but
+// does not fully close, the window); restore()/verify(): the SAME baseline digest their
+// #785 pinned-descriptor read already produces) — or `null` when no such read happened
+// (an early usage error, a --skip-unchanged push that never reaches backend.put() at
+// all, or verify --level quick without --sha256, where forcing a digest would mean an
+// unconditional extra full-file read this function must not impose). `null` here means
+// "not available", not "zero" — same contract every other nullable AuditEntry field
+// already keeps.
 export async function recordAudit(args: {
   command: AuditEntry['command'];
   o: CliOptions;
   backend: string | null;
   locator: string | null;
+  artifactSha256: string | null;
   exitCode: number;
   startedAt: number;
 }): Promise<void> {
   try {
-    const artifactSha256 = args.o.in ? await sha256(args.o.in).catch(() => null) : null;
     const recipientsFingerprint = args.o.in ? await readRecipientsFingerprint(args.o.in) : null;
     await appendAuditEntry({
       timestamp: new Date().toISOString(),
       command: args.command,
       backend: args.backend,
       locator: args.locator,
-      artifact_sha256: artifactSha256,
+      artifact_sha256: args.artifactSha256,
       machine: hostname(),
       recipients_fingerprint: recipientsFingerprint,
       exit_code: args.exitCode,

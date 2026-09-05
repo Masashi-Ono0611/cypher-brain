@@ -59,6 +59,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEV_ARGS } from './dev-node-flags.mjs';
+import { sha256 } from '../src/lib/util.ts';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BIN = join(ROOT, 'bin', 'cypher-brain.mjs');
@@ -370,6 +371,15 @@ try {
     return found;
   }
 
+  // Multi-model review (Codex): the most recent line of $CYPHER_BRAIN_HOME/audit-log.jsonl
+  // — used below to assert the audit trail's own artifact_sha256 for a restore run under
+  // attack, a deterministic substitution the audit selftest's own (unchanged-file) digest
+  // checks cannot exercise (see src/lib/audit.ts's own doc comment on recordAudit()).
+  const lastAuditEntry = async () => {
+    const lines = (await readFile(join(HOME_DIR, 'audit-log.jsonl'), 'utf8')).trim().split('\n').filter(Boolean);
+    return JSON.parse(lines[lines.length - 1]);
+  };
+
   // ---- control: the barrier itself must not change a clean restore ----------
   {
     const inPath = join(TMP, 'control.age');
@@ -414,6 +424,25 @@ try {
         '(a) rename-swap: no attacker content reached --out-dir',
         !markers.has('attacker'),
         `markers: ${JSON.stringify([...markers])}`,
+      );
+      // Multi-model review (Codex), TOCTOU fix positive control: the audit trail's own
+      // artifact_sha256 for THIS run must be the VERIFIED (original/good) artifact's
+      // digest, not the substitute's — even though the path `inPath` currently points
+      // at (i.e. --in's directory entry now IS) the evil bytes, since the rename-swap
+      // above never renamed anything back. A reopen-by-path implementation of
+      // recordAudit() (the pre-fix version) would read THIS path AFTER restoreImpl()
+      // settles and record the ATTACKER's digest instead — the exact bug the audit
+      // selftest's own (unchanged-file) digest checks cannot distinguish from correct
+      // behavior, since there `--in` never differs from what it started as.
+      const auditEntry = await lastAuditEntry();
+      const goodDigest = await sha256(good);
+      const evilDigest = await sha256(evil);
+      check(
+        '(a) rename-swap: the audit entry records the VERIFIED digest, not a reopen-by-path read of the substituted file',
+        auditEntry?.command === 'restore' &&
+          auditEntry?.artifact_sha256 === goodDigest &&
+          auditEntry?.artifact_sha256 !== evilDigest,
+        `entry=${JSON.stringify(auditEntry)} good=${goodDigest} evil=${evilDigest}`,
       );
     }
   }
