@@ -32,6 +32,18 @@ let ACTIVE_RESTORE_OUT_DIR_PREEXISTED = false; // whether restore() created out-
 // other's cleanup).
 let ACTIVE_RESTORE_SCRATCH_DIR: string | null = null;
 let ACTIVE_VERIFY_SCRATCH_DIR: string | null = null; // verify --level remote/drill's pulled-ciphertext (+, for drill, decrypted-plaintext) scratch dir, for its ENTIRE lifetime
+// Audit finding (Codex review): recovery-kit's kit-generation-time decrypt-verification
+// (recoverykit.ts) pulls the target backup's ciphertext into its own scratch dir before
+// decrypt-checking an about-to-be-embedded key against it — a SEPARATE resource from
+// every field above (restore()'s own scratch dirs), never tracked before this. A signal
+// (Ctrl-C) during the download or the passphrase prompt that follows left this dir
+// (holding a full copy of the target backup's CIPHERTEXT — lower stakes than plaintext,
+// but still an unswept temp dir with no cleanup path) behind forever. A scalar slot, not
+// a Set, matching ACTIVE_STAGE/ACTIVE_OUT_PART above: `recovery-kit` is CLI-only (see
+// recoverykit.ts's own file-header comment) and, unlike restore()/verify(), is never
+// reachable from the long-lived MCP server, so at most one of these is ever active in a
+// process.
+let ACTIVE_RECOVERY_KIT_VERIFY_DIR: string | null = null;
 // The MCP server's own fetch dirs (src/mcp.ts): verify_restore and restore_now each pull
 // a locator into a private temp dir (`pulled.age`), and restore_now additionally copies a
 // caller-given `file` into one before pinning it (`given.age`). Ciphertext, not plaintext
@@ -74,6 +86,23 @@ const ACTIVE_SCAN_REPORT_DIRS = new Set<string>();
 // tmpRoot in flight in the same process (MCP server, or `schedule install`'s cron
 // running push then immediately pull).
 const ACTIVE_TON_TMP_DIRS = new Set<string>();
+// Audit finding: restore.ts's expandComponents() mkdirSync's its OWN scratch dir per
+// component (`<targetDir>.expand-<pid>-<hex>`, holding that ONE component's freshly-
+// decrypted plaintext while tar extracts into it) — a SEPARATE resource from
+// ACTIVE_RESTORE_SCRATCH_DIR above, and one restoreImpl() has already stopped tracking
+// by the time expandComponents() runs at all: restoreImpl() clears
+// ACTIVE_RESTORE_SCRATCH_DIR the instant the OUTER extract's own scratch dir is gone
+// (see setActiveRestoreScratchDir's call sites in restore.ts), which is BEFORE
+// component auto-expand starts — the exact same "narrower tracking is not enough by
+// itself" gap setActiveVerifyScratchDir's own doc comment above already describes for
+// verify --level drill, just for restore's component-expand step instead. Without this,
+// a signal landing while any one component's tar extraction is in flight left that
+// component's scratch dir (freshly-decrypted plaintext) unswept forever. A Set, not a
+// scalar slot, for the same reason ACTIVE_TON_TMP_DIRS above is one: restore() is
+// shared by cli.ts AND mcp.ts's restore_now tool (see restore.ts's own header comment
+// on restore()), so the long-lived MCP server can have more than one restore_now
+// (each running its own expandComponents() loop) in flight at once.
+const ACTIVE_EXPAND_SCRATCH_DIRS = new Set<string>();
 // #734: the init wizard (src/lib/wizard.ts) creates secret key material (the primary
 // identity, an optional offline backup keypair, an optional signing keypair) BEFORE
 // its own long snapshot()/push() phase runs, and its normal rollback (an async
@@ -290,6 +319,12 @@ export const setActiveRestoreScratchDir = (v: string | null): void => {
 export const setActiveVerifyScratchDir = (v: string | null): void => {
   ACTIVE_VERIFY_SCRATCH_DIR = v;
 };
+// recoverykit.ts calls this the same one-tick-after-mkdtempSync discipline every other
+// setActive*/add* above uses, and clears it (v=null) only once its own cleanup (rm, in
+// util.ts) has actually finished removing the dir.
+export const setActiveRecoveryKitVerifyDir = (v: string | null): void => {
+  ACTIVE_RECOVERY_KIT_VERIFY_DIR = v;
+};
 // mcp.ts registers a fetch dir in the SAME tick it is created (mkdtempSync, no await in
 // between — an `await mkdtemp()` would leave the directory on disk but untracked for as
 // long as the continuation is queued) and deregisters it only AFTER its own `rm` has
@@ -332,6 +367,16 @@ export const addActiveTonTmpDir = (dir: string): void => {
 };
 export const removeActiveTonTmpDir = (dir: string): void => {
   ACTIVE_TON_TMP_DIRS.delete(dir);
+};
+// expandComponents() (src/lib/restore.ts) calls these the same way every other
+// add/remove-Set pair above does: add() in the same tick mkdirSync creates the per-
+// component scratch dir (no await in between), delete() only after its own rmrf() in
+// the loop's `finally` has actually finished removing it.
+export const addActiveExpandScratchDir = (dir: string): void => {
+  ACTIVE_EXPAND_SCRATCH_DIRS.add(dir);
+};
+export const removeActiveExpandScratchDir = (dir: string): void => {
+  ACTIVE_EXPAND_SCRATCH_DIRS.delete(dir);
 };
 // #734: init() (wizard.ts) registers a synchronous rollback callback right after its
 // own primary keygen succeeds, and clears it (v=null) in its own `finally` block —
@@ -449,6 +494,14 @@ export function installStageSignalGuard(): void {
         forceRmSync(ACTIVE_VERIFY_SCRATCH_DIR);
         ACTIVE_VERIFY_SCRATCH_DIR = null;
       }
+      // recovery-kit's kit-generation-time decrypt-verification scratch dir (see
+      // ACTIVE_RECOVERY_KIT_VERIFY_DIR's own doc comment above) — always safe to erase
+      // outright, same reasoning as ACTIVE_VERIFY_SCRATCH_DIR just above: always a
+      // directory recoverykit.ts mkdtempSync'd itself, never caller-owned.
+      if (ACTIVE_RECOVERY_KIT_VERIFY_DIR) {
+        forceRmSync(ACTIVE_RECOVERY_KIT_VERIFY_DIR);
+        ACTIVE_RECOVERY_KIT_VERIFY_DIR = null;
+      }
       // Every MCP fetch dir currently in flight (see ACTIVE_MCP_FETCH_DIRS above) — a set,
       // so concurrent tool calls are each erased rather than only whichever registered
       // last. Always safe to erase outright: each one is a directory mcp.ts mkdtempSync'd
@@ -468,6 +521,15 @@ export function installStageSignalGuard(): void {
       // so there is no still-writing process left to race with removing its directory.
       for (const dir of ACTIVE_TON_TMP_DIRS) forceRmSync(dir);
       ACTIVE_TON_TMP_DIRS.clear();
+      // Audit finding: every component-expand scratch dir currently in flight (see
+      // ACTIVE_EXPAND_SCRATCH_DIRS above) — a set for the same MCP-concurrency reason
+      // ACTIVE_TON_TMP_DIRS is one. forceRmSync, not a bare rmSync, for the identical
+      // #826 reason ACTIVE_RESTORE_SCRATCH_DIR's own branch above uses it: this can be
+      // mid-mergeNoClobber() (moving entries out of it) at the exact instant a signal
+      // lands, and can also carry a mode-restricted directory (#782) from the archive
+      // it was extracted from.
+      for (const dir of ACTIVE_EXPAND_SCRATCH_DIRS) forceRmSync(dir);
+      ACTIVE_EXPAND_SCRATCH_DIRS.clear();
       // #734: run the init wizard's own key rollback (if one is currently registered)
       // BEFORE re-raising the signal below — this is the only chance it gets, since
       // re-raising terminates the process without ever unwinding back into wizard.ts's
