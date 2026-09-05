@@ -101,6 +101,7 @@
     "selftest:ledger": "bash scripts/selftest-ledger.sh",
     "selftest:receipt": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-receipt.mjs",
     "selftest:audit": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-audit.mjs",
+    "selftest:dev-shim-reexec": "node scripts/selftest-dev-shim-reexec.mjs",
     "selftest:otel": "node scripts/selftest-otel.mjs",
     "selftest:runner": "bash scripts/selftest-runner.sh",
     "mutation-test": "stryker run",

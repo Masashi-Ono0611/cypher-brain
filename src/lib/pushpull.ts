@@ -316,11 +316,12 @@ function displayLocator(backend: string, locator: string): string {
 // push was committing would discard the locator that push had just paid for.
 async function pushCore(
   o: CliOptions,
+  digestBox?: { value: string | null },
 ): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
-  if (!o.save_locator) return pushCoreLocked(o);
+  if (!o.save_locator) return pushCoreLocked(o, digestBox);
   const release = await acquirePushLock('save-locator', await saveLocatorLockKey(o.save_locator));
   try {
-    return await pushCoreLocked(o);
+    return await pushCoreLocked(o, digestBox);
   } finally {
     await release();
   }
@@ -328,6 +329,7 @@ async function pushCore(
 
 async function pushCoreLocked(
   o: CliOptions,
+  digestBox?: { value: string | null },
 ): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
   // #779: a required flag simply being absent is the same UsageError class as above.
   if (!o.in) throw new UsageError('--in <file.age> required');
@@ -544,6 +546,28 @@ async function pushCoreLocked(
   // strictly sequential (the sidecar's only starts once this one has resolved), which is
   // what the tracker's non-atomic check-then-charge contract requires.
   const spendTracker: SpendTracker = { spent: 0n };
+  // #226/TOCTOU fix (multi-model review round 2 — Codex review): read the digest as
+  // late as this function can make it — immediately before backend.put() below, the
+  // actual point where `o.in`'s bytes are read for upload — rather than any earlier
+  // point in this function (argument validation, --plan validation, the paid-backend
+  // price estimate's own network round trip, the --yes/CYPHER_BRAIN_YES consent check).
+  // All of those can take real time (a network call, a lock wait in pushCore() above),
+  // and a digest taken before them describes the artifact as it was at THAT earlier
+  // moment, not necessarily what backend.put() is about to actually read. This does not
+  // make the two reads atomic — `o.in` could still change in the gap between this read
+  // and backend.put()'s own internal read of the same path, since every backend opens
+  // the file itself rather than accepting an already-open descriptor or these exact
+  // bytes — but it is the closest this function can get without restructuring every
+  // backend's put() to accept a pinned descriptor (out of scope for this fix: six
+  // separate backend implementations — file/arweave/turbo/rclone/ton/ton-provider —
+  // would each need to change how they read their upload source). The gap is not merely
+  // theoretical scheduling slack, either (Codex review round 2): rclone.ts's own put()
+  // does a remote-object existence probe (an rclone subprocess round trip) before it
+  // ever reads `file`, so even THIS backend's own internal steps can widen the window
+  // further. Best-effort, same fallback recordAudit() itself used to apply: an --in that
+  // fails to hash here is not a NEW failure mode, since backend.put() immediately below
+  // would fail the exact same read moments later anyway.
+  if (digestBox) digestBox.value = await sha256(o.in).catch(() => null);
   const locator = await backend.put(o.in, {
     yes,
     remote: o.remote,
@@ -715,15 +739,29 @@ async function pushCoreLocked(
 // checks on whatever push() throws. Audit recording itself is advisory (recordAudit()/
 // appendAuditEntry() never throw — see audit.ts) and never delays returning/rethrowing
 // pushCore()'s own outcome by more than the recording call itself takes.
+// `digestBox` (multi-model review round 2 — Codex review): the FIRST version of this
+// fix read the digest here, in push(), before calling pushCore() at all — closer to
+// pushCore() than recordAudit()'s old reopen-after-everything, but still not close to
+// the actual upload: pushCoreLocked() below can spend real time on lock acquisition
+// (--save-locator's cross-process lock), a paid backend's own network price query, and
+// the --yes/CYPHER_BRAIN_YES consent check between that early read and backend.put()'s
+// own — an artifact replaced with different-but-still-valid ciphertext in that window
+// would upload the NEW bytes while the audit trail recorded the OLD digest. Moved to
+// pushCoreLocked() instead (see its own comment at the digestBox.value assignment,
+// right before backend.put()) — this box is how that later-computed value gets back out
+// to both recordAudit() calls below, since pushCoreLocked() can throw (a partial
+// failure, a signature-upload failure, …) after already setting it.
 export async function push(o: CliOptions): Promise<boolean> {
   const startedAt = Date.now();
+  const digestBox: { value: string | null } = { value: null };
   try {
-    const result = await pushCore(o);
+    const result = await pushCore(o, digestBox);
     await recordAudit({
       command: 'push',
       o,
       backend: o.backend ?? null,
       locator: result.locator,
+      artifactSha256: digestBox.value,
       exitCode: 0,
       startedAt,
     });
@@ -742,7 +780,15 @@ export async function push(o: CliOptions): Promise<boolean> {
         : e instanceof PushUncertainSpendError
           ? (e.confirmedCiphertextLocator ?? null)
           : null;
-    await recordAudit({ command: 'push', o, backend: o.backend ?? null, locator, exitCode: 1, startedAt });
+    await recordAudit({
+      command: 'push',
+      o,
+      backend: o.backend ?? null,
+      locator,
+      artifactSha256: digestBox.value,
+      exitCode: 1,
+      startedAt,
+    });
     throw e;
   }
 }

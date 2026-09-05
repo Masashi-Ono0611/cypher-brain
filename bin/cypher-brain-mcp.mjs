@@ -16,6 +16,12 @@ try {
   if (alreadyReexeced || !(err && err.code === 'ERR_MODULE_NOT_FOUND')) {
     throw err;
   }
-  const { reexecUnderDevLoader } = await import('../scripts/dev-shim-reexec.mjs');
+  const { reexecUnderDevLoader, isMissingDevEntrypoint } = await import('../scripts/dev-shim-reexec.mjs');
+  // Narrowed to the ONE known scenario this fallback exists for — see
+  // isMissingDevEntrypoint's own doc comment in dev-shim-reexec.mjs for why a bare
+  // ERR_MODULE_NOT_FOUND code alone is too broad a trigger.
+  if (!isMissingDevEntrypoint(err, '../src/mcp.js', import.meta.url)) {
+    throw err;
+  }
   await reexecUnderDevLoader(import.meta.url, process.argv.slice(2));
 }

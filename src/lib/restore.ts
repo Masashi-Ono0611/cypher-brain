@@ -1064,13 +1064,34 @@ async function expandComponents(outDir: string, manifestText: string): Promise<b
 // settles, success or failure — advisory only (recordAudit() never throws), and the
 // caught error is rethrown UNCHANGED afterward so nothing about restoreImpl()'s own
 // outcome is altered by this wrapper.
+//
+// `digestBox` (multi-model review, TOCTOU): a mutable out-param restoreImpl() fills in
+// the moment it computes its own baseline digest (the #785 pinned-descriptor read),
+// so THIS wrapper can pass that SAME value to recordAudit() below instead of letting
+// recordAudit() reopen --in by path once restoreImpl() has already settled — by then
+// the descriptor is closed and the extraction (or a failure partway through it) has
+// had the whole run to change what sits at that path. Read on both the success and
+// failure branches: restoreImpl() can throw after the baseline digest was already
+// computed, and the failed run's audit entry deserves the same non-reopened value the
+// successful one gets. Stays `null` if restoreImpl() never got far enough to compute
+// one (an early usage error, a file that fails to open) — correctly "not available",
+// not a fabricated value.
 export async function restore(o: CliOptions): Promise<void> {
   const startedAt = Date.now();
+  const digestBox: { value: string | null } = { value: null };
   try {
-    await restoreImpl(o);
+    await restoreImpl(o, undefined, digestBox);
   } catch (e) {
     printMascot('sad');
-    await recordAudit({ command: 'restore', o, backend: null, locator: null, exitCode: 1, startedAt });
+    await recordAudit({
+      command: 'restore',
+      o,
+      backend: null,
+      locator: null,
+      artifactSha256: digestBox.value,
+      exitCode: 1,
+      startedAt,
+    });
     throw e;
   }
   // Deliberately OUTSIDE the try: printMascot('happy') itself throwing (e.g. some
@@ -1079,7 +1100,15 @@ export async function restore(o: CliOptions): Promise<void> {
   // above and print 'sad' + rethrow over a restore that actually already
   // succeeded (multi-model review finding on PR #200).
   printMascot('happy');
-  await recordAudit({ command: 'restore', o, backend: null, locator: null, exitCode: 0, startedAt });
+  await recordAudit({
+    command: 'restore',
+    o,
+    backend: null,
+    locator: null,
+    artifactSha256: digestBox.value,
+    exitCode: 0,
+    startedAt,
+  });
 }
 
 // `opened` (#785, Codex review): --level drill hands over the SAME descriptor its own
@@ -1089,7 +1118,16 @@ export async function restore(o: CliOptions): Promise<void> {
 // gap would have been extracted with the earlier PASS still on screen. When it is
 // passed, the caller owns the descriptor and closes it; every other caller (the CLI's
 // `restore`) opens and closes its own here.
-async function restoreImpl(o: CliOptions, opened?: OpenedRestoreArtifact): Promise<void> {
+//
+// `digestBox` (multi-model review, TOCTOU, see restore()'s own comment above): only the
+// CLI `restore` caller passes one — --level drill's internal call below does not, since
+// that run's audit entry belongs to `verify`, not `restore`, and is handled entirely by
+// verify()'s own wrapper.
+async function restoreImpl(
+  o: CliOptions,
+  opened?: OpenedRestoreArtifact,
+  digestBox?: { value: string | null },
+): Promise<void> {
   // #779: a required flag simply being absent is the same "command line itself was
   // malformed" class as an unrecognized command/enum value — UsageError, exit 2, not
   // the generic-failure 1.
@@ -1146,6 +1184,10 @@ async function restoreImpl(o: CliOptions, opened?: OpenedRestoreArtifact): Promi
     // one that catches an in-place overwrite mid-restore — available on every restore
     // rather than only on pinned ones. It costs one extra read pass over --in.
     const baselineSha256 = await artifact.sha256();
+    // Handed to restore()'s own recordAudit() call below, unchanged for the rest of this
+    // run — see restoreImpl's own doc comment above for why this is the value the audit
+    // trail records, not a later reopen-by-path.
+    if (digestBox) digestBox.value = baselineSha256;
     // #645: --sha256 <hex> pins --in to a hash known out-of-band, the exact same shape
     // pull() already fail-closes on (pushpull.ts) and verify() already reports as
     // sha256_match — but until #645 restoreImpl() never read o.sha256 back at all. The
@@ -1526,10 +1568,15 @@ function printFileCheckVerdict(verdict: 'PASS' | 'FAIL' | 'PARTIAL'): void {
 // `opened` (#785): --level remote/drill pass the descriptor they already hold for the
 // artifact they just pulled, so the checks here and (for drill) the restore that follows
 // all read the same pinned bytes. --level quick opens and closes its own.
+//
+// `digestBox` (multi-model review, TOCTOU — see verify()'s own comment above): only
+// --level quick's caller passes one; remote/drill never do (their audit entry has no
+// local --in to bind a digest to in the first place).
 async function runFileChecks(
   o: CliOptions,
   printVerdictLine: boolean,
   opened?: OpenedRestoreArtifact,
+  digestBox?: { value: string | null },
 ): Promise<FileCheckResult> {
   // #779: same UsageError treatment as restoreImpl()'s own --in/--out-dir checks above.
   if (!o.in) throw new UsageError('--in <file.age> required');
@@ -1542,7 +1589,7 @@ async function runFileChecks(
   // the restore step (drill) has to refuse an over-cap one.
   const artifact = opened ?? (await openRestoreArtifact(o.in));
   try {
-    return await runFileChecksOn(o, artifact, printVerdictLine);
+    return await runFileChecksOn(o, artifact, printVerdictLine, digestBox);
   } finally {
     if (!opened) await artifact.close();
   }
@@ -1552,6 +1599,7 @@ async function runFileChecksOn(
   o: CliOptions,
   artifact: OpenedRestoreArtifact,
   printVerdictLine: boolean,
+  digestBox?: { value: string | null },
 ): Promise<FileCheckResult> {
   const sz = artifact.size;
   const head = await artifact.readHead(64);
@@ -1569,6 +1617,11 @@ async function runFileChecksOn(
   let gotHash: string | undefined;
   if (o.sha256) {
     gotHash = await artifact.sha256();
+    // Handed to verify()'s own recordAudit() call, when this is the --level quick call
+    // chain — see verify()'s own doc comment for why this only ever fires when --sha256
+    // was given (an unconditional digest here would cost an extra full-file read verify
+    // --level quick has never paid on an artifact of any size).
+    if (digestBox) digestBox.value = gotHash;
     hashOk = gotHash.toLowerCase() === String(o.sha256).toLowerCase();
     if (!o.json) {
       console.log(
@@ -1788,15 +1841,25 @@ function finishVerify(
 // with no OTHER await in between. Using verifyImpl()'s own return value sidesteps
 // that race entirely; process.exitCode itself is left set exactly as before, for every
 // other existing caller/contract that reads it.
+// `digestBox` (multi-model review, TOCTOU — see restore()'s own identical comment
+// above): --level quick is the only path that can fill this in (it reads a LOCAL --in
+// file through the same #785 pinned descriptor restore() uses, and only when --sha256
+// was given — computing one unconditionally would mean an unconditional extra
+// full-file read verify --level quick has never paid on an artifact of any size).
+// --level remote/drill never touch --in at all (they fetch by locator instead), so this
+// stays null for them either way — the exact same null recordAudit()'s old reopen-by-
+// path would have produced there too (`args.o.in` is simply unset on those levels).
 export async function verify(o: CliOptions): Promise<void> {
   const startedAt = Date.now();
+  const digestBox: { value: string | null } = { value: null };
   try {
-    const exitCode = await verifyImpl(o);
+    const exitCode = await verifyImpl(o, digestBox);
     await recordAudit({
       command: 'verify',
       o,
       backend: o.backend ?? null,
       locator: o.locator ?? null,
+      artifactSha256: digestBox.value,
       exitCode,
       startedAt,
     });
@@ -1806,6 +1869,7 @@ export async function verify(o: CliOptions): Promise<void> {
       o,
       backend: o.backend ?? null,
       locator: o.locator ?? null,
+      artifactSha256: digestBox.value,
       exitCode: 1,
       startedAt,
     });
@@ -1813,7 +1877,7 @@ export async function verify(o: CliOptions): Promise<void> {
   }
 }
 
-async function verifyImpl(o: CliOptions): Promise<number> {
+async function verifyImpl(o: CliOptions, digestBox?: { value: string | null }): Promise<number> {
   const level = o.level ?? 'quick';
   if (level !== 'quick' && level !== 'remote' && level !== 'drill') {
     // #435: --level is an enum-valued flag, same "did you mean" class #425 already
@@ -1853,7 +1917,7 @@ async function verifyImpl(o: CliOptions): Promise<number> {
     // (or grepping a captured log for "level:") could not tell "quick ran" apart from
     // "nothing ran" — same field, same meaning, for parity across all three depths.
     if (!o.json) console.log(`level: ${level}`);
-    const r = await runFileChecks(o, true);
+    const r = await runFileChecks(o, true, undefined, digestBox);
     return finishVerify(o, r, { level });
   }
 

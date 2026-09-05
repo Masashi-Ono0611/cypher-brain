@@ -18,6 +18,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { DEV_ARGS } from './dev-node-flags.mjs';
+import { sha256 } from '../src/lib/util.ts';
 
 let failed = 0;
 const check = (name, cond, detail) => {
@@ -231,6 +232,11 @@ try {
   cbOk({}, 'keygen');
   cbOk({}, 'snapshot', '--dir', src, '--out', join(tmp, 'snap.age'));
 
+  // Ground truth for the TOCTOU-fix positive controls below: the real sha256 of the
+  // pushed/restored/verified artifact, computed independently of anything push()/
+  // restore()/verify() themselves do.
+  const snapDigest = await sha256(join(tmp, 'snap.age'));
+
   const fileEnv = { CYPHER_BRAIN_FILE_DIR: join(tmp, 'store') };
   const loc = cbOk(fileEnv, 'push', '--in', join(tmp, 'snap.age'), '--backend', 'file');
   let entries = await readLog();
@@ -239,6 +245,15 @@ try {
   check('the entry locator matches what push printed', entries[0]?.locator === loc, `${entries[0]?.locator} vs ${loc}`);
   check('the entry exit_code is 0', entries[0]?.exit_code === 0, entries[0]?.exit_code);
   check('the first entry has prev_hash null', entries[0]?.prev_hash === null, entries[0]?.prev_hash);
+  // Multi-model review, TOCTOU fix: push() now reads this digest itself, once, before
+  // pushCore() starts — recordAudit() no longer reopens --in by path after the fact.
+  // Confirms the threaded-through value actually lands in the recorded entry (and is
+  // correct), not just that SOME value shows up.
+  check(
+    'the push entry records the artifact digest it actually pushed (TOCTOU fix, not a reopen-by-path)',
+    entries[0]?.artifact_sha256 === snapDigest,
+    `${entries[0]?.artifact_sha256} vs ${snapDigest}`,
+  );
 
   cbOk({}, 'restore', '--in', join(tmp, 'snap.age'), '--out-dir', join(tmp, 'restored'));
   entries = await readLog();
@@ -248,6 +263,14 @@ try {
     JSON.stringify(entries.map((e) => e.command)),
   );
   check('the second entry command is "restore"', entries[1]?.command === 'restore', entries[1]?.command);
+  // Same TOCTOU-fix control as push above: restore() now threads through the SAME
+  // #785 pinned-descriptor baseline digest restoreImpl() already computes for its own
+  // in-place-overwrite check, instead of recordAudit() reopening --in afterward.
+  check(
+    'the restore entry records the artifact digest it actually restored (TOCTOU fix, not a reopen-by-path)',
+    entries[1]?.artifact_sha256 === snapDigest,
+    `${entries[1]?.artifact_sha256} vs ${snapDigest}`,
+  );
 
   cbOk({}, 'verify', '--in', join(tmp, 'snap.age'));
   entries = await readLog();
@@ -260,6 +283,35 @@ try {
     'the third entry command is "verify" with exit_code 0 (verify --level quick PASSed)',
     entries[2]?.command === 'verify' && entries[2]?.exit_code === 0,
     JSON.stringify(entries[2]),
+  );
+  // TOCTOU fix: --level quick WITHOUT --sha256 never computes a full-file digest at all
+  // (forcing one unconditionally would cost verify --level quick an extra full read on
+  // every artifact, however large) — recordAudit() must record `null` here, not a value
+  // reopened by path from whatever happens to be at --in right now.
+  check(
+    'a --level quick verify WITHOUT --sha256 records no artifact digest (avoids an unconditional extra full-file read)',
+    entries[2]?.artifact_sha256 === null,
+    entries[2]?.artifact_sha256,
+  );
+
+  // A --level quick verify WITH --sha256 DOES already compute the full digest (to
+  // compare against the pin) — that SAME value must be the one recordAudit() gets,
+  // still without any reopen-by-path. Run against an isolated audit log so this extra
+  // invocation does not perturb the `entries` index arithmetic the rest of Part B below
+  // relies on.
+  const pinnedAuditLogPath = join(tmp, 'pinned-audit-log.jsonl');
+  cbOk({ CYPHER_BRAIN_AUDIT_LOG: pinnedAuditLogPath }, 'verify', '--in', join(tmp, 'snap.age'), '--sha256', snapDigest);
+  const pinnedEntries = (await readFile(pinnedAuditLogPath, 'utf8'))
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  check(
+    'a --level quick verify WITH --sha256 records the digest it just checked against the pin',
+    pinnedEntries.length === 1 &&
+      pinnedEntries[0]?.command === 'verify' &&
+      pinnedEntries[0]?.artifact_sha256 === snapDigest,
+    JSON.stringify(pinnedEntries),
   );
 
   const jsonReport = JSON.parse(cbOk({}, 'audit', '--json'));

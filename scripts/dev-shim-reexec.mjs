@@ -22,6 +22,42 @@
 //     holding stdio after the client believed the process had stopped. Fix: use async
 //     spawn, forward SIGINT/SIGTERM/SIGHUP from the wrapper to the child, and wait for
 //     the child to actually exit before the wrapper exits (mirroring its signal/code).
+//
+// isMissingDevEntrypoint (multi-model review, round 3): both bin/*.mjs shims used to
+// treat ANY `err.code === 'ERR_MODULE_NOT_FOUND'` out of their top-level
+// `await import('../src/*.js')` as "needs the dev loader", too broad a match. The ONE
+// scenario this whole file exists for is that top-level import itself failing because
+// only the sibling `src/*.ts` exists and nothing has told node to remap `.js` -> `.ts`
+// yet (see bin/cypher-brain.mjs's own header comment) — but src/cli.ts (or src/mcp.ts)
+// goes on to import a long chain of its own `./lib/*.js`-specifier files, and if a
+// caller's environment ALREADY has the dev loader active (NODE_OPTIONS carrying
+// --experimental-strip-types --import dev-cli-loader.mjs, exactly what every
+// selftest*.sh/cli-smoke.sh script sets) and one of THOSE nested imports is a genuine,
+// unrelated bug (a typo'd path, a file moved without updating its importer), Node
+// raises the exact same ERR_MODULE_NOT_FOUND code for that failure too. The old,
+// unconditional check could not tell the two apart: it would re-exec a SECOND `node`
+// process — with the SAME loader flags the environment already had active, changing
+// nothing — that fails on the identical unrelated bug all over again, masking a real
+// break behind a pointless extra spawn (and, since `CYPHER_BRAIN_DEV_SHIM_REEXEC=1` is
+// only set on that second attempt, the confusing detour only ever costs one extra hop,
+// never an actual infinite loop — but a wrong diagnosis and a wasted process either
+// way). Node's ERR_MODULE_NOT_FOUND carries the failing specifier's own resolved URL on
+// `err.url` (verified empirically against this repo's own dev-ts-resolve-hook.mjs: a
+// nested missing import's `err.url` points at THAT specifier, never at the top-level
+// entrypoint) — comparing it against the entrypoint's own URL is what narrows this back
+// down to exactly the one scenario this shim is meant to work around.
+export function isMissingDevEntrypoint(err, specifier, callerUrl) {
+  if (err?.code !== 'ERR_MODULE_NOT_FOUND') return false;
+  // `err.url` is not a documented, versioned part of Node's public error API — it is an
+  // internal implementation detail of the ESM resolver that has been present and stable
+  // across every currently-supported Node line (this repo's own `engines.node` floor,
+  // >=22.6.0, through the latest). If some future Node version ever stops setting it,
+  // `err.url` reads back `undefined`, which never strictly-equals a real file:// URL —
+  // this narrows to "assume NOT the known scenario" (no re-exec, the original error
+  // surfaces immediately) rather than silently reverting to the old too-broad match.
+  return err.url === new URL(specifier, callerUrl).href;
+}
+
 export async function reexecUnderDevLoader(callerUrl, extraArgv) {
   const { spawn } = await import('node:child_process');
   const { fileURLToPath } = await import('node:url');

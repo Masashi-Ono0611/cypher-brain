@@ -135,6 +135,10 @@ const PARALLEL = [
   npmTest('selftest:config-file'),
   npmTest('selftest:wallet-balance'),
   npmTest('selftest:audit'),
+  // Parallel-safe: every fixture lives under its own mkdtemp tree, never touches the
+  // real bin/*.mjs or src/cli.ts/src/mcp.ts, binds no port, and only reads (never
+  // writes) scripts/dev-shim-reexec.mjs / dev-cli-loader.mjs / dev-ts-resolve-hook.mjs.
+  npmTest('selftest:dev-shim-reexec'),
   npmTest('selftest:properties'),
   npmTest('selftest:ledger'),
   npmTest('selftest:idempotency-lib'),
