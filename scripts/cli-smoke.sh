@@ -415,6 +415,9 @@ grep -Fq 'wallet: expected create | address | balance, got: adress (did you mean
 # a genuinely unrelated nested sub-verb still gets no suggestion (same #425 asymmetry
 # the top-level unknown-command test above already covers).
 node "$DIST" wallet xyz > /dev/null 2> "$TMP/nested-wallet-unrelated.err"
+WALLET_XYZ_RC=$?
+[ "$WALLET_XYZ_RC" = "2" ] \
+  || { echo "[FAIL] 'wallet xyz' exited $WALLET_XYZ_RC, expected 2 (an unrecognized sub-verb, same parser-level refusal as 'wallet adress' above)"; cat "$TMP/nested-wallet-unrelated.err"; exit 1; }
 if grep -qi "did you mean" "$TMP/nested-wallet-unrelated.err"; then
   echo "[FAIL] 'wallet xyz' (unrelated to every sub-verb) got a spurious did-you-mean suggestion"; cat "$TMP/nested-wallet-unrelated.err"; exit 1
 fi
@@ -442,6 +445,9 @@ grep -Fq 'did you mean ton?' "$TMP/enum-chain.err" \
   || { echo "[FAIL] '--chain tona' exited $ENUM_CHAIN_RC, expected 2 (a parser-level refusal, #781)"; exit 1; }
 # a genuinely unrelated enum value still gets no suggestion.
 node "$DIST" verify --level bogus --in "$TMP/does-not-exist.age" > /dev/null 2> "$TMP/enum-level-unrelated.err"
+ENUM_LEVEL_UNRELATED_RC=$?
+[ "$ENUM_LEVEL_UNRELATED_RC" = "2" ] \
+  || { echo "[FAIL] '--level bogus' exited $ENUM_LEVEL_UNRELATED_RC, expected 2 (an unrecognized enum value, same parser-level refusal as '--level remtoe' above)"; cat "$TMP/enum-level-unrelated.err"; exit 1; }
 if grep -qi "did you mean" "$TMP/enum-level-unrelated.err"; then
   echo "[FAIL] '--level bogus' (unrelated to every level) got a spurious did-you-mean suggestion"; cat "$TMP/enum-level-unrelated.err"; exit 1
 fi
@@ -499,7 +505,8 @@ for JSON_BACKEND in file rclone turbo; do
     const o = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     const want = ["backend", "size_bytes", "cost", "unit", "approx_ar", "usd_estimate", "note"];
     console.log(want.filter((k) => !(k in o)).join(","));
-  ' "$TMP/est-$JSON_BACKEND.json")
+  ' "$TMP/est-$JSON_BACKEND.json") \
+    || { echo "[FAIL] estimate --backend $JSON_BACKEND --json produced unparseable JSON"; cat "$TMP/est-$JSON_BACKEND.json"; exit 1; }
   [ -z "$MISSING" ] \
     || { echo "[FAIL] estimate --backend $JSON_BACKEND --json is missing key(s): $MISSING"; cat "$TMP/est-$JSON_BACKEND.json"; exit 1; }
 done
@@ -530,6 +537,9 @@ grep -Fq 'unknown backend' "$TMP/err.txt" \
   || { echo "[FAIL] stderr no longer carries the human-readable error"; cat "$TMP/err.txt"; exit 1; }
 # and WITHOUT --json, stdout on the error path stays empty exactly as before
 node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend nosuchbackend > "$TMP/err-nojson.out" 2>/dev/null
+ERR_NOJSON_RC=$?
+[ "$ERR_NOJSON_RC" != "0" ] \
+  || { echo "[FAIL] estimate --backend nosuchbackend (no --json) exited 0, expected non-zero"; exit 1; }
 [ ! -s "$TMP/err-nojson.out" ] \
   || { echo "[FAIL] the error path writes to stdout even without --json"; cat "$TMP/err-nojson.out"; exit 1; }
 echo "[PASS] dist --json error path: {error, code: CB-E013, exit_code} on stdout, stderr unchanged, no stdout without --json"
@@ -663,9 +673,15 @@ M4_RK_RC=$?
 grep -Fq -- 'does not read --json' "$TMP/m4-recovery-kit.err" \
   || { echo "[FAIL] 'recovery-kit --json' was not refused as unread — it is still format-by-outcome"; cat "$TMP/m4-recovery-kit.err"; exit 1; }
 node "$DIST" init --json > /dev/null 2> "$TMP/m4-init.err" < /dev/null
+M4_INIT_RC=$?
+[ "$M4_INIT_RC" = "2" ] \
+  || { echo "[FAIL] 'init --json' exited $M4_INIT_RC, expected 2 (refused upfront as a flag it does not read)"; cat "$TMP/m4-init.err"; exit 1; }
 grep -Fq -- 'does not read --json' "$TMP/m4-init.err" \
   || { echo "[FAIL] 'init --json' was not refused as unread — it is still format-by-outcome"; cat "$TMP/m4-init.err"; exit 1; }
 node "$DIST" publish-latest --domain example.ton --from-locator-file "$TMP/does-not-exist-locator" --json > /dev/null 2> "$TMP/m4-publish-latest.err"
+M4_PUBLISH_LATEST_RC=$?
+[ "$M4_PUBLISH_LATEST_RC" = "2" ] \
+  || { echo "[FAIL] 'publish-latest --json' exited $M4_PUBLISH_LATEST_RC, expected 2 (refused upfront as a flag it does not read)"; cat "$TMP/m4-publish-latest.err"; exit 1; }
 grep -Fq -- 'does not read --json' "$TMP/m4-publish-latest.err" \
   || { echo "[FAIL] 'publish-latest --json' was not refused as unread — it is still format-by-outcome"; cat "$TMP/m4-publish-latest.err"; exit 1; }
 echo "[PASS] dist recovery-kit/init/publish-latest --json: refused upfront (not format-by-outcome) (#781)"
