@@ -333,14 +333,23 @@ function runTest(t) {
 
       // Hygiene, per test: whatever is still in this test's TMPDIR is this test's. Empty
       // -> take the directory away so verify.mjs's sandbox ends up empty; non-empty ->
-      // leave it exactly where it is, so verify.mjs names it.
+      // leave it exactly where it is, so verify.mjs names it. A read failure that is NOT
+      // "the directory is simply gone" (ENOENT — a test that removed its own sandbox dir,
+      // which is within its rights) must not read as "nothing leaked": an unreadable
+      // directory has not been confirmed empty, and reporting it clean is the same
+      // false-PASS this hygiene check exists to catch.
       let leaked = [];
+      let inspectionFailed = null;
       try {
         leaked = readdirSync(dir);
-      } catch {
-        leaked = [];
+      } catch (e) {
+        if (e?.code === 'ENOENT') {
+          leaked = [];
+        } else {
+          inspectionFailed = e;
+        }
       }
-      if (leaked.length === 0) {
+      if (leaked.length === 0 && !inspectionFailed) {
         try {
           rmdirSync(dir);
         } catch {
@@ -350,7 +359,17 @@ function runTest(t) {
       let status = code === 0 && !signal ? 'PASS' : 'FAIL';
       let note = '';
       if (signal) note = `\n[killed by ${signal}]`;
-      if (leaked.length > 0 && status === 'PASS') {
+      if (inspectionFailed) {
+        const detail = inspectionFailed.code ?? inspectionFailed.message;
+        if (status === 'PASS') {
+          status = 'LEAK';
+          note +=
+            `\n[FAIL] temp hygiene: this test's own TMPDIR at ${dir} could not be inspected (${detail}) — ` +
+            `an unreadable directory is not confirmed empty, so this is reported as a leak rather than a silent PASS`;
+        } else {
+          note += `\n[note] this test's own TMPDIR at ${dir} also could not be inspected for hygiene (${detail})`;
+        }
+      } else if (leaked.length > 0 && status === 'PASS') {
         status = 'LEAK';
         note =
           `\n[FAIL] temp hygiene: this test left ${leaked.length} entry(ies) in its own TMPDIR (#328/#607):\n` +
@@ -506,6 +525,14 @@ if (!failed && !shuttingDown) {
 if (failed) {
   console.error(`\n[FAIL] ${failed.name} (${failed.status}) — its output is in the block above`);
   exit(failed.code || 1);
+}
+// A signal can stop scheduling before any test actually failed (SIGINT mid-run), and
+// `failed` stays unset in that case — but the run did not finish, so the success banner
+// below must not print. exit() already turns this into a non-zero/signal death; this is
+// only about not also claiming "every selftest passed" on the way there.
+if (shuttingDown) {
+  console.error(`\n[FAIL] run-selftests was interrupted (${shuttingDown}) before every test finished`);
+  exit(1);
 }
 console.log(
   planPath ? `\n[PASS] every test in ${planPath} passed (NOT the real suite)` : '\n[PASS] every selftest passed',

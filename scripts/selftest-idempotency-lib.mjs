@@ -147,7 +147,10 @@ try {
       lost.length === 0,
       lost.length > 0 ? `lost: ${lost.join(', ')}` : undefined,
     );
-    const wrong = keys.filter((_key, i) => results[i] !== undefined && results[i].fingerprint !== `fp-${i}`);
+    const wrong = keys.filter(
+      (_key, i) =>
+        results[i] !== undefined && (results[i].fingerprint !== `fp-${i}` || results[i].result?.locator !== `loc-${i}`),
+    );
     check(
       'every surviving key kept its OWN fingerprint/result, not a sibling’s',
       wrong.length === 0,
