@@ -39,17 +39,29 @@ const child = spawn(cmd, cmdArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
 let transcript = '';
 let qaIndex = 0;
 let eofSent = false;
+// Same fix as drive-init.mjs's sibling variable (see its own comment): only ever
+// search the transcript FORWARD from the end of the previous match, for BOTH the
+// scripted qa[] prompts and the final eofAfter target — matching against the full
+// accumulated transcript let a later target spuriously match text left over from an
+// earlier, already-consumed prompt.
+let searchFrom = 0;
 
 function tryAdvance() {
   while (qaIndex < qa.length) {
     const [waitFor, send] = qa[qaIndex];
-    if (!transcript.includes(waitFor)) return;
+    const idx = transcript.indexOf(waitFor, searchFrom);
+    if (idx === -1) return;
+    searchFrom = idx + waitFor.length;
     child.stdin.write(`${send}\r`);
     qaIndex++;
   }
-  if (!eofSent && transcript.includes(eofAfter)) {
-    eofSent = true;
-    child.stdin.end(); // the whole point of this driver — see the header comment above
+  if (!eofSent) {
+    const idx = transcript.indexOf(eofAfter, searchFrom);
+    if (idx !== -1) {
+      searchFrom = idx + eofAfter.length;
+      eofSent = true;
+      child.stdin.end(); // the whole point of this driver — see the header comment above
+    }
   }
 }
 

@@ -24,9 +24,35 @@ cb() {
   node "${BIN_DEV_ARGS[@]}" "$BIN" "$@"
 }
 
-# sha: sha256 of a file, as a bare lowercase hex string.
+# sha: sha256 of a file, as a bare lowercase hex string. Fails loudly (return 1, no
+# stdout) if shasum itself fails (e.g. the file is missing or unreadable) — on its OWN,
+# not by relying on the caller's shell options. The previous `shasum ... | cut ...`
+# pipeline's exit status happened to already come out non-zero in every current caller
+# (they all run under `set -o pipefail`, which makes a pipeline's exit status the exit
+# status of shasum, the one command that actually failed, even though `cut` itself
+# still exits 0 on the empty stdin that failure leaves it) — so this change does not
+# alter sha()'s exit status for any existing caller. What it DOES do is stop that
+# correctness from being an accident of the caller's shell options: a future caller (or
+# this file's own sha(), called directly rather than through a sourcing script) that
+# does not set pipefail would previously have seen `sha()` "succeed" with an empty
+# string for a missing file; now it fails regardless of pipefail.
+#
+# IMPORTANT, and NOT fixed by the above (Codex review, #851 follow-up): sha()'s own
+# exit status is invisible to a caller that only inspects its STDOUT — `[ "$(sha a)" =
+# "$(sha b)" ]` and `[ "$(sha a)" != "$known_hash" ]` both discard the command
+# substitution's exit status; they only ever see stdout, which is "" on failure whether
+# sha() returns 0 or 1. So a caller comparing two `sha()` calls directly (or `sha()`
+# against a value not independently verified to be non-empty) can still see a false
+# match/mismatch if the file it expected to exist does not. There is no fix for this
+# INSIDE sha() itself — the fix is at each such call site: capture the value, then
+# either check it is non-empty (or `test -f` the underlying file) before comparing. See
+# selftest-pq.sh, selftest-storage.sh, selftest-rclone.sh, selftest-keygen-force.sh, and
+# selftest-plan.sh for the specific call sites this repo currently has that needed (and
+# now have) that guard.
 sha() {
-  shasum -a 256 "$1" | cut -d' ' -f1
+  local h
+  h="$(shasum -a 256 "$1")" || return 1
+  printf '%s\n' "${h%% *}"
 }
 
 # push_lock_file <home> <kind> <key>: the advisory lock file push takes for (kind, key)

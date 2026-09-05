@@ -100,6 +100,17 @@ func fetchAccountStateAt(ctx context.Context, url string) (*accountState, int, e
 	if err := json.Unmarshal(body, &acc); err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("GET %s: non-JSON response: %s", url, truncate(string(body), 200))
 	}
+	// Codex review finding (Warning): json.Unmarshal leaves Status as its zero value
+	// ("") when the response is well-formed JSON that simply omits the "status" field
+	// (a tonapi schema change, a proxy/CDN error page shaped like JSON, a partial
+	// response) — that empty string would otherwise flow silently into stateVerdict(),
+	// which prints it as an "<unrecognized tonapi status "">" without distinguishing
+	// "the response was malformed/incomplete" from "tonapi returned a genuinely new
+	// status value this CLI doesn't know about yet" (the latter is the ONLY case that
+	// default branch is meant to describe). Fail loud on the former instead.
+	if acc.Status == "" {
+		return nil, resp.StatusCode, fmt.Errorf("GET %s: response is missing the required 'status' field: %s", url, truncate(string(body), 200))
+	}
 	return &acc, resp.StatusCode, nil
 }
 

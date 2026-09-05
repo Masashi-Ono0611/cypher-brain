@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"strings"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -349,35 +350,48 @@ func runDeploy(ctx context.Context, args []string, stdout io.Writer) error {
 		)
 	}
 
+	// Codex review finding (Warning): every fmt.Fprintf/Fprintln call in this function
+	// discarded its own write error — for the block below (the deploy SUMMARY, which
+	// carries the deeplink the operator must actually see and sign), a silently-failed
+	// write (e.g. a broken pipe on stdout) would let this function return nil while the
+	// operator never received the one output that matters. There is no early return
+	// after this point (the function unconditionally returns nil below), so it is safe
+	// to build the whole block in memory first (strings.Builder.Write never itself
+	// fails, per its docs) and check the error on the SINGLE write that actually reaches
+	// stdout, instead of losing partially-buffered progress output on an error path.
+	var out strings.Builder
 	if f.mainnet {
-		fmt.Fprintln(stdout, "")
-		fmt.Fprintln(stdout, "!! MAINNET MODE — REAL TON, REAL MONEY. Review the deeplink in your wallet !!")
-		fmt.Fprintln(stdout, "!! before approving. There is no undo.                                    !!")
-		fmt.Fprintln(stdout, "")
+		fmt.Fprintln(&out, "")
+		fmt.Fprintln(&out, "!! MAINNET MODE — REAL TON, REAL MONEY. Review the deeplink in your wallet !!")
+		fmt.Fprintln(&out, "!! before approving. There is no undo.                                    !!")
+		fmt.Fprintln(&out, "")
 	}
 
-	fmt.Fprintln(stdout, "== deploy ==")
-	fmt.Fprintf(stdout, "  network:        %s\n", network)
-	fmt.Fprintf(stdout, "  bag id:         %x\n", p.bagID)
-	fmt.Fprintf(stdout, "  contract addr:  %s\n", res.contractAddr.StringRaw())
-	fmt.Fprintf(stdout, "  provider pubkey: %x\n", p.providerPubkey)
-	fmt.Fprintf(stdout, "  owner:          %s\n", p.owner.StringRaw())
-	fmt.Fprintf(stdout, "  rate:           %d nanoTON/MB/day\n", p.rateNanoPerMB)
-	fmt.Fprintf(stdout, "  span:           %d day(s)\n", p.spanDays)
-	fmt.Fprintf(stdout, "  data size:      %d bytes\n", p.dataSizeBytes)
-	fmt.Fprintf(stdout, "  piece size:     %d bytes\n", p.pieceSize)
-	fmt.Fprintf(stdout, "  merkle hash:    %x\n", p.merkleHash)
-	fmt.Fprintf(stdout, "  storage cost:   %.9f TON (%s nanoTON)\n", nanoToFloat(res.costNano), res.costNano)
-	fmt.Fprintf(stdout, "  + deploy buffer: %.9f TON (%s nanoTON)\n", nanoToFloat(deployBufferNano), deployBufferNano)
-	fmt.Fprintf(stdout, "  = amount:       %.9f TON (%s nanoTON)\n", nanoToFloat(res.amountNano), res.amountNano)
-	fmt.Fprintf(stdout, "  deeplink:       %s\n", res.deeplink)
-	fmt.Fprintln(stdout, "")
-	fmt.Fprintln(stdout, "Review the amount + recipient in your wallet BEFORE approving.")
-	fmt.Fprintln(stdout, "After signing, confirm it landed with:")
-	fmt.Fprintf(stdout, "  storage-v1-client status --contract %s%s\n", res.contractAddr.StringRaw(), statusFlag)
-	fmt.Fprintln(stdout, "then tell the provider it exists with:")
-	fmt.Fprintf(stdout, "  storage-v1-client notify --provider-pubkey %x --contract %s%s\n",
+	fmt.Fprintln(&out, "== deploy ==")
+	fmt.Fprintf(&out, "  network:        %s\n", network)
+	fmt.Fprintf(&out, "  bag id:         %x\n", p.bagID)
+	fmt.Fprintf(&out, "  contract addr:  %s\n", res.contractAddr.StringRaw())
+	fmt.Fprintf(&out, "  provider pubkey: %x\n", p.providerPubkey)
+	fmt.Fprintf(&out, "  owner:          %s\n", p.owner.StringRaw())
+	fmt.Fprintf(&out, "  rate:           %d nanoTON/MB/day\n", p.rateNanoPerMB)
+	fmt.Fprintf(&out, "  span:           %d day(s)\n", p.spanDays)
+	fmt.Fprintf(&out, "  data size:      %d bytes\n", p.dataSizeBytes)
+	fmt.Fprintf(&out, "  piece size:     %d bytes\n", p.pieceSize)
+	fmt.Fprintf(&out, "  merkle hash:    %x\n", p.merkleHash)
+	fmt.Fprintf(&out, "  storage cost:   %.9f TON (%s nanoTON)\n", nanoToFloat(res.costNano), res.costNano)
+	fmt.Fprintf(&out, "  + deploy buffer: %.9f TON (%s nanoTON)\n", nanoToFloat(deployBufferNano), deployBufferNano)
+	fmt.Fprintf(&out, "  = amount:       %.9f TON (%s nanoTON)\n", nanoToFloat(res.amountNano), res.amountNano)
+	fmt.Fprintf(&out, "  deeplink:       %s\n", res.deeplink)
+	fmt.Fprintln(&out, "")
+	fmt.Fprintln(&out, "Review the amount + recipient in your wallet BEFORE approving.")
+	fmt.Fprintln(&out, "After signing, confirm it landed with:")
+	fmt.Fprintf(&out, "  storage-v1-client status --contract %s%s\n", res.contractAddr.StringRaw(), statusFlag)
+	fmt.Fprintln(&out, "then tell the provider it exists with:")
+	fmt.Fprintf(&out, "  storage-v1-client notify --provider-pubkey %x --contract %s%s\n",
 		p.providerPubkey, res.contractAddr.StringRaw(), statusFlag)
+	if _, err := io.WriteString(stdout, out.String()); err != nil {
+		return fmt.Errorf("writing deploy summary (including the deeplink to sign): %w", err)
+	}
 	return nil
 }
 

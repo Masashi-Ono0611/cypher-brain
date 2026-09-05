@@ -42,21 +42,37 @@ RECLEN=$(wc -c <"$PQ/recipient.txt")
   || { echo "[FAIL] hybrid recipient suspiciously small ($RECLEN bytes)"; exit 1; }
 
 echo "== keygen --wrap-in-place --pq is rejected (--pq has nothing to act on there) =="
-if cb "$PQ" keygen --wrap-in-place --pq 2>/dev/null; then
+if cb "$PQ" keygen --wrap-in-place --pq >/dev/null 2>"$TMP/wrap-pq.err"; then
   echo "[FAIL] --wrap-in-place --pq was accepted (should refuse — --pq would silently no-op)"; exit 1
 fi
-echo "[PASS] --wrap-in-place --pq is refused"
+# Assert the SPECIFIC rejection reason, not just "some failure" — a --wrap-in-place
+# --pq call could also fail for an unrelated reason (e.g. a missing identity file)
+# and this check would still (wrongly) pass. The exact wording comes from
+# src/lib/keys.ts's keygen() --pq/--wrap-in-place guard.
+grep -q -- '--pq has no effect with --wrap-in-place' "$TMP/wrap-pq.err" \
+  && echo "[PASS] --wrap-in-place --pq is refused with the specific --pq/--wrap-in-place error" \
+  || { echo "[FAIL] --wrap-in-place --pq failed, but not with the expected --pq/--wrap-in-place error"; cat "$TMP/wrap-pq.err"; exit 1; }
 
 echo "== keygen --pq --passphrase: the passphrase-wrap path is agnostic to identity type =="
 cb "$X25519" keygen >/dev/null # plain X25519, used as the backup key below
 PQWRAP="$TMP/keys-pq-wrapped"
 CYPHER_BRAIN_HOME="$PQWRAP" CYPHER_BRAIN_PASSPHRASE="pq-selftest-pass-1234" \
   node "${BIN_DEV_ARGS[@]}" "$BIN" keygen --pq --passphrase >/dev/null
-# a passphrase-wrapped identity file is age ciphertext, not the raw AGE-SECRET-KEY-PQ-1…
-# text — confirm it no longer starts with that plaintext prefix (it's now wrapped).
-head -c 32 "$PQWRAP/identity.age" | grep -qv '^AGE-SECRET-KEY-PQ-1' \
-  && echo "[PASS] identity.age is passphrase-wrapped (no longer plaintext hybrid identity)" \
-  || { echo "[FAIL] identity.age still looks like a plaintext identity"; exit 1; }
+# a passphrase-wrapped identity file is age ciphertext with a leading scrypt stanza —
+# not just "doesn't start with AGE-SECRET-KEY-PQ-1" (which e.g. an empty or truncated
+# file would also satisfy). Assert the POSITIVE shape instead: it must actually start
+# with the age magic followed immediately by a scrypt stanza, exactly the same anchored
+# check src/lib/crypt.ts's classifyIdentityFileAtRest() uses to recognize a passphrase
+# wrap (vs. plain ciphertext-not-passphrase or an unrecognized file).
+WRAP_HEADER="$(head -c 64 "$PQWRAP/identity.age")"
+case "$WRAP_HEADER" in
+  "age-encryption.org/v1"$'\n'"-> scrypt "*)
+    echo "[PASS] identity.age is passphrase-wrapped (age-encryption.org/v1 + scrypt stanza)" ;;
+  *)
+    echo "[FAIL] identity.age does not start with the expected age-encryption.org/v1 + scrypt header"
+    head -c 64 "$PQWRAP/identity.age" | cat -v
+    exit 1 ;;
+esac
 
 SRC="$TMP/brain-src"; mkdir -p "$SRC"
 MARKER="pq-secret-thought-$(od -An -N6 -tx1 /dev/urandom | tr -d ' ')"
@@ -77,9 +93,14 @@ echo "== snapshot -> push (file) -> pull -> verify -> restore, encrypted to the 
 cb "$PQ" snapshot --dir "$SRC" --out "$TMP/snap.age"
 LOC=$(cb "$PQ" push --in "$TMP/snap.age" --backend file)
 cb "$PQ" pull --locator "$LOC" --backend file --out "$TMP/got.age"
-# Explicit existence check first: sha()'s own pipeline (shasum | cut) can still exit 0
-# on a missing file (cut sees empty stdin), so without this a `pull` that exited 0 but
-# silently wrote nothing would compare "" = "" here and pass.
+# Explicit existence check first: sha() on a missing file returns "", and a
+# `[ "$(sha a)" = "$(sha b)" ]` comparison never sees sha()'s own exit status (see
+# scripts/selftest-lib.sh's comment on sha() for why) — only its stdout. Without this, a
+# `pull` that exited 0 but silently wrote nothing at $TMP/got.age would compare "" here;
+# it happens to compare against a REAL hash on the other side (snap.age was already
+# produced by a checked `snapshot` above), so this particular comparison would still
+# correctly fail — but only by accident. Assert the precondition explicitly rather than
+# relying on that.
 test -f "$TMP/got.age" || { echo "[FAIL] pull exited 0 but wrote no output at $TMP/got.age"; exit 1; }
 [ "$(sha "$TMP/got.age")" = "$(sha "$TMP/snap.age")" ] && echo "[PASS] pulled ciphertext == pushed ciphertext" \
   || { echo "[FAIL] pulled/pushed ciphertext mismatch"; exit 1; }

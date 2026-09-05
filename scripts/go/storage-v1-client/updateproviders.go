@@ -253,6 +253,16 @@ func runUpdateProviders(ctx context.Context, args []string, stdout io.Writer) er
 			p.contract.StringRaw(), acc.Status,
 		)
 	}
+	// Codex review finding (Warning): 'active' only proves SOME contract is running
+	// at this address — not that it is a StorageV1 contract. Without this, a typo'd
+	// --contract (or any other active account) would sail past the status check above
+	// and get offered a funded, signable modify_providers deeplink to a contract that
+	// cannot possibly act on it — wasting --gas-ton at best. providers.go's own
+	// assertStorageV1Code (same package) is the existing, deploy-code-hash-based check
+	// for exactly this identity question; reuse it here rather than re-deriving it.
+	if err := assertStorageV1Code(acc.Code); err != nil {
+		return err
+	}
 
 	deeplink := buildUpdateProvidersDeeplink(p.contract, body.ToBOC(), p.gasNano, p.testnet)
 
