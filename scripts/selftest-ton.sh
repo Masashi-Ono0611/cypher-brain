@@ -22,7 +22,10 @@ source "$ROOT/scripts/selftest-lib.sh"
 TMP="$(mktemp -d)"
 SEEDER_PID=""
 cleanup() {
-  [ -n "$SEEDER_PID" ] && kill "$SEEDER_PID" 2>/dev/null
+  # `|| :` on each kill: under `set -e`, a dead SEEDER_PID makes `kill` the
+  # last (and failing) command in this `&&` list, which aborts the EXIT trap
+  # right here — skipping `rm -rf "$TMP"` below and leaking the temp dir.
+  [ -n "$SEEDER_PID" ] && kill "$SEEDER_PID" 2>/dev/null || :
   rm -rf "$TMP"
 }
 trap cleanup EXIT

@@ -22,8 +22,12 @@ TMP="$(mktemp -d)"
 SEEDER_PID=""
 TONAPI_PID=""
 cleanup() {
-  [ -n "$SEEDER_PID" ] && kill "$SEEDER_PID" 2>/dev/null
-  [ -n "$TONAPI_PID" ] && kill "$TONAPI_PID" 2>/dev/null
+  # `|| :` on each kill: under `set -e`, a dead PID makes `kill` the last (and
+  # failing) command in this `&&` list, which aborts the EXIT trap right
+  # here — skipping the remaining cleanup lines below (including rm -rf
+  # "$TMP") and leaking the temp dir and/or the sibling mock daemon.
+  [ -n "$SEEDER_PID" ] && kill "$SEEDER_PID" 2>/dev/null || :
+  [ -n "$TONAPI_PID" ] && kill "$TONAPI_PID" 2>/dev/null || :
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -58,7 +62,13 @@ MOCK_TONAPI_ADDRESS="$MOCK_ADDR" MOCK_TONAPI_BAG_ID="$BAG_ID" MOCK_TONAPI_FLIP_A
 TONAPI_PID=$!
 READY=0
 for _ in $(seq 1 50); do
-  if curl -s "http://127.0.0.1:$TONAPI_PORT/v2/dns/test.ton" >/dev/null 2>&1; then READY=1; break; fi
+  # -f: mock-tonapi.mjs always replies 200 for this route once it is routing
+  # requests, so an HTTP error (>=400) here means something other than
+  # "still starting up". --max-time: bound each probe so a hung connection
+  # cannot stall this loop indefinitely (worst case ~100s across all 50
+  # probes, vs. the near-instant per-probe failure a real "not up yet"
+  # connection refusal gives).
+  if curl -sf --max-time 2 "http://127.0.0.1:$TONAPI_PORT/v2/dns/test.ton" >/dev/null 2>&1; then READY=1; break; fi
   sleep 0.2
 done
 [ "$READY" = 1 ] || { echo "[FAIL] mock tonapi server did not come up on port $TONAPI_PORT"; exit 1; }
