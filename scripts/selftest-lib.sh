@@ -170,7 +170,14 @@ start_ton_seeder() {
   SEEDER_PID=$!
   local ready=0
   for _ in $(seq 1 50); do
-    if curl -s "http://127.0.0.1:$MOCK_PORT/api/v1/list" >/dev/null 2>&1; then
+    # -f: mock-tonutils.mjs's /api/v1/list handler always replies 200 once the
+    # server is routing requests, so an HTTP error (>=400) here means
+    # something other than "still starting up" and should not be counted as
+    # ready. --max-time: bound each individual probe so a connection that
+    # hangs (rather than being refused) cannot stall this readiness loop
+    # indefinitely (worst case ~100s across all 50 probes, vs. the near-
+    # instant per-probe failure a real "not up yet" connection refusal gives).
+    if curl -sf --max-time 2 "http://127.0.0.1:$MOCK_PORT/api/v1/list" >/dev/null 2>&1; then
       ready=1
       break
     fi
@@ -191,7 +198,7 @@ while [ \$# -gt 0 ] && [ "\$1" != "--" ]; do
 done
 [ "\${1:-}" = "--" ] && shift
 shift # host
-cd "$SEEDER_HOME"
+cd "$SEEDER_HOME" || exit 1
 exec bash -c "\$*"
 EOF
   cat >"$SHIM/scp" <<EOF

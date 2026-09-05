@@ -189,7 +189,22 @@ const child = spawn(process.execPath, [runner, '--jobs', '2', '--plan', plan], {
   stdio: ['ignore', 'inherit', 'inherit'],
   env: { ...process.env, TMPDIR: sandbox, TMP: sandbox, TEMP: sandbox },
 });
-const alive = () => spawnSync('pgrep', ['-f', marker]).status === 0;
+// pgrep -f matches on the FULL command line, and this very process's own argv
+// (this script was invoked as `node supervise.mjs ... marker`) contains
+// `marker` as a literal argument — so a naive `pgrep -f marker` matches THIS
+// supervisor immediately, before the fake grandchild has even been scheduled,
+// making the wait below a no-op and letting a regression that never starts
+// the grandchild pass undetected. Exclude this process's own pid.
+const alive = () => {
+  const r = spawnSync('pgrep', ['-f', marker]);
+  if (r.status !== 0) return false;
+  const pids = String(r.stdout)
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map(Number);
+  return pids.some((pid) => pid !== process.pid);
+};
 const deadline = Date.now() + 20000;
 while (!alive()) {
   if (Date.now() > deadline) {
