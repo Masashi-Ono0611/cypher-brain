@@ -56,7 +56,7 @@ file_mode() {
 
 echo "== (a) init refuses when an identity already exists (init is for a FRESH setup only) =="
 EXISTS_HOME="$TMP/exists-home"
-CYPHER_BRAIN_HOME="$EXISTS_HOME" cb keygen > /dev/null
+CYPHER_BRAIN_HOME="$EXISTS_HOME" with_timeout 30 cb keygen > /dev/null
 EXISTS_RC=0
 CYPHER_BRAIN_HOME="$EXISTS_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
   with_timeout 10 node "${BIN_DEV_ARGS[@]}" "$BIN" init < /dev/null > "$TMP/exists.log" 2>&1 || EXISTS_RC=$?
@@ -345,7 +345,7 @@ echo "[PASS] push wrote a 7-field --save-locator file (ciphertext + signature lo
 
 SNAP="$(find "$WIZ_CB_HOME" -maxdepth 1 -name 'brain-*.age' | head -n1)"
 [ -n "$SNAP" ] || { echo "[FAIL] no brain-*.age snapshot found under CYPHER_BRAIN_HOME"; exit 1; }
-CYPHER_BRAIN_HOME="$WIZ_CB_HOME" cb verify --in "$SNAP" > "$TMP/verify.log" 2>&1 || { echo "[FAIL] verify on the wizard's own snapshot failed"; cat "$TMP/verify.log"; exit 1; }
+CYPHER_BRAIN_HOME="$WIZ_CB_HOME" with_timeout 30 cb verify --in "$SNAP" > "$TMP/verify.log" 2>&1 || { echo "[FAIL] verify on the wizard's own snapshot failed"; cat "$TMP/verify.log"; exit 1; }
 grep -q 'VERDICT: PASS' "$TMP/verify.log" || { echo "[FAIL] verify verdict on the wizard's snapshot is not PASS"; cat "$TMP/verify.log"; exit 1; }
 echo "[PASS] the wizard's own snapshot verifies (real ciphertext, wrong key rejected, primary identity decrypts it)"
 
@@ -419,7 +419,7 @@ grep -q 'Path to the o2b bank-export bundle' "$TMP/wizard-o2b.log" || { echo "[F
 # "brain-*.age" check above).
 O2B_SNAP="$(find "$O2B_WIZ_CB_HOME" -maxdepth 1 -name 'brain-*.age' | head -n1)"
 [ -n "$O2B_SNAP" ] || { echo "[FAIL] no brain-*.age snapshot found under the o2b wizard's CYPHER_BRAIN_HOME"; exit 1; }
-CYPHER_BRAIN_HOME="$O2B_WIZ_CB_HOME" cb restore --in "$O2B_SNAP" --out-dir "$TMP/o2b-wiz-restore" >/dev/null 2>&1 \
+CYPHER_BRAIN_HOME="$O2B_WIZ_CB_HOME" with_timeout 30 cb restore --in "$O2B_SNAP" --out-dir "$TMP/o2b-wiz-restore" >/dev/null 2>&1 \
   || { echo "[FAIL] restore of the wizard's o2b snapshot failed"; exit 1; }
 grep -q '"profile": "o2b"' "$TMP/o2b-wiz-restore/manifest.json" \
   || { echo "[FAIL] wizard's o2b snapshot manifest lacks profile o2b"; cat "$TMP/o2b-wiz-restore/manifest.json"; exit 1; }
@@ -489,7 +489,7 @@ grep -qF "$OBS_BADPATH does not exist" "$TMP/wizard-obsidian.log" || { echo "[FA
 [ -f "$OBS_CB_HOME/sign-identity.key" ] || { echo "[FAIL] signing identity is missing — the #605 repro's own rollback target must survive a bad obsidian vault answer"; exit 1; }
 OBS_SNAP="$(find "$OBS_CB_HOME" -maxdepth 1 -name 'brain-*.age' | head -n1)"
 [ -n "$OBS_SNAP" ] || { echo "[FAIL] no brain-*.age snapshot found under the obsidian wizard's CYPHER_BRAIN_HOME"; exit 1; }
-CYPHER_BRAIN_HOME="$OBS_CB_HOME" cb restore --in "$OBS_SNAP" --out-dir "$TMP/obsidian-wiz-restore" >/dev/null 2>&1 \
+CYPHER_BRAIN_HOME="$OBS_CB_HOME" with_timeout 30 cb restore --in "$OBS_SNAP" --out-dir "$TMP/obsidian-wiz-restore" >/dev/null 2>&1 \
   || { echo "[FAIL] restore of the wizard's obsidian snapshot failed"; exit 1; }
 grep -q '"profile": "obsidian"' "$TMP/obsidian-wiz-restore/manifest.json" \
   || { echo "[FAIL] wizard's obsidian snapshot manifest lacks profile obsidian"; cat "$TMP/obsidian-wiz-restore/manifest.json"; exit 1; }
@@ -707,7 +707,7 @@ RB_SRC="$TMP/rollback-src"; mkdir -p "$RB_SRC"
 printf 'rollback-marker\n' > "$RB_SRC/note.txt"
 RB_BACKUP_HOME="${RB_CB_HOME}-backup" # the default sibling path the wizard suggests for the backup key
 RB_WALLET="$TMP/rollback-wallet.json"
-cb wallet create --out "$RB_WALLET" > "$TMP/rollback-walletcreate.log" 2>&1 \
+with_timeout 30 cb wallet create --out "$RB_WALLET" > "$TMP/rollback-walletcreate.log" 2>&1 \
   || { echo "[FAIL] test setup: could not create a wallet fixture for the rollback test"; cat "$TMP/rollback-walletcreate.log"; exit 1; }
 
 cat > "$TMP/qa-rollback-fail.json" <<JSON
@@ -1062,7 +1062,7 @@ M_SRC="$TMP/backup-preexist-src"; mkdir -p "$M_SRC"
 printf 'backup-preexist-marker\n' > "$M_SRC/note.txt"
 M_BACKUP_HOME="$TMP/backup-preexist-existing-backup" # a REAL, already-set-up backup identity lives here BEFORE the wizard ever runs
 
-CYPHER_BRAIN_HOME="$M_BACKUP_HOME" cb keygen > "$TMP/backup-preexist-setup.log" 2>&1 \
+CYPHER_BRAIN_HOME="$M_BACKUP_HOME" with_timeout 30 cb keygen > "$TMP/backup-preexist-setup.log" 2>&1 \
   || { echo "[FAIL] test setup: could not create a real pre-existing backup identity"; cat "$TMP/backup-preexist-setup.log"; exit 1; }
 [ -f "$M_BACKUP_HOME/identity.age" ] || { echo "[FAIL] test setup: pre-existing backup identity.age was not created"; exit 1; }
 [ -f "$M_BACKUP_HOME/recipient.txt" ] || { echo "[FAIL] test setup: pre-existing backup recipient.txt was not created"; exit 1; }
@@ -1148,10 +1148,10 @@ awk '/^BEGIN SAVE-LOCATOR LINE$/{f=1;next}/^END SAVE-LOCATOR LINE$/{f=0}f' "$KIT
 grep -q '^AGE-SECRET-KEY-1' "$DRILL/restore-identity.age" || { echo "DRILL RESULT: [FAIL] extracted identity does not look like an age secret key"; exit 1; }
 
 CYPHER_BRAIN_FILE_DIR="$WIZ_STORE" HOME="$DRILL" CYPHER_BRAIN_HOME="$DRILL/no-such-home" \
-  cb pull --from-locator-file "$DRILL/restore-locator.tsv" --out "$DRILL/restored.age" > "$TMP/drill-pull.log" 2>&1 \
+  with_timeout 30 cb pull --from-locator-file "$DRILL/restore-locator.tsv" --out "$DRILL/restored.age" > "$TMP/drill-pull.log" 2>&1 \
   || { echo "DRILL RESULT: [FAIL] pull --from-locator-file (kit's locator alone) failed"; cat "$TMP/drill-pull.log"; exit 1; }
 CYPHER_BRAIN_HOME="$DRILL/no-such-home" \
-  cb restore --in "$DRILL/restored.age" --out-dir "$DRILL/restored" --identity "$DRILL/restore-identity.age" > "$TMP/drill-restore.log" 2>&1 \
+  with_timeout 30 cb restore --in "$DRILL/restored.age" --out-dir "$DRILL/restored" --identity "$DRILL/restore-identity.age" > "$TMP/drill-restore.log" 2>&1 \
   || { echo "DRILL RESULT: [FAIL] restore --identity (kit's backup identity alone) failed"; cat "$TMP/drill-restore.log"; exit 1; }
 
 TARFILE="$(find "$DRILL/restored" -maxdepth 1 -name '*.tar.gz' | head -n1)"
@@ -1236,7 +1236,7 @@ echo "[PASS] a detected gbrain config prompts for --pg (defaulting to yes) and t
 PG_SNAP="$(find "$PG_CB_HOME" -maxdepth 1 -name 'brain-*.age' | head -n1)"
 [ -n "$PG_SNAP" ] || { echo "[FAIL] no brain-*.age snapshot found for the pg run"; exit 1; }
 PG_RESTORE_DIR="$TMP/pg-restored"
-CYPHER_BRAIN_HOME="$PG_CB_HOME" cb restore --in "$PG_SNAP" --out-dir "$PG_RESTORE_DIR" > "$TMP/pg-restore.log" 2>&1 \
+CYPHER_BRAIN_HOME="$PG_CB_HOME" with_timeout 30 cb restore --in "$PG_SNAP" --out-dir "$PG_RESTORE_DIR" > "$TMP/pg-restore.log" 2>&1 \
   || { echo "[FAIL] restoring the pg run's snapshot failed"; cat "$TMP/pg-restore.log"; exit 1; }
 [ -f "$PG_RESTORE_DIR/db.dump" ] || { echo "[FAIL] restored tree has no db.dump — --pg was not actually threaded into snapshot()"; exit 1; }
 grep -qF 'fake-pg-dump-content' "$PG_RESTORE_DIR/db.dump" || { echo "[FAIL] db.dump does not contain the shimmed pg_dump output — the wizard is not really invoking pg_dump"; exit 1; }
@@ -1301,7 +1301,7 @@ grep -qF 'Postgres dump: not included' "$PG2_KIT_PATH" || { echo "[FAIL] kit doe
 PG2_SNAP="$(find "$PG2_CB_HOME" -maxdepth 1 -name 'brain-*.age' | head -n1)"
 [ -n "$PG2_SNAP" ] || { echo "[FAIL] no brain-*.age snapshot found for the pg-decline run"; exit 1; }
 PG2_RESTORE_DIR="$TMP/pg2-restored"
-CYPHER_BRAIN_HOME="$PG2_CB_HOME" cb restore --in "$PG2_SNAP" --out-dir "$PG2_RESTORE_DIR" > "$TMP/pg2-restore.log" 2>&1 \
+CYPHER_BRAIN_HOME="$PG2_CB_HOME" with_timeout 30 cb restore --in "$PG2_SNAP" --out-dir "$PG2_RESTORE_DIR" > "$TMP/pg2-restore.log" 2>&1 \
   || { echo "[FAIL] restoring the pg-decline run's snapshot failed"; cat "$TMP/pg2-restore.log"; exit 1; }
 if [ -f "$PG2_RESTORE_DIR/db.dump" ]; then echo "[FAIL] declining the Postgres prompt still produced a db.dump component"; exit 1; fi
 echo "[PASS] declining the gbrain-detected Postgres prompt (auto-detect defaults to yes, but a real 'n' is honored) proceeds without --pg — no db.dump, kit says not included"
@@ -1360,7 +1360,7 @@ esac
 PG3_SNAP="$(find "$PG3_CB_HOME" -maxdepth 1 -name 'brain-*.age' | head -n1)"
 [ -n "$PG3_SNAP" ] || { echo "[FAIL] no brain-*.age snapshot found for the whitespace-pg run"; exit 1; }
 PG3_RESTORE_DIR="$TMP/pg3-restored"
-CYPHER_BRAIN_HOME="$PG3_CB_HOME" cb restore --in "$PG3_SNAP" --out-dir "$PG3_RESTORE_DIR" > "$TMP/pg3-restore.log" 2>&1 \
+CYPHER_BRAIN_HOME="$PG3_CB_HOME" with_timeout 30 cb restore --in "$PG3_SNAP" --out-dir "$PG3_RESTORE_DIR" > "$TMP/pg3-restore.log" 2>&1 \
   || { echo "[FAIL] restoring the whitespace-pg run's snapshot failed"; cat "$TMP/pg3-restore.log"; exit 1; }
 [ -f "$PG3_RESTORE_DIR/db.dump" ] || { echo "[FAIL] restored tree has no db.dump — a whitespace-only connection-string answer silently dropped the Postgres backup entirely (the P2 regression)"; exit 1; }
 grep -qF 'fake-pg-dump-content' "$PG3_RESTORE_DIR/db.dump" || { echo "[FAIL] db.dump does not contain the shimmed pg_dump output"; exit 1; }
@@ -1513,7 +1513,7 @@ O3_CB_HOME="$TMP/wallet-precheck-present-cb-home"
 O3_SRC="$TMP/wallet-precheck-present-src"; mkdir -p "$O3_SRC"
 printf 'wallet-precheck-present-marker\n' > "$O3_SRC/note.txt"
 O3_WALLET="$TMP/wallet-precheck-present-wallet.json"
-cb wallet create --out "$O3_WALLET" > "$TMP/wallet-precheck-present-walletcreate.log" 2>&1 \
+with_timeout 30 cb wallet create --out "$O3_WALLET" > "$TMP/wallet-precheck-present-walletcreate.log" 2>&1 \
   || { echo "[FAIL] test setup: could not create a wallet fixture"; cat "$TMP/wallet-precheck-present-walletcreate.log"; exit 1; }
 
 cat > "$TMP/qa-wallet-precheck-present.json" <<JSON
@@ -1554,7 +1554,7 @@ O4_CB_HOME="$TMP/wallet-precheck-defaultpath-cb-home"; mkdir -p "$O4_CB_HOME"
 O4_SRC="$TMP/wallet-precheck-defaultpath-src"; mkdir -p "$O4_SRC"
 printf 'wallet-precheck-defaultpath-marker\n' > "$O4_SRC/note.txt"
 unset CYPHER_BRAIN_AR_WALLET # this suite's own environment must not already have one set
-CYPHER_BRAIN_HOME="$O4_CB_HOME" cb wallet create > "$TMP/wallet-precheck-defaultpath-walletcreate.log" 2>&1 \
+CYPHER_BRAIN_HOME="$O4_CB_HOME" with_timeout 30 cb wallet create > "$TMP/wallet-precheck-defaultpath-walletcreate.log" 2>&1 \
   || { echo "[FAIL] test setup: could not create a default-path wallet fixture"; cat "$TMP/wallet-precheck-defaultpath-walletcreate.log"; exit 1; }
 
 cat > "$TMP/qa-wallet-precheck-defaultpath.json" <<JSON
@@ -1666,11 +1666,11 @@ MISMATCH_CB_HOME="$TMP/mismatch-cb-home"
 MISMATCH_SRC="$TMP/mismatch-src"; mkdir -p "$MISMATCH_SRC"
 printf 'mismatch-marker\n' > "$MISMATCH_SRC/note.txt"
 
-CYPHER_BRAIN_HOME="$MISMATCH_CB_HOME" cb keygen --sign > "$TMP/mismatch-setup-a.log" 2>&1 \
+CYPHER_BRAIN_HOME="$MISMATCH_CB_HOME" with_timeout 30 cb keygen --sign > "$TMP/mismatch-setup-a.log" 2>&1 \
   || { echo "[FAIL] test setup: could not generate signing keypair A"; cat "$TMP/mismatch-setup-a.log"; exit 1; }
 cp "$MISMATCH_CB_HOME/sign-recipient.pub" "$TMP/mismatch-recipient-a.pub"
 
-CYPHER_BRAIN_HOME="$MISMATCH_CB_HOME" cb keygen --sign --force > "$TMP/mismatch-setup-b.log" 2>&1 \
+CYPHER_BRAIN_HOME="$MISMATCH_CB_HOME" with_timeout 30 cb keygen --sign --force > "$TMP/mismatch-setup-b.log" 2>&1 \
   || { echo "[FAIL] test setup: could not regenerate signing keypair B"; cat "$TMP/mismatch-setup-b.log"; exit 1; }
 cp "$TMP/mismatch-recipient-a.pub" "$MISMATCH_CB_HOME/sign-recipient.pub"
 # Checksummed BEFORE the run under test: "-f still exists" alone does not prove the
@@ -1717,7 +1717,7 @@ echo "== (r2) init also refuses a signing pair whose CRYPTOGRAPHIC keys match bu
 KEYID_HOME="$TMP/keyid-mismatch-home"; mkdir -p "$KEYID_HOME"
 KEYID_CB_HOME="$TMP/keyid-mismatch-cb-home"
 
-CYPHER_BRAIN_HOME="$KEYID_CB_HOME" cb keygen --sign > "$TMP/keyid-mismatch-setup.log" 2>&1 \
+CYPHER_BRAIN_HOME="$KEYID_CB_HOME" with_timeout 30 cb keygen --sign > "$TMP/keyid-mismatch-setup.log" 2>&1 \
   || { echo "[FAIL] test setup: could not generate a signing keypair"; cat "$TMP/keyid-mismatch-setup.log"; exit 1; }
 python3 - "$KEYID_CB_HOME/sign-identity.key" <<'PY'
 import re
