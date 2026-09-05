@@ -1171,11 +1171,16 @@ async function settleIntentAgainstLedger(intent: SpendIntentRecord, contractAddr
   }
   try {
     // fsync the LEDGER before recording that it is durable (second review pass).
-    // receipt.ts's appendReceipt() deliberately does not sync (it is a report written
-    // after the fact), so without this the `settled` transition — which IS fsync'd — could
-    // outlive the receipt it attests to across a power loss, leaving a durable record
-    // saying nothing is owed and no receipt to back it. Fail closed: if the ledger cannot
-    // be flushed, the intent stays unsettled and doctor keeps reporting it.
+    // receipt.ts's appendReceipt() now also fsyncs the file (and the directory entry)
+    // itself right after writing it, but this call stays as a second, point-in-time
+    // confirmation taken immediately before the `settled` transition below rather than
+    // being removed now that it is redundant in the common case: the two calls can be
+    // separated by other work (the receipt read-back above, warn() calls), and this is
+    // the one guarantee that must hold at THIS instant — if the ledger cannot be
+    // flushed right now for any reason, the `settled` transition — which IS fsync'd —
+    // must not outlive the receipt it attests to across a power loss, leaving a durable
+    // record saying nothing is owed and no receipt to back it. Fail closed: if the
+    // ledger cannot be flushed, the intent stays unsettled and doctor keeps reporting it.
     await fsyncPath(RECEIPT_LEDGER);
   } catch (e) {
     warn(

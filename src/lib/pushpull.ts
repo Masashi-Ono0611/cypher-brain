@@ -109,13 +109,15 @@ export interface SavedLocator {
   recipientsFingerprint: string | undefined;
   sigLocator: string | undefined; // #214: where the "<in>.minisig" sidecar was pushed, if any
   signKeyId: string | undefined; // #250: which signing key produced that sidecar
+  remote: string | undefined; // the rclone `--remote <name>:<path>` destination this push used, if any
 }
 
-// Parse the FIRST locator line of a save-locator file into its (up to 7) fields.
+// Parse the FIRST locator line of a save-locator file into its (up to 8) fields.
 // Returns null when the file is missing/empty — callers treat that as "no previous
 // push recorded". The 3-field legacy format, the 4-field one (+content_digest), the
-// 5-field one (+recipients_fingerprint), the 6-field one (+sig_locator, #214) and the
-// 7-field one (+sign_key_id, #250) all parse here identically.
+// 5-field one (+recipients_fingerprint), the 6-field one (+sig_locator, #214), the
+// 7-field one (+sign_key_id, #250) and the 8-field one (+remote, rclone-destination
+// change detection) all parse here identically.
 export async function readSavedLocatorLine(path: string): Promise<SavedLocator | null> {
   let text: string;
   try {
@@ -128,8 +130,8 @@ export async function readSavedLocatorLine(path: string): Promise<SavedLocator |
     .map((l) => l.trim())
     .find((l) => l && !l.startsWith('#'));
   if (!line) return null;
-  const [locator, backend, sha, contentDigest, recipientsFingerprint, sigLocator, signKeyId] = line.split('\t');
-  return { locator, backend, sha, contentDigest, recipientsFingerprint, sigLocator, signKeyId };
+  const [locator, backend, sha, contentDigest, recipientsFingerprint, sigLocator, signKeyId, remote] = line.split('\t');
+  return { locator, backend, sha, contentDigest, recipientsFingerprint, sigLocator, signKeyId, remote };
 }
 
 // Returns whether an upload actually happened: false for the --skip-unchanged
@@ -163,13 +165,23 @@ export async function readSavedLocatorLine(path: string): Promise<SavedLocator |
 //      content ACCEPT (the invalid-signature checks in restore/verify are
 //      untouched); the gap is that the store quietly keeps a stale-authenticity
 //      copy.
-// All three are compared against the current --save-locator file's fields (4th =
+//   4. the RCLONE DESTINATION (elevated-caution review): for --backend rclone, the
+//      --remote <name>:<path> the ciphertext actually lands at. Without this check,
+//      reusing one --save-locator file after CHANGING --remote (a different rclone
+//      remote name, or the same remote with a different path) would report SKIPPED
+//      using the OLD locator even though nothing was ever backed up to the NEW
+//      destination — the same "the recovery pointer names somewhere the backup
+//      never actually went" class of gap #806/#807 closed for the concurrent case,
+//      here for the sequential one. Irrelevant to every other backend (their put()
+//      ignores --remote entirely — see assertRemoteRequiresRcloneBackend above), so
+//      it never blocks a skip for arweave/turbo/ton-provider/file/ton.
+// All four are compared against the current --save-locator file's fields (4th =
 // content_digest, 5th = recipients_fingerprint, 6th = sig_locator, 7th =
-// sign_key_id). Any missing piece on EITHER side (no sidecar/--digest, a legacy
-// 3/4-field file, a different backend) proceeds normally: skip is an optimization
-// that only fires when EVERY signal is known and equal — an unknown signal must
-// never be treated as "unchanged". --force pushes anyway. Checked before the
-// paid-backend consent gate: a skipped push contacts nothing and spends nothing.
+// sign_key_id, 8th = remote). Any missing piece on EITHER side (no sidecar/--digest,
+// a legacy 3/4/5/6/7-field file, a different backend) proceeds normally: skip is an
+// optimization that only fires when EVERY signal is known and equal — an unknown
+// signal must never be treated as "unchanged". --force pushes anyway. Checked before
+// the paid-backend consent gate: a skipped push contacts nothing and spends nothing.
 async function resolveSkipUnchanged(
   o: CliOptions,
 ): Promise<{ skip: true; locator: string; sigLocator: string | null } | { skip: false }> {
@@ -211,7 +223,15 @@ async function resolveSkipUnchanged(
     : curSigning.signed
       ? prevSigned && !!prev?.signKeyId && prev.signKeyId.toLowerCase() === curSigning.keyId
       : !prevSigned;
-  if (contentUnchanged && recipientsUnchanged && signingUnchanged && prev) {
+  // Only rclone reads --remote at all (see the comment above this function), so every
+  // other backend's destination cannot have "changed" — true unconditionally there.
+  // For rclone, both sides must be KNOWN and equal: a legacy save-locator file with no
+  // 8th field is treated the same as an unknown signal everywhere else in this
+  // function — unknown must never read as "unchanged", or the very bug this closes
+  // (a stale --save-locator surviving a --remote change) would resurface for exactly
+  // the files written before this field existed.
+  const remoteUnchanged = o.backend !== 'rclone' || !!(o.remote && prev?.remote && prev.remote === o.remote);
+  if (contentUnchanged && recipientsUnchanged && signingUnchanged && remoteUnchanged && prev) {
     console.error(
       `SKIPPED: content, recipients and signing unchanged (digest ${cur}) — already pushed to ${o.backend} as ${prev.locator} (--force to push anyway)`,
     );
@@ -692,7 +712,11 @@ async function pushCoreLocked(
       // --from-locator-file reads it back to also fetch the signature alongside the
       // ciphertext. The 7th (#250) is the signing key id inside that sidecar, so the
       // next --skip-unchanged can tell "still signed by the same key" apart from
-      // "signing just got enabled" or "the signing key was rotated".
+      // "signing just got enabled" or "the signing key was rotated". The 8th
+      // (elevated-caution review) is the rclone --remote destination this push
+      // actually used (empty for every other backend), so the next --skip-unchanged
+      // can tell a --remote change apart from an unchanged destination (see
+      // resolveSkipUnchanged's own comment for the gap this closes).
       // This is a POSITIONAL format, so a later field can only occupy its slot if the
       // earlier ones exist too — when contentDigest/recipientsFingerprint are
       // themselves missing (an --in not produced by this cypher-brain's own snapshot,
@@ -700,14 +724,21 @@ async function pushCoreLocked(
       // rather than omitted, so the later ones still land in their correct positions
       // instead of silently being dropped (readSavedLocatorLine's positional
       // destructuring reads an empty field as falsy, same as a genuinely-absent one,
-      // for --skip-unchanged). Trailing empties are dropped, so an unsigned push still
-      // writes exactly the 5-field line it wrote before #214.
+      // for --skip-unchanged). Trailing empties are dropped, so an unsigned,
+      // non-rclone push still writes exactly the 5-field line it wrote before #214.
       const digest = await sha256(o.in);
       const contentDigest = await contentDigestFor(o);
       const recipientsFingerprint = await recipientsFingerprintFor(o);
       const writtenSigning = sigLocator ? await signingStateFor(o) : null;
       const signKeyId = writtenSigning?.signed ? writtenSigning.keyId : null;
-      const optional = [contentDigest ?? '', recipientsFingerprint ?? '', sigLocator ?? '', signKeyId ?? ''];
+      const remoteField = o.backend === 'rclone' ? (o.remote ?? '') : '';
+      const optional = [
+        contentDigest ?? '',
+        recipientsFingerprint ?? '',
+        sigLocator ?? '',
+        signKeyId ?? '',
+        remoteField,
+      ];
       while (optional.length > 0 && optional[optional.length - 1] === '') optional.pop();
       const fields = [locator, o.backend, digest, ...optional];
       // Atomic write: a crash / ENOSPC mid-rewrite must not leave the recovery pointer
@@ -796,14 +827,18 @@ export async function push(o: CliOptions): Promise<boolean> {
 // Used only by cypher-brain-mcp's idempotency-key replay path (#220, multi-model review
 // P2): a repeat snapshot_now call carrying a DIFFERENT locator_file than the original
 // call must still get the recovery pointer written to ITS requested path, even though a
-// replay re-uploads nothing. Deliberately minimal — locator/backend/sha256 only, NOT the
-// content-digest/recipients-fingerprint/signing fields the full save-locator write above
-// derives by re-reading the sidecars next to `o.in` at push TIME. Re-deriving those here
-// would mean re-reading whatever currently sits at the ORIGINAL call's `out` path, which
-// the idempotency log does not itself vouch is still the same file an agent could have
-// since overwritten with something unrelated. The three fields written here are exactly
-// the ones the idempotency log already recorded at the time of the original successful
-// push, so there is nothing to re-derive or risk going stale.
+// replay re-uploads nothing. `fields` is deliberately minimal — locator/backend/sha256
+// only, NOT the content-digest/recipients-fingerprint/signing/remote fields the full
+// save-locator write above derives by re-reading the sidecars next to `o.in` at push
+// TIME. Re-deriving those here would mean re-reading whatever currently sits at the
+// ORIGINAL call's `out` path, which the idempotency log does not itself vouch is still
+// the same file an agent could have since overwritten with something unrelated. The
+// three fields in `fields` are exactly the ones the idempotency log already recorded at
+// the time of the original successful push, so there is nothing to re-derive or risk
+// going stale from THIS function's inputs — but when the target file already records
+// the SAME locator (a real push already ran and wrote those richer fields), this does
+// NOT discard them: see writeReplayedSavedLocatorLocked's own comment for why a
+// downgrade would be its own regression.
 export async function writeReplayedSavedLocator(
   savedLocatorPath: string,
   fields: { locator: string; backend: string; sha256: string },
@@ -831,7 +866,32 @@ export async function writeReplayedSavedLocator(
           'Point locator_file at a path of its own, or remove that file if the record it holds is no longer wanted.',
       );
     }
-    await writeReplayedSavedLocatorLocked(savedLocatorPath, fields);
+    // Elevated-caution review, round 2: a matching LOCATOR alone is not sufficient
+    // grounds to trust `existing`'s other fields enough to carry them forward — refuse
+    // (rather than silently combine two disagreeing records into one) if the same
+    // locator is somehow already recorded under a DIFFERENT backend or a DIFFERENT
+    // ciphertext sha256 than this replay's own. That combination should be unreachable
+    // in ordinary operation (a locator's own schema prefix ties it to one backend, and
+    // the same locator string with a different sha would mean two uploads collided on
+    // one name), but writeReplayedSavedLocatorLocked's preservation logic below trusts
+    // `existing` precisely BECAUSE the locator matched — if backend/sha do not also
+    // match, that trust is unfounded, and preserving `existing`'s optional fields
+    // alongside `fields`'s own backend/sha would fabricate a record naming a
+    // combination that never actually existed.
+    if (
+      existing &&
+      existing.locator === fields.locator &&
+      (existing.backend !== fields.backend || existing.sha !== fields.sha256)
+    ) {
+      throw new Error(
+        `${savedLocatorPath} already records locator ${JSON.stringify(fields.locator)} under backend=` +
+          `${JSON.stringify(existing.backend)}/sha256=${JSON.stringify(existing.sha)}, which does not match this ` +
+          `replayed call's backend=${JSON.stringify(fields.backend)}/sha256=${JSON.stringify(fields.sha256)} — ` +
+          'refusing to combine the two into one record. This should not happen under normal operation; inspect ' +
+          'the file by hand.',
+      );
+    }
+    await writeReplayedSavedLocatorLocked(savedLocatorPath, fields, existing);
   } finally {
     await release();
   }
@@ -840,11 +900,34 @@ export async function writeReplayedSavedLocator(
 async function writeReplayedSavedLocatorLocked(
   savedLocatorPath: string,
   fields: { locator: string; backend: string; sha256: string },
+  existing: SavedLocator | null,
 ): Promise<void> {
   await mkdir(dirname(resolve(savedLocatorPath)), { recursive: true });
+  // Elevated-caution review: a replay whose locator MATCHES what is already recorded
+  // (the only case reaching this point — the caller above already refused a mismatch)
+  // must not DOWNGRADE richer metadata a real push already wrote here. content_digest/
+  // recipients_fingerprint/sig_locator/sign_key_id/remote are exactly what a later
+  // --skip-unchanged run compares against (resolveSkipUnchanged above), and this
+  // replay uploaded nothing new to re-derive them from — see this function's own doc
+  // comment for why they are not re-derived here. Truncating the line back down to 3
+  // bare fields would silently discard that optimization (and, for a signed/rclone
+  // push, force an unnecessary and possibly PAID re-push the next time --skip-
+  // unchanged runs) even though nothing about the underlying push actually changed.
+  const preserved =
+    existing?.locator === fields.locator
+      ? [
+          existing.contentDigest ?? '',
+          existing.recipientsFingerprint ?? '',
+          existing.sigLocator ?? '',
+          existing.signKeyId ?? '',
+          existing.remote ?? '',
+        ]
+      : [];
+  while (preserved.length > 0 && preserved[preserved.length - 1] === '') preserved.pop();
+  const allFields = [fields.locator, fields.backend, fields.sha256, ...preserved];
   const tmp = `${savedLocatorPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   try {
-    await writeFile(tmp, `${fields.locator}\t${fields.backend}\t${fields.sha256}\n`, { flag: 'w' });
+    await writeFile(tmp, `${allFields.join('\t')}\n`, { flag: 'w' });
     await rename(tmp, savedLocatorPath);
   } catch (e) {
     await rm(tmp, { force: true });

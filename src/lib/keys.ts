@@ -1,6 +1,8 @@
 // keygen + identity/recipient helpers.
-import { mkdir, writeFile, rm, rename, chmod, readFile, stat } from 'node:fs/promises';
+import { mkdir, open, rename, rm, chmod, readFile, type FileHandle } from 'node:fs/promises';
+import { constants as FS_CONST } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import { dirname } from 'node:path';
 import {
   HOME,
   IDENTITY,
@@ -13,7 +15,7 @@ import {
 } from './config.js';
 import { generateKeypair, identityFileText, askNewPassphrase, wrapIdentity } from './crypt.js';
 import { keygenSignAt } from './minisign.js';
-import { exists } from './util.js';
+import { exists, syncDirectoryChain } from './util.js';
 import type { CliOptions } from './types.js';
 
 // Core of keygen(), parameterized over WHERE to write (home dir + identity/recipient
@@ -71,6 +73,25 @@ function elideRecipient(recipient: string): string {
 // the SAME fail-closed, no-clobber-unless-force write this module already gives the
 // age identity, instead of a hand-rolled second write path with its own TOCTOU/partial-
 // write behavior to keep in sync.
+//
+// Both branches fsync the file's own bytes (fh.sync(), before the rename in the
+// --force branch, so the rename can never make VISIBLE a payload that has not yet
+// reached disk) AND the directory holding `path` afterward — an identity/JWK/wallet
+// file this codebase tells the operator "back this up now" for is exactly the kind of
+// write that must survive a crash the instant after it returns, not merely reach the
+// kernel page cache. Same durability posture pending-spend.ts's own append already
+// has, applied here to the credential writes this module owns.
+//
+// The directory sync goes through util.ts's syncDirectoryChain(), NOT a bare
+// fsyncPath(dirname(path)) call (elevated-caution review, Codex round 2): fsyncPath()
+// opens the directory as a file handle, which win32 cannot do at all — syncDirectoryChain
+// is what carries the `if (process.platform === 'win32') return;` guard. Calling
+// fsyncPath() on a directory directly here would make `keygen`/`wallet create` throw
+// unconditionally on Windows the instant after successfully writing the file.
+// `undefined` for its second argument is correct in both call sites below: `dirname(path)`
+// is always an already-existing directory by the time writeKeyFile runs (keygenAt/
+// keygenSignAt/wallet.ts's createKeyFile all mkdir it first), so there is no newly-created
+// ancestor chain to walk — only `dirname(path)` itself needs syncing.
 export async function writeKeyFile(
   path: string,
   payload: string | Uint8Array,
@@ -78,17 +99,31 @@ export async function writeKeyFile(
   force: boolean,
 ): Promise<void> {
   if (!force) {
-    await writeFile(path, payload, { mode, flag: 'wx' });
+    const fh = await open(path, 'wx', mode);
+    try {
+      await fh.writeFile(payload);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    await syncDirectoryChain(dirname(path), undefined);
     return;
   }
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  await writeFile(tmp, payload, { mode, flag: 'wx' });
+  const fh = await open(tmp, 'wx', mode);
+  try {
+    await fh.writeFile(payload);
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
   try {
     await rename(tmp, path);
   } catch (e) {
     await rm(tmp, { force: true });
     throw e;
   }
+  await syncDirectoryChain(dirname(path), undefined);
 }
 
 // Preserve the OLD identity's exact bytes before a --force run may replace it, as
@@ -113,16 +148,62 @@ export async function writeKeyFile(
 // (a directory, a FIFO, ...) sitting there instead of a real identity: there is
 // nothing sensible to preserve in that case, and the write that follows this call
 // already fails on its own, with a clear filesystem error, the moment it hits the
-// same obstacle. The stat()-then-isFile() guard before ever calling readFile()
-// mirrors doctor.ts's identical guard on the same class of path, for the same
-// reason — readFile() on a FIFO with no writer blocks indefinitely.
+// same obstacle.
+//
+// Classified and read through a SINGLE open file descriptor, not stat(path) followed
+// by a separate readFile(path) (TOCTOU close, elevated-caution review): those are two
+// independent syscalls against the PATH, and a concurrent `--force` run's own
+// write-then-rename (writeKeyFile above) can land in the gap between them — this
+// process could then classify one generation of the file (the one stat() saw) and back
+// up a DIFFERENT one (whatever readFile() finds moments later), silently mislabeling
+// which identity the backup actually holds. Opening the path once and then running
+// fstat()/read() against that SAME descriptor pins both operations to one inode
+// regardless of what happens to the path afterward.
+//
+// Opened with O_NONBLOCK (elevated-caution review, Codex round 2 — a plain open(path,
+// 'r') blocks INDEFINITELY if `path` is a FIFO with no writer connected yet, which is
+// exactly the hang doctor.ts's own stat()-before-read guard on this same class of path,
+// and this function's OWN original stat()-then-readFile() form, both existed to avoid;
+// switching to a bare open() as the FIRST call reintroduced it). O_NONBLOCK has no
+// effect on the read further down, which only ever runs against a confirmed REGULAR
+// file (gated by `st.isFile()` below) — a FIFO/socket/directory is rejected before
+// fh.readFile() is ever reached.
+//
+// ENOENT — genuinely nothing at `path` — is the ONLY open() failure treated as "nothing
+// to preserve" (elevated-caution review, Codex round 2: the original stat()+readFile()
+// form let a readFile() failure on an unreadable-but-PRESENT file — EACCES, say —
+// propagate uncaught out of this function, which aborts the whole --force keygen run
+// before either destructive write runs. Catching every open() error the same way,
+// including EACCES, would silently let --force replace an identity it could not
+// verify it had backed up — the opposite of what #786 exists to guarantee).
 export async function backupIdentityFile(path: string): Promise<string | undefined> {
-  const st = await stat(path).catch(() => null);
-  if (!st?.isFile()) return undefined;
-  const raw = await readFile(path);
-  const backupPath = `${path}.bak-${Date.now()}-${randomBytes(4).toString('hex')}`;
-  await writeFile(backupPath, raw, { mode: 0o600, flag: 'wx' });
-  return backupPath;
+  let fh: FileHandle;
+  try {
+    fh = await open(path, FS_CONST.O_RDONLY | FS_CONST.O_NONBLOCK);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return undefined;
+    throw e;
+  }
+  try {
+    const st = await fh.stat().catch(() => null);
+    if (!st?.isFile()) return undefined;
+    const raw = await fh.readFile();
+    const backupPath = `${path}.bak-${Date.now()}-${randomBytes(4).toString('hex')}`;
+    const bfh = await open(backupPath, 'wx', 0o600);
+    try {
+      await bfh.writeFile(raw);
+      await bfh.sync(); // durability — see writeKeyFile's own fsync discipline note above
+    } finally {
+      await bfh.close();
+    }
+    // syncDirectoryChain(), not a bare fsyncPath(dirname(...)) — see writeKeyFile's own
+    // comment on this exact point (win32 cannot open a directory as a file handle at
+    // all; `dirname(backupPath)` === `dirname(path)`, an already-existing directory).
+    await syncDirectoryChain(dirname(backupPath), undefined);
+    return backupPath;
+  } finally {
+    await fh.close();
+  }
 }
 
 export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
@@ -231,11 +312,33 @@ async function wrapInPlace(identityPath: string): Promise<void> {
     throw new Error(`${identityPath} is already passphrase-wrapped (age ciphertext) — nothing to do.`);
   }
   console.log('Set a passphrase to protect the identity at rest (you will enter it on restore/verify):');
-  const payload = await wrapIdentity(rawText, await askNewPassphrase());
+  const passphrase = await askNewPassphrase();
+  // TOCTOU close (elevated-caution review), NARROWED FURTHER in round 2: `raw` above
+  // was read before BOTH askNewPassphrase() (an interactive TTY prompt — enter +
+  // confirm — that can take arbitrarily long) AND wrapIdentity() (an scrypt-based KDF —
+  // a real, non-trivial async CPU operation, not merely a syscall). If a concurrent
+  // `keygen --force` replaced identityPath with a brand-new keypair at ANY point before
+  // the write below, writing back a wrap of the STALE bytes read above would silently
+  // discard that new identity — and every future snapshot the new identity's recipient
+  // was about to protect — with no warning at all. The re-check is therefore placed
+  // AFTER wrapIdentity() runs, not before it (round 1 of this fix checked right after
+  // the passphrase prompt but before wrapIdentity(), which still left the KDF's own
+  // duration inside the unchecked window) — narrowing the window to the few syscalls
+  // between this check and the write below, the same kind of narrowing (not a full
+  // close) push-lock.ts's own stealLock() re-check documents for its own TOCTOU gap.
+  const payload = await wrapIdentity(rawText, passphrase);
+  const recheck = await readFile(identityPath).catch(() => null);
+  if (recheck === null || !recheck.equals(raw)) {
+    throw new Error(
+      `${identityPath} changed while waiting for the passphrase — refusing to overwrite what may now be a ` +
+        'different identity. Re-run "keygen --wrap-in-place" once nothing else is writing to this file.',
+    );
+  }
   // Atomic temp-then-rename (writeKeyFile's force=true path, same helper keygenAt's
   // own --force replace uses above) rather than a plain writeFile: the pre-existing
-  // identityPath is only ever replaced once the new payload is fully written, so a
-  // crash/Ctrl-C mid-write can't leave a truncated, unusable identity file behind.
+  // identityPath is only ever replaced once the new payload is fully written (and
+  // fsync'd — see writeKeyFile's own durability note), so a crash/Ctrl-C mid-write
+  // can't leave a truncated, unusable identity file behind.
   await writeKeyFile(identityPath, payload, 0o600, true);
   console.log(`identity re-written, passphrase-wrapped: ${identityPath}`);
 }

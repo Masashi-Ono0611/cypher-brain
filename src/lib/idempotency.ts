@@ -16,10 +16,11 @@
 // a save-locator), so there is no positional-TSV backward-compatibility surface to
 // preserve, and JSON-per-line is simpler to extend than a growing positional format would
 // be.
-import { writeFile, readFile, rename, rm, mkdir, stat } from 'node:fs/promises';
+import { readFile, rename, rm, mkdir, open, link, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
-import { errMsg, readJsonlLog } from './util.js';
+import { errMsg, readJsonlLog, syncDirectoryChain } from './util.js';
+import { warn } from './warn.js';
 
 // One stored line. `fingerprint` is an opaque, caller-computed digest of whatever fields
 // define "the same call" for that tool (snapshot_now's is dirs/pg/recipients/out/backend/
@@ -120,6 +121,23 @@ async function readAllRecords(path: string): Promise<ReadResult> {
         typeof p.key === 'string' &&
         typeof p.tool === 'string' &&
         typeof p.recordedAt === 'string' &&
+        // Elevated-caution review: a recordedAt that does not even PARSE as a date
+        // (a truncated write, a hand edit, a future format this reader does not
+        // understand) is a shape problem, not a timing one — checked here, in the
+        // structural validator, rather than left for isFresh() below to quietly
+        // read as "0/NaN ms old, therefore not fresh, therefore expired". Those two
+        // outcomes look identical to isLive() for a `retention: 'ttl'` record — a
+        // TTL record with a broken timestamp would silently vanish from every
+        // lookup as if it had aged out normally — but they are NOT the same thing:
+        // an expired record safely means "no prior call, do the real work"; a
+        // record this reader cannot even date is one whose CONTENTS cannot be
+        // trusted, including whether it was ever meant to be 'permanent' (a
+        // tombstone for a payment whose outcome was never confirmed — see
+        // IdempotencyRetention's own doc comment). Failing the shape check here
+        // routes it through this file's existing `corrupted` machinery instead,
+        // which already fails BOTH lookup and record-write closed rather than
+        // silently treating "unreadable" as "safe to ignore".
+        Number.isFinite(Date.parse(p.recordedAt)) &&
         typeof p.fingerprint === 'string' &&
         p.result &&
         typeof p.result === 'object' &&
@@ -147,6 +165,12 @@ async function readAllRecords(path: string): Promise<ReadResult> {
   return { records: items, corrupted: skippedLines > 0 };
 }
 
+// The `Number.isFinite(t)` guard below is now belt-and-suspenders: readAllRecords'
+// own shape validator (above) already rejects a StoredLine whose recordedAt does not
+// parse as a date, routing it through `corrupted` instead of ever reaching here — see
+// that validator's own comment for why a malformed timestamp must fail closed rather
+// than silently read as "expired". Kept here too since this function has no other way
+// to enforce it if ever called with data that bypassed that validator.
 const isFresh = (recordedAt: string, ttlSeconds: number, now: number): boolean => {
   const t = Date.parse(recordedAt);
   return Number.isFinite(t) && now - t < ttlSeconds * 1000;
@@ -241,29 +265,204 @@ const LOCK_RETRY_DELAY_MS = 50;
 // polling past the staleness threshold gets at least one more chance to observe it.
 const LOCK_MAX_WAIT_MS = LOCK_STALE_MS + LOCK_RETRY_DELAY_MS * 20;
 
+// `pidAlive` is a small, deliberate DUPLICATE of push-lock.ts's own local helper of the
+// same name, not an import: push-lock.ts imports newLockToken/lockTokenPid/
+// releaseLockFileIfOwned FROM this file, so this file taking a dependency back on
+// push-lock.ts for one three-line function would create a cycle. Kept byte-identical
+// to push-lock.ts's copy on purpose.
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
+// Elevated-caution review, three findings fixed together here (they share one root
+// cause: this lock used to be a BARE mtime-based staleness check with no ownership
+// token at all, unlike push-lock.ts's more careful design, which this now mirrors):
+//
+//  1. No ownership token. The lock body used to be just `String(process.pid)`, and a
+//     "steal" was a blind `rm()` of whatever sat at lockPath with no way to confirm
+//     what was actually being removed — two waiters racing to steal the SAME
+//     abandoned lock could each unlink the OTHER's freshly-created lock, defeating
+//     the exclusion this file exists to provide. newLockToken() (pid.timestamp.random
+//     — the same format push-lock.ts already writes, and already imported by it FROM
+//     here) plus a steal-by-RENAME (push-lock.ts's stealLock(): move the exact lock
+//     aside, re-read it, and put it back if the move turns out to have grabbed a
+//     different — newer, live — lock) closes that: of two waiters, exactly one
+//     rename succeeds, and the loser's own rename fails ENOENT rather than silently
+//     deleting the winner's claim.
+//  2. A busy-loop on a persistent non-ENOENT stat()/readFile() error. The old code's
+//     catch swallowed EVERYTHING from that read into a bare `continue` with no
+//     deadline check in that branch at all — for an ENOENT (the lock was released
+//     between our failed create and this read) retrying immediately is correct, but
+//     for a PERSISTENT error (EACCES on the lock directory, the path replaced by
+//     something unreadable, …) the exact same error recurs on every immediate retry
+//     too, pinning a core to reproducing it forever. Only ENOENT retries immediately
+//     now; any other read failure falls back to the same bounded wait/backoff a held
+//     lock gets, so it fails closed via IdempotencyStoreError instead of spinning.
+//  3. Release is now ownership-checked (releaseLockFileIfOwned, shared with
+//     claimIdempotencyKey/push-lock.ts), not an unconditional `rm()` — the latter
+//     would delete a lock this process no longer actually holds (one that was
+//     stolen from it after being judged abandoned), out from under whoever holds it
+//     now.
+interface LockHolder {
+  text: string;
+  mtimeMs: number;
+}
+
+// Sequentially, not in parallel (mirrors push-lock.ts's readHolder): a lock replaced in
+// between would otherwise pair one generation's bytes with another generation's mtime.
+// null means GONE (ENOENT — released between a failed create and this read, or between
+// two calls to this function), a normal/retryable state; any OTHER failure (EACCES on
+// the lock directory, an I/O error, ...) throws instead, since a lock that cannot be
+// read is neither confirmably held nor confirmably free.
+async function readLockHolder(lockPath: string): Promise<LockHolder | null> {
+  try {
+    const text = await readFile(lockPath, 'utf8');
+    const mtimeMs = (await stat(lockPath)).mtimeMs;
+    return { text, mtimeMs };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+// Abandoned exactly like push-lock.ts's own isAbandoned(): its recorded pid is gone, or
+// the token does not parse at all AND it has sat past the staleness window (an
+// unparseable-but-fresh lock is only ever the tiny window between another process's
+// exclusive-create and its own fsync'd write completing).
+function isLockAbandoned(holder: LockHolder): boolean {
+  const pid = lockTokenPid(holder.text);
+  const stale = Date.now() - holder.mtimeMs > LOCK_STALE_MS;
+  return pid === null ? stale : !pidAlive(pid) || stale;
+}
+
 async function withLogLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const lockPath = `${path}.lock`;
-  await mkdir(dirname(resolve(path)), { recursive: true });
+  const dir = dirname(resolve(path));
+  const firstCreated = await mkdir(dir, { recursive: true });
+  // Elevated-caution review, Codex round 2 (Critical, claim durability #2): this is the
+  // mkdir that actually creates the directory tree the FIRST time this log is ever
+  // touched — recordIdempotencyResult's own `fn()` below does a SECOND mkdir(dir,
+  // {recursive:true}) later, but by then this one has already made `dir` exist, so that
+  // second call's own `firstCreated` would always read back as undefined and its own
+  // syncDirectoryChain call would never reach the ancestors THIS call is the one that
+  // actually created. Syncing here, right after creating them, is what keeps a crash on
+  // a brand-new CYPHER_BRAIN_HOME from losing the directory ENTRIES the lock file (and
+  // the log file fn() writes) depend on.
+  await syncDirectoryChain(dir, firstCreated);
+  const token = newLockToken();
   const deadline = Date.now() + LOCK_MAX_WAIT_MS;
   for (;;) {
     try {
-      // Exclusive create: succeeds only if no OTHER holder currently owns the lock — this
-      // (not the read-modify-rename itself) is the actual mutual-exclusion primitive.
-      await writeFile(lockPath, String(process.pid), { flag: 'wx' });
+      // Exclusive create: succeeds only if no OTHER holder currently owns the lock —
+      // this (not the read-modify-rename itself) is the actual mutual-exclusion
+      // primitive. fsync'd before this process ever treats itself as the holder, so
+      // the claim itself is durable (and so a concurrent reader can never observe an
+      // exclusively-created-but-still-empty lock file as "unparseable").
+      const fh = await open(lockPath, 'wx');
+      try {
+        await fh.writeFile(token, 'utf8');
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
       break;
     } catch (e) {
       if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') throw e;
-      // Someone else holds it — unless it looks abandoned (a process that crashed between
-      // acquiring and releasing it), in which case steal it rather than wait forever for a
-      // lock nobody will ever release.
+      let holder: LockHolder | null;
       try {
-        const st = await stat(lockPath);
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-          await rm(lockPath, { force: true });
-          continue;
+        holder = await readLockHolder(lockPath);
+      } catch (readErr) {
+        // See finding 2 above: a persistent error recurs on every immediate retry
+        // too, so this falls back to the same bounded wait/backoff a held lock gets
+        // rather than busy-looping.
+        if (Date.now() > deadline) {
+          throw new IdempotencyStoreError(
+            `cannot read the idempotency log lock at ${lockPath} ` +
+              `(${(readErr as NodeJS.ErrnoException)?.code ?? 'unknown error'}) — refusing to write without it ` +
+              'rather than risk a lost update.',
+            { cause: readErr },
+          );
         }
-      } catch {
-        continue; // the lock disappeared between our failed create and this stat — retry now
+        await new Promise((r) => setTimeout(r, LOCK_RETRY_DELAY_MS));
+        continue;
+      }
+      if (holder === null) continue; // released between our failed create and this read — retry now, no backoff needed
+      if (isLockAbandoned(holder)) {
+        // Re-read IMMEDIATELY before the rename and re-judge (elevated-caution
+        // review, Codex round 2, Critical: "the lock rewrite still permits
+        // concurrent owners" — this file's first pass at this fix judged abandoned
+        // from `holder` above and went straight to the rename, with no adjacent
+        // re-check; mirroring push-lock.ts's stealLock() exactly, as intended,
+        // means ALSO doing this second read right before acting, narrowing the
+        // window between "judged abandoned" and "acted on it" to two adjacent
+        // syscalls rather than however long this iteration's earlier work took).
+        // Without it, a SEPARATE waiter that already completed its own steal-and-
+        // reacquire cycle in the time since `holder` was read would have its
+        // fresh, LIVE lock renamed away here instead — reopening, for a narrower
+        // window, the exact concurrent-owners race this rewrite exists to close.
+        // A failed re-read (including ENOENT, meaning someone else already
+        // resolved it) is treated as "cannot confirm — do not steal", not as
+        // license to proceed; the next loop iteration re-evaluates from scratch,
+        // and a PERSISTENT read failure still gets the bounded backoff above on
+        // its next pass through the primary read.
+        const fresh = await readLockHolder(lockPath).catch(() => null);
+        if (!fresh || fresh.text !== holder.text || !isLockAbandoned(fresh)) continue;
+        // Steal via rename, not a blind rm (see finding 1 above): of two waiters
+        // that both judge the SAME lock abandoned, exactly one moves it aside — the
+        // other's rename fails ENOENT instead of unlinking the winner's fresh claim.
+        const side = `${lockPath}.stale.${token}`;
+        try {
+          await rename(lockPath, side);
+        } catch (renameErr) {
+          if ((renameErr as NodeJS.ErrnoException)?.code === 'ENOENT') continue; // someone else already took/freed it
+          throw renameErr;
+        }
+        // A read failure here is NOT "it matched" (push-lock.ts's own stealLock()
+        // documents the same rule): treating it as one would discard whatever was
+        // moved aside, which — if it was in fact a NEW holder's lock claimed in the
+        // gap between the read above and this rename — leaves that holder running
+        // with nothing recording that it holds anything. Unknown goes down the
+        // restore path below, same as a known mismatch.
+        const moved = await readFile(side, 'utf8').catch(() => null);
+        if (moved === null || moved !== holder.text) {
+          // Not (provably) the lock just judged abandoned. Put it back rather than
+          // discard it: `link` (not a re-write) restores the ORIGINAL bytes even
+          // when they could not be read, and fails with EEXIST rather than
+          // clobbering if a third party has since created its own lock at that
+          // path. If it fails, the side file is deliberately KEPT (not removed) —
+          // a holder whose lock is missing is a holder nobody can see, so leaving
+          // the evidence beats deleting it silently.
+          //
+          // Residual, stated rather than silently assumed away (Codex round 2):
+          // this restore is itself two separate syscalls (rename-away, then
+          // link-back), during which `lockPath` briefly does not exist at all — a
+          // THIRD process racing to acquire in that exact instant can create its
+          // own lock there before this restore runs, in which case `link` below
+          // fails EEXIST and this branch's warn() fires. That is the same class of
+          // narrowing-not-closing residual push-lock.ts's own module header
+          // documents for this identical rename-then-maybe-restore pattern
+          // ("no path-based lock can make [check-then-act] atomic... a guarantee
+          // stronger than that needs an OS-level lock... a different change from
+          // this one") — closing it fully needs the same OS-level advisory lock
+          // that file already rules out of scope for this codebase.
+          try {
+            await link(side, lockPath);
+            await rm(side, { force: true });
+          } catch {
+            warn(
+              `could not restore an idempotency log lock that was moved aside while recovering a stale one — ` +
+                `${side} holds its contents; remove that file once no push/paid call is running`,
+            );
+          }
+          continue; // re-evaluate from scratch — this may or may not be resolved now
+        }
+        await rm(side, { force: true }).catch(() => {});
+        continue; // the path is now clear — the top of the loop's open('wx') retries
       }
       if (Date.now() > deadline) {
         throw new IdempotencyStoreError(
@@ -277,7 +476,7 @@ async function withLogLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
   } finally {
-    await rm(lockPath, { force: true });
+    await releaseLockFileIfOwned(lockPath, token);
   }
 }
 
@@ -383,10 +582,32 @@ function claimLockPath(path: string, tool: string, key: string): string {
  */
 export async function claimIdempotencyKey(path: string, tool: string, key: string): Promise<() => Promise<void>> {
   const lockPath = claimLockPath(path, tool, key);
-  await mkdir(dirname(resolve(path)), { recursive: true });
+  const dir = dirname(resolve(path));
+  const firstCreated = await mkdir(dir, { recursive: true });
   const token = newLockToken();
   try {
-    await writeFile(lockPath, token, { flag: 'wx' });
+    // fsync'd (elevated-caution review) before this call ever returns a release
+    // function to its caller: the claim is what stands between a retried paid MCP
+    // call and paying twice, so the claim itself must be durable, not merely
+    // reached the kernel page cache, the instant this call reports success.
+    const fh = await open(lockPath, 'wx');
+    try {
+      await fh.writeFile(token, 'utf8');
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    // Elevated-caution review, Codex round 2 (Critical: "claim durability remains
+    // incomplete") — syncing the fd's CONTENT is not enough: the DIRECTORY ENTRY this
+    // exclusive create just added is a separate durability fact, and an fsync'd file
+    // whose creation is still only in the page cache can come back missing entirely
+    // after a crash. For a claim specifically, "missing entirely" means a retry after
+    // the crash sees no claim at all and is free to spend again — exactly the
+    // double-spend window this function exists to close. Also covers the (rare)
+    // case where `dir` itself did not exist yet: `firstCreated` carries every
+    // ancestor this call's own mkdir just created, so those directory entries are
+    // synced too, not only the immediate one.
+    await syncDirectoryChain(dir, firstCreated);
   } catch (e) {
     if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') throw e;
     // Best-effort age hint for the operator only — never used to decide anything (see
@@ -554,14 +775,28 @@ export async function recordIdempotencyResult(
       retention,
     };
     const lines = [...kept, fresh].map((r) => JSON.stringify(r));
-    await mkdir(dirname(resolve(path)), { recursive: true });
+    const dir = dirname(resolve(path));
+    const firstCreated = await mkdir(dir, { recursive: true });
     const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
     try {
-      await writeFile(tmp, `${lines.join('\n')}\n`, { flag: 'w' });
+      // fsync'd before the rename (elevated-caution review), the same "write, sync,
+      // THEN rename" ordering keys.ts's writeKeyFile/pending-spend.ts's appendLine
+      // use — the rename must never make a payload VISIBLE at `path` before it has
+      // actually reached disk, and the directory entry the rename creates/updates is
+      // synced too (util.ts's syncDirectoryChain) so the rewrite itself survives a
+      // crash the instant after this call returns.
+      const fh = await open(tmp, 'w');
+      try {
+        await fh.writeFile(`${lines.join('\n')}\n`, 'utf8');
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
       await rename(tmp, path);
     } catch (e) {
       await rm(tmp, { force: true });
       throw e;
     }
+    await syncDirectoryChain(dir, firstCreated);
   });
 }

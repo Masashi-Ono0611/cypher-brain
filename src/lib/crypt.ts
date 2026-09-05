@@ -15,6 +15,7 @@ import { readFile } from 'node:fs/promises';
 import { spawn, type ChildProcess, type StdioNull, type StdioPipe } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { StringDecoder } from 'node:string_decoder';
 import {
   Encrypter,
   Decrypter,
@@ -71,6 +72,25 @@ export function identityFileText(identity: string, recipient: string): string {
   return `# created: ${new Date().toISOString()}\n# public key: ${recipient}\n${identity}\n`;
 }
 
+// A rejected recipient is described only by STRUCTURE (its length, and a short, fixed
+// prefix), never verbatim (elevated-caution review): a caller who mixes up flags — or
+// hands a recipients file that accidentally contains a private identity line — can pass
+// a SECRET key here instead of a public recipient. Embedding the raw rejected value in
+// the thrown error (as this used to do) meant a full secret key could end up echoed
+// into whatever reads that error — a log, a CI transcript, a bug report — which is
+// exactly the leak this codebase's own secret-handling discipline elsewhere (util.ts's
+// redactPgConn, restore.ts's various "never print the secret itself" comments) exists
+// to prevent. The prefix is capped at a small, FIXED length regardless of the value's
+// own length — long enough to recognize a class of mistake (a truncated age1…
+// recipient, an accidentally-pasted "AGE-SECRET-KEY-1…" identity, a stray ssh key,
+// plain garbage) without exposing enough of an actual secret's bytes to narrow it down.
+const REJECTED_RECIPIENT_PREFIX_CHARS = 12;
+function describeRejectedRecipient(r: string): string {
+  const prefix = r.slice(0, REJECTED_RECIPIENT_PREFIX_CHARS);
+  const more = r.length > REJECTED_RECIPIENT_PREFIX_CHARS ? '…' : '';
+  return `${r.length} char(s), starting ${JSON.stringify(prefix)}${more}`;
+}
+
 // Stryker restore all
 export function newEncrypter(recipients: string[]): Encrypter {
   const e = new Encrypter();
@@ -81,7 +101,10 @@ export function newEncrypter(recipients: string[]): Encrypter {
       // Note this is STRICTER than `age -R`, which also accepted ssh-* recipient
       // lines — typage takes native age recipients only, so a stray ssh key in a
       // recipients file is now rejected here even without the recipient pin.
-      throw new Error(`invalid recipient ${JSON.stringify(r)}: ${errMsg(err)}`);
+      // errMsg(err) itself is safe to include verbatim: typage's own rejection
+      // (age-encryption's recipients.js) is always the fixed string "invalid
+      // recipient", never the value being rejected.
+      throw new Error(`invalid recipient (${describeRejectedRecipient(r)}): ${errMsg(err)}`);
     }
   }
   return e;
@@ -300,8 +323,20 @@ function promptHidden(question: string): Promise<string> {
       stdin.pause();
       process.stderr.write('\n');
     };
+    // #<elevated-caution review>: a STATEFUL decoder, not d.toString('utf8') per chunk
+    // — a raw-mode TTY delivers 'data' events per read() syscall, which can split a
+    // multibyte UTF-8 character (e.g. one of a Japanese passphrase's characters, 3
+    // bytes) across two separate chunks. Decoding each chunk independently turns the
+    // truncated lead bytes into a U+FFFD replacement character in the FIRST chunk and
+    // garbles the leftover continuation bytes in the SECOND — silently corrupting the
+    // passphrase in a way that only surfaces LATER, when the operator tries to unwrap
+    // an identity with the passphrase they actually typed and it no longer matches.
+    // node:string_decoder's StringDecoder buffers any incomplete trailing byte
+    // sequence and prepends it to the next .write() call, so a character split across
+    // chunk boundaries decodes correctly either way.
+    const decoder = new StringDecoder('utf8');
     const onData = (d: Buffer) => {
-      for (const ch of d.toString('utf8')) {
+      for (const ch of decoder.write(d)) {
         if (ch === '') {
           cleanup();
           return reject(new Error('interrupted'));
