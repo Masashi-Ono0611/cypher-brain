@@ -39,12 +39,15 @@ import {
   setActiveRestoreOutDir,
   setActiveRestoreScratchDir,
   setActiveVerifyScratchDir,
+  addActiveExpandScratchDir,
+  removeActiveExpandScratchDir,
 } from './signal-guard.js';
 import { didYouMean, nearestName } from './suggest.js';
 import { moodForVerdict, printMascot, printJson } from './ui.js';
 import { pull, signatureGap } from './pushpull.js';
 import { recordAudit } from './audit.js';
 import { UsageError } from './errors.js';
+import { warn } from './warn.js';
 import type { CliOptions } from './types.js';
 
 // #228: this file's StrykerJS mutation run (`npm run mutation-test`) is deliberately
@@ -669,7 +672,44 @@ async function moveNoClobber(s: string, d: string, entry: Dirent): Promise<void>
 // expansion of this exact component (see expandComponents below); a first-time
 // expansion instead renames the whole freshly-extracted tree into place in one atomic
 // step and never calls this at all.
-async function mergeNoClobber(src: string, dest: string): Promise<void> {
+async function mergeNoClobber(src: string, dest: string, opts: { revalidateDest?: boolean } = {}): Promise<void> {
+  // #<TOCTOU audit finding, restore.ts:706>: `revalidateDest` is set ONLY by this
+  // function's own recursive call below, never by either external caller
+  // (expandComponents()/restoreImpl() call the top level with it unset, exactly as
+  // before — deliberately, since restoreImpl's top-level `dest` can legitimately be a
+  // symlink the caller pointed --out-dir at, and refusing that here would be a real
+  // regression, not a security fix).
+  //
+  // The recursive call's own `dest` is always a SUBDIRECTORY this same function just
+  // decided — moments ago, via the loop's own `dStat = await lstat(d)` below — was a
+  // real, plain directory, safe to merge into. WITHOUT this option, that ONE decision
+  // would be trusted for the ENTIRE remaining lifetime of `dest`: every one of `src`'s
+  // (potentially many) entries, moved or recursed into one at a time below, real
+  // wall-clock time apart. A local attacker with write access to --out-dir's ancestry
+  // could unlink `dest` and drop a symlink at the same name partway through that loop,
+  // after which every LATER `join(dest, entry.name)` write in the SAME loop would
+  // resolve through it instead of into the tree restore actually owns (Codex review:
+  // an earlier version of this fix re-checked only ONCE, at this function's own entry —
+  // immediately after the caller's own check, with no meaningful time between the two —
+  // which left this exact loop-duration window completely open despite claiming to
+  // narrow it).
+  //
+  // The fix re-lstat's `dest` itself (never through a `join()` — see the residual note
+  // below for why that distinction matters) immediately before EVERY entry in the loop
+  // below, not once at the top. That shrinks the window from "however long this whole
+  // (possibly deep, possibly large) subtree merge takes" down to "however long ONE
+  // entry's own move/recurse takes" — the smallest granularity available without
+  // fd-relative primitives.
+  //
+  // Residual, stated rather than hidden (same posture as moveNoClobber()'s own doc
+  // comment above): this closes the window for `dest` becoming a symlink ITSELF, not for
+  // one of `dest`'s ANCESTORS being swapped — `lstat(join(dest, entry.name))` below
+  // still transparently follows any symlink sitting between `--out-dir` and `dest`, and
+  // Node exposes no fd-relative openat/mkdirat with O_NOFOLLOW to close that too. And the
+  // check-then-use gap for a single entry, while now as small as this loop can make it,
+  // is not literally zero — a swap landing in the instant between this lstat and the
+  // very next operation still slips through. Neither residual is new here; both already
+  // exist, undisputed, in every other lstat-then-act pair in this file.
   // Moving an entry OUT of `src` now means unlink(s), which needs write on `src` itself —
   // where the old whole-directory rename() needed nothing. tar's --no-same-permissions
   // only masks bits OFF, so a directory the archive recorded at 0500 arrives in the
@@ -684,6 +724,26 @@ async function mergeNoClobber(src: string, dest: string): Promise<void> {
     /* not ours to widen — let the per-entry operation below report the real failure */
   }
   for (const entry of await readdir(src, { withFileTypes: true })) {
+    // revalidateDest: re-lstat `dest` ITSELF, fresh, immediately before this entry's own
+    // move/recurse decision below — see this function's own doc comment above for why
+    // this has to happen HERE (once per entry, not once per call) to actually narrow the
+    // window rather than just relocate it.
+    if (opts.revalidateDest) {
+      let destStat: Awaited<ReturnType<typeof lstat>>;
+      try {
+        destStat = await lstat(dest);
+      } catch (e) {
+        throw new Error(
+          `refusing to merge into ${dest}: it disappeared since it was last confirmed a directory (${errMsg(e)})`,
+        );
+      }
+      if (!destStat.isDirectory()) {
+        throw new Error(
+          `refusing to merge into ${dest}: it is no longer a plain directory (it was one moments ago) — this looks ` +
+            'like a local race rather than ordinary no-clobber content, so restore refuses rather than writing through it',
+        );
+      }
+    }
     const s = join(src, entry.name);
     const d = join(dest, entry.name);
     // lstat, not exists()/stat(): exists() follows symlinks, so a pre-existing `d` that
@@ -704,7 +764,11 @@ async function mergeNoClobber(src: string, dest: string): Promise<void> {
       dStat = undefined;
     }
     if (entry.isDirectory() && dStat?.isDirectory()) {
-      await mergeNoClobber(s, d);
+      // revalidateDest: true — the nested call re-lstat's `d` itself, per entry of ITS
+      // OWN loop, the same way this level's own loop just did for `dest` above (see
+      // mergeNoClobber's own doc comment on `revalidateDest` for the full race this
+      // narrows and its residual limits).
+      await mergeNoClobber(s, d, { revalidateDest: true });
     } else if (!dStat) {
       try {
         await moveNoClobber(s, d, entry);
@@ -930,11 +994,35 @@ async function expandComponents(outDir: string, manifestText: string): Promise<b
   try {
     await refuseIfSymlink(expandedRoot, 'expand root');
   } catch (e) {
-    console.error(`warning: ${errMsg(e)} — skipping component auto-expand entirely`);
+    // Audit finding: this used to say only "skipping component auto-expand entirely" —
+    // true, but it buried HOW MANY manifest components that affects behind a single
+    // stderr line easy to scroll past, with nothing at the end of the run to catch a
+    // caller who missed it. Naming the count here makes the impact legible on its own,
+    // without changing the deliberate "not an expand failure" exit-code posture below
+    // (see this catch's own return value, and the "Best-effort throughout" doc comment
+    // above this function). Codex review: warn(), not a bare console.error — this is
+    // exactly the class of "a human/agent relaying this run must see it" hazard #347's
+    // chokepoint exists for, and a bare console.error is invisible to the CLI's end-of-
+    // run warning summary and MCP's own `warnings` array.
+    warn(
+      `${errMsg(e)} — skipping component auto-expand entirely ` +
+        `(${candidates.length} manifest component(s) not expanded; the raw *.tar.gz archive(s) remain in ${outDir} for you to expand manually)`,
+    );
     return true; // nothing was attempted (defense-in-depth refusal, not an expand failure)
   }
   mkdirSync(expandedRoot, { recursive: true });
   const rows: ExpandedRow[] = [];
+  // Audit finding: names of components this loop deliberately left un-expanded — an
+  // unsafe manifest name, no backing archive, or a symlink squatting on the target
+  // directory name — WITHOUT counting as an expand FAILURE (see this function's own
+  // "Best-effort throughout" doc comment above; each case already has its own doc
+  // comment at the `continue` site explaining exactly why it is allowed). Collected here
+  // so the loop can print ONE unmissable summary line below instead of leaving a caller
+  // to notice (or miss) each "warning:" line individually — by design this does NOT flip
+  // `hadFailures`/the exit code, matching the tested behavior in
+  // scripts/selftest.sh's symlink-refusal cases (a skip here is a deliberate no-clobber-
+  // style refusal, not an attempted-and-failed expand).
+  const skipped: string[] = [];
   let hadFailures = false;
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
@@ -947,6 +1035,7 @@ async function expandComponents(outDir: string, manifestText: string): Promise<b
         `warning: skipping component with an unsafe manifest name "${sanitizeForDisplay(c.name)}" ` +
           '(contains a path separator or is a dot-segment) — refusing to treat manifest.json\'s "name" as a path',
       );
+      skipped.push(`${sanitizeForDisplay(c.name)} (unsafe manifest name)`);
       continue;
     }
     const archivePath = join(outDir, c.name);
@@ -957,7 +1046,21 @@ async function expandComponents(outDir: string, manifestText: string): Promise<b
     // still exists (just with stale content); that case is now refused earlier, in
     // restoreImpl's own findStaleComponentArchives() check, before expandComponents() ever
     // runs. Nothing was attempted here, so this is not counted as an expand failure.
-    if (!(await exists(archivePath))) continue;
+    //
+    // Audit finding: this `continue` used to be entirely silent — the comment above
+    // explained why skipping it here is CORRECT, but nothing at runtime ever said it
+    // actually happened. A caller had no way to notice this component was skipped short
+    // of reading source. Print it, same as every other skip in this loop — warn(), not
+    // console.error (Codex review), for the same #347-chokepoint reason as the
+    // expandedRoot-symlink warning above.
+    if (!(await exists(archivePath))) {
+      warn(
+        `manifest lists component "${sanitizeForDisplay(c.name)}" but no backing archive was found ` +
+          `in ${outDir} — skipping (see this line's own doc comment above for what this can mean)`,
+      );
+      skipped.push(`${sanitizeForDisplay(c.name)} (no backing archive in ${outDir})`);
+      continue;
+    }
 
     // The "<NNN>-" prefix EXACTLY guarantees uniqueness WITHIN this manifest; the
     // trailing sourceDigest() makes a collision ACROSS manifests practically negligible
@@ -973,6 +1076,7 @@ async function expandComponents(outDir: string, manifestText: string): Promise<b
       await refuseIfSymlink(targetDir, 'expanded component directory');
     } catch (e) {
       console.error(`warning: ${errMsg(e)} — skipping ${sanitizeForDisplay(c.name)}`);
+      skipped.push(`${sanitizeForDisplay(c.name)} (${errMsg(e)})`);
       continue;
     }
     // A prior run's expansion of this exact component, if any — re-running restore
@@ -996,6 +1100,13 @@ async function expandComponents(outDir: string, manifestText: string): Promise<b
       await inspectPlainArchive(archivePath);
       await refuseIfSymlink(scratchDir, 'expand scratch directory'); // defense in depth: this name should never pre-exist
       mkdirSync(scratchDir, { recursive: true });
+      // Audit finding: register the SAME tick mkdirSync creates it, no await in between —
+      // otherwise a signal landing while this continuation is still queued would find an
+      // untracked scratch dir already holding this component's freshly-decrypted
+      // plaintext (see ACTIVE_EXPAND_SCRATCH_DIRS's own doc comment in signal-guard.ts
+      // for why restoreImpl()'s own ACTIVE_RESTORE_SCRATCH_DIR tracking does not cover
+      // this — it is cleared before component auto-expand ever starts).
+      addActiveExpandScratchDir(scratchDir);
       await run('tar', ['-xzf', archivePath, '--no-same-owner', '--no-same-permissions', '-C', scratchDir], {
         timeoutMs: PIPE_TIMEOUT_MS,
       });
@@ -1013,12 +1124,31 @@ async function expandComponents(outDir: string, manifestText: string): Promise<b
       // a plain rm() throws EACCES on any directory under it without an owner-write bit
       // (unlinking an entry needs write on its PARENT) — leaving that plaintext on disk.
       await rmrf(scratchDir);
+      // Deregister only AFTER rmrf() above has actually finished removing it — mirrors
+      // every other add/remove-Set pair in signal-guard.ts (see ACTIVE_MCP_FETCH_DIRS's
+      // own doc comment there): removing the registration before the directory is
+      // actually gone would leave a window where a signal finds it untracked while
+      // plaintext still sits on disk.
+      removeActiveExpandScratchDir(scratchDir);
     }
     rows.push({
       dir: relative(outDir, targetDir),
       name: sanitizeForDisplay(c.name),
       source: sanitizeForDisplay(c.source),
     });
+  }
+  // Audit finding: one unmissable summary line, printed BEFORE either return path below
+  // (the early "nothing expanded" one and the normal "expanded N component(s)" one) so a
+  // caller cannot lose track of a skip among many other stderr lines — deliberately
+  // separate from `hadFailures`/the exit code, which stays exactly as it was (see
+  // `skipped`'s own doc comment above for why these are not counted as failures). warn(),
+  // not console.error (Codex review): this is exactly the "a human/agent relaying this
+  // run must see it" class #347's chokepoint exists for.
+  if (skipped.length > 0) {
+    warn(
+      `${skipped.length} manifest component(s) were not expanded — ${skipped.join('; ')} ` +
+        '(not counted as an expand failure; run with --verbose and inspect --out-dir to confirm nothing unexpected was skipped)',
+    );
   }
   if (rows.length === 0) return !hadFailures;
 
@@ -1488,9 +1618,19 @@ async function restoreImpl(
     if (o.pg) {
       const dump = join(o.out_dir, 'db.dump');
       if (!(await exists(dump))) throw new Error(`--pg given but no db.dump in snapshot`);
-      await run(pgTool('pg_restore'), ['--no-owner', '--no-privileges', '--clean', '--if-exists', '-d', o.pg, dump], {
-        timeoutMs: PIPE_TIMEOUT_MS,
-      });
+      // --single-transaction (audit finding): without it, `--clean --if-exists` drops each
+      // object right before recreating it, one DDL statement at a time outside any wrapping
+      // transaction. A pg_restore that dies partway through (timeout, killed connection,
+      // OOM) leaves --pg's database in a MID-RESTORE state — some objects already dropped,
+      // the rest never recreated — with no atomic rollback to fall back on. Wrapping the
+      // whole restore in one transaction means a failure anywhere rolls the target database
+      // back to exactly what it was before this call started, instead of a half-restored mess
+      // that then has to be diagnosed by hand.
+      await run(
+        pgTool('pg_restore'),
+        ['--no-owner', '--no-privileges', '--clean', '--if-exists', '--single-transaction', '-d', o.pg, dump],
+        { timeoutMs: PIPE_TIMEOUT_MS },
+      );
       console.log(`pg_restore -> ${redactPgConn(o.pg)} done`);
     }
     // #527 "Related finding": run this LAST, after --pg above (still best-effort — every

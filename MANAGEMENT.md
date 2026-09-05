@@ -128,7 +128,13 @@ note). Recovery on a fresh machine then needs only those two things — no `inde
 saved sha256 is applied automatically, so a substituted ciphertext is rejected.
 After each push, `cypher-brain recovery-kit --from-locator-file <this file>` regenerates
 the printable kit `init` produced, pointed at the NEW locator — the printed copy goes
-stale each cycle otherwise (#364):
+stale each cycle otherwise (#364). Whenever an identity is embedded
+(`--inline-identity` and/or `--backup-identity`), regeneration also pulls the target
+backup once and proves the embedded identity actually decrypts it, recording
+"Decrypt-verified: YES/NO" next to that identity in the printed kit (`NO` means the
+proof could not be attempted non-interactively — e.g. a wrapped identity with no TTY
+and no `CYPHER_BRAIN_PASSPHRASE` — not that it failed; a genuine mismatch refuses kit
+generation outright instead):
 
 ```sh
 cypher-brain pull --from-locator-file ~/restore/latest-locator.tsv --out latest.age

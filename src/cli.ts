@@ -1086,6 +1086,16 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       <age1…-or-path>, since its public recipient cannot be derived without the
       passphrase. PQ hybrid identities (AGE-SECRET-KEY-PQ-1…) classify and derive the
       same as X25519 ones.
+      Whenever an identity is embedded (--inline-identity and/or --backup-identity),
+      recovery-kit pulls the target backup this kit's own save-locator line points at
+      (a network fetch, once) and proves that identity actually decrypts it — the SAME
+      positive control verify runs for an identity already on this machine, never
+      extracting anything to disk. A wrapped identity may prompt for its passphrase
+      (or read CYPHER_BRAIN_PASSPHRASE); an identity that cannot decrypt the target
+      backup refuses kit generation outright rather than printing a kit that would not
+      work. Each embedded block records "Decrypt-verified: YES/NO" — NO means the proof
+      could not be attempted non-interactively (no TTY/CYPHER_BRAIN_PASSPHRASE), not
+      that it failed.
       A regenerated kit marks the profile/Postgres columns "unknown" rather than guessing —
       the locator file does not record them.
       CLI-only by design: no MCP tool exposes this (the kit can embed PRIVATE key blocks,

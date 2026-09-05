@@ -234,6 +234,37 @@ export function armorCiphertext(bytes: Uint8Array): string {
   return armor.encode(bytes);
 }
 
+// Audit finding (Codex review, recovery-kit decrypt-verification): loadIdentities()
+// takes a PATH and re-reads it — exactly wrong for a caller (recovery-kit) that must
+// verify the SAME bytes it already classified via classifyIdentityFileAtRest() and is
+// about to print into a kit. Re-reading the path a second time verifies whatever is AT
+// that path NOW, which is not necessarily what was captured earlier: a key swapped in
+// between the two reads (or a concurrent rewrite) would let a WORKING key pass
+// verification while the kit embeds the EARLIER, un-verified one. This takes the
+// already-classified `IdentityAtRest` (never touches the filesystem again) so the
+// bytes verified are, by construction, the exact bytes the caller already has in hand.
+export async function identitiesFromAtRest(at: IdentityAtRest): Promise<string[]> {
+  let text: string;
+  if (at.kind === 'wrapped') {
+    const pass = await askPassphrase('Enter passphrase for the identity being embedded: ');
+    try {
+      text = await unwrap(at.bytes, pass);
+    } catch (e) {
+      throw new Error(`could not unwrap identity (wrong passphrase?): ${errMsg(e)}`);
+    }
+  } else if (at.kind === 'plaintext') {
+    text = at.text;
+  } else {
+    throw new Error(`not a usable identity (${at.kind})`);
+  }
+  const ids = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
+  if (ids.length === 0) throw new Error('no identities found');
+  return ids;
+}
+
 async function unwrap(raw: Buffer, pass: string): Promise<string> {
   const d = new Decrypter();
   d.addPassphrase(pass);

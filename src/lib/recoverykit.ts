@@ -22,14 +22,24 @@
 // stakes.
 
 import { randomBytes } from 'node:crypto';
+import { createReadStream, mkdtempSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { identityToRecipient } from 'age-encryption';
-import { IDENTITY, PIN_RECIPIENTS, RECIPIENT, SIGN_IDENTITY, SIGN_RECIPIENT } from './config.js';
-import { armorCiphertext, classifyIdentityFileAtRest } from './crypt.js';
-import { promoteNoClobber, readSavedLocatorLine } from './pushpull.js';
+import { IDENTITY, PIN_RECIPIENTS, PIPE_TIMEOUT_MS, RECIPIENT, SIGN_IDENTITY, SIGN_RECIPIENT } from './config.js';
+import {
+  armorCiphertext,
+  classifyIdentityFileAtRest,
+  decryptToChild,
+  identitiesFromAtRest,
+  newDecrypter,
+  type IdentityAtRest,
+} from './crypt.js';
+import { promoteNoClobber, pull } from './pushpull.js';
+import { installStageSignalGuard, setActiveRecoveryKitVerifyDir } from './signal-guard.js';
 import type { CliOptions } from './types.js';
-import { exists, redactPgConn } from './util.js';
+import { errMsg, exists, redactPgConn } from './util.js';
 import { warn } from './warn.js';
 import { UsageError } from './errors.js';
 
@@ -75,6 +85,13 @@ export interface KitInputs {
   /** 'none' = the run is known to have had no pg dump; 'unknown' = a regenerated kit that cannot know (#364). */
   pg: { conn: string } | 'none' | 'unknown';
   generatedAt: string;
+  /** Codex-review suggestion: per-embedded-identity decrypt-verification outcome against
+   *  THIS kit's own target backup — set only by the standalone `recovery-kit` command
+   *  (verifyEmbeddedKeyDecryptsTarget() above). Omitted entirely for `init`'s own
+   *  wizard-printed kit (wizard.ts), which never runs that check — buildRecoveryKit()
+   *  prints no notice at all when a given key's status is absent, so this is purely
+   *  additive for the standalone command and changes nothing for `init`'s kit. */
+  keyVerification?: { backup?: 'verified' | 'skipped'; primary?: 'verified' | 'skipped' };
 }
 
 // The two marker blocks (PRIMARY/BACKUP IDENTITY, SAVE-LOCATOR) plus the fixed
@@ -171,6 +188,13 @@ export function buildRecoveryKit(k: KitInputs): string {
     lines.push('END PRIMARY IDENTITY FILE');
     lines.push('(Inlined via --inline-identity. The wrap passphrase is NOT in this kit — keep it');
     lines.push(' memorized or stored separately, never written next to this block.)');
+    if (k.keyVerification?.primary === 'verified') {
+      lines.push('Decrypt-verified: YES — this identity was proven, at kit-generation time, to decrypt the');
+      lines.push('target backup named by the SAVE-LOCATOR line below.');
+    } else if (k.keyVerification?.primary === 'skipped') {
+      lines.push('Decrypt-verified: NO — kit generation could not prove this (no TTY/CYPHER_BRAIN_PASSPHRASE');
+      lines.push('available when this kit was made). Confirm with a real restore before relying on it.');
+    }
     lines.push('');
   } else {
     lines.push('--- PRIMARY IDENTITY (already on this machine — not duplicated here) ---');
@@ -186,6 +210,13 @@ export function buildRecoveryKit(k: KitInputs): string {
     lines.push('BEGIN BACKUP IDENTITY FILE');
     lines.push(k.backup.identityText.replace(/\n+$/, ''));
     lines.push('END BACKUP IDENTITY FILE');
+    if (k.keyVerification?.backup === 'verified') {
+      lines.push('Decrypt-verified: YES — this identity was proven, at kit-generation time, to decrypt the');
+      lines.push('target backup named by the SAVE-LOCATOR line below.');
+    } else if (k.keyVerification?.backup === 'skipped') {
+      lines.push('Decrypt-verified: NO — kit generation could not prove this (no TTY/CYPHER_BRAIN_PASSPHRASE');
+      lines.push('available when this kit was made). Confirm with a real restore before relying on it.');
+    }
     lines.push('');
   } else {
     lines.push('--- BACKUP IDENTITY ---');
@@ -331,6 +362,79 @@ export async function writeRecoveryKitFile(path: string, text: string, opts: { c
   }
 }
 
+// Audit finding: everything above this point in recoveryKit() checks an identity
+// file's FORMAT (classifyIdentityFileAtRest: is it wrapped/plaintext/an armored
+// recipient-ciphertext pasted by mistake?) and, for a plaintext backup, that its
+// DERIVED recipient string is well-formed — but nothing anywhere actually proves the
+// key can decrypt the one backup this kit's own "QUICK RECOVERY" instructions tell an
+// operator to pull and restore. A wrong --backup-recipient, a --backup-identity that
+// was never added as a snapshot recipient for THIS push, or a stale backup keypair
+// from a prior init would all sail through every check above and print a kit whose
+// recovery steps do not work — discovered only during an actual disaster, the one time
+// this document is supposed to work. This runs the identical positive-control proof
+// `verify`'s own runFileChecks() already runs for an identity already resident on this
+// machine (decrypt | tar -tf -, never extracting to disk) against an identity this
+// command is instead about to EMBED into a printable document.
+// `at` MUST be the exact IdentityAtRest object the caller already classified for this
+// identity (never a fresh path re-read here — see identitiesFromAtRest()'s own doc
+// comment in crypt.ts: this is precisely what lets this function verify the SAME bytes
+// the caller is about to print into the kit, not whatever a second read of the path
+// happens to return, which a Codex review round caught this earlier version getting
+// wrong via loadIdentities(path)).
+// Codex-review suggestion: returns the outcome ('verified'/'skipped') rather than void,
+// so the caller can print it into the kit itself (KitInputs.keyVerification below) —
+// otherwise a printed kit that was only EVER skip-verified carries no trace of that once
+// it leaves the machine, and a reader has no way to know the proof was never actually run.
+async function verifyEmbeddedKeyDecryptsTarget(
+  kind: 'backup' | 'primary',
+  at: IdentityAtRest,
+  targetPath: string,
+): Promise<'verified' | 'skipped'> {
+  let identities: string[];
+  try {
+    identities = await identitiesFromAtRest(at); // prompts for a wrap passphrase, or reads CYPHER_BRAIN_PASSPHRASE
+  } catch (e) {
+    // A prompt-unavailable failure (no TTY, no CYPHER_BRAIN_PASSPHRASE — see
+    // crypt.ts's promptHidden()) is a genuinely unattended kit-generation run, not a
+    // sign the key is wrong. Report it as a loud, explicit SKIP — mirroring verify's
+    // own "VERDICT: PARTIAL — decryptability was NOT proven on this box" posture when
+    // it cannot prove decryptability from where it runs — rather than failing kit
+    // generation outright over something this command cannot control non-interactively.
+    if (errMsg(e).includes('requires both stdin and stderr to be a TTY')) {
+      warn(
+        `could not verify the ${kind} identity actually decrypts this kit's target backup — its passphrase ` +
+          'prompt needs a TTY (set CYPHER_BRAIN_PASSPHRASE to verify non-interactively instead). This kit was ' +
+          'generated WITHOUT that proof; confirm it with a real restore before relying on it.',
+      );
+      return 'skipped';
+    }
+    // Anything else here (e.g. "could not unwrap … (wrong passphrase?)") means the
+    // identity itself could not even be read — that IS the bug class this function
+    // exists to catch, so it must fail kit generation, not be swallowed as a skip.
+    throw new Error(`could not read the ${kind} identity to verify it decrypts this kit's target backup: ${errMsg(e)}`);
+  }
+  try {
+    // consStdout: 'ignore' (Codex review): decryptToChild()'s default is 'inherit',
+    // which would print the target backup's decrypted archive LISTING straight to this
+    // process's own stdout — corrupting `recovery-kit` (no --out)'s "print the kit to
+    // stdout" contract with leaked archive entries ahead of the actual kit text (caught
+    // by an earlier version of this fix leaking `./`, `./brain.tar.gz`, `./manifest.json`
+    // into a manual test run). Matches runFileChecks()'s own identical positive-control
+    // call (restore.ts) for the exact same reason.
+    await decryptToChild(newDecrypter(identities), () => createReadStream(targetPath), 'tar', ['-tf', '-'], {
+      consStdout: 'ignore',
+      timeoutMs: PIPE_TIMEOUT_MS,
+    });
+  } catch (e) {
+    throw new Error(
+      `the ${kind} identity this kit is about to embed CANNOT decrypt the target backup it points at ` +
+        `(${errMsg(e)}) — refusing to generate a kit whose own recovery instructions would not work. Re-check ` +
+        '--backup-identity/--backup-recipient (or the primary identity) against the snapshot this locator names.',
+    );
+  }
+  return 'verified';
+}
+
 /** `cypher-brain recovery-kit` (#364) — regenerate the kit for the CURRENT latest
  *  push, from a save-locator file + on-disk key material. CLI-only (see file header). */
 export async function recoveryKit(o: CliOptions): Promise<void> {
@@ -346,13 +450,45 @@ export async function recoveryKit(o: CliOptions): Promise<void> {
   if (o.backup_recipient && !o.backup_identity) {
     throw new UsageError('--backup-recipient only makes sense WITH --backup-identity — pass both, or neither');
   }
-  const saved = await readSavedLocatorLine(o.from_locator_file);
-  if (!saved) {
+  // Codex review (Critical): a SINGLE read of --from-locator-file, not two. This used
+  // to call readSavedLocatorLine(path) (its own internal readFile) for the PARSED
+  // fields, then a second, independent readFile(path) below for the exact printed
+  // line — two reads of the same file at two different instants. A push landing on
+  // this file between them (rewriting it with a NEW locator — pushpull.ts's own
+  // temp-then-rename save-locator write) let the first read parse the OLD locator (what
+  // decrypt-verification below actually pulls and checks) while the second read printed
+  // the NEW one into the kit (what "Decrypt-verified: YES" claims to describe) —
+  // reproduced with a mocked double-read in review. Reading once and deriving both the
+  // parsed fields and the printed line from that SAME text closes it: whichever
+  // locator this run happens to see, the kit's claim and the kit's proof now always
+  // describe the identical bytes.
+  let savedLocatorFileText: string;
+  try {
+    savedLocatorFileText = await readFile(o.from_locator_file, 'utf8');
+  } catch (e) {
+    throw new Error(
+      `${o.from_locator_file} has no locator line — run a push with --save-locator first, and point ` +
+        `--from-locator-file at the file it wrote (${errMsg(e)})`,
+    );
+  }
+  const savedLocatorLine =
+    savedLocatorFileText
+      .split('\n')
+      .map((l) => l.trim())
+      .find((l) => l && !l.startsWith('#')) ?? '';
+  if (!savedLocatorLine) {
     throw new Error(
       `${o.from_locator_file} has no locator line — run a push with --save-locator first, and point ` +
         '--from-locator-file at the file it wrote',
     );
   }
+  // Same (locator, backend, sha, content_digest, recipients_fingerprint, sig_locator,
+  // sign_key_id) shape readSavedLocatorLine() (pushpull.ts) parses — duplicated here,
+  // rather than calling it, specifically so this parses the text THIS function already
+  // read once, instead of triggering that function's own second readFile(path).
+  const [locator, backend, sha, contentDigest, recipientsFingerprint, sigLocator, signKeyId] =
+    savedLocatorLine.split('\t');
+  const saved = { locator, backend, sha, contentDigest, recipientsFingerprint, sigLocator, signKeyId };
   // Same truncated-file guard pull's --from-locator-file applies: a kit whose
   // "Backend used" column reads undefined is a broken recovery document.
   if (!saved.locator || !saved.backend) {
@@ -361,11 +497,6 @@ export async function recoveryKit(o: CliOptions): Promise<void> {
         'locator line is missing the locator and/or backend column',
     );
   }
-  const savedLocatorLine =
-    (await readFile(o.from_locator_file, 'utf8'))
-      .split('\n')
-      .map((l) => l.trim())
-      .find((l) => l && !l.startsWith('#')) ?? '';
 
   // Deliberately the standard layout only — no per-file --identity override: the kit
   // pairs the identity with $CYPHER_BRAIN_HOME/recipient.txt, and letting one half be
@@ -392,8 +523,13 @@ export async function recoveryKit(o: CliOptions): Promise<void> {
   // re-armored here (pure re-encoding, `age -p -a` compatible) so it can survive
   // the print/copy-paste the kit exists for.
   let primaryInline: { text: string } | null = null;
+  // Captured alongside `primaryInline` so decrypt-verification below can reuse the
+  // EXACT same at-rest classification (bytes it already read), never re-reading
+  // IDENTITY's path a second time (see identitiesFromAtRest()'s own doc comment).
+  let primaryAtRest: IdentityAtRest | null = null;
   if (o.inline_identity) {
     const at = await classifyIdentityFileAtRest(IDENTITY);
+    primaryAtRest = at;
     if (at.kind === 'plaintext') {
       throw new Error(
         `${IDENTITY} is NOT passphrase-wrapped — refusing to inline a bare private key into a printable ` +
@@ -416,9 +552,12 @@ export async function recoveryKit(o: CliOptions): Promise<void> {
   // store for a backup key, so inlining an unwrapped one is a supported choice —
   // but a LOUD one, via the #347 warning chokepoint, unlike the primary above).
   let backup: BackupKey | null = null;
+  // Captured alongside `backup` for the same reason as `primaryAtRest` above.
+  let backupAtRest: IdentityAtRest | null = null;
   if (o.backup_identity) {
     if (!(await exists(o.backup_identity))) throw new Error(`no backup identity at ${o.backup_identity}`);
     const at = await classifyIdentityFileAtRest(o.backup_identity);
+    backupAtRest = at;
     if (at.kind !== 'plaintext' && at.kind !== 'wrapped') {
       throw new Error(
         `${o.backup_identity} is not an identity file (${
@@ -471,6 +610,67 @@ export async function recoveryKit(o: CliOptions): Promise<void> {
     };
   }
 
+  // Audit finding: only when an identity is actually about to be EMBEDDED (inlined
+  // primary, or a backup identity) is there anything new here to prove — the common
+  // "no --inline-identity, no --backup-identity" case stays exactly as fast/offline as
+  // before, with no network round-trip added. Pulls the SAME target this kit's own
+  // save-locator line points at, once, into a private scratch file, purely to decrypt-
+  // verify against it (never extracted, never written anywhere else) — see
+  // verifyEmbeddedKeyDecryptsTarget()'s own doc comment above for why.
+  const keyVerification: { backup?: 'verified' | 'skipped'; primary?: 'verified' | 'skipped' } = {};
+  if (backup || primaryInline) {
+    // Codex review (Critical): pull() by `locator`/`backend`/`sha256` taken from `saved`
+    // — the SAME parse of --from-locator-file already captured at the top of this
+    // function — rather than passing `from_locator_file` again, which would make pull()
+    // re-read and re-parse that file a SECOND time. A file changed between the two reads
+    // (or overwritten by a concurrent push) would otherwise let this fetch, and thus the
+    // whole proof below, silently target a DIFFERENT backup than the one `savedLocatorLine`
+    // actually put in the kit. Binding to `saved`'s already-captured fields closes that.
+    installStageSignalGuard();
+    // mkdtempSync (not async mkdtemp), and setActiveRecoveryKitVerifyDir called
+    // immediately after with no await between them — same one-tick discipline every
+    // other mkdtempSync + setActive*/add* pair in this codebase uses (see
+    // signal-guard.ts): an `await mkdtemp()` would leave the directory on disk but
+    // untracked for as long as the continuation is queued.
+    const scratchDir = mkdtempSync(join(tmpdir(), 'cypher-brain-kit-verify-'));
+    setActiveRecoveryKitVerifyDir(scratchDir);
+    try {
+      const target = join(scratchDir, 'target.age');
+      await pull({
+        locator: saved.locator,
+        backend: saved.backend,
+        sha256: saved.sha,
+        sig_locator: saved.sigLocator,
+        out: target,
+        dirs: [],
+        tables: [],
+        recipients: [],
+      });
+      // Codex review (Critical): verify against the EXACT at-rest bytes already
+      // captured above (`backupAtRest`/`primaryAtRest`), never a fresh path re-read —
+      // see identitiesFromAtRest()'s own doc comment in crypt.ts.
+      if (backup)
+        keyVerification.backup = await verifyEmbeddedKeyDecryptsTarget(
+          'backup',
+          backupAtRest as IdentityAtRest,
+          target,
+        );
+      if (primaryInline) {
+        keyVerification.primary = await verifyEmbeddedKeyDecryptsTarget(
+          'primary',
+          primaryAtRest as IdentityAtRest,
+          target,
+        );
+      }
+    } finally {
+      // Deregister only AFTER rm() below has actually finished removing it — mirrors
+      // every other add/remove-Set (or, here, setActive/clear-scalar) pair in
+      // signal-guard.ts (see ACTIVE_MCP_FETCH_DIRS's own doc comment there).
+      await rm(scratchDir, { recursive: true, force: true });
+      setActiveRecoveryKitVerifyDir(null);
+    }
+  }
+
   const kitText = buildRecoveryKit({
     primaryIdentityPath: IDENTITY,
     primaryInline,
@@ -483,6 +683,7 @@ export async function recoveryKit(o: CliOptions): Promise<void> {
     backend: saved.backend,
     pg: 'unknown',
     generatedAt: new Date().toISOString(),
+    keyVerification,
   });
 
   if (o.out) {
