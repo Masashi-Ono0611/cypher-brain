@@ -729,7 +729,19 @@ export async function push(o: CliOptions): Promise<boolean> {
     });
     return result.success;
   } catch (e) {
-    const locator = e instanceof PushPartialSuccessError ? e.locator : null;
+    // #818: PushUncertainSpendError is deliberately NOT a PushPartialSuccessError (see
+    // that class's own doc comment), so the branch above alone misses it entirely and
+    // records `locator: null` — discarding the one field (confirmedCiphertextLocator)
+    // it carries specifically for the case where the CIPHERTEXT upload already
+    // succeeded and only the ".minisig" sidecar's spend went ambiguous. The error
+    // message and mcp.ts's own idempotency handling already carry this pointer
+    // independently, so this only closes the same gap in the audit trail.
+    const locator =
+      e instanceof PushPartialSuccessError
+        ? e.locator
+        : e instanceof PushUncertainSpendError
+          ? (e.confirmedCiphertextLocator ?? null)
+          : null;
     await recordAudit({ command: 'push', o, backend: o.backend ?? null, locator, exitCode: 1, startedAt });
     throw e;
   }

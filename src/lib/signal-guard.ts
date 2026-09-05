@@ -218,15 +218,21 @@ function unlockRecursiveSync(root: string): void {
   const stack: string[] = [root];
   while (stack.length > 0) {
     const dir = stack.pop() as string;
+    // chmod FIRST: an archive-extracted directory can carry a mode with NO read/
+    // execute bit at all (0o000, or write-only), which makes readdirSync() itself
+    // fail with EACCES before chmod ever gets a chance to restore access — the exact
+    // "#782" scenario this function exists for. chmod does not require read access to
+    // its target (only ownership), so doing it first is what lets the readdirSync()
+    // right after it actually succeed for a directory this restrictive.
+    try {
+      chmodSync(dir, 0o700);
+    } catch {}
     let names: string[];
     try {
       names = readdirSync(dir);
     } catch {
       continue; // not a directory, or already gone — nothing to unlock
     }
-    try {
-      chmodSync(dir, 0o700);
-    } catch {}
     for (const name of names) {
       const p = join(dir, name);
       let st: ReturnType<typeof lstatSync>;
