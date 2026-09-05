@@ -89,19 +89,25 @@ function extractDocHelp(readme) {
 
 function printDiff(expected, actual) {
   const tmp = mkdtempSync(join(tmpdir(), 'cb-help-docs-'));
-  const expectedFile = join(tmp, 'readme-help.txt');
-  const actualFile = join(tmp, 'actual-help.txt');
-  writeFileSync(expectedFile, `${expected}\n`);
-  writeFileSync(actualFile, `${actual}\n`);
-  const diff = spawnSync(
-    'diff',
-    ['-u', '--label', 'README.md (committed)', '--label', 'cypher-brain --help (actual)', expectedFile, actualFile],
-    {
-      encoding: 'utf8',
-    },
-  );
-  console.error(diff.stdout || diff.stderr || '(diff produced no output)');
-  rmSync(tmp, { recursive: true, force: true });
+  try {
+    const expectedFile = join(tmp, 'readme-help.txt');
+    const actualFile = join(tmp, 'actual-help.txt');
+    writeFileSync(expectedFile, `${expected}\n`);
+    writeFileSync(actualFile, `${actual}\n`);
+    const diff = spawnSync(
+      'diff',
+      ['-u', '--label', 'README.md (committed)', '--label', 'cypher-brain --help (actual)', expectedFile, actualFile],
+      {
+        encoding: 'utf8',
+      },
+    );
+    console.error(diff.stdout || diff.stderr || '(diff produced no output)');
+  } finally {
+    // Belt-and-suspenders: this only ever holds diagnostic text, never key material, but a
+    // write exception (e.g. disk full) before the old unconditional rmSync would still leak
+    // the tmp dir — same discipline as npm run verify's own TMPDIR hygiene check.
+    rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 function writeDocHelp(readme, actualHelp, startIdx, endIdx) {
