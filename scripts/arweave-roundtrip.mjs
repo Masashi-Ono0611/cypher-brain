@@ -48,6 +48,44 @@ const TX_RE = /^[A-Za-z0-9_-]{43}$/; // base64url Arweave tx id
 // script's own exit (Codex review).
 const stubProcs = [];
 
+// Every stub below announces readiness with a single `READY:<port>\n` line on its
+// stdout (always via console.log, which appends the trailing newline), and this waits
+// for it. A spawned child's stdout arrives in whatever chunks the pipe happens to
+// deliver — a slow scheduler tick or a line that straddles a buffer boundary can split
+// `READY:5173\n` into e.g. `READY:51` then `73\n` across two separate 'data' events.
+// Matching each chunk in isolation (the previous shape of this code, duplicated at every
+// stub call site below) has TWO failure modes, not one: a split between `READY:` and the
+// digits never matches at all (times out reporting "did not start" for a stub that came
+// up fine), but a split MID-DIGIT is worse — `READY:51` alone still matches `/READY:(\d+)/`
+// and resolves with the truncated port 51 instead of waiting for the rest, so the caller
+// connects to the wrong port and fails with an unrelated-looking error. Accumulating the
+// buffer across chunks (as arlocal's own readiness check below already does) fixes the
+// first failure mode but NOT the second — a partial buffer like `READY:51` still matches
+// greedily. Requiring the trailing `\n` closes both: it can only match once the whole
+// line, digits included, has actually arrived.
+const waitForReady = (proc, label, timeoutMs = 8000) =>
+  new Promise((resolve, reject) => {
+    let buf = '';
+    let settled = false;
+    const done = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      proc.stdout.removeListener('data', onData);
+      proc.removeListener('error', onError);
+      fn(arg);
+    };
+    const onData = (d) => {
+      buf += d;
+      const m = buf.match(/READY:(\d+)\n/);
+      if (m) done(resolve, m[1]);
+    };
+    const onError = (e) => done(reject, e);
+    const timer = setTimeout(() => done(reject, new Error(`${label} did not start`)), timeoutMs);
+    proc.stdout.on('data', onData);
+    proc.once('error', onError);
+  });
+
 const log = (m) => console.error(`· ${m}`);
 // arlocal runs in a SEPARATE process (scripts/arlocal-server.mjs) so the cb()
 // spawns below don't inherit its sockets and deadlock — see that file's header.
@@ -120,6 +158,46 @@ const fail = (m) => {
   console.log(`[FAIL] ${m}`);
   failed = true;
 };
+// This script's own direct HTTP calls to arlocal (mint/mine/tx-status — never a spawned
+// pull/push subprocess, which already carries its own `timeout` via spawnSync) had two
+// gaps: no per-call deadline, so a stalled arlocal could hang this script forever with
+// nothing bounding it; and an unread response body, which leaves an undici socket
+// outstanding instead of being returned to the pool. The body is always read here,
+// including on a non-2xx response, so every caller gets it back already drained.
+const FETCH_TIMEOUT_MS = 10_000;
+const boundedFetch = async (url, init) => {
+  try {
+    // The body read is inside the SAME try as the request itself (Codex review): a
+    // `.catch(() => '')` around only `res.text()` would turn a body that stalls or
+    // resets mid-stream — headers already arrived as a real 200 — into a silent
+    // `{ok: true, body: ''}`, which is exactly the false-PASS shape this whole pass
+    // exists to close. Letting it throw means the abort signal (which also covers an
+    // in-flight body read, not just the initial response) still bounds it, and the
+    // caller's own error handling (mine()'s retry, or the outer script's FAIL report)
+    // sees the failure instead of an empty string that reads as success.
+    const res = await fetch(url, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    const body = await res.text();
+    return { res, body };
+  } catch (e) {
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+      throw new Error(`request to ${url} did not complete within ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw e;
+  }
+};
+// arweave-js's transactions.post() resolves with a {status, statusText, data} response
+// object on a non-2xx result — it does NOT throw. The two junk-transaction fixtures
+// below discarded that return value entirely, so a post that never actually landed
+// (e.g. a transient 4xx/5xx from arlocal) would go unnoticed here and only surface much
+// later as a confusing, unrelated-looking failure in whatever assertion depended on that
+// tx existing (the shape-gate / AGE_MAGIC tests further down).
+const assertPosted = (postResult, label) => {
+  if (postResult.status < 200 || postResult.status >= 300) {
+    throw new Error(
+      `${label}: ar.transactions.post() did not land (status ${postResult.status} ${postResult.statusText})`,
+    );
+  }
+};
 // #360: a dropped connection to /mine was measured failing an otherwise-green run
 // twice in a row (a bare "fetch failed" with the server still alive), then vanishing
 // with no code change. A short, loud, bounded retry distinguishes "one dropped
@@ -134,7 +212,9 @@ let mineRetriesLeft = 2;
 const mine = async () => {
   for (;;) {
     try {
-      return await fetch(`http://localhost:${PORT}/mine`).then((r) => r.text());
+      const { res, body } = await boundedFetch(`http://localhost:${PORT}/mine`);
+      if (!res.ok) throw new Error(`arlocal /mine returned ${res.status}: ${body.slice(0, 200)}`);
+      return body;
     } catch (e) {
       if (mineRetriesLeft <= 0) throw e;
       mineRetriesLeft--;
@@ -152,7 +232,10 @@ try {
   const addr = await ar.wallets.jwkToAddress(jwk);
   const walletPath = join(tmp, 'wallet.json');
   await writeFile(walletPath, JSON.stringify(jwk), { mode: 0o600 }); // 0600: avoid the loose-perms warning (#35)
-  await fetch(`http://localhost:${PORT}/mint/${addr}/100000000000000`);
+  const mintResult = await boundedFetch(`http://localhost:${PORT}/mint/${addr}/100000000000000`);
+  if (!mintResult.res.ok) {
+    throw new Error(`arlocal /mint returned ${mintResult.res.status}: ${mintResult.body.slice(0, 200)}`);
+  }
   log('wallet funded');
 
   const env = {
@@ -363,7 +446,7 @@ try {
     jwk,
   );
   await ar.transactions.sign(junkSidecarTx, jwk);
-  await ar.transactions.post(junkSidecarTx);
+  assertPosted(await ar.transactions.post(junkSidecarTx), 'shape-gate junk sidecar tx');
   await mine();
   const fakeSidecar = [...signedFields];
   fakeSidecar[5] = junkSidecarTx.id;
@@ -473,20 +556,7 @@ try {
   );
   const dropSrv = spawn('node', [dropSrvFile, String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'] });
   stubProcs.push(dropSrv);
-  const dropPort = await new Promise((res, rej) => {
-    const to = setTimeout(() => rej(new Error('drop proxy did not start')), 8000);
-    dropSrv.once('error', (e) => {
-      clearTimeout(to);
-      rej(e);
-    });
-    dropSrv.stdout.on('data', (d) => {
-      const m = String(d).match(/READY:(\d+)/);
-      if (m) {
-        clearTimeout(to);
-        res(m[1]);
-      }
-    });
-  });
+  const dropPort = await waitForReady(dropSrv, 'drop proxy');
   const ambiguousSnap = join(tmp, 'ambiguous.age');
   cb('snapshot', '--dir', src, '--out', ambiguousSnap);
   const ledgerPath = join(tmp, 'ambiguous-ledger.jsonl');
@@ -550,20 +620,7 @@ try {
   );
   const blindSrv = spawn('node', [blindSrvFile, String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'] });
   stubProcs.push(blindSrv);
-  const blindPort = await new Promise((res, rej) => {
-    const to = setTimeout(() => rej(new Error('blind-probe proxy did not start')), 8000);
-    blindSrv.once('error', (e) => {
-      clearTimeout(to);
-      rej(e);
-    });
-    blindSrv.stdout.on('data', (d) => {
-      const m = String(d).match(/READY:(\d+)/);
-      if (m) {
-        clearTimeout(to);
-        res(m[1]);
-      }
-    });
-  });
+  const blindPort = await waitForReady(blindSrv, 'blind-probe proxy');
   const uncertainSnap = join(tmp, 'uncertain.age');
   cb('snapshot', '--dir', src, '--out', uncertainSnap);
   const uncertainLedgerPath = join(tmp, 'uncertain-ledger.jsonl');
@@ -596,7 +653,9 @@ try {
   let arlocalStatusErr = '';
   if (uncertainTx) {
     try {
-      arlocalStatus = (await fetch(`http://127.0.0.1:${PORT}/tx/${uncertainTx}/status`)).status;
+      // Only `.status` is asserted below, but the body is still drained (boundedFetch
+      // always reads it) rather than left unconsumed on the response.
+      arlocalStatus = (await boundedFetch(`http://127.0.0.1:${PORT}/tx/${uncertainTx}/status`)).res.status;
     } catch (e) {
       arlocalStatusErr = e?.message ?? String(e);
     }
@@ -644,20 +703,7 @@ try {
   );
   const sidecarSrv = spawn('node', [sidecarSrvFile, String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'] });
   stubProcs.push(sidecarSrv);
-  const sidecarPort = await new Promise((res, rej) => {
-    const to = setTimeout(() => rej(new Error('sidecar proxy did not start')), 8000);
-    sidecarSrv.once('error', (e) => {
-      clearTimeout(to);
-      rej(e);
-    });
-    sidecarSrv.stdout.on('data', (d) => {
-      const m = String(d).match(/READY:(\d+)/);
-      if (m) {
-        clearTimeout(to);
-        res(m[1]);
-      }
-    });
-  });
+  const sidecarPort = await waitForReady(sidecarSrv, 'sidecar proxy');
   const sidecarSnap = join(tmp, 'sidecar-uncertain.age');
   cb('snapshot', '--dir', src, '--out', sidecarSnap); // signs on its own — see the #832 note above
   const sidecarPush = spawnSync('node', [...DEV_ARGS, BIN, 'push', '--in', sidecarSnap, '--backend', 'arweave'], {
@@ -743,7 +789,7 @@ try {
     jwk,
   );
   await ar.transactions.sign(junkTx, jwk);
-  await ar.transactions.post(junkTx);
+  assertPosted(await ar.transactions.post(junkTx), 'AGE_MAGIC junk L1 tx');
   await mine();
   const l1AgeOut = join(tmp, 'l1-agemagic.age');
   const sentinel = `PRE-EXISTING-VALID-CONTENT-SENTINEL-${randomBytes(6).toString('hex')}`;
@@ -775,20 +821,7 @@ try {
   );
   const l1SsrfSrv = spawn('node', [l1SsrfSrvFile], { stdio: ['ignore', 'pipe', 'pipe'] });
   stubProcs.push(l1SsrfSrv);
-  const l1SsrfPort = await new Promise((res, rej) => {
-    const to = setTimeout(() => rej(new Error('L1 ssrf stub did not start')), 8000);
-    l1SsrfSrv.once('error', (e) => {
-      clearTimeout(to);
-      rej(e);
-    });
-    l1SsrfSrv.stdout.on('data', (d) => {
-      const m = String(d).match(/READY:(\d+)/);
-      if (m) {
-        clearTimeout(to);
-        res(m[1]);
-      }
-    });
-  });
+  const l1SsrfPort = await waitForReady(l1SsrfSrv, 'L1 ssrf stub');
   const l1SsrfOut = join(tmp, 'l1-ssrf.age');
   const l1ssrf = spawnSync(
     'node',
@@ -838,20 +871,7 @@ try {
   );
   const stallSrv = spawn('node', [stallSrvFile], { stdio: ['ignore', 'pipe', 'pipe'] });
   stubProcs.push(stallSrv);
-  const stallPort = await new Promise((res, rej) => {
-    const to = setTimeout(() => rej(new Error('stall stub did not start')), 8000);
-    stallSrv.once('error', (e) => {
-      clearTimeout(to);
-      rej(e);
-    });
-    stallSrv.stdout.on('data', (d) => {
-      const m = String(d).match(/READY:(\d+)/);
-      if (m) {
-        clearTimeout(to);
-        res(m[1]);
-      }
-    });
-  });
+  const stallPort = await waitForReady(stallSrv, 'stall stub');
   const t0 = Date.now();
   const timeoutOut = join(tmp, 'l1-timeout.age');
   const l1to = spawnSync(
@@ -974,20 +994,7 @@ try {
   );
   const badGw = spawn('node', [badGwFile], { stdio: ['ignore', 'pipe', 'pipe'] });
   stubProcs.push(badGw);
-  const badPort = await new Promise((res, rej) => {
-    const to = setTimeout(() => rej(new Error('badgw stub did not start')), 8000);
-    badGw.once('error', (e) => {
-      clearTimeout(to);
-      rej(e);
-    });
-    badGw.stdout.on('data', (d) => {
-      const m = String(d).match(/READY:(\d+)/);
-      if (m) {
-        clearTimeout(to);
-        res(m[1]);
-      }
-    });
-  });
+  const badPort = await waitForReady(badGw, 'badgw stub');
   const bgOut = join(tmp, 'badgate.age');
   const bg = spawnSync('node', [...DEV_ARGS, BIN, 'pull', '--locator', loc, '--backend', 'arweave', '--out', bgOut], {
     env: { ...env, CYPHER_BRAIN_AR_PORT: '1', CYPHER_BRAIN_AR_GATEWAYS: `http://127.0.0.1:${badPort}` },
@@ -1016,20 +1023,7 @@ try {
   );
   const badGw2 = spawn('node', [badGw2File], { stdio: ['ignore', 'pipe', 'pipe'] });
   stubProcs.push(badGw2);
-  const badPort2 = await new Promise((res, rej) => {
-    const to = setTimeout(() => rej(new Error('badgw2 stub did not start')), 8000);
-    badGw2.once('error', (e) => {
-      clearTimeout(to);
-      rej(e);
-    });
-    badGw2.stdout.on('data', (d) => {
-      const m = String(d).match(/READY:(\d+)/);
-      if (m) {
-        clearTimeout(to);
-        res(m[1]);
-      }
-    });
-  });
+  const badPort2 = await waitForReady(badGw2, 'badgw2 stub');
   const ft = spawnSync(
     'node',
     [...DEV_ARGS, BIN, 'pull', '--locator', loc, '--backend', 'arweave', '--out', join(tmp, 'ft.age')],
@@ -1063,20 +1057,7 @@ try {
   );
   const uaSrv = spawn('node', [uaSrvFile, join(tmp, 'snap.age')], { stdio: ['ignore', 'pipe', 'pipe'] });
   stubProcs.push(uaSrv);
-  const uaPort = await new Promise((res, rej) => {
-    const to = setTimeout(() => rej(new Error('ua stub did not start')), 8000);
-    uaSrv.once('error', (e) => {
-      clearTimeout(to);
-      rej(e);
-    });
-    uaSrv.stdout.on('data', (d) => {
-      const m = String(d).match(/READY:(\d+)/);
-      if (m) {
-        clearTimeout(to);
-        res(m[1]);
-      }
-    });
-  });
+  const uaPort = await waitForReady(uaSrv, 'ua stub');
   const ua = spawnSync(
     'node',
     [...DEV_ARGS, BIN, 'pull', '--locator', loc, '--backend', 'arweave', '--out', join(tmp, 'ua.age')],
@@ -1118,20 +1099,7 @@ try {
   for (const c of ssrfCases) {
     const ssrfSrv = spawn('node', [ssrfSrvFile, c.target], { stdio: ['ignore', 'pipe', 'pipe'] });
     stubProcs.push(ssrfSrv);
-    const ssrfPort = await new Promise((res, rej) => {
-      const to = setTimeout(() => rej(new Error('ssrf stub did not start')), 8000);
-      ssrfSrv.once('error', (e) => {
-        clearTimeout(to);
-        rej(e);
-      });
-      ssrfSrv.stdout.on('data', (d) => {
-        const m = String(d).match(/READY:(\d+)/);
-        if (m) {
-          clearTimeout(to);
-          res(m[1]);
-        }
-      });
-    });
+    const ssrfPort = await waitForReady(ssrfSrv, 'ssrf stub');
     const ssrfOut = join(tmp, `ssrf-${ssrfPort}.age`);
     const ss = spawnSync(
       'node',
