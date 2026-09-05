@@ -1117,7 +1117,7 @@ export async function init(_o: CliOptions): Promise<boolean> {
           // produce a confident answer — that is how the original bug happened.
           if (gbrain.dataPath) {
             console.log(`\nIts config records the store at:\n  ${gbrain.dataPath}`);
-            if (pathCoveredBy(gbrain.dataPath, snapshotOpts.dirs)) {
+            if (await pathCoveredBy(gbrain.dataPath, snapshotOpts.dirs)) {
               console.log('The path(s) you gave above cover it, so the snapshot will contain the database.');
             } else {
               console.log('NONE of the paths you gave above covers it — as answered, this backup would NOT contain');

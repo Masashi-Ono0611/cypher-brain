@@ -105,6 +105,11 @@ const PARALLEL = [
   { name: 'cli-smoke', cmd: 'bash', args: ['scripts/cli-smoke.sh'] },
   npmTest('selftest:verify-levels'),
   npmTest('selftest:gbrain-pglite'),
+  // In-process unit test of src/lib/gbrain.ts's pathCoveredBy() — same shape as
+  // selftest:idempotency-lib below: no CYPHER_BRAIN_HOME, no port, no LaunchAgent
+  // write, everything it creates lives under its own mkdtemp beneath the per-test
+  // TMPDIR (removed in a `finally`), and it only imports src/lib/gbrain.ts.
+  npmTest('selftest:path-covered-by'),
   npmTest('selftest:otel'),
   npmTest('selftest:ton'),
   npmTest('selftest:profiles'),

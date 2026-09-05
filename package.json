@@ -76,6 +76,7 @@
     "selftest:schedule": "bash scripts/selftest-schedule.sh",
     "selftest:init": "bash scripts/selftest-init.sh",
     "selftest:gbrain-pglite": "bash scripts/selftest-gbrain-pglite.sh",
+    "selftest:path-covered-by": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-path-covered-by.mjs",
     "selftest:help-docs": "bash scripts/selftest-help-docs.sh",
     "selftest:arweave": "node scripts/arweave-roundtrip.mjs",
     "selftest:arweave-nodeps": "node scripts/selftest-arweave-nodeps.mjs",
