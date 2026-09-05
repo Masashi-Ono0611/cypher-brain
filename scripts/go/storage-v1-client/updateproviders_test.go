@@ -2,11 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/hex"
+	"encoding/json"
 	"math/big"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
+	"github.com/xssnick/tonutils-storage-provider/pkg/contract"
 )
 
 func TestBuildUpdateProvidersBodyValidation(t *testing.T) {
@@ -288,5 +294,76 @@ func TestParseUpdateProvidersFlagsMaxSpendGuardIsCheckedAtRunTime(t *testing.T) 
 	}
 	if p.gasNano.Cmp(p.maxSpendNano) <= 0 {
 		t.Fatal("test setup invalid: expected gasNano > maxSpendNano to exercise the run-time guard path")
+	}
+}
+
+// updateProvidersRunArgs is the full set of flags a happy-path runUpdateProviders
+// call needs — factored out so both tests below build an identical, valid request
+// and differ only in the mocked tonapi response.
+func updateProvidersRunArgs() []string {
+	return []string{
+		"--contract", "0:" + strings.Repeat("c", 64),
+		"--provider-pubkey", strings.Repeat("ab", 32),
+		"--rate-nano-per-mb-day", "800",
+		"--span-days", "192",
+	}
+}
+
+// TestRunUpdateProvidersRejectsForeignCode is the positive control for the
+// assertStorageV1Code guard added to runUpdateProviders (review finding: an
+// 'active' status alone does not prove the account is a StorageV1 contract —
+// without this check, a typo'd/foreign --contract would sail past the status
+// check and get offered a funded, signable repair deeplink to a contract that
+// cannot possibly act on it). Mirrors providers_test.go's own
+// TestRunProvidersRejectsForeignCode for the same underlying check.
+func TestRunUpdateProvidersRejectsForeignCode(t *testing.T) {
+	for name, codeHex := range map[string]string{
+		"missing code": "",
+		"foreign code": hex.EncodeToString(cell.BeginCell().MustStoreUInt(0xdead, 32).EndCell().ToBOC()),
+		"code not hex": "zzzz",
+	} {
+		t.Run(name, func(t *testing.T) {
+			withMockTonapiPaths(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":  "active",
+					"balance": 1,
+					"code":    codeHex,
+				})
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var out bytes.Buffer
+			err := runUpdateProviders(ctx, updateProvidersRunArgs(), &out)
+			if err == nil {
+				t.Fatalf("expected a refusal for %s, got nil (stdout: %s)", name, out.String())
+			}
+			if strings.Contains(out.String(), "deeplink") {
+				t.Fatalf("%s: a repair deeplink was offered anyway: %s", name, out.String())
+			}
+		})
+	}
+}
+
+// TestRunUpdateProvidersAcceptsRealCode is the negative control alongside the
+// test above: the REAL StorageV1 code must still pass, proving the new check
+// rejects foreign code specifically rather than refusing everything.
+func TestRunUpdateProvidersAcceptsRealCode(t *testing.T) {
+	withMockTonapiPaths(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":  "active",
+			"balance": 5000000000,
+			"code":    hex.EncodeToString(contract.V1Code.ToBOC()),
+		})
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var out bytes.Buffer
+	if err := runUpdateProviders(ctx, updateProvidersRunArgs(), &out); err != nil {
+		t.Fatalf("runUpdateProviders: unexpected error with the real StorageV1 code: %v (stdout: %s)", err, out.String())
+	}
+	if !strings.Contains(out.String(), "deeplink:") {
+		t.Fatalf("expected a repair deeplink in stdout, got: %s", out.String())
 	}
 }

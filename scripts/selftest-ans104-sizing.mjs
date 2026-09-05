@@ -18,6 +18,8 @@ import Arweave from 'arweave';
 import { Readable } from 'node:stream';
 import { ArweaveSigner, TurboNodeSigner } from '@ardrive/turbo-sdk';
 import {
+  ARWEAVE_SIGNER_OWNER_LENGTH,
+  ARWEAVE_SIGNER_SIGNATURE_LENGTH,
   CYPHER_BRAIN_DATA_ITEM_TAGS,
   dataItemOverheadBytes,
   serializedTagsSize,
@@ -99,6 +101,32 @@ for (const bad of [null, undefined, {}, { ownerLength: 'x', signatureLength: 0 }
     JSON.stringify(got),
   );
 }
+// The live-ArweaveSigner check above can't tell "signerLengthsOrDefaults genuinely read
+// signer.ownerLength/signatureLength" from "it always returns the 512/512 defaults" —
+// ArweaveSigner's real RSA-4096 lengths happen to BE 512/512, so both implementations
+// return the same numbers for that fixture. A fake signer whose declared lengths differ
+// from the defaults closes that gap: only a real pass-through survives it.
+const nonDefaultSigner = { ownerLength: 777, signatureLength: 333 };
+const liveNonDefault = signerLengthsOrDefaults(nonDefaultSigner);
+check(
+  'a usable signer with NON-default lengths is read verbatim, not silently replaced by the defaults',
+  liveNonDefault.ownerLength === 777 && liveNonDefault.signatureLength === 333,
+  JSON.stringify(liveNonDefault),
+);
+// Half-usable: one field is a real number, the other isn't — each length must be decided
+// independently (not "if either field is bad, default BOTH").
+const halfUsableSigner = { ownerLength: 900, signatureLength: 'not-a-number' };
+const halfUsable = signerLengthsOrDefaults(halfUsableSigner);
+check(
+  'a signer with only ONE usable length keeps that one and defaults only the other',
+  halfUsable.ownerLength === 900 && halfUsable.signatureLength === ARWEAVE_SIGNER_SIGNATURE_LENGTH,
+  JSON.stringify(halfUsable),
+);
+check(
+  'the defaults referenced above are themselves 512/512 (the ArweaveSigner constants this whole file assumes)',
+  ARWEAVE_SIGNER_OWNER_LENGTH === 512 && ARWEAVE_SIGNER_SIGNATURE_LENGTH === 512,
+  `${ARWEAVE_SIGNER_OWNER_LENGTH}/${ARWEAVE_SIGNER_SIGNATURE_LENGTH}`,
+);
 
 console.log('');
 if (failed) {

@@ -71,9 +71,12 @@ echo "== (B) ciphertext + signed sidecar both upload, then --save-locator's OWN 
 cb snapshot --dir "$SRC" --out "$TMP/locfail.age" >/dev/null
 CT_SHA_B=$(shasum -a 256 "$TMP/locfail.age" | cut -d' ' -f1)
 SIG_SHA_B=$(shasum -a 256 "$TMP/locfail.age.minisig" | cut -d' ' -f1)
-# --save-locator's own mkdir(dirname(...)) fails with ENOTDIR: its PARENT path component
-# is a pre-existing regular FILE, not a directory — deterministic, no hash prediction
-# needed for this one.
+# --save-locator's own mkdir(dirname(...)) fails because its PARENT path component is a
+# pre-existing regular FILE, not a directory — deterministic, no hash prediction needed
+# for this one. The errno Node's fs.mkdir({recursive:true}) surfaces for "the target
+# already exists as a non-directory" is platform-dependent — observed as EEXIST ("file
+# already exists") on macOS, and other platforms are documented to report ENOTDIR for the
+# same underlying condition — so the assertion below accepts either.
 BAD_LOCATOR_PARENT="$TMP/locfail-parent-is-a-file"
 printf 'not a directory\n' >"$BAD_LOCATOR_PARENT"
 BAD_LOCATOR_FILE="$BAD_LOCATOR_PARENT/locator.tsv"
@@ -86,6 +89,19 @@ echo "[PASS] push refuses (nonzero exit) when --save-locator's own write fails"
 grep -q 'upload succeeded' "$TMP/locfail-push.out" \
   && echo "[PASS] the error says the upload already succeeded" \
   || { echo "[FAIL] error did not say the upload already succeeded"; cat "$TMP/locfail-push.out"; exit 1; }
+# Same specific-diagnostic bar as scenario A's "names the signature sidecar" check
+# above — "upload succeeded" alone doesn't distinguish THIS failure (PushLocatorWriteError,
+# --save-locator's own write) from scenario A's (PushSignatureUploadError, the .minisig
+# sidecar). Assert the message names --save-locator as the step that failed, and surfaces
+# the forced "parent is a file" cause underneath it (src/lib/push-partial-success.ts's
+# PushLocatorWriteError wraps `cause.message` verbatim; see the comment above the forced
+# failure setup for why this accepts either errno).
+grep -q -- '--save-locator failed' "$TMP/locfail-push.out" \
+  && echo "[PASS] the error names --save-locator itself as the step that failed" \
+  || { echo "[FAIL] error did not name --save-locator as the failing step"; cat "$TMP/locfail-push.out"; exit 1; }
+grep -qi 'ENOTDIR\|not a directory\|EEXIST\|file already exists' "$TMP/locfail-push.out" \
+  && echo "[PASS] the error surfaces the underlying parent-is-a-file cause (forced failure mode)" \
+  || { echo "[FAIL] error did not surface the underlying parent-is-a-file cause"; cat "$TMP/locfail-push.out"; exit 1; }
 grep -qF "$CT_SHA_B" "$TMP/locfail-push.out" \
   && echo "[PASS] the error names the ciphertext's own locator" \
   || { echo "[FAIL] error did not name the ciphertext locator ($CT_SHA_B)"; cat "$TMP/locfail-push.out"; exit 1; }

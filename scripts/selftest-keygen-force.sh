@@ -80,6 +80,11 @@ test -f "$BACKUP_PATH" || { echo "[FAIL] the announced backup path does not exis
 [ "$(sha "$BACKUP_PATH")" = "$ORIG_SHA_B" ] || { echo "[FAIL] the backup is not byte-identical to the OLD identity"; exit 1; }
 BACKUP_MODE="$(stat -c '%a' "$BACKUP_PATH" 2>/dev/null || stat -f '%Lp' "$BACKUP_PATH")"
 [ "$BACKUP_MODE" = "600" ] || { echo "[FAIL] the backup is mode $BACKUP_MODE, expected 600"; exit 1; }
+# Explicit existence check first (same reasoning as selftest-pq.sh's own guard,
+# scripts/selftest-lib.sh#sha): sha() returns "" for a missing file, and "" is always
+# != a real hash — so without this, a --force that deleted identity.age WITHOUT writing
+# a replacement would wrongly satisfy this "!=" check and read as a successful replace.
+test -f "$CYPHER_BRAIN_HOME/identity.age" || { echo "[FAIL] --force left no identity.age at all (deleted without replacing)"; exit 1; }
 [ "$(sha "$CYPHER_BRAIN_HOME/identity.age")" != "$ORIG_SHA_B" ] || { echo "[FAIL] --force did not actually replace the identity"; exit 1; }
 RC=0
 cb restore --in "$TMP/snap-b.age" --out-dir "$TMP/restored-b-new" >"$TMP/b-new.log" 2>&1 || RC=$?
@@ -115,6 +120,9 @@ test -f "$SIGN_BACKUP_PATH" || { echo "[FAIL] the announced signing backup path 
 [ "$(sha "$SIGN_BACKUP_PATH")" = "$ORIG_SIGN_SHA_D" ] || { echo "[FAIL] the signing backup is not byte-identical to the OLD signing identity"; exit 1; }
 SIGN_BACKUP_MODE="$(stat -c '%a' "$SIGN_BACKUP_PATH" 2>/dev/null || stat -f '%Lp' "$SIGN_BACKUP_PATH")"
 [ "$SIGN_BACKUP_MODE" = "600" ] || { echo "[FAIL] the signing backup is mode $SIGN_BACKUP_MODE, expected 600"; exit 1; }
+# Same "!=" guard as the identity check above: sha() on a missing file returns "",
+# which is always != a real hash — check the file still exists before trusting "!=".
+test -f "$CYPHER_BRAIN_HOME/sign-identity.key" || { echo "[FAIL] --sign --force left no sign-identity.key at all (deleted without replacing)"; exit 1; }
 [ "$(sha "$CYPHER_BRAIN_HOME/sign-identity.key")" != "$ORIG_SIGN_SHA_D" ] || { echo "[FAIL] --sign --force did not actually replace the signing identity"; exit 1; }
 echo "[PASS] a successful --sign --force writes a byte-identical, mode-0600 backup of the OLD signing identity"
 

@@ -116,6 +116,13 @@ echo "[PASS] push refuses to overwrite an existing --remote object without --for
 
 echo "== the SAME push WITH --force succeeds and overwrites (#533 — no regression to --force's existing --skip-unchanged meaning) =="
 cb push --in "$TMP/snap2.age" --backend rclone --remote "$OVERWRITE_REMOTE" --force >/dev/null
+# Explicit existence check first (same reasoning as selftest-pq.sh's own guard,
+# scripts/selftest-lib.sh#sha): sha() returns "" for a missing file. $TMP/snap2.age's own
+# existence was already established by the checked `snapshot` above, so without this a
+# --force push that exited 0 but silently deleted the remote object without rewriting it
+# would still correctly fail the comparison below (against a real hash) — but only by
+# accident. Assert the precondition explicitly.
+test -f "$OVERWRITE_STORE_PATH" || { echo "[FAIL] --force push exited 0 but left no object at $OVERWRITE_STORE_PATH"; exit 1; }
 [ "$(sha "$OVERWRITE_STORE_PATH")" = "$(sha "$TMP/snap2.age")" ] && echo "[PASS] --force overwrites the existing --remote object, same as before this fix" || { echo "[FAIL] --force did not overwrite the remote object"; exit 1; }
 
 echo "== push to a genuinely NEW/empty --remote path still succeeds without --force (no false-positive refusal, #533) =="

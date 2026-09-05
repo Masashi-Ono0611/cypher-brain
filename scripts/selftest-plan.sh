@@ -58,6 +58,11 @@ echo "[PASS] estimate --out refuses to clobber an existing plan file without --f
 # this exact refusal) — the file's content actually changes (a fresh created_at).
 sleep 1.1
 CYPHER_BRAIN_FILE_DIR="$TMP/store" cb estimate --in "$TMP/snap.age" --backend file --out "$TMP/clobber-plan.json" --force >"$TMP/clobber-force.out" 2>"$TMP/clobber-force.err"
+# Explicit existence check first (same reasoning as selftest-pq.sh's own guard,
+# scripts/selftest-lib.sh#sha): sha() returns "" for a missing file, and "" is always
+# != a real hash — so without this, a --force that deleted the plan file WITHOUT
+# rewriting it would wrongly satisfy this "!=" check and read as a successful rewrite.
+test -f "$TMP/clobber-plan.json" || { echo "[FAIL] --force left no plan file at all (deleted without rewriting)"; exit 1; }
 [ "$(sha "$TMP/clobber-plan.json")" != "$BEFORE_HASH" ] || { echo "[FAIL] --force did not actually rewrite the plan file"; exit 1; }
 echo "[PASS] estimate --out --force overwrites an existing plan file"
 

@@ -53,11 +53,21 @@ const [cmd, ...cmdArgs] = args.slice(sepIdx + 1);
 const child = spawn(cmd, cmdArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
 let transcript = '';
 let qaIndex = 0;
+// Only ever search the transcript FORWARD from the end of the previous step's own
+// match — never re-scan text this driver already consumed. Matching each step's
+// waitFor against the FULL accumulated transcript (as this used to) let a LATER
+// step's substring spuriously match stale text left over from an EARLIER prompt (or
+// this driver's own already-sent answer bytes, which node's pty/pipe echo can put
+// right back into the child's combined stdout+stderr) — firing that step's answer
+// before the corresponding real prompt had actually printed.
+let searchFrom = 0;
 
 function tryAdvance() {
   while (qaIndex < qa.length) {
     const [waitFor, send] = qa[qaIndex];
-    if (!transcript.includes(waitFor)) return;
+    const idx = transcript.indexOf(waitFor, searchFrom);
+    if (idx === -1) return;
+    searchFrom = idx + waitFor.length;
     child.stdin.write(`${send}\r`);
     qaIndex++;
   }

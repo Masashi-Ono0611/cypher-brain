@@ -450,6 +450,12 @@ echo "== legacy 3-field save-locator: pull still works AND --skip-unchanged does
 LEGACY="$TMP/legacy-locator.tsv"
 printf '%s\t%s\t%s\n' "$LOC1" file "$(sha "$TMP/s1.age")" > "$LEGACY"
 cb pull --from-locator-file "$LEGACY" --out "$TMP/legacy-got.age"
+# Explicit existence check first (same reasoning as selftest-pq.sh's own guard,
+# scripts/selftest-lib.sh#sha): sha() returns "" for a missing file. $TMP/s1.age's own
+# existence was already established earlier, so without this a `pull` that exited 0 but
+# silently wrote nothing here would still correctly fail the comparison below (""
+# against a real hash) — but only by accident. Assert the precondition explicitly.
+test -f "$TMP/legacy-got.age" || { echo "[FAIL] pull --from-locator-file exited 0 but wrote no output at $TMP/legacy-got.age"; exit 1; }
 [ "$(sha "$TMP/legacy-got.age")" = "$(sha "$TMP/s1.age")" ] || { echo "[FAIL] legacy 3-field pull bytes mismatch"; exit 1; }
 echo "[PASS] pull --from-locator-file accepts a legacy 3-field line (recovery unbroken)"
 cb push --in "$TMP/s2.age" --backend file --save-locator "$LEGACY" --skip-unchanged >"$TMP/legacy.out" 2>"$TMP/legacy.err"
@@ -494,6 +500,14 @@ cb snapshot --dir "$SRC2" --out "$TMP/race-a.age"
 cb snapshot --dir "$SRC2" --out "$TMP/race-b.age"
 [ "$(cat "$TMP/race-a.age.digest")" = "$(cat "$TMP/race-b.age.digest")" ] \
   || { echo "[FAIL] the two race artifacts do not share a content digest — --skip-unchanged could never fire for the loser"; exit 1; }
+# Explicit existence check first (same reasoning as selftest-pq.sh's own guard,
+# scripts/selftest-lib.sh#sha): both snapshots above ran under `set -e` (so a nonzero
+# exit would already have aborted), but a `snapshot` that exits 0 while silently writing
+# nothing is exactly the class of bug this suite exists to catch — sha() on such a
+# missing file returns "", and "" is always != a real hash, so without this a single
+# missing race artifact would wrongly satisfy the "!=" check below.
+test -f "$TMP/race-a.age" || { echo "[FAIL] snapshot exited 0 but wrote no output at $TMP/race-a.age"; exit 1; }
+test -f "$TMP/race-b.age" || { echo "[FAIL] snapshot exited 0 but wrote no output at $TMP/race-b.age"; exit 1; }
 [ "$(sha "$TMP/race-a.age")" != "$(sha "$TMP/race-b.age")" ] \
   || { echo "[FAIL] the two race artifacts are byte-identical — a double upload would be invisible in a content-addressed store"; exit 1; }
 RACE_BEFORE=$(ls "$CYPHER_BRAIN_FILE_DIR" | wc -l | tr -d ' ')
