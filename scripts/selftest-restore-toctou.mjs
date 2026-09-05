@@ -153,6 +153,76 @@ try {
     } finally {
       await a.close();
     }
+    // A -> B -> A: the intermediate-read window the module's own header comment (#785,
+    // lines 38-43 above) describes but the two-read positive control above never
+    // exercises — every existing case here only ever has TWO completed digests, so
+    // "the LAST one differs from the reference" and "SOME one differs from the
+    // reference" happen to give the same answer. Content that returns to the ORIGINAL
+    // baseline bytes at the point restore's final digest check runs (having been
+    // swapped away and back in between, seen by some earlier phase) must still be
+    // caught — a change detector implemented as "compare the baseline to only the most
+    // recently completed digest" would silently miss exactly this, even though the
+    // module's own artifactChangedDigest() scans ALL of completedDigests() with .find()
+    // rather than just the last entry, specifically to catch this.
+    {
+      const aba = join(TMP, 'owner-aba.bin');
+      // Shared prefix, well past HEAD_BIND_BYTES (64, artifact.ts) — so observedHeads()
+      // NEVER disagrees between A and B and artifactChangedDigest()'s cheap "first
+      // bytes" check (checked FIRST, before completedDigests()) stays silent throughout.
+      // That is deliberate: this case is specifically about the WHOLE-FILE comparison
+      // (completedDigests()'s own .find() over every entry) catching a divergence the
+      // head check structurally cannot see, the same reason lines 122-126 above give for
+      // differing only past the header.
+      const SHARED_HEAD = Buffer.alloc(1024, 0x41);
+      const CONTENT_A = Buffer.concat([SHARED_HEAD, Buffer.alloc(64 * 1024, 0x61)]); // 'a' tail
+      const CONTENT_B = Buffer.concat([SHARED_HEAD, Buffer.alloc(64 * 1024, 0x62)]); // 'b' tail — same length, different bytes
+      await writeFile(aba, CONTENT_A);
+      const owner = await openRestoreArtifact(aba);
+      try {
+        const baselineA = await owner.sha256(); // phase 1: reads A
+        await writeFile(aba, CONTENT_B);
+        const middleB = await owner.sha256(); // phase 2 (the intermediate read): reads B
+        check(
+          'Part 0 (A->B->A): the intermediate B read really did produce a DIFFERENT digest than A (positive control on the fixture)',
+          middleB !== baselineA,
+        );
+        await writeFile(aba, CONTENT_A); // swap back to the ORIGINAL bytes
+        const finalA = await owner.sha256(); // phase 3: reads A again — matches the baseline
+        check(
+          'Part 0 (A->B->A): the final read really does match the baseline again, byte-for-byte (positive control on the fixture)',
+          finalA === baselineA,
+        );
+        const abaHeads = owner.observedHeads();
+        check(
+          'Part 0 (A->B->A): the shared prefix keeps observedHeads() from ever disagreeing (isolates this to the whole-file comparison)',
+          new Set(abaHeads).size === 1,
+          JSON.stringify(abaHeads),
+        );
+        const abaDigests = owner.completedDigests();
+        check(
+          'Part 0 (A->B->A): completedDigests() records all THREE reads, not just the distinct values',
+          abaDigests.length === 3 &&
+            abaDigests[0] === baselineA &&
+            abaDigests[1] === middleB &&
+            abaDigests[2] === finalA,
+          JSON.stringify(abaDigests),
+        );
+        const withRef = artifactChangedDigest(owner, baselineA);
+        check(
+          'Part 0 (A->B->A): a change is caught, via the WHOLE-FILE comparison, even though the FIRST and LAST reads agree — the intermediate B read must not be shadowed by the return to baseline',
+          withRef?.scope === 'contents' && withRef?.observed === middleB,
+          JSON.stringify(withRef),
+        );
+        const noRef = artifactChangedDigest(owner);
+        check(
+          'Part 0 (A->B->A): the no-reference form (compares against the FIRST completed digest) catches it too',
+          noRef?.scope === 'contents' && noRef?.observed === middleB,
+          JSON.stringify(noRef),
+        );
+      } finally {
+        await owner.close();
+      }
+    }
     // #218's cap has to survive a file that GROWS after the fstat at open time: the cap
     // is accepted here (32 KiB file, 64 KiB limit) and must still fire once a stream
     // actually delivers more than that.
@@ -261,7 +331,12 @@ try {
       '  while [ ! -e "$CB_PHASE_GO" ]; do',
       '    sleep 0.05',
       '    waited=$((waited + 1))',
-      '    if [ "$waited" -ge 1200 ]; then break; fi   # 60s ceiling: never wedge the suite',
+      // 60s ceiling: never wedge the suite. This is a FAIL-OPEN escape hatch by
+      // construction (the tar stub gives up waiting and lets the real tar run whether or
+      // not the JS-side swap ever completed) — so it must never be silent. Mark it before
+      // falling through, so the harness can tell "the swap landed, then we proceeded" from
+      // "we gave up waiting for the swap and proceeded anyway, so this run proves nothing".
+      '    if [ "$waited" -ge 1200 ]; then printf \'timeout\\n\' > "$CB_PHASE_GO_TIMEOUT"; break; fi',
       '  done',
       'fi',
       `exec ${JSON.stringify(REAL_TAR)} "$@"`,
@@ -292,12 +367,14 @@ try {
     const n = ++runNo;
     const sentinel = join(TMP, `sentinel-${n}`);
     const go = join(TMP, `go-${n}`);
+    const goTimeout = join(TMP, `go-timeout-${n}`);
     const child = spawn('node', [...DEV_ARGS, BIN, 'restore', '--in', inPath, '--out-dir', outDir], {
       env: cliEnv({
         PATH: `${STUBBIN}:${process.env.PATH}`,
         TAR_STUB_MODE: 'block-version',
         CB_PHASE_SENTINEL: sentinel,
         CB_PHASE_GO: go,
+        CB_PHASE_GO_TIMEOUT: goTimeout,
       }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -329,7 +406,7 @@ try {
     if (!reached) {
       if (exitCode === null) await reap();
       else await exited;
-      return { reached: false, code: exitCode, out, err };
+      return { reached: false, reason: 'no-sentinel', code: exitCode, out, err };
     }
     try {
       await atBarrier();
@@ -338,10 +415,44 @@ try {
       await reap();
       reached = false;
       err += `\nbarrier callback threw: ${e?.message ?? e}`;
-      return { reached, code: exitCode, out, err };
+      return { reached, reason: 'no-sentinel', code: exitCode, out, err };
     }
     await exited;
-    return { reached, code: exitCode, out, err };
+    // The stub's OWN internal wait for the go-file has a 60s ceiling that fails OPEN by
+    // construction (it gives up and lets the real tar run regardless — see the stub
+    // script's comment above). If that ceiling fired, the child may well have reached
+    // `tar --version` and moved past it BEFORE this harness's swap (`atBarrier()`) ever
+    // took effect — a run whose apparent pass/fail proves nothing about ordering, not a
+    // genuine barrier-respecting run. Fail this closed rather than trust whatever
+    // exit code/output happened to come out of that race.
+    if (existsSync(goTimeout)) {
+      return {
+        reached: false,
+        reason: 'go-timeout',
+        code: exitCode,
+        out,
+        err: `${err}\n[selftest] the stub's internal 60s wait for the go-file timed out — the swap may not have landed before extraction resumed; this run's result is not trustworthy and is treated as BLOCKED`,
+      };
+    }
+    return { reached, reason: undefined, code: exitCode, out, err };
+  }
+
+  // Shared call-site reporting for restoreWithBarrier()'s two distinct "did not reach a
+  // trustworthy barrier" outcomes — a sentinel that never appeared (the child never got
+  // to `tar --version`) versus the stub's own internal go-wait timing out (the child DID
+  // reach the barrier, but the 60s ceiling on waiting for the swap fired before this
+  // harness's callback finished, so the run cannot be trusted to have actually parked for
+  // the swap). Both fail closed: this returns false so callers skip every downstream
+  // assertion instead of grading a race.
+  function checkReached(r, label) {
+    if (r.reached) return true;
+    blocked(
+      `${label}: restore reached the pre-extraction barrier`,
+      r.reason === 'go-timeout'
+        ? "the stub's internal 60s wait for the go-file timed out — the swap may not have completed before extraction resumed"
+        : 'sentinel never appeared',
+    );
+    return false;
   }
 
   // A scratch tree is a SIBLING of --out-dir (`<out-dir>.restore-<pid>-<hex>`), so a
@@ -386,8 +497,7 @@ try {
     const outDir = join(TMP, 'out-control');
     await copyFile(good, inPath);
     const r = await restoreWithBarrier(inPath, outDir, async () => {});
-    if (!r.reached) blocked('control: restore reached the pre-extraction barrier', 'sentinel never appeared');
-    else {
+    if (checkReached(r, 'control')) {
       check('control: a restore parked at the barrier still succeeds', r.code === 0, `exit ${r.code}: ${r.err}`);
       const markers = await markersUnder(outDir);
       check(
@@ -406,8 +516,7 @@ try {
     await copyFile(good, inPath);
     await copyFile(evil, decoy);
     const r = await restoreWithBarrier(inPath, outDir, () => rename(decoy, inPath));
-    if (!r.reached) blocked('(a) rename-swap: restore reached the barrier', 'sentinel never appeared');
-    else {
+    if (checkReached(r, '(a) rename-swap')) {
       check(
         '(a) rename-swap: the swap is confirmed to have landed (positive control on the attack)',
         (await readFile(inPath)).equals(evilBytes),
@@ -455,8 +564,7 @@ try {
     // writeFile truncates and rewrites the SAME inode — the primitive a writer with
     // access to --in's path would use, and the one the descriptor cannot see through.
     const r = await restoreWithBarrier(inPath, outDir, () => writeFile(inPath, evilBytes));
-    if (!r.reached) blocked('(b) in-place overwrite: restore reached the barrier', 'sentinel never appeared');
-    else {
+    if (checkReached(r, '(b) in-place overwrite')) {
       const all = `${r.out}\n${r.err}`;
       check(
         '(b) in-place overwrite: the overwrite is confirmed to have landed (positive control on the attack)',
