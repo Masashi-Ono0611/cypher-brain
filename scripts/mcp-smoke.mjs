@@ -168,13 +168,43 @@ function openFifoForWrite(path, child, label) {
   });
 }
 
+// Malformed COMPLETE lines already warned about once — de-duplicated so a line that keeps
+// failing to parse across many polls (this function re-parses the whole cumulative buffer
+// on every call, not just newly-arrived bytes) does not spam stderr once per 100ms tick.
+const warnedMalformedLines = new Set();
+
 function parseFrames(buf) {
   const out = [];
-  for (const line of buf.split('\n')) {
-    const s = line.trim();
+  const lines = buf.split('\n');
+  // `buf` is the cumulative buffer as of THIS call, and this runs on every poll while more
+  // data keeps arriving — so the LAST element of the split is the only one that can still be
+  // an in-flight fragment (not yet followed by the '\n' the child will eventually write).
+  // Every EARLIER element was already terminated by a real '\n' in the buffer, so it is a
+  // complete line by construction — a parse failure there is a genuinely malformed frame,
+  // not "hasn't fully arrived yet", and silently dropping it (as this used to, identically
+  // for both cases) could hide a real protocol bug behind what looks like a passing test.
+  for (let i = 0; i < lines.length - 1; i++) {
+    const s = lines[i].trim();
     if (!s) continue;
     try {
       out.push(JSON.parse(s));
+    } catch (err) {
+      if (!warnedMalformedLines.has(s)) {
+        warnedMalformedLines.add(s);
+        process.stderr.write(
+          `MCP SMOKE: malformed JSON-RPC line from the server, ignored (this was already newline-terminated, ` +
+            `so it is not an in-flight fragment): ${JSON.stringify(s).slice(0, 300)} ` +
+            `(${err instanceof Error ? err.message : String(err)})\n`,
+        );
+      }
+    }
+  }
+  // The final split element has no trailing '\n' yet in this snapshot of the buffer — a
+  // parse failure here really can mean "still being written", so it stays silent, as before.
+  const last = lines[lines.length - 1].trim();
+  if (last) {
+    try {
+      out.push(JSON.parse(last));
     } catch {
       /* incomplete JSON line — ignore */
     }
@@ -250,16 +280,7 @@ async function runIdempotencyTtlValidationTest(tmp) {
         `idempotency TTL validation: server with an UNSET TTL failed to initialize: ${JSON.stringify(initRes)}`,
       );
   } finally {
-    try {
-      okChild.stdin.end();
-    } catch {
-      /* ignore */
-    }
-    try {
-      okChild.kill();
-    } catch {
-      /* ignore */
-    }
+    await killAndWait(okChild);
   }
   process.stdout.write(
     `MCP SMOKE (idempotency TTL validation): PASS — refused to start for ${badValues.length} invalid TTL value(s) ` +
@@ -343,16 +364,7 @@ async function runMaxSpendValidationTest(tmp) {
         `max-spend validation: server with both variables UNSET failed to initialize: ${JSON.stringify(initRes)}`,
       );
   } finally {
-    try {
-      okChild.stdin.end();
-    } catch {
-      /* ignore */
-    }
-    try {
-      okChild.kill();
-    } catch {
-      /* ignore */
-    }
+    await killAndWait(okChild);
   }
   process.stdout.write(
     'MCP SMOKE (max-spend validation): PASS — refused to start for invalid CYPHER_BRAIN_MAX_SPEND/' +
@@ -519,16 +531,7 @@ async function runIdempotencyCorruptedLogTest(tmp) {
         '(ERR_IDEMPOTENCY_STORE_UNREADABLE), doing no work\n',
     );
   } finally {
-    try {
-      child.stdin.end();
-    } catch {
-      /* ignore */
-    }
-    try {
-      child.kill();
-    } catch {
-      /* ignore */
-    }
+    await killAndWait(child);
   }
 }
 
@@ -624,18 +627,20 @@ async function runIdempotencyTtlTest(tmp) {
       'MCP SMOKE (idempotency TTL): PASS — immediate replay hit the cache, replay after TTL expiry re-executed\n',
     );
   } finally {
-    try {
-      child3.stdin.end();
-    } catch {
-      /* ignore */
-    }
-    try {
-      child3.kill();
-    } catch {
-      /* ignore */
-    }
+    await killAndWait(child3);
   }
 }
+
+// A single counter shared by every makeRpcClient() instance in this process (rather than
+// a per-client counter) so the id actually written to the wire is unique across every
+// server this file spawns, not merely "probably unique within one connection". Without
+// this, the id namespace this file's ~50+ send()/waitFor() call sites hand-pick (1, 2, 3 …
+// 5001, 6000+n, 9003, 22001-22007, 30701-30708) only avoids collisions because whoever adds
+// the next call remembers to pick an unused literal — nothing enforces it. Callers keep
+// using their own literal id (readable in error messages, and it is what waitFor() is
+// called with); send() maps it to a fresh globally-unique wire id and waitFor() translates
+// back, so no code outside this function has to change.
+let rpcWireIdSeq = 0;
 
 // Wires one spawned MCP server's stdout/stderr into the same send()/waitFor(id)
 // JSON-RPC-over-stdio pattern the main flow below uses — pulled out so the isolated
@@ -644,6 +649,13 @@ async function runIdempotencyTtlTest(tmp) {
 function makeRpcClient(child) {
   let stdoutBuf = '';
   let stderrBuf = '';
+  // A spawn-level failure (node binary missing, EMFILE, …) emits 'error', not 'exit'. The
+  // previous `throw err` here ran inside the 'error' listener's own call stack — asynchronous
+  // and outside every caller's try/finally — so it crashed the whole process immediately,
+  // skipping every pending test's cleanup instead of just failing the one in flight.
+  // Recording it (same idiom as arweave-roundtrip.mjs's `arSpawnError`) lets waitFor() raise
+  // it as an ordinary rejection that a caller's finally block DOES run for.
+  let spawnError = null;
   child.stdout.on('data', (d) => {
     stdoutBuf += d.toString('utf8');
   });
@@ -651,14 +663,39 @@ function makeRpcClient(child) {
     stderrBuf += d.toString('utf8');
   });
   child.on('error', (err) => {
-    throw err;
+    spawnError = err;
   });
-  const send = (msg) => child.stdin.write(`${JSON.stringify(msg)}\n`);
+  const wireIdOf = new Map(); // caller-supplied id -> globally-unique id actually sent
+  const send = (msg) => {
+    if (msg.id === undefined) {
+      // A notification (e.g. notifications/initialized) — no id, no response expected, so
+      // nothing to remap.
+      child.stdin.write(`${JSON.stringify(msg)}\n`);
+      return;
+    }
+    const wireId = ++rpcWireIdSeq;
+    wireIdOf.set(msg.id, wireId);
+    child.stdin.write(`${JSON.stringify({ ...msg, id: wireId })}\n`);
+  };
   async function waitFor(id) {
+    // No silent fallback to the literal `id` here: since every wire id is a small
+    // sequential integer (rpcWireIdSeq), a caller id that was never actually send()'d on
+    // this connection could otherwise coincidentally equal SOME other call's real wire id
+    // and silently resolve to that unrelated response (multi-model review) — the same class
+    // of bug this whole change exists to close, just moved into the fallback branch instead
+    // of removed. A waitFor() with no matching send() is a test bug, not a network
+    // condition, so it fails immediately and unambiguously instead.
+    if (!wireIdOf.has(id)) {
+      throw new Error(`waitFor(${id}) called for an id that was never sent on this connection (test bug)`);
+    }
+    const wireId = wireIdOf.get(id);
     const deadline = Date.now() + TIMEOUT_MS;
     while (Date.now() < deadline) {
-      const frame = parseFrames(stdoutBuf).find((f) => f.id === id);
-      if (frame) return frame;
+      if (spawnError) {
+        throw new Error(`no response for id=${id}: the server process failed to spawn: ${spawnError.message}`);
+      }
+      const frame = parseFrames(stdoutBuf).find((f) => f.id === wireId);
+      if (frame) return { ...frame, id };
       await wait(100);
     }
     throw new Error(
@@ -666,6 +703,67 @@ function makeRpcClient(child) {
     );
   }
   return { send, waitFor };
+}
+
+// SIGTERM, then escalate to SIGKILL if the process has not exited within a bounded
+// window — the same killAndWait() idiom already used for tearing down a spawned MCP
+// server elsewhere in this repo (scripts/selftest-mcp-uncertain-spend.mjs,
+// scripts/selftest-mcp-snapshot-policy.mjs). A plain `child.kill()` with no escalation
+// relies on the server exiting promptly on SIGTERM alone — true today, but this server
+// installs its own signal handler (src/lib/signal-guard.ts) specifically so it CAN run
+// cleanup before exiting, so "exits promptly" is a behavior, not a guarantee. Ends stdin
+// first (the pre-existing teardown order at every call site) so the server sees EOF before
+// any signal.
+function killAndWait(child, timeoutMs = 3000) {
+  try {
+    child.stdin?.end();
+  } catch {
+    /* already closed */
+  }
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolveDone) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(sigkillTimer);
+      clearTimeout(giveUpTimer);
+      // The giveUpTimer path below calls `done` directly rather than via the 'exit' event,
+      // so `once()` never gets a chance to auto-remove this listener on that path — remove
+      // it explicitly so a child that (pathologically) exits later doesn't invoke a second,
+      // already-settled `done`.
+      child.removeListener('exit', done);
+      resolveDone();
+    };
+    child.once('exit', done);
+    const sigkillTimer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }, timeoutMs);
+    // Last-resort bound (multi-model review): child.kill() can return false — signal not
+    // delivered — WITHOUT throwing, so neither the SIGTERM catch above nor the SIGKILL
+    // above is guaranteed to fire `done()` in that case, and nothing then guarantees an
+    // 'exit' event ever arrives either. Without this, that combination would leave the
+    // promise (and whatever awaits it) pending forever — exactly the unbounded hang this
+    // whole escalation exists to prevent, just moved one failure mode deeper. Disclosed
+    // residual limitation (multi-model review): this bounds the PROMISE, not the underlying
+    // process — if SIGKILL is somehow never actually delivered to a genuinely still-live
+    // child, this script's own process could still be kept alive by that child's handle and
+    // this file's own stdout/stderr listeners on it. SIGKILL silently failing to reach a
+    // process this script owns and can signal is not a failure mode observed in practice on
+    // the platforms this suite runs on; detaching stdio / force-`process.exit()`ing to cover
+    // it is not worth the added complexity for a residual risk this far outside how
+    // child.kill() actually behaves.
+    const giveUpTimer = setTimeout(done, timeoutMs + 5000);
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      done();
+    }
+  });
 }
 
 // 3. keygen / wallet_create / wallet_address round-trip (issue #174): a SEPARATE
@@ -766,16 +864,7 @@ async function runKeygenWalletTests(tmp) {
         `wallet_create fresh+no-clobber ok, wallet_address matches wallet_create\n`,
     );
   } finally {
-    try {
-      child2.stdin.end();
-    } catch {
-      /* ignore */
-    }
-    try {
-      child2.kill();
-    } catch {
-      /* ignore */
-    }
+    await killAndWait(child2);
   }
 }
 
@@ -866,16 +955,7 @@ async function runScheduleStatusNotInstalledTest(tmp) {
         'installed, cb_code CB-E014 preserved, a genuinely corrupt schedule.json still reports ERR_INTERNAL\n',
     );
   } finally {
-    try {
-      child4.stdin.end();
-    } catch {
-      /* ignore */
-    }
-    try {
-      child4.kill();
-    } catch {
-      /* ignore */
-    }
+    await killAndWait(child4);
   }
 }
 
@@ -1029,16 +1109,7 @@ async function runPaidConsentDescriptionTest(tmp) {
         `${paidFromEnum.length} advertised paid backend(s) have a recorded description rather than the fallback\n`,
     );
   } finally {
-    try {
-      child5.stdin.end();
-    } catch {
-      /* ignore */
-    }
-    try {
-      child5.kill();
-    } catch {
-      /* ignore */
-    }
+    await killAndWait(child5);
   }
 }
 
@@ -1102,12 +1173,26 @@ async function runCleanupFailurePreservesOutcomeTest(tmp) {
   // mkfifo via the system binary — node:fs has no FIFO creation primitive.
   const identityFifo = join(tmp, 'cleanup-failure-identity.fifo');
   const mkfifo = spawnSync('mkfifo', ['-m', '600', identityFifo], { encoding: 'utf8' });
-  if (mkfifo.status !== 0) {
+  if (mkfifo.error) {
+    // A spawn-level failure — mkfifo.error set, mkfifo.status left null — means the
+    // `mkfifo` binary itself could not be launched (ENOENT: no such command on this
+    // platform). That is the one case this test genuinely cannot control for, so it SKIPs
+    // loudly rather than fail.
     process.stdout.write(
-      `MCP SMOKE (cleanup failure): SKIP — mkfifo unavailable on this platform (${mkfifo.stderr?.trim() || mkfifo.error?.message}), ` +
+      `MCP SMOKE (cleanup failure): SKIP — mkfifo unavailable on this platform (${mkfifo.error.message}), ` +
         'so the #793 cleanup-failure window could not be opened deterministically\n',
     );
     return;
+  }
+  if (mkfifo.status !== 0) {
+    // The binary DID run here — a non-zero exit with no spawn-level error (permission
+    // denied, disk full, a stale FIFO already at this path from a previous crashed run, …)
+    // is a real problem with THIS run's environment, not "mkfifo does not exist here", and
+    // must be reported as a failure rather than silently folded into the same SKIP above.
+    throw new Error(
+      `mkfifo failed unexpectedly (the binary ran and refused — this is not "mkfifo is unsupported here"): ` +
+        `status=${mkfifo.status} stderr=${mkfifo.stderr?.trim()}`,
+    );
   }
 
   const child6 = spawn(process.execPath, [SERVER_PATH], {
@@ -1240,16 +1325,7 @@ async function runCleanupFailurePreservesOutcomeTest(tmp) {
     );
   } finally {
     await chmod(serverTmp, 0o700).catch(() => {});
-    try {
-      child6.stdin.end();
-    } catch {
-      /* ignore */
-    }
-    try {
-      child6.kill();
-    } catch {
-      /* ignore */
-    }
+    await killAndWait(child6);
   }
 }
 
@@ -2944,7 +3020,7 @@ async function run(tmp) {
         );
       }
     } finally {
-      devChild.kill();
+      await killAndWait(devChild);
     }
 
     // 2m. schedule_status must REJECT unexpected arguments rather than silently
@@ -3497,16 +3573,7 @@ async function run(tmp) {
         `different-key-not-a-free-pass=CB-E009\n`,
     );
   } finally {
-    try {
-      child.stdin.end();
-    } catch {
-      /* ignore */
-    }
-    try {
-      child.kill();
-    } catch {
-      /* ignore */
-    }
+    await killAndWait(child);
   }
 }
 
@@ -3570,7 +3637,6 @@ async function runSignalCleanupTest(tmp) {
   const { send, waitFor } = makeRpcClient(child);
   const leftovers = async () => (await readdir(isolatedTmp)).filter((n) => n.startsWith('cypher-brain-mcp-'));
 
-  let signalled = false;
   try {
     send({
       jsonrpc: '2.0',
@@ -3636,7 +3702,6 @@ async function runSignalCleanupTest(tmp) {
     }
 
     child.kill('SIGTERM');
-    signalled = true;
     // Bounded: a handler that cleans up but never re-raises would otherwise hang the whole
     // smoke suite instead of failing it.
     const exited = await Promise.race([
@@ -3662,18 +3727,13 @@ async function runSignalCleanupTest(tmp) {
       );
     }
   } finally {
-    if (!signalled) {
-      try {
-        child.stdin.end();
-      } catch {
-        /* ignore */
-      }
-      try {
-        child.kill();
-      } catch {
-        /* ignore */
-      }
-    }
+    // Always run this, even after the deliberate SIGTERM above: killAndWait() is a no-op if
+    // the process already exited (which it did on every passing run), so this adds nothing
+    // to that path — but if the assertion just above threw because the server never
+    // actually exited within the 15s window (a genuine SIGTERM-handling bug), skipping this
+    // would leak that still-alive server process past this script's own exit. That gap
+    // existed here before this file's kill(-> SIGKILL) escalation was added elsewhere.
+    await killAndWait(child);
   }
   process.stdout.write(
     'MCP SMOKE (signal cleanup): PASS — SIGTERM with two verify_restore calls in flight left no ' +
