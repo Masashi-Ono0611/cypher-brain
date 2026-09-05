@@ -1071,9 +1071,42 @@ TOUT="$TMP/timeout-snap.age"
 START=$(date +%s)
 START_MARKER="$TMP/timeout-start-marker"; touch "$START_MARKER"
 set +e
-TERR=$(PATH="$STUBBIN:$PATH" TAR_STUB_MODE=wedge CYPHER_BRAIN_PIPE_TIMEOUT=600 node "${BIN_DEV_ARGS[@]}" "$BIN" snapshot --dir "$SRC" --out "$TOUT" 2>&1); TRC=$?
+# with_timeout 45: an independent, external safety net -- NOT the thing under test.
+# The CLI's OWN pipeline timeout (CYPHER_BRAIN_PIPE_TIMEOUT=600ms + escalation) is what
+# the assertions below verify, via the ELAPSED check after the fact. But that check only
+# runs once this command substitution has already returned -- if the CLI's own timeout
+# escalation regressed and stopped firing at all, this line would block forever with no
+# bound of its own (rules/shell-ops.md: every wait needs its OWN deadline, not just an
+# outer one). 45s is comfortably above the < 15s the passing path asserts (so it can
+# never mask a real pass as a timeout) and short enough to fail fast with a clear
+# diagnostic instead of hanging the whole suite/CI job.
+TERR=$(PATH="$STUBBIN:$PATH" TAR_STUB_MODE=wedge CYPHER_BRAIN_PIPE_TIMEOUT=600 with_timeout 45 node "${BIN_DEV_ARGS[@]}" "$BIN" snapshot --dir "$SRC" --out "$TOUT" 2>&1); TRC=$?
 set -e
 ELAPSED=$(( $(date +%s) - START ))
+# 137 here almost always means with_timeout's OWN 45s watchdog had to SIGKILL the CLI -- a
+# genuine hang (the CLI's internal escalation regressed) -- but a bare exit status alone
+# can't PROVE which SIGKILL landed (Codex review: an unrelated external kill of the same
+# process would look identical). Correlate with ELAPSED: our watchdog can only fire at
+# >=45s, so anything close to that bound is this test's own safety net, not a coincidence.
+# Note a real, narrower limitation this cannot fully rule out either way (Codex review):
+# with_timeout's own cleanup unconditionally SIGKILLs the whole process group right after
+# the CLI itself exits, whether or not the CLI's OWN escalation already reaped its tar
+# child -- so a CLI regression that fails to kill its child but still exits promptly on
+# its own could, in principle, have that leftover child silently swept up by this external
+# safety net before ELAPSED even approaches 45s. That narrower case is a property of the
+# shared with_timeout helper (scripts/selftest-lib.sh, already used at 30+ other call
+# sites) and is not something this test's own change can distinguish without redesigning
+# that shared helper -- out of scope here. The file-based checks below (.part / staged
+# plaintext) remain the primary evidence for that class of regression.
+if [ "$TRC" = "137" ]; then
+  if [ "$ELAPSED" -ge 40 ]; then
+    echo "[FAIL] wedged-tar snapshot hung -- the CLI's own pipeline timeout never fired; killed by this test's 45s safety-net watchdog instead (ELAPSED=${ELAPSED}s)"
+  else
+    echo "[FAIL] wedged-tar snapshot exited via SIGKILL (status 137) after only ${ELAPSED}s -- too early to be this test's 45s safety-net watchdog; something else sent SIGKILL"
+  fi
+  echo "$TERR"
+  exit 1
+fi
 [ "$TRC" != "0" ] || { echo "[FAIL] wedged-tar snapshot exited 0"; exit 1; }
 printf '%s' "$TERR" | grep -qi "timed out" || { echo "[FAIL] no timeout error surfaced"; echo "$TERR"; exit 1; }
 # < 15s proves the SIGKILL escalation fired (timeout 0.6s + 2s SIGKILL + overhead),
@@ -1329,10 +1362,39 @@ CYPHER_BRAIN_HOME="$TMP/keys" CYPHER_BRAIN_PG_BIN="$FAKE_PGBIN_R" \
 PGTO_OUT="$TMP/pg-timeout-out"
 START=$(date +%s)
 set +e
+# with_timeout 45: an independent, external safety net -- NOT the thing under test (same
+# rationale as the pipeline-tar wedge test above). The CLI's own timeoutMs (proc.ts) is
+# what the ELAPSED assertion below verifies, but that check only runs once this command
+# substitution has already returned -- a regressed CLI timeout would otherwise block this
+# line forever with no bound of its own. 45s sits comfortably above the < 15s the passing
+# path asserts, so it can never mask a real pass, and turns a hang into a fast, diagnosable
+# failure instead of stalling the whole suite/CI job.
 TERR=$(CYPHER_BRAIN_HOME="$TMP/keys" CYPHER_BRAIN_PG_BIN="$FAKE_PGBIN_R" CYPHER_BRAIN_PIPE_TIMEOUT=600 \
-  node "${BIN_DEV_ARGS[@]}" "$BIN" restore --in "$PGTO_SNAP" --out-dir "$PGTO_OUT" --pg "postgres://fake/scratch" --yes 2>&1); TRC=$?
+  with_timeout 45 node "${BIN_DEV_ARGS[@]}" "$BIN" restore --in "$PGTO_SNAP" --out-dir "$PGTO_OUT" --pg "postgres://fake/scratch" --yes 2>&1); TRC=$?
 set -e
 ELAPSED=$(( $(date +%s) - START ))
+# 137 here almost always means with_timeout's OWN 45s watchdog had to SIGKILL the CLI -- a
+# genuine hang (the CLI's own timeoutMs never fired) -- but a bare exit status alone can't
+# PROVE which SIGKILL landed (Codex review: an unrelated external kill of the same process
+# would look identical). Correlate with ELAPSED: our watchdog can only fire at >=45s, so
+# anything close to that bound is this test's own safety net, not a coincidence. Same
+# narrower limitation as the pipeline-tar wedge test above applies here too: with_timeout's
+# own cleanup unconditionally SIGKILLs the whole process group right after the CLI exits,
+# so a CLI regression that fails to kill its own pg_restore child but still exits promptly
+# could, in principle, have that leftover child swept up by this external safety net before
+# ELAPSED approaches 45s -- a property of the shared with_timeout helper (30+ other call
+# sites), not something fixable here without redesigning that shared helper. The db.dump
+# absence / manifest checks a real pg_restore run leaves behind remain the primary evidence
+# for that class of regression in this specific test.
+if [ "$TRC" = "137" ]; then
+  if [ "$ELAPSED" -ge 40 ]; then
+    echo "[FAIL] restore with a wedged pg_restore hung -- the CLI's own timeoutMs never fired; killed by this test's 45s safety-net watchdog instead (ELAPSED=${ELAPSED}s)"
+  else
+    echo "[FAIL] restore with a wedged pg_restore exited via SIGKILL (status 137) after only ${ELAPSED}s -- too early to be this test's 45s safety-net watchdog; something else sent SIGKILL"
+  fi
+  echo "$TERR"
+  exit 1
+fi
 [ "$TRC" != "0" ] || { echo "[FAIL] restore with a wedged pg_restore exited 0"; exit 1; }
 printf '%s' "$TERR" | grep -qi "timed out" || { echo "[FAIL] no timeout error surfaced for a wedged pg_restore"; echo "$TERR"; exit 1; }
 [ "$ELAPSED" -lt 15 ] || { echo "[FAIL] pg_restore took ${ELAPSED}s — timeoutMs did not bound it (< the 30s stub sleep)"; exit 1; }
