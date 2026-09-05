@@ -127,6 +127,47 @@ const TIMEOUT_MS = 30_000;
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// fs.open() on a FIFO opened for writing blocks at the OS level until some process opens
+// the other end for reading — a Promise.race against a timer cannot cancel that underlying
+// syscall, but racing it against the SERVER's own exit can: if the server rejects the
+// request (or crashes) before ever opening its end, our open() would otherwise block
+// forever with no diagnostic (the failure mode a plain `await open(path, 'w')` cannot
+// detect). Whichever settles first wins; losing the race to a late `open()` still closes
+// the handle so it is not leaked.
+function openFifoForWrite(path, child, label) {
+  return new Promise((resolveOpen, rejectOpen) => {
+    let settled = false;
+    const onExit = (code, signal) => {
+      if (settled) return;
+      settled = true;
+      rejectOpen(
+        new Error(
+          `${label}: server exited (code=${code}, signal=${signal}) before opening the FIFO for reading — ` +
+            'expected it to be blocked on the pull this test is exercising',
+        ),
+      );
+    };
+    child.once('exit', onExit);
+    open(path, 'w').then(
+      (handle) => {
+        if (settled) {
+          handle.close().catch(() => {});
+          return;
+        }
+        settled = true;
+        child.removeListener('exit', onExit);
+        resolveOpen(handle);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        child.removeListener('exit', onExit);
+        rejectOpen(err);
+      },
+    );
+  });
+}
+
 function parseFrames(buf) {
   const out = [];
   for (const line of buf.split('\n')) {
@@ -335,6 +376,7 @@ async function runIdempotencyCorruptedLogTest(tmp) {
   const keygenRes = spawnSync(process.execPath, [SERVER_PATH.replace(/mcp\.mjs$/, 'cli.mjs'), 'keygen'], {
     env: { ...process.env, CYPHER_BRAIN_HOME: home },
     encoding: 'utf8',
+    timeout: TIMEOUT_MS, // a hung setup call must fail loudly, not wedge the whole suite
   });
   if (keygenRes.status !== 0) {
     throw new Error(`corrupted-log test: keygen failed (${keygenRes.status}): ${keygenRes.stderr || keygenRes.stdout}`);
@@ -507,6 +549,7 @@ async function runIdempotencyTtlTest(tmp) {
   const keygenRes = spawnSync(process.execPath, [SERVER_PATH.replace(/mcp\.mjs$/, 'cli.mjs'), 'keygen'], {
     env: { ...process.env, CYPHER_BRAIN_HOME: home3 },
     encoding: 'utf8',
+    timeout: TIMEOUT_MS, // a hung setup call must fail loudly, not wedge the whole suite
   });
   if (keygenRes.status !== 0) {
     throw new Error(
@@ -679,7 +722,13 @@ async function runKeygenWalletTests(tmp) {
     const keygen3 = await waitFor(4);
     const keygen3Sc = keygen3.result?.structuredContent;
     if (keygen3.result?.isError) throw new Error(`keygen (force) failed: ${JSON.stringify(keygen3Sc).slice(0, 500)}`);
-    if (keygen3Sc?.recipient === keygen1Sc.recipient)
+    // Shape-checked the same way as the fresh keygen above (3a) — without this, a malformed
+    // or missing structuredContent (recipient undefined) would silently satisfy the
+    // not-equal check below (undefined !== a real recipient string) and report a rotation
+    // that never actually happened.
+    if (typeof keygen3Sc?.recipient !== 'string' || !keygen3Sc.recipient.startsWith('age1'))
+      throw new Error(`keygen (force) recipient unexpected: ${JSON.stringify(keygen3Sc?.recipient)}`);
+    if (keygen3Sc.recipient === keygen1Sc.recipient)
       throw new Error('keygen (force) did not generate a new keypair (recipient unchanged)');
 
     // 3d. wallet_create on a brand-new home: must succeed and actually write the JWK.
@@ -1034,7 +1083,8 @@ async function runCleanupFailurePreservesOutcomeTest(tmp) {
   const cliPath = SERVER_PATH.replace(/mcp\.mjs$/, 'cli.mjs');
   const cliEnv = { ...process.env, CYPHER_BRAIN_HOME: home6, CYPHER_BRAIN_FILE_DIR: store6 };
   const runCli = (args) => {
-    const res = spawnSync(process.execPath, [cliPath, ...args], { env: cliEnv, encoding: 'utf8' });
+    // A hung setup call must fail loudly, not wedge the whole suite.
+    const res = spawnSync(process.execPath, [cliPath, ...args], { env: cliEnv, encoding: 'utf8', timeout: TIMEOUT_MS });
     if (res.status !== 0)
       throw new Error(
         `cleanup-failure setup: cypher-brain ${args[0]} failed (${res.status}): ${res.stderr || res.stdout}`,
@@ -1087,7 +1137,9 @@ async function runCleanupFailurePreservesOutcomeTest(tmp) {
     });
 
     // Blocks until the server opens the FIFO for reading — the handshake described above.
-    const fifoHandle = await open(identityFifo, 'w');
+    // Races against the server exiting first so a rejected/crashed request fails this test
+    // with a clear message instead of hanging on a FIFO nothing will ever read.
+    const fifoHandle = await openFifoForWrite(identityFifo, child6, 'cleanup-failure test (identity FIFO)');
     try {
       const fetchDirs = (await readdir(serverTmp)).filter((n) => n.startsWith('cypher-brain-mcp-'));
       if (fetchDirs.length === 0) {
@@ -1145,7 +1197,8 @@ async function runCleanupFailurePreservesOutcomeTest(tmp) {
       method: 'tools/call',
       params: { name: 'verify_restore', arguments: { locator: bogusLocator, backend: 'file' } },
     });
-    const fifoHandle2 = await open(bogusLocator, 'w');
+    // Same race-against-exit handshake as the identity FIFO above.
+    const fifoHandle2 = await openFifoForWrite(bogusLocator, child6, 'cleanup-failure test (store FIFO)');
     try {
       const fetchDirs2 = (await readdir(serverTmp)).filter((n) => n.startsWith('cypher-brain-mcp-'));
       if (fetchDirs2.length === 0)
@@ -1212,6 +1265,12 @@ async function run(tmp) {
   // used to sit in `tmp`, alongside home rather than inside it.
   const locatorFile = join(home, 'latest-locator.tsv');
   const launchdDir = join(tmp, 'launchagents'); // install() writes a plist here even with --no-load — must never touch the real ~/Library/LaunchAgents
+  // Pinned explicitly for the same reason runScheduleStatusNotInstalledTest() pins it
+  // (config.ts's own default already resolves here from CYPHER_BRAIN_HOME, but relying on
+  // that default means an ambient CYPHER_BRAIN_SCHEDULE_DIR this process happened to
+  // inherit would win via the `...process.env` spread below, sending the REAL
+  // schedule_install call further down this function outside the isolated temp tree).
+  const scheduleDir = join(home, 'schedule');
 
   // keygen via the bundled CLI (dist/cli.mjs — already built by the time this smoke
   // test runs in `npm run verify`). Previously this dynamic-imported src/lib/keys.mjs
@@ -1225,6 +1284,7 @@ async function run(tmp) {
   const keygenRes = spawnSync(process.execPath, [SERVER_PATH.replace(/mcp\.mjs$/, 'cli.mjs'), 'keygen'], {
     env: { ...process.env },
     encoding: 'utf8',
+    timeout: TIMEOUT_MS, // a hung setup call must fail loudly, not wedge the whole suite
   });
   if (keygenRes.status !== 0) {
     throw new Error(`keygen failed (${keygenRes.status}): ${keygenRes.stderr || keygenRes.stdout}`);
@@ -1241,6 +1301,7 @@ async function run(tmp) {
       CYPHER_BRAIN_HOME: home,
       CYPHER_BRAIN_FILE_DIR: store,
       CYPHER_BRAIN_LAUNCHD_DIR: launchdDir, // install() writes a plist here even with --no-load
+      CYPHER_BRAIN_SCHEDULE_DIR: scheduleDir, // see the comment on scheduleDir above
       // The MCP spend gate must hold EVEN when the CLI env escape hatch is set.
       CYPHER_BRAIN_YES: '1',
       // #800: snapshot_now is now fail-closed over MCP — it refuses unless the OPERATOR
@@ -1672,7 +1733,10 @@ async function run(tmp) {
     // 2b-3. #307: the gate is actually WIRED to snapshot(), not just advertised. Needs
     // the real binary, so it SKIPs without one — same idiom as scripts/selftest.sh's
     // own #215 section. The structural assertions above run either way.
-    if (spawnSync('sh', ['-c', 'command -v gitleaks'], { encoding: 'utf8' }).status === 0) {
+    // Reuses gitleaksOnPath (computed above from CYPHER_BRAIN_GITLEAKS_BIN, same as the
+    // server itself resolves) rather than re-probing the literal `gitleaks` name — a custom
+    // bin path would otherwise make this SKIP even when the wiring could actually be tested.
+    if (gitleaksOnPath) {
       const leakDir = join(tmp, 'leaky');
       await mkdir(leakDir, { recursive: true });
       // A gitleaks-detectable dummy credential — same synthetic AWS key selftest.sh's
@@ -3074,7 +3138,9 @@ async function run(tmp) {
     await writeFile(join(signedSrc, 'note.txt'), 'signed-artifact-probe\n');
     const signedAge = join(tmp, 'signed-probe.age');
     const CLI = SERVER_PATH.replace(/mcp\.mjs$/, 'cli.mjs');
-    const cliRun = (args) => spawnSync(process.execPath, [CLI, ...args], { env: { ...process.env }, encoding: 'utf8' });
+    // A hung setup call must fail loudly, not wedge the whole suite.
+    const cliRun = (args) =>
+      spawnSync(process.execPath, [CLI, ...args], { env: { ...process.env }, encoding: 'utf8', timeout: TIMEOUT_MS });
     const kgSign = cliRun(['keygen', '--sign']);
     if (kgSign.status !== 0) throw new Error(`setup: keygen --sign failed: ${kgSign.stderr || kgSign.stdout}`);
     // #832: NOT `--sign` — that is keygen's flag, which snapshot never read and now
@@ -3372,8 +3438,11 @@ async function run(tmp) {
       );
 
     // Then the real wiring, when a gitleaks exists for install to resolve and bake in.
+    // Reuses gitleaksOnPath (see the scan_secrets wiring check above) so a custom
+    // CYPHER_BRAIN_GITLEAKS_BIN path is honored here too, instead of re-probing the literal
+    // `gitleaks` name and silently skipping when a custom bin is what's actually configured.
     let schedScanSummary = 'skipped (no gitleaks)';
-    if (spawnSync('sh', ['-c', 'command -v gitleaks'], { encoding: 'utf8' }).status === 0) {
+    if (gitleaksOnPath) {
       send({
         jsonrpc: '2.0',
         id: 30706,
@@ -3478,6 +3547,7 @@ async function runSignalCleanupTest(tmp) {
   const keygenRes = spawnSync(process.execPath, [SERVER_PATH.replace(/mcp\.mjs$/, 'cli.mjs'), 'keygen'], {
     env: { ...process.env, CYPHER_BRAIN_HOME: home },
     encoding: 'utf8',
+    timeout: TIMEOUT_MS, // a hung setup call must fail loudly, not wedge the whole suite
   });
   if (keygenRes.status !== 0) {
     throw new Error(
