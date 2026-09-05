@@ -23,23 +23,60 @@ export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeou
 // swallows the retry's own removal errors the same way plain rm({force:true}) already
 // does; a chmod that itself fails (e.g. a foreign-owned entry) is swallowed too, so the
 // final rm() below still gets a chance to remove whatever it can.
+//
+// `path` itself is chmod'd BEFORE the readdir() below (Codex review): a directory whose
+// own mode denies read/execute (not just write) made the old ordering's readdir() throw
+// and return immediately, leaving that directory (and everything under it) locked and
+// never reaching the retry rm() — the exact "leaving decrypted content behind" outcome
+// this function exists to prevent, just one level higher than the case #209 already
+// covered. This matches what the paragraph above already claimed ("chmod ... FIRST,
+// then retry") — the code had drifted from its own documented intent.
+//
+// Symlinks are skipped entirely, never chmod'd (Codex review, round 2): a Dirent's
+// isDirectory() does NOT follow a symlink (it reports the link itself, not its target),
+// so a symlink previously fell into the "not a directory" chmod(0o600) branch below —
+// but chmod(2) DOES follow symlinks, so that call silently changed the MODE OF WHATEVER
+// THE LINK POINTS AT, which can be arbitrarily far outside `path` (a snapshot/restore
+// tree this code walks can contain a symlink entry by design — see snapshot.ts's own
+// lstat comment). rm({force:true})'s own retry never needs a symlink's target mode
+// touched to unlink the link itself (that only needs write on the link's PARENT
+// directory, already covered by chmod'ing `path`/its subdirectories), so skipping it
+// here costs nothing. The check is NOT only inside the loop below: `path` — the
+// argument this function is CALLED with, at the top level from rmrf() — needs the same
+// lstat-first guard, or a caller-supplied `path` that is itself a symlink would have its
+// chmod(0o700)/readdir() follow the link and unlock (then potentially recurse into)
+// whatever it points at, entirely outside the tree rmrf() was asked to remove (round 1
+// of this same review only guarded the entries found BY readdir, missing the directory
+// readdir() is called ON).
 async function unlockRecursive(path: string): Promise<void> {
+  let st: Awaited<ReturnType<typeof lstat>>;
+  try {
+    st = await lstat(path);
+  } catch {
+    return; // already gone — nothing to unlock
+  }
+  if (st.isSymbolicLink()) return; // never follow — see this function's own doc comment
+  try {
+    await chmod(path, st.isDirectory() ? 0o700 : 0o600);
+  } catch {}
+  if (!st.isDirectory()) return; // a plain file: nothing to descend into
   let entries: Dirent[];
   try {
     entries = await readdir(path, { withFileTypes: true });
   } catch {
-    return; // not a directory, or already gone — nothing to unlock
+    return; // unreadable even after the chmod above (e.g. foreign-owned) — nothing more to unlock
   }
   for (const e of entries) {
+    if (e.isSymbolicLink()) continue;
     const p = join(path, e.name);
-    if (e.isDirectory()) await unlockRecursive(p);
+    if (e.isDirectory()) {
+      await unlockRecursive(p);
+      continue; // already chmod'd itself, above
+    }
     try {
-      await chmod(p, e.isDirectory() ? 0o700 : 0o600);
+      await chmod(p, 0o600);
     } catch {}
   }
-  try {
-    await chmod(path, 0o700);
-  } catch {}
 }
 
 export async function rmrf(path: string): Promise<void> {
@@ -369,10 +406,20 @@ export function redactPgConn(conn: string): string {
     // a strictly safer over-match here) optionally containing escaped characters (e.g.
     // password='a\'b c') — match any of these shapes rather than only \S+, which would
     // leave a trailing fragment of a quoted, space-containing secret unredacted.
-    const secretVal = `(?:'(?:[^'\\\\]|\\\\.)*'|"(?:[^"\\\\]|\\\\.)*"|\\S+)`;
+    //
+    // Two more gaps closed here (Codex review): libpq's own conninfo grammar allows
+    // whitespace around the "=" (`password = secret`), which the old `\bpassword=`
+    // anchor (no `\s*`) never matched at all — leaving the whole pair unredacted, not
+    // just trailing text. And an UNQUOTED value's internal whitespace must itself be
+    // backslash-escaped (`password=sec\ ret`) per that same grammar; the old `\S+` for
+    // the unquoted case stopped at the first (unescaped-looking) space, again leaving a
+    // trailing fragment of the real secret in the clear. `(?:\\.|\S)+` consumes an
+    // escaped pair OR a non-space char, repeated — so an escaped space no longer ends
+    // the match early.
+    const secretVal = `(?:'(?:[^'\\\\]|\\\\.)*'|"(?:[^"\\\\]|\\\\.)*"|(?:\\\\.|\\S)+)`;
     return conn
       .replace(/:\/\/([^:@/]+):[^@/]*@/, '://$1@')
-      .replace(new RegExp(`\\b(password|sslpassword)=${secretVal}`, 'gi'), '$1=REDACTED');
+      .replace(new RegExp(`\\b(password|sslpassword)\\s*=\\s*${secretVal}`, 'gi'), '$1=REDACTED');
   }
 }
 

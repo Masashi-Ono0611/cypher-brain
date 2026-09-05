@@ -20,7 +20,7 @@ import { mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TON_BIN, TON_NETWORK_CONFIG, TON_TONAPI_URL, TON_TONVIEWER_URL, CIPHER_YES } from './config.js';
-import { errMsg, exists, rmrf, sdkImportAdvice, sleep } from './util.js';
+import { errMsg, requireFile, rmrf, sdkImportAdvice, sleep } from './util.js';
 import { warn } from './warn.js';
 import { installStageSignalGuard, addActiveTonTmpDir, removeActiveTonTmpDir } from './signal-guard.js';
 import { readSavedLocatorLine } from './pushpull.js';
@@ -164,7 +164,17 @@ async function tonapiJson<T>(url: string, timeoutMs: number): Promise<T> {
     const body = await r.text().catch(() => '');
     throw new Error(`tonapi ${url} -> HTTP ${r.status}: ${body.slice(0, 200)}`);
   }
-  return (await r.json()) as T;
+  const body: unknown = await r.json();
+  // A 200 response body that is `null` (or any non-object JSON value) is not this
+  // function's problem to interpret — every caller's `T` shape assumes an object it can
+  // property-access (Codex review: resolveDomainNftAddress's own `data.item?.address`
+  // would otherwise throw a raw, uncaught TypeError reading `.item` off `null`, escaping
+  // that function's try/catch instead of producing its intended
+  // "could not resolve domain … via tonapi" message).
+  if (body === null || typeof body !== 'object') {
+    throw new Error(`tonapi ${url} -> unexpected response shape (not a JSON object): ${JSON.stringify(body)}`);
+  }
+  return body as T;
 }
 
 interface TonApiDnsInfo {
@@ -304,7 +314,14 @@ export async function publishLatest(o: CliOptions): Promise<void> {
   // #482: distinguish "file missing" from "file has no valid locator" — same two
   // failure modes pull's --from-locator-file already separates (pushpull.ts, pull()),
   // instead of collapsing both into readSavedLocatorLine's generic null.
-  if (!(await exists(o.from_locator_file))) throw new Error(`no such locator file: ${o.from_locator_file}`);
+  //
+  // requireFile(), not util.ts's bare exists() (Codex review): exists() swallows EVERY
+  // access() failure — not just ENOENT — into a bare `false`, so a permission error on
+  // this path would misreport as "no such locator file" instead of surfacing the real
+  // problem. requireFile() already draws exactly that ENOENT/ENOTDIR-vs-everything-else
+  // line (see its own doc comment in util.ts) and throws the identical wording via
+  // `what: 'locator file'`.
+  await requireFile(o.from_locator_file, 'locator file');
   const saved = await readSavedLocatorLine(o.from_locator_file);
   if (!saved) {
     throw new Error(

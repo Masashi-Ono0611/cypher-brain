@@ -143,8 +143,14 @@ function installStdoutEpipeGuard(): void {
 
 /** Print one JSON document to stdout — the single writer, see the note above. */
 export function printJson(value: unknown): void {
-  jsonWritten = true;
   installEpipeGuard();
   installStdoutEpipeGuard();
-  console.log(JSON.stringify(value));
+  // Serialize BEFORE flipping jsonWritten (Codex review): a `value` that JSON.stringify
+  // itself rejects (a circular structure, a BigInt) throws here, before anything reaches
+  // stdout. The old order flipped the flag first, so hasWrittenJson() would then lie to
+  // the top-level error handler ("a JSON document was already printed") for a call that
+  // printed nothing at all — suppressing the JSON error object #270 exists to guarantee.
+  const text = JSON.stringify(value);
+  jsonWritten = true;
+  console.log(text);
 }
