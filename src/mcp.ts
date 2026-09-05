@@ -381,7 +381,16 @@ async function discardFetchDir(dir: string | null): Promise<void> {
 // stderr line alone; it is not normalized into an Error here because doing so would mean
 // replacing the thrown value, which is the thing this must not do.
 function noteCleanupWarningOnError(e: unknown, warnMsg: string): void {
-  console.error(`warning: ${warnMsg}`);
+  // rawStderrLine, not console.error: this runs AFTER captureCall() has already restored
+  // console.error for THIS call, but the MCP SDK dispatches tool calls concurrently
+  // (Promise.resolve().then(() => handler(...)), never awaited before the next message is
+  // read) and captureCall()'s console.error swap is a MODULE-LEVEL global, not scoped to
+  // one call. If a DIFFERENT call's captureCall() is active at this exact tick, a bare
+  // console.error() here would be captured into THAT call's `err`/`warnings` instead of
+  // this server's own stderr, misattributing this cleanup's diagnostic to an unrelated
+  // response. This line is explicitly meant to go straight to stderr regardless (the
+  // structured side of it is attached separately, onto `e.cbWarnings` below).
+  rawStderrLine(`warning: ${warnMsg}`);
   if (!(e instanceof Error)) return;
   try {
     const carrier = e as Error & { cbWarnings?: unknown };
@@ -419,7 +428,10 @@ async function discardFetchDirWarningOnResult(
     const warnMsg =
       `failed to clean up ${context} fetch/scratch dir ${dir} after a successful ${context}: ` +
       `${errMsg(cleanupErr)} — it may remain on disk until server restart.`;
-    console.error(`warning: ${warnMsg}`);
+    // rawStderrLine, not console.error — see noteCleanupWarningOnError()'s own comment:
+    // a concurrently-active, unrelated call's captureCall() would otherwise swallow this
+    // line into ITS OWN result instead of this server's stderr.
+    rawStderrLine(`warning: ${warnMsg}`);
     const existing = Array.isArray(payload.warnings) ? (payload.warnings as string[]) : [];
     payload.warnings = [...existing, warnMsg];
   }
@@ -1148,8 +1160,14 @@ async function assertSnapshotPolicy(dirs: readonly string[], recipients: readonl
   if (MCP_SOURCE_ROOTS_ERROR) {
     // The parse detail names the operator's own value, so it goes to the server's stderr
     // (outside captureCall, so it is NOT relayed to the caller) rather than into the
-    // refusal — see the containment refusal below for the same reasoning.
-    console.error(`snapshot policy: ${MCP_SOURCE_ROOTS_ERROR.message}`);
+    // refusal — see the containment refusal below for the same reasoning. rawStderrLine,
+    // not console.error: this runs BEFORE this call's own captureCall(), so a
+    // concurrently-active DIFFERENT call (the MCP SDK dispatches tool calls without
+    // awaiting the previous one — see noteCleanupWarningOnError()'s own comment) would
+    // otherwise have console.error swapped to ITS buffer, and this operator-configuration
+    // detail would leak into that unrelated call's own result instead of staying
+    // server-side.
+    rawStderrLine(`snapshot policy: ${MCP_SOURCE_ROOTS_ERROR.message}`);
     throw snapshotPolicyDenied(
       'CYPHER_BRAIN_MCP_SOURCE_ROOTS is set but is not a usable list of roots, so no directory can be checked ' +
         'against it (this server logged the specific reason to its own stderr)',
@@ -1207,7 +1225,10 @@ async function assertSnapshotPolicy(dirs: readonly string[], recipients: readonl
       // Neither is needed to act on the refusal: the caller knows what it passed, and the
       // operator, who is the only one who can change the roots, has the full detail on
       // this server's stderr (logged outside captureCall, so it is not relayed back).
-      console.error(
+      // rawStderrLine, not console.error — same reason as the MCP_SOURCE_ROOTS_ERROR
+      // branch above: this also runs before this call's own captureCall(), so it must not
+      // ride whichever call currently has console.error swapped in.
+      rawStderrLine(
         `snapshot policy: refused dirs entry ${JSON.stringify(dir)} — resolves to ${resolved}, outside every ` +
           `CYPHER_BRAIN_MCP_SOURCE_ROOTS root (${MCP_SOURCE_ROOTS.join(', ')})`,
       );
@@ -2767,6 +2788,23 @@ async function handleScheduleInstall(args: ToolArgs): Promise<CallToolResult> {
       'ERR_INVALID_INPUT',
       `scan_secrets must be one of ${SCAN_SECRETS_MODES.join('|')} — got ${JSON.stringify(scanSecrets)}`,
     );
+  // #800 sibling gap: schedule_install's `dirs`/`recipients` are the exact same
+  // plaintext-source/key-recipient shape assertSnapshotPolicy's own header comment
+  // describes for snapshot_now — a directory to read, a key to encrypt it to — and this
+  // tool goes further, PERSISTING an unattended nightly run of it (a launchd
+  // plist/crontab entry) rather than doing it once. The MCP snapshot policy
+  // (CYPHER_BRAIN_MCP_SOURCE_ROOTS / CYPHER_BRAIN_PIN_RECIPIENTS) exists specifically
+  // because an MCP caller is this server's own threat model's untrusted party, and
+  // MCP_SOURCE_ROOTS containment is an MCP-layer-only concept (never enforced by
+  // src/lib/schedule.ts or src/lib/snapshot.ts, which schedule_install shares with the
+  // CLI) — so leaving this call ungated let a caller install a recurring, unattended
+  // snapshot+push of ANY directory this server process can read, with none of the
+  // containment snapshot_now already enforces for a one-off call. Same placement
+  // discipline as handleSnapshotNow's own call: after the cheap type checks that make
+  // `dirs`/`recipients` string[]s, before ANYTHING with a side effect — including the
+  // confirm_install consequential-action gate below, so a denied call leaves no system
+  // file behind either.
+  await assertSnapshotPolicy(dirs, recipients);
 
   // Consequential-action gate FIRST — before any file write happens, same
   // discipline as every other mutating tool in this server. Covers BOTH the
