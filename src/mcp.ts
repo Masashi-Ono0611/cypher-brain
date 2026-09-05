@@ -1217,7 +1217,19 @@ async function assertSnapshotPolicy(dirs: readonly string[], recipients: readonl
   );
   for (const [i, dir] of dirs.entries()) {
     const resolved = resolvedDirs[i];
-    if (!pathCoveredBy(resolved, roots)) {
+    // pathCoveredBy() itself now touches the filesystem (multi-model review, #858
+    // follow-up: it resolves storePath through realpath() to correctly refuse a
+    // symlink-mediated escape) — wrapped in underPolicy() for the same reason every
+    // other filesystem call in this gate already is: a race between the resolution
+    // above and this second look (a symlink loop or permission error introduced right
+    // here) must fail closed through the SAME sanitized denial, not escape as a raw
+    // ERR_INTERNAL that could leak what this gate deliberately never echoes.
+    const covered = await underPolicy(
+      `dirs entry ${JSON.stringify(dir)} could not be checked against the configured roots`,
+      `Check that this server can still reach ${JSON.stringify(dir)} and every configured root. ${POLICY_DOC_REF}`,
+      () => pathCoveredBy(resolved, roots),
+    );
+    if (!covered) {
       // The refusal names the caller's OWN path and nothing else (multi-model review
       // round 2, #800). Echoing the resolved path would turn this gate into a symlink
       // oracle — submit paths, read back where they really point — and echoing the root

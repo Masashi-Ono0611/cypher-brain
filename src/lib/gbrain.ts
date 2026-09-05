@@ -17,9 +17,9 @@
 // Nothing is copied from it; the rules below are reimplemented from the documented
 // config contract and described here in our own words.
 import type { Dirent } from 'node:fs';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { lstat, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
 export type GbrainEngine = 'pglite' | 'postgres';
 
@@ -216,6 +216,123 @@ export async function detectGbrainEngine(configPath: string): Promise<GbrainEngi
   }
 }
 
+// #838's snapshot-policy gate in src/mcp.ts treats a missing filesystem component as
+// "not there yet" rather than an error (a `dirs` entry a caller hasn't created, or a
+// root the operator is still setting up) — ENOTDIR rides along with ENOENT because a
+// path component that turns out to be a plain file rather than a directory means
+// nothing exists AT the target either, and walking up is the right response either
+// way. pathCoveredBy() below needs the exact same distinction for the same reason, so
+// it is reused rather than redefined with slightly different membership.
+const PATH_ABSENT_CODES = new Set(['ENOENT', 'ENOTDIR']);
+
+/**
+ * True iff `p` exists ON DISK, right now, as a symlink (dangling or not). False when
+ * nothing exists at `p` at all (ENOENT/ENOTDIR — the same absent-vs-error distinction
+ * `realpathOrNearestAncestor()` below makes too, and for the same reason: "not there"
+ * is an ordinary, expected outcome here, not a failure).
+ *
+ * Any OTHER failure (EACCES, EIO, …) is deliberately NOT folded into `false` — multi-
+ * model review: an earlier version caught every error uniformly, so a `dirs` entry this
+ * process could not `lstat` for a real reason (not "it doesn't exist") silently fell
+ * through as "not a symlink" and was then handed to `realpathOrNearestAncestor()`
+ * anyway, which uses `realpath()` (a DIFFERENT syscall, not guaranteed to fail the same
+ * way) and could still resolve and be treated as covering its target — the exact
+ * confidently-wrong outcome this whole fix exists to remove, just reached through a
+ * swallowed error instead of a design gap. Propagating here means it surfaces exactly
+ * where every other unexpected fs error from this file already does: a caller across a
+ * security boundary (src/mcp.ts) converts it into its own sanitized denial.
+ */
+async function isSymlink(p: string): Promise<boolean> {
+  try {
+    return (await lstat(p)).isSymbolicLink();
+  } catch (e) {
+    if (PATH_ABSENT_CODES.has((e as NodeJS.ErrnoException)?.code ?? '')) return false;
+    throw e;
+  }
+}
+
+/**
+ * Resolves `p` through the real filesystem (following every symlink) as far as
+ * anything actually exists, and no further. A component that does not exist YET — the
+ * ordinary case for a gbrain store or a backup destination nobody has created — is not
+ * an error: this walks UP to the nearest ancestor `realpath()` can resolve and
+ * re-attaches the still-nonexistent tail lexically, so a not-yet-created path still
+ * gets a real (as far as it goes) answer instead of an exception.
+ *
+ * This mirrors `realpathOfNearestAncestor()` in src/mcp.ts line for line, duplicated
+ * rather than imported: mcp.ts already imports pathCoveredBy FROM this module, so the
+ * reverse import would be circular, and this module has no other reason to depend on
+ * mcp.ts.
+ *
+ * Any OTHER failure (a symlink loop, a permission error, …) is deliberately left to
+ * propagate rather than folded into a guessed answer — see pathCoveredBy()'s own doc
+ * comment for why a coverage check that is wrong with confidence is worse than one that
+ * throws.
+ */
+async function realpathOrNearestAncestor(p: string): Promise<string> {
+  const abs = resolve(p);
+  try {
+    return await realpath(abs);
+  } catch (e) {
+    if (!PATH_ABSENT_CODES.has((e as NodeJS.ErrnoException)?.code ?? '')) throw e;
+  }
+  let dir = dirname(abs);
+  const tail: string[] = [basename(abs)];
+  for (;;) {
+    try {
+      const real = await realpath(dir);
+      return join(real, ...tail);
+    } catch (e) {
+      if (!PATH_ABSENT_CODES.has((e as NodeJS.ErrnoException)?.code ?? '')) throw e;
+      const parent = dirname(dir);
+      if (parent === dir) throw e; // reached the filesystem root and even that failed
+      tail.unshift(basename(dir));
+      dir = parent;
+    }
+  }
+}
+
+/**
+ * Same walk as realpathOrNearestAncestor() above, but for `storePath` specifically —
+ * where the difference between "nothing is there yet" and "something IS there, and it
+ * is a symlink whose target does not exist" (a DANGLING symlink) changes the answer
+ * pathCoveredBy() below must give, not just how it gets there. Both failures raise the
+ * identical ENOENT/ENOTDIR from realpath() and are indistinguishable to
+ * realpathOrNearestAncestor()'s walk, but they mean opposite things for a coverage
+ * claim: a path that has never been created might still be created later, right where
+ * it is named (the ordinary case realpathOrNearestAncestor() already preserves). A
+ * dangling symlink, by contrast, EXISTS on disk right now and definitively does not
+ * lead to real data anywhere — `tar` archives it as a broken-pointer symlink entry
+ * (src/lib/snapshot.ts's own comment on lstat-based top-level symlink handling), never
+ * as bytes. Checked at every component walked past, not only the final one — a symlink
+ * partway up `storePath`'s ancestry that dangles is exactly as broken as `storePath`
+ * itself dangling.
+ */
+async function realStorePathOrDangling(storePath: string): Promise<{ real: string } | { dangling: true }> {
+  const abs = resolve(storePath);
+  try {
+    return { real: await realpath(abs) };
+  } catch (e) {
+    if (!PATH_ABSENT_CODES.has((e as NodeJS.ErrnoException)?.code ?? '')) throw e;
+  }
+  if (await isSymlink(abs)) return { dangling: true };
+  let dir = dirname(abs);
+  const tail: string[] = [basename(abs)];
+  for (;;) {
+    try {
+      const real = await realpath(dir);
+      return { real: join(real, ...tail) };
+    } catch (e) {
+      if (!PATH_ABSENT_CODES.has((e as NodeJS.ErrnoException)?.code ?? '')) throw e;
+      if (await isSymlink(dir)) return { dangling: true };
+      const parent = dirname(dir);
+      if (parent === dir) throw e; // reached the filesystem root and even that failed
+      tail.unshift(basename(dir));
+      dir = parent;
+    }
+  }
+}
+
 /**
  * Is `storePath` inside (or equal to) at least one of `dirs`? Both sides are resolved
  * first, and the containment test is on path SEGMENTS, never a bare string prefix —
@@ -226,14 +343,72 @@ export async function detectGbrainEngine(configPath: string): Promise<GbrainEngi
  * returns `/` — so the naive `${root}/` produced `//` and made `--dir /` fail to cover
  * anything at all (review round 2). A false negative on a coverage claim is the same
  * family of bug as the false positive this function was written to prevent.
+ *
+ * #858's follow-up finding: "resolved" above used to mean node:path's `resolve()` alone
+ * — purely lexical, never touching the filesystem — so a symlink anywhere in either
+ * path was left exactly as written. A PGLite `database_path` that is itself a symlink
+ * pointing OUTSIDE every covered `--dir` was then reported "covered" merely because the
+ * symlink FILE happened to sit inside one lexically, even though archiving that
+ * directory only captures the link itself (tar does not dereference) — the coverage
+ * claim was confidently wrong in exactly the direction that matters, a backup that
+ * looks complete but silently omits the real data. `storePath` is now resolved through
+ * the real filesystem — following symlinks, all the way through, not just its own final
+ * component — before the containment check, closing that false positive and also fixing
+ * the necessary symmetric case: a symlink that sits OUTSIDE every covered root but
+ * points at real data genuinely INSIDE one is now correctly reported as covered, since
+ * the archive captures that data as an ordinary directory when it walks the covered
+ * root regardless of what path a config or a user used to name it.
+ *
+ * A DANGLING symlink anywhere along `storePath` (one whose target does not exist) can
+ * never lead to real data, so it is never "covered" by anything — see
+ * realStorePathOrDangling()'s own doc comment.
+ *
+ * Each `dirs` ENTRY, on the other hand, is deliberately NOT resolved through a symlink
+ * at its own top level (multi-model review — this is the necessary correction to an
+ * earlier version of this fix that resolved both sides symmetrically, which is wrong
+ * here specifically): `dirs` are the literal `--dir` arguments an actual `cypher-brain
+ * snapshot` run would archive, and `tar` never dereferences a TOP-LEVEL symlink
+ * argument (src/lib/profiles.ts and src/lib/snapshot.ts document the same fact for the
+ * archiving code itself) — it archives the link, not whatever it points at. A `dirs`
+ * entry that is itself a symlink therefore cannot cover anything through this fix's
+ * resolution, no matter where it points: including it would be the exact same
+ * confidently-wrong-in-the-dangerous-direction mistake the `storePath` fix above
+ * exists to remove, just moved to the other argument. This is a no-op for
+ * src/mcp.ts's own callers of this function: its `roots` (CYPHER_BRAIN_MCP_SOURCE_ROOTS)
+ * are already resolved to their real, non-symlink target by `resolveConfiguredRoot()`
+ * before they ever reach here — a root the OPERATOR configured as a symlink is still
+ * honored (that resolution, not this one, is what makes it so) — so `isSymlink()` on an
+ * already-dereferenced path is always false there. A `dirs` entry that does not exist
+ * yet is unaffected either way — `isSymlink()` is false for "nothing there", and
+ * realpathOrNearestAncestor()'s existing not-yet-created handling still applies.
+ *
+ * Any OTHER resolution failure (a symlink loop, a permission error) propagates rather
+ * than being swallowed into a guessed boolean — a caller across a security boundary
+ * (src/mcp.ts's snapshot-policy gate) is expected to convert that into its own
+ * sanitized denial rather than let this function's raw filesystem error escape.
+ *
+ * RESIDUAL, the same family of point-in-time check src/mcp.ts already documents for
+ * itself: a path resolved here, then swapped for a symlink before whatever reads it
+ * next (an archive, `gbrain pglite-repair`, …) actually gets there, is not re-checked.
+ * Closing that needs the same openat/RESOLVE_BENEATH-bound reads Node does not expose,
+ * out of scope here as it is everywhere else this codebase makes the same tradeoff.
+ * Also out of scope, as it was before this fix: a symlink NESTED inside a covered `dirs`
+ * entry that diverts ELSEWHERE — `storePath`'s own full resolution already lands on
+ * wherever that symlink actually leads, so it is judged against where the data truly
+ * is, not where a config or a user's path text implies it is; this fix changes nothing
+ * about that half of the containment test.
  */
-export function pathCoveredBy(storePath: string, dirs: readonly string[]): boolean {
-  const target = resolve(storePath);
-  return dirs.some((d) => {
-    const root = resolve(d);
+export async function pathCoveredBy(storePath: string, dirs: readonly string[]): Promise<boolean> {
+  const resolution = await realStorePathOrDangling(storePath);
+  if ('dangling' in resolution) return false;
+  const target = resolution.real;
+  for (const d of dirs) {
+    if (await isSymlink(resolve(d))) continue;
+    const root = await realpathOrNearestAncestor(d);
     const prefix = root.endsWith(sep) ? root : `${root}${sep}`;
-    return target === root || target.startsWith(prefix);
-  });
+    if (target === root || target.startsWith(prefix)) return true;
+  }
+  return false;
 }
 
 // A PGLite store IS a PostgreSQL data directory, and carries Postgres's own two
