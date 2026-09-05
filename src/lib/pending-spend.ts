@@ -143,6 +143,16 @@ async function syncDirectories(dir: string, firstCreated: string | undefined): P
       if (parent === d) break; // reached the filesystem root
       toSync.push(parent);
     }
+    // `firstCreated` is itself a newly-created directory (mkdir's own contract: "the
+    // first directory path created"), and its own directory ENTRY lives in its
+    // parent, exactly like every other level the loop above already walks — the loop
+    // stops the instant `d === firstCreated`, one level short of syncing that parent.
+    // Without this, the topmost newly-created directory's own entry (e.g. `dir` ===
+    // `firstCreated`, when only ONE new directory was created and the loop above never
+    // runs at all) is never durably recorded in ITS parent, which can leave that
+    // directory — and the fsync'd record inside it — missing entirely after a crash.
+    const parentOfFirstCreated = dirname(firstCreated);
+    if (parentOfFirstCreated !== firstCreated) toSync.push(parentOfFirstCreated);
   }
   for (const d of toSync) await fsyncPath(d);
 }
