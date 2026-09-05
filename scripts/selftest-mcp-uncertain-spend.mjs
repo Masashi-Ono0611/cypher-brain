@@ -39,6 +39,36 @@ const CLI_PATH = join(ROOT, 'dist', 'cli.mjs');
 const TIMEOUT_MS = 120_000;
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// SIGTERM, then escalate to SIGKILL if the server (which installs its own
+// SIGINT/SIGTERM/SIGHUP handler — src/lib/signal-guard.ts — for graceful shutdown) has
+// not exited within a bounded window. A plain `child.kill()` with no wait/escalation
+// could leave one of this test's several server processes running past this script's exit.
+function killAndWait(child, timeoutMs = 3000) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    child.once('exit', done);
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }, timeoutMs);
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      done();
+    }
+  });
+}
+
 let failed = 0;
 const check = (name, cond, detail) => {
   if (cond) {
@@ -363,8 +393,16 @@ async function main() {
     const key2 = 'uncertain-key-2';
     const out2 = join(tmp, 'snap2.age');
     await writeFile(`${logPath}.lock`, 'held by the #809 fixture', { flag: 'w' });
+    // Chained (not just tracked) so the finally block's `await lastHeartbeat` drains every
+    // write, not only the most recently started one: clearInterval only stops FUTURE ticks,
+    // and if writes ever overlapped, awaiting just the latest could still race an EARLIER
+    // one that resolves after it, recreating the lock file after the rm() below and
+    // contaminating the cases that run after this block (Codex review).
+    let lastHeartbeat = Promise.resolve();
     const keepLockFresh = setInterval(() => {
-      writeFile(`${logPath}.lock`, `held by the #809 fixture ${Date.now()}`, { flag: 'w' }).catch(() => {});
+      lastHeartbeat = lastHeartbeat.then(() =>
+        writeFile(`${logPath}.lock`, `held by the #809 fixture ${Date.now()}`, { flag: 'w' }).catch(() => {}),
+      );
     }, 1000);
     let blocked;
     try {
@@ -377,6 +415,7 @@ async function main() {
       blocked = await client.waitFor(12);
     } finally {
       clearInterval(keepLockFresh);
+      await lastHeartbeat;
       await rm(`${logPath}.lock`, { force: true });
     }
     const blockedSc = sc(blocked);
@@ -499,13 +538,7 @@ async function main() {
       `submissions=${gateway.state.submissions}`,
     );
   } finally {
-    for (const child of children) {
-      try {
-        child.kill();
-      } catch {
-        /* ignore */
-      }
-    }
+    await Promise.all(children.map((child) => killAndWait(child).catch(() => {})));
     gateway.server.close();
     await rm(tmp, { recursive: true, force: true });
   }

@@ -295,8 +295,8 @@ try {
   else if (!r.stdout.includes('EXPIRED')) fail(`an expired approval was not flagged: ${r.stdout}`);
   else if (!r.stdout.includes('spendable balance : 0 winc'))
     fail(`expired credit was still reported as spendable: ${r.stdout}`);
-  else if (r.stdout.includes('CYPHER_BRAIN_AR_PAID_BY=<payer address>'))
-    fail(`nagged to set PAID_BY for an approval that has already expired: ${r.stdout}`);
+  else if (r.stderr.includes('CYPHER_BRAIN_AR_PAID_BY=<payer address>'))
+    fail(`nagged to set PAID_BY for an approval that has already expired: ${r.stderr}`);
   else pass('wallet balance: an expired approval is labelled EXPIRED, not counted as spendable, and skips the nudge');
 
   // 3b. an EXHAUSTED approval (live, but nothing left) must not be advertised either —
@@ -309,8 +309,8 @@ try {
   r = await run(['--address', ADDR]);
   if (r.code !== 0) fail(`exhausted-approval run exited ${r.code}: ${r.stderr.slice(0, 200)}`);
   else if (!r.stdout.includes('remaining 0 winc')) fail(`exhausted approval not shown as drained: ${r.stdout}`);
-  else if (r.stdout.includes('CYPHER_BRAIN_AR_PAID_BY=<payer address>'))
-    fail(`nudged to set PAID_BY for a fully consumed approval: ${r.stdout}`);
+  else if (r.stderr.includes('CYPHER_BRAIN_AR_PAID_BY=<payer address>'))
+    fail(`nudged to set PAID_BY for a fully consumed approval: ${r.stderr}`);
   else pass('wallet balance: a fully consumed approval is not advertised as reachable credit');
 
   // 3c. ...and it must not silence the mismatch warning either: PAID_BY naming a drained
@@ -328,8 +328,8 @@ try {
   r = await run(['--address', ADDR]);
   if (r.code !== 0) fail(`unreadable-expiry run exited ${r.code}: ${r.stderr.slice(0, 200)}`);
   else if (!r.stdout.includes('expiry UNKNOWN')) fail(`an unreadable expiry was not surfaced: ${r.stdout}`);
-  else if (r.stdout.includes('CYPHER_BRAIN_AR_PAID_BY=<payer address>'))
-    fail(`recommended an approval whose expiry could not be read: ${r.stdout}`);
+  else if (r.stderr.includes('CYPHER_BRAIN_AR_PAID_BY=<payer address>'))
+    fail(`recommended an approval whose expiry could not be read: ${r.stderr}`);
   else pass('wallet balance: an unreadable expiry is shown as UNKNOWN and never recommended');
 
   // 3e. an ETH payer written in the other case is the SAME account — warning here would
@@ -337,13 +337,22 @@ try {
   body = funded();
   r = await run(['--address', ADDR], { CYPHER_BRAIN_AR_PAID_BY: PAYER.toLowerCase() });
   if (r.code !== 0) fail(`lowercase-payer run exited ${r.code}: ${r.stderr.slice(0, 200)}`);
-  else if (r.stdout.includes('matches no live approval'))
-    fail(`a lowercase ETH payer was treated as a different account: ${r.stdout}`);
+  else if (r.stderr.includes('matches no live approval'))
+    fail(`a lowercase ETH payer was treated as a different account: ${r.stderr}`);
   else pass('wallet balance: an ETH payer matches case-insensitively (checksummed vs lowercase)');
 
   // 3f. NEGATIVE control for 3e: case folding must NOT leak to case-SENSITIVE chains, or
-  // it would invent a match between two genuinely different Arweave accounts.
-  const arCaseVariant = `${ADDR.slice(0, -1)}${ADDR.slice(-1) === 'O' ? 'o' : 'O'}`;
+  // it would invent a match between two genuinely different Arweave accounts. This must
+  // be a GENUINE case flip of ADDR (same address, different letter-casing) — flipping the
+  // trailing character blindly is not that: ADDR ends in the digit '0', which the
+  // 'O'-or-'o' ternary below turns into the letter 'O', producing an address that differs
+  // from ADDR at the byte level regardless of case, so even unconditional lowercasing
+  // would still (correctly, but for the wrong reason) call it a mismatch.
+  const lastAlphaIndex = [...ADDR].map((_c, i) => i).findLast((i) => /[A-Za-z]/.test(ADDR[i]));
+  if (lastAlphaIndex === undefined) throw new Error('ADDR fixture has no alphabetic character to case-flip');
+  const flipped = ADDR[lastAlphaIndex] === ADDR[lastAlphaIndex].toUpperCase() ? 'toLowerCase' : 'toUpperCase';
+  const arCaseVariant =
+    ADDR.slice(0, lastAlphaIndex) + ADDR[lastAlphaIndex][flipped]() + ADDR.slice(lastAlphaIndex + 1);
   body = funded({ receivedApprovals: [approval({ payingAddress: arCaseVariant })] });
   r = await run(['--address', ADDR], { CYPHER_BRAIN_AR_PAID_BY: ADDR });
   if (r.code !== 0) fail(`arweave case-variant run exited ${r.code}: ${r.stderr.slice(0, 200)}`);

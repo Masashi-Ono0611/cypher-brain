@@ -53,6 +53,37 @@ const fail = (msg) => {
   throw new Error(msg);
 };
 
+// SIGTERM, then escalate to SIGKILL if the server (which installs its own
+// SIGINT/SIGTERM/SIGHUP handler — src/lib/signal-guard.ts — for graceful shutdown) has
+// not exited within a bounded window. This test spawns ~30 short-lived servers, one per
+// policy case; a plain `child.kill()` with no wait/escalation would let any of them
+// linger past this function returning, which the fire-and-forget call could never catch.
+function killAndWait(child, timeoutMs = 3000) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    child.once('exit', done);
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }, timeoutMs);
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      done();
+    }
+  });
+}
+
 function parseFrames(buf) {
   const out = [];
   for (const line of buf.split('\n')) {
@@ -102,7 +133,7 @@ async function callSnapshotNow(env, args) {
     send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'snapshot_now', arguments: args } });
     return await waitFor(2);
   } finally {
-    child.kill();
+    await killAndWait(child);
   }
 }
 
@@ -469,6 +500,10 @@ async function run(tmp) {
     if (first.result?.isError)
       fail(`replay setup: the permitted call failed: ${JSON.stringify(first.result).slice(0, 500)}`);
     if (!existsSync(idempotencyLog)) fail('replay setup: no idempotency log was written by the permitted call');
+    // Existence of the log file alone does not prove THIS key was cached — assert the
+    // exact key is in it, or "replay" below could be an ordinary denial in disguise.
+    if (!(await readFile(idempotencyLog, 'utf8')).includes(key))
+      fail(`replay setup: idempotency_key ${key} was not recorded in ${idempotencyLog}`);
     // Same HOME (so the recorded key is still there), same arguments — but the operator
     // has since narrowed the roots so this source is no longer authorized. The replay
     // must be refused rather than served from cache, and must not write the locator file
@@ -503,6 +538,9 @@ async function run(tmp) {
     const first = await callSnapshotNow(withRoots(okRoots), args);
     if (first.result?.isError)
       fail(`pin-replay setup: the permitted call failed: ${JSON.stringify(first.result).slice(0, 500)}`);
+    if (!existsSync(idempotencyLog)) fail('pin-replay setup: no idempotency log was written by the permitted call');
+    if (!(await readFile(idempotencyLog, 'utf8')).includes(key))
+      fail(`pin-replay setup: idempotency_key ${key} was not recorded in ${idempotencyLog}`);
     // Same roots, same arguments — only the pin moved to a key this call does not name.
     const narrowed = { ...withRoots(okRoots), CYPHER_BRAIN_PIN_RECIPIENTS: otherRecipientPath };
     const second = await callSnapshotNow(narrowed, { ...args, locator_file: locatorFile });

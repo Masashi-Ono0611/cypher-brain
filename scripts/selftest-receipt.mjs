@@ -232,16 +232,15 @@ try {
     cbOk({}, 'keygen');
     cbOk({}, 'snapshot', '--dir', src, '--out', join(tmp, 'snap.age'));
 
-    // free backend: push, then confirm no receipt was written (nothing to persist)
+    // free backend: push, then confirm no receipt was written (nothing to persist).
+    // readReceiptsAt() itself already treats "no file" (ENOENT — also correct: nothing
+    // was ever written) as an empty list, so this no longer needs its own catch — and
+    // must not have one, or a genuine read/parse failure here (a bug that wrote a
+    // GARBLED receipt, say) would be swallowed as "also correct" instead of failing loud.
     const fileEnv = { CYPHER_BRAIN_FILE_DIR: join(tmp, 'store') };
     const freePushLoc = cbOk(fileEnv, 'push', '--in', join(tmp, 'snap.age'), '--backend', 'file');
     check('file backend push succeeds', /^\S+$/.test(freePushLoc), freePushLoc);
-    let ledgerEmptyAfterFreePush;
-    try {
-      ledgerEmptyAfterFreePush = (await readReceiptsAt(join(tmp, 'keys', 'receipt-ledger.jsonl'))).length === 0;
-    } catch {
-      ledgerEmptyAfterFreePush = true; // ledger file not created at all — also correct
-    }
+    const ledgerEmptyAfterFreePush = (await readReceiptsAt(join(tmp, 'keys', 'receipt-ledger.jsonl'))).length === 0;
     check('file backend (free) push does NOT write a receipt', ledgerEmptyAfterFreePush);
 
     console.error('push --backend arweave...');
@@ -444,8 +443,13 @@ async function readReceiptsAt(path) {
   let text;
   try {
     text = await readFile(path, 'utf8');
-  } catch {
-    return [];
+  } catch (e) {
+    // ENOENT ("nothing has ever been written here") is the only read failure that means
+    // "no receipts" — any other error (permissions, EISDIR, ...) is a genuine unknown, and
+    // reading it as an empty ledger would let a bug that corrupts/blocks the ledger file
+    // pass a "no receipt written" assertion instead of failing it.
+    if (e?.code === 'ENOENT') return [];
+    throw e;
   }
   return text
     .trim()
