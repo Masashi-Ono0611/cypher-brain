@@ -58,7 +58,13 @@ export function run(cmd: string, args: string[], { input, timeoutMs, onStderrLin
         rej(new Error(`${cmd} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
     }
-    p.stdout?.on('data', (d) => (out += d));
+    // Decoded through StringDecoder rather than String(chunk)/`+= d` (Codex review for
+    // stdout, matching stderr's own existing reasoning below): a multi-byte character
+    // straddling a chunk boundary would otherwise be mangled into replacement characters
+    // — measured on a split UTF-8 "€" — and stdout carries the same paths/text stderr
+    // does for callers that parse it (e.g. `rclone lsjson`).
+    const stdoutDecoder = new StringDecoder('utf8');
+    p.stdout?.on('data', (d) => (out += stdoutDecoder.write(d as Buffer)));
     // A chunk is not a line: a stats line can arrive split across two reads, and two
     // lines can arrive in one. Hold the trailing partial until its newline shows up,
     // so a caller never sees half a line (and never has to re-assemble one itself).
@@ -69,6 +75,23 @@ export function run(cmd: string, args: string[], { input, timeoutMs, onStderrLin
     //.
     const decoder = new StringDecoder('utf8');
     let pending = '';
+    // Set when a caller-supplied onStderrLine itself throws (Codex review): without
+    // this, that throw escapes from inside an EventEmitter's 'data' dispatch — which is
+    // NOT inside this Promise's executor call stack by the time it runs — so it becomes
+    // an uncaught exception that crashes the whole process instead of a rejected run()
+    // a caller could catch. Once set, the child is killed and every further line this
+    // run() would have delivered is dropped: the callback already proved it cannot be
+    // trusted with more input this run.
+    let callbackFailed: Error | undefined;
+    const safeOnStderrLine = (line: string) => {
+      if (!onStderrLine || callbackFailed) return;
+      try {
+        onStderrLine(line);
+      } catch (e) {
+        callbackFailed = e instanceof Error ? e : new Error(String(e));
+        p.kill('SIGKILL');
+      }
+    };
     p.stderr?.on('data', (d) => {
       const chunk = decoder.write(d as Buffer);
       if (!onStderrLine) {
@@ -79,13 +102,13 @@ export function run(cmd: string, args: string[], { input, timeoutMs, onStderrLin
       pending += chunk;
       const lines = pending.split('\n');
       pending = lines.pop() ?? '';
-      for (const line of lines) if (line !== '') onStderrLine(line);
+      for (const line of lines) if (line !== '') safeOnStderrLine(line);
       // A child that never emits a newline would otherwise grow `pending` for the whole
       // run, defeating the very bound this streaming path exists to provide. Flush the
       // over-long fragment as a line: a caller that cannot parse it drops it, which is
       // the same outcome as never seeing it, without the memory.
       if (pending.length > ERR_TAIL_LIMIT) {
-        onStderrLine(pending);
+        safeOnStderrLine(pending);
         pending = '';
       }
     });
@@ -97,12 +120,30 @@ export function run(cmd: string, args: string[], { input, timeoutMs, onStderrLin
     p.on('close', (code) => {
       clearTimeout(timer);
       doneChild();
+      // Flush each StringDecoder's own trailing state (Codex review): `.write()` alone
+      // holds back an incomplete multi-byte sequence at the end of a chunk, waiting for
+      // its continuation bytes — the right call while the stream is still open, but at
+      // 'close' there is no more input coming. Without `.end()` here, a child whose
+      // stdout/stderr happens to end mid-character (a truncated/invalid tail, or simply
+      // EOF landing inside one) silently drops those bytes instead of the replacement
+      // character StringDecoder is designed to emit for them.
+      out += stdoutDecoder.end();
+      const finalErrChunk = decoder.end();
+      if (finalErrChunk) {
+        if (!onStderrLine) {
+          err += finalErrChunk;
+        } else {
+          err = (err + finalErrChunk).slice(-ERR_TAIL_LIMIT);
+          pending += finalErrChunk;
+        }
+      }
       // A child that exits without a trailing newline still said something; deliver it
       // rather than swallowing the last line of a tool that does not terminate output.
       if (onStderrLine && pending !== '') {
-        onStderrLine(pending);
+        safeOnStderrLine(pending);
         pending = '';
       }
+      if (callbackFailed) return rej(callbackFailed);
       if (code === 0 && !stdinFailed) return res({ out, err });
       if (code === 0)
         return rej(new Error(`${cmd}: stdin write failed before it read all input: ${stdinFailed?.message}`));

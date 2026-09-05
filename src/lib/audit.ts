@@ -230,6 +230,22 @@ async function withAuditLogLock<T>(fn: () => Promise<T>): Promise<T> {
   const token = `${process.pid}.${Date.now()}.${randomBytes(16).toString('hex')}`;
   const deadline = Date.now() + AUDIT_LOCK_MAX_WAIT_MS;
   for (;;) {
+    // Checked at the TOP of every iteration (Codex review), not only on the
+    // still-held/not-stale branch below: both `continue` paths further down (a
+    // just-stolen stale lock, or one that disappeared between our failed create and the
+    // stat() that follows it) used to loop back to `writeFile` with NEITHER this check
+    // NOR the retry delay below it. A lock whose steal attempt keeps failing (e.g.
+    // removeOwnedLock's rm() hitting a persistent, non-EEXIST-class error swallowed by
+    // its own best-effort catch) span this exact gap: it always looks stale, is never
+    // actually removed, and every iteration took the `continue` branch that skipped
+    // AUDIT_LOCK_MAX_WAIT_MS entirely — a tight CPU-spinning loop with no timeout, the
+    // opposite of what that constant's own name promises callers.
+    if (Date.now() > deadline) {
+      throw new Error(
+        `timed out after ${AUDIT_LOCK_MAX_WAIT_MS}ms waiting for the audit log lock at ${lockPath} ` +
+          `(held by another process) — refusing to append without it rather than risk forking the chain`,
+      );
+    }
     try {
       // Exclusive create: succeeds only if no OTHER holder currently owns the lock —
       // this (not the read-then-append itself) is the actual mutual-exclusion primitive.
@@ -249,16 +265,10 @@ async function withAuditLogLock<T>(fn: () => Promise<T>): Promise<T> {
           // finishing normally and a third process acquiring a fresh lock in between.
           const staleContent = await readFile(lockPath, 'utf8').catch(() => null);
           if (staleContent !== null) await removeOwnedLock(lockPath, staleContent);
-          continue;
+          continue; // deadline re-checked at the top of the loop
         }
       } catch {
-        continue; // the lock disappeared between our failed create and this stat — retry now
-      }
-      if (Date.now() > deadline) {
-        throw new Error(
-          `timed out after ${AUDIT_LOCK_MAX_WAIT_MS}ms waiting for the audit log lock at ${lockPath} ` +
-            `(held by another process) — refusing to append without it rather than risk forking the chain`,
-        );
+        continue; // the lock disappeared between our failed create and this stat — retry now (deadline re-checked at the top of the loop)
       }
       await new Promise((r) => setTimeout(r, AUDIT_LOCK_RETRY_DELAY_MS));
     }
