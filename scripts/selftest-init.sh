@@ -33,6 +33,13 @@ source "$ROOT/scripts/dev-node-flags.sh"
 # call needs its OWN deadline, not just an outer one).
 source "$ROOT/scripts/selftest-lib.sh"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# Point TMPDIR at a directory INSIDE $TMP (not the ambient system tmp) so that when
+# with_timeout/with_stdin_timeout SIGKILLs a wedged wizard/CLI child, whatever staged
+# plaintext it created (identity material, snapshot staging dirs, etc. -- none of
+# which get a chance to run their own finally-block cleanup under SIGKILL) still lands
+# under $TMP and is removed by the EXIT trap above, instead of leaking into the
+# system-wide temp directory this script's own trap never touches.
+export TMPDIR="$TMP/system-tmp"; mkdir -p "$TMPDIR"
 
 # file_mode: portable octal permission-bits lookup. GNU coreutils `stat` (Linux,
 # this repo's ubuntu-latest CI matrix cells) and BSD `stat` (macOS) both accept a
@@ -50,19 +57,26 @@ file_mode() {
 echo "== (a) init refuses when an identity already exists (init is for a FRESH setup only) =="
 EXISTS_HOME="$TMP/exists-home"
 CYPHER_BRAIN_HOME="$EXISTS_HOME" cb keygen > /dev/null
-if CYPHER_BRAIN_HOME="$EXISTS_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
-  with_timeout 10 node "${BIN_DEV_ARGS[@]}" "$BIN" init < /dev/null > "$TMP/exists.log" 2>&1; then
-  echo "[FAIL] init did not refuse with a pre-existing identity"; cat "$TMP/exists.log"; exit 1
-fi
+EXISTS_RC=0
+CYPHER_BRAIN_HOME="$EXISTS_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 10 node "${BIN_DEV_ARGS[@]}" "$BIN" init < /dev/null > "$TMP/exists.log" 2>&1 || EXISTS_RC=$?
+[ "$EXISTS_RC" != "0" ] || { echo "[FAIL] init did not refuse with a pre-existing identity"; cat "$TMP/exists.log"; exit 1; }
+# A nonzero status alone doesn't prove init refused PROMPTLY: 137 means with_timeout's own
+# 10s watchdog had to SIGKILL it, which is a hang (possibly after printing the very message
+# grepped for below), not the same as a clean, fast refusal.
+[ "$EXISTS_RC" != "137" ] || { echo "[FAIL] init did not refuse promptly -- it hung until the 10s with_timeout watchdog SIGKILLed it"; cat "$TMP/exists.log"; exit 1; }
 grep -qi "already exists" "$TMP/exists.log" || { echo "[FAIL] refusal does not name the existing identity"; cat "$TMP/exists.log"; exit 1; }
 grep -qi "keygen --force" "$TMP/exists.log" || { echo "[FAIL] refusal does not point at keygen --force"; cat "$TMP/exists.log"; exit 1; }
 echo "[PASS] init refuses a pre-existing identity and points at keygen --force"
 
 echo "== (b) init refuses promptly (no hang) when stdin is not a TTY and no escape hatch is set =="
 TTY_HOME="$TMP/tty-check-home"
-if CYPHER_BRAIN_HOME="$TTY_HOME" with_timeout 10 node "${BIN_DEV_ARGS[@]}" "$BIN" init < /dev/null > "$TMP/tty.log" 2>&1; then
-  echo "[FAIL] init did not refuse a non-TTY stdin"; cat "$TMP/tty.log"; exit 1
-fi
+TTY_RC=0
+CYPHER_BRAIN_HOME="$TTY_HOME" with_timeout 10 node "${BIN_DEV_ARGS[@]}" "$BIN" init < /dev/null > "$TMP/tty.log" 2>&1 || TTY_RC=$?
+[ "$TTY_RC" != "0" ] || { echo "[FAIL] init did not refuse a non-TTY stdin"; cat "$TMP/tty.log"; exit 1; }
+# 137 (SIGKILL) means the 10s with_timeout watchdog killed it -- a hang, not a refusal --
+# even if the expected message happened to be printed before the hang. Prove promptness.
+[ "$TTY_RC" != "137" ] || { echo "[FAIL] init did not refuse promptly -- it hung until the 10s with_timeout watchdog SIGKILLed it"; cat "$TMP/tty.log"; exit 1; }
 grep -qi "requires stdin to be a TTY" "$TMP/tty.log" || { echo "[FAIL] refusal does not mention the TTY requirement"; cat "$TMP/tty.log"; exit 1; }
 [ ! -f "$TTY_HOME/identity.age" ] || { echo "[FAIL] an identity was written despite the TTY refusal"; exit 1; }
 echo "[PASS] init refuses promptly (bounded by with_timeout, no hang) when stdin is not a TTY"
@@ -199,6 +213,14 @@ echo "[PASS] a nonexistent directory answer re-prompts instead of throwing — p
 # this count would be 1 (the summary block never mentioned it at all — the transcript
 # had no run summary for this event whatsoever).
 grep -q '⚠  run summary' "$TMP/nodir2.log" || { echo "[FAIL] issue #732: no end-of-run warning summary was printed even though a directory was dropped mid-run"; cat "$TMP/nodir2.log"; exit 1; }
+# Two mentions anywhere in the transcript (this file's existing check below) plus a
+# summary header existing SOMEWHERE do not together prove the dropped path is mentioned
+# INSIDE that summary block specifically -- both could, in principle, come from the
+# mid-run notice alone while the summary itself stays silent. Slice the transcript from
+# the summary marker onward and check the mention lands in that slice.
+NODIR2_SUMMARY_BLOCK="$(sed -n '/⚠  run summary/,$p' "$TMP/nodir2.log")"
+printf '%s' "$NODIR2_SUMMARY_BLOCK" | grep -qF "$NODIR2_BADPATH does not exist" \
+  || { echo "[FAIL] issue #732: the dropped directory is not mentioned INSIDE the run-summary block itself"; cat "$TMP/nodir2.log"; exit 1; }
 NODIR2_BADPATH_MENTIONS="$(grep -oF "$NODIR2_BADPATH does not exist" "$TMP/nodir2.log" | wc -l | tr -d ' ')"
 [ "$NODIR2_BADPATH_MENTIONS" -ge 2 ] || { echo "[FAIL] issue #732: expected the dropped directory to be mentioned at least twice (mid-run notice + run-summary recap via warn()), got $NODIR2_BADPATH_MENTIONS"; cat "$TMP/nodir2.log"; exit 1; }
 echo "[PASS] the dropped (typo'd) directory survives into the end-of-run warning summary via warn() (issue #732)"
@@ -872,10 +894,11 @@ echo "== (j2) retry after a post-push failure correctly REFUSES — identity + s
 # starting "clean" here would be wrong: it would silently abandon the real,
 # already-pushed snapshot (and, on a paid backend, already-spent money) in favor of
 # a brand new identity that cannot decrypt it.
-if CYPHER_BRAIN_HOME="$SNAP_CB_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
-  with_timeout 10 node "${BIN_DEV_ARGS[@]}" "$BIN" init < /dev/null > "$TMP/snap-preserve-retry.log" 2>&1; then
-  echo "[FAIL] a retry after a post-push failure did not refuse — it should, since the identity/snapshot are preserved"; cat "$TMP/snap-preserve-retry.log"; exit 1
-fi
+SNAP_RETRY_RC=0
+CYPHER_BRAIN_HOME="$SNAP_CB_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 10 node "${BIN_DEV_ARGS[@]}" "$BIN" init < /dev/null > "$TMP/snap-preserve-retry.log" 2>&1 || SNAP_RETRY_RC=$?
+[ "$SNAP_RETRY_RC" != "0" ] || { echo "[FAIL] a retry after a post-push failure did not refuse — it should, since the identity/snapshot are preserved"; cat "$TMP/snap-preserve-retry.log"; exit 1; }
+[ "$SNAP_RETRY_RC" != "137" ] || { echo "[FAIL] the retry did not refuse promptly -- it hung until the 10s with_timeout watchdog SIGKILLed it"; cat "$TMP/snap-preserve-retry.log"; exit 1; }
 grep -qi "already exists" "$TMP/snap-preserve-retry.log" || { echo "[FAIL] retry's refusal was not the expected pre-existing-identity error"; cat "$TMP/snap-preserve-retry.log"; exit 1; }
 [ -f "$SNAP_CB_HOME/identity.age" ] || { echo "[FAIL] the preserved primary identity vanished between the two runs"; exit 1; }
 [ -n "$(find "$SNAP_CB_HOME" -maxdepth 1 -name 'brain-*.age' 2>/dev/null | head -n1)" ] || { echo "[FAIL] the preserved snapshot artifact vanished between the two runs"; exit 1; }
@@ -934,10 +957,11 @@ K_TMP_LEFTOVER="$(find "$K_CB_HOME" -maxdepth 1 -name 'latest-locator.tsv.*.tmp'
 echo "[PASS] a locator-write failure AFTER a successful push preserves the identity, recipient, AND the dated snapshot artifact — the error surfaces the ACTION-REQUIRED locator value instead of losing it"
 
 echo "== (k2) retry after the finding-1 locator-write failure correctly REFUSES (identity + snapshot preserved, exactly as (j2)) =="
-if CYPHER_BRAIN_HOME="$K_CB_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
-  with_timeout 10 node "${BIN_DEV_ARGS[@]}" "$BIN" init < /dev/null > "$TMP/locator-preserve-retry.log" 2>&1; then
-  echo "[FAIL] a retry after a finding-1 locator-write failure did not refuse — it should, since the identity/snapshot are preserved"; cat "$TMP/locator-preserve-retry.log"; exit 1
-fi
+LOCATOR_RETRY_RC=0
+CYPHER_BRAIN_HOME="$K_CB_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_timeout 10 node "${BIN_DEV_ARGS[@]}" "$BIN" init < /dev/null > "$TMP/locator-preserve-retry.log" 2>&1 || LOCATOR_RETRY_RC=$?
+[ "$LOCATOR_RETRY_RC" != "0" ] || { echo "[FAIL] a retry after a finding-1 locator-write failure did not refuse — it should, since the identity/snapshot are preserved"; cat "$TMP/locator-preserve-retry.log"; exit 1; }
+[ "$LOCATOR_RETRY_RC" != "137" ] || { echo "[FAIL] the retry did not refuse promptly -- it hung until the 10s with_timeout watchdog SIGKILLed it"; cat "$TMP/locator-preserve-retry.log"; exit 1; }
 grep -qi "already exists" "$TMP/locator-preserve-retry.log" || { echo "[FAIL] retry's refusal was not the expected pre-existing-identity error"; cat "$TMP/locator-preserve-retry.log"; exit 1; }
 echo "[PASS] a second 'cypher-brain init' run against the same CYPHER_BRAIN_HOME correctly refuses instead of silently starting over on top of the preserved, already-uploaded snapshot"
 
@@ -1168,14 +1192,20 @@ TEST_PG_CONN_REDACTED="postgres://tester@localhost:5432/gbrain-selftest?password
 FAKE_PGBIN="$TMP/fake-pgbin-snapshot"; mkdir -p "$FAKE_PGBIN"
 cat > "$FAKE_PGBIN/pg_dump" <<'SHIM'
 #!/usr/bin/env bash
+set -eu
 # args: -Fc --no-owner --no-privileges [-t table ...] -f <dumpPath> <conn> — find -f's value
 out=""; prev=""
 for a in "$@"; do
   if [ "$prev" = "-f" ]; then out="$a"; fi
   prev="$a"
 done
+: "${out:?fake pg_dump: no -f <path> found in argv}"
 printf 'fake-pg-dump-content\n' > "$out"
-exit 0
+# PG_DUMP_ARGV_LOG is OPTIONAL (unlike the -f path above) -- most callers of this shim
+# only care that pg_dump ran at all, but a caller that needs to prove WHICH connection
+# string actually reached pg_dump (e.g. a fallback-default test, where every call
+# produces identical fixture content regardless of argv) can point this at a log file.
+if [ -n "${PG_DUMP_ARGV_LOG:-}" ]; then printf '%s\n' "$@" > "$PG_DUMP_ARGV_LOG"; fi
 SHIM
 chmod +x "$FAKE_PGBIN/pg_dump"
 
@@ -1225,7 +1255,16 @@ if grep -qF "$TEST_PG_PASSWORD_QUERY" "$PG_KIT_PATH"; then echo "[FAIL] recovery
 # Fugu review finding: the printed restore command must NOT auto-embed the SOURCE
 # connection as the restore --pg target — pg_restore --clean would DROP/replace objects
 # in whatever database --pg names, so a verbatim copy-paste could clobber a live DB.
-if grep -qF -- "--pg \"$TEST_PG_CONN" "$PG_KIT_PATH"; then echo "[FAIL] kit restore command auto-embeds the SOURCE connection as --pg — copy-paste risks clobbering the live database"; cat "$PG_KIT_PATH"; exit 1; fi
+# Check against the REDACTED connection (independent of the password checks above,
+# which already guarantee the RAW connection can't appear anywhere in the kit — matching
+# only the raw form here would make this assertion pass vacuously even if the wizard
+# embedded the still-dangerous-but-password-free redacted source as --pg), across the
+# quoting styles a restore command could plausibly use.
+if grep -qF -- "--pg \"$TEST_PG_CONN_REDACTED" "$PG_KIT_PATH" \
+  || grep -qF -- "--pg '$TEST_PG_CONN_REDACTED" "$PG_KIT_PATH" \
+  || grep -qF -- "--pg $TEST_PG_CONN_REDACTED" "$PG_KIT_PATH"; then
+  echo "[FAIL] kit restore command auto-embeds the (redacted) SOURCE connection as --pg — copy-paste risks clobbering the live database"; cat "$PG_KIT_PATH"; exit 1
+fi
 echo "[PASS] the recovery kit records the Postgres connection with its password redacted, never auto-embeds --pg with the source, and warns to restore into a SCRATCH database"
 
 echo "== (m2) declining the gbrain-detected Postgres prompt proceeds without --pg (opt-out works, Grok review coverage gap) =="
@@ -1295,12 +1334,29 @@ cat > "$TMP/qa-pg-whitespace.json" <<JSON
 ]
 JSON
 
-CYPHER_BRAIN_HOME="$PG3_CB_HOME" CYPHER_BRAIN_FILE_DIR="$PG3_STORE" HOME="$PG_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 CYPHER_BRAIN_PG_BIN="$FAKE_PGBIN" \
+# PG_DUMP_ARGV_LOG: the shim always writes identical fixture content regardless of the
+# connection string it received, so "db.dump exists and contains the fixture" alone
+# would ALSO pass if the fallback silently used the whitespace answer verbatim, or an
+# empty string, instead of the real default -- prove the connection string pg_dump
+# actually got (its own last positional argument, see snapshot.ts's pg_dump call) is
+# the non-blank fallback, not the whitespace this test answered with.
+PG3_ARGV_LOG="$TMP/pg3-dump-argv.txt"
+CYPHER_BRAIN_HOME="$PG3_CB_HOME" CYPHER_BRAIN_FILE_DIR="$PG3_STORE" HOME="$PG_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 CYPHER_BRAIN_PG_BIN="$FAKE_PGBIN" PG_DUMP_ARGV_LOG="$PG3_ARGV_LOG" \
   with_timeout 90 node "$ROOT/scripts/drive-init.mjs" --qa "$TMP/qa-pg-whitespace.json" --out "$TMP/wizard-pg-whitespace.log" \
   -- node "${BIN_DEV_ARGS[@]}" "$BIN" init \
   || { echo "[FAIL] the whitespace-only pg connection-string run did not complete"; cat "$TMP/wizard-pg-whitespace.log"; exit 1; }
 grep -q 'cypher-brain init: complete' "$TMP/wizard-pg-whitespace.log" || { echo "[FAIL] whitespace-pg run: wizard log lacks its own completion marker"; cat "$TMP/wizard-pg-whitespace.log"; exit 1; }
 grep -q 'postgres:          included (pg_dump)' "$TMP/wizard-pg-whitespace.log" || { echo "[FAIL] a whitespace-only connection-string answer did not fall back to the default — pg_dump was silently skipped (the P2 regression)"; cat "$TMP/wizard-pg-whitespace.log"; exit 1; }
+[ -s "$PG3_ARGV_LOG" ] || { echo "[FAIL] pg_dump's argv was never logged — the shim did not run"; exit 1; }
+# printf '%s\n' "$@" (in the shim) writes one argv item per line -- the connection
+# string is pg_dump's own LAST positional argument (snapshot.ts's pg_dump call), i.e.
+# the log file's last line.
+PG3_ACTUAL_CONN="$(tail -n1 "$PG3_ARGV_LOG")"
+case "$PG3_ACTUAL_CONN" in
+  ''|' '|'   ') echo "[FAIL] pg_dump was invoked with a blank/whitespace connection string ('$PG3_ACTUAL_CONN') — the whitespace answer reached pg_dump instead of falling back to the default"; cat "$PG3_ARGV_LOG"; exit 1 ;;
+  postgres://*localhost:5432/gbrain) ;;
+  *) echo "[FAIL] pg_dump's connection string ('$PG3_ACTUAL_CONN') does not match the documented default shape (postgres://<user>@localhost:5432/gbrain)"; cat "$PG3_ARGV_LOG"; exit 1 ;;
+esac
 PG3_SNAP="$(find "$PG3_CB_HOME" -maxdepth 1 -name 'brain-*.age' | head -n1)"
 [ -n "$PG3_SNAP" ] || { echo "[FAIL] no brain-*.age snapshot found for the whitespace-pg run"; exit 1; }
 PG3_RESTORE_DIR="$TMP/pg3-restored"
@@ -1550,10 +1606,11 @@ P_HOME="$TMP/nonpipe-stdin-home"; mkdir -p "$P_HOME"
 P_CB_HOME="$TMP/nonpipe-stdin-cb-home"
 printf '\x03' > "$TMP/ctrlc-byte.bin" # a raw Ctrl+C byte — clack decodes this as a cancel keypress
 
-if CYPHER_BRAIN_HOME="$P_CB_HOME" HOME="$P_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
-  with_stdin_timeout 30 node "${BIN_DEV_ARGS[@]}" "$BIN" init < "$TMP/ctrlc-byte.bin" > "$TMP/nonpipe-stdin.log" 2>&1; then
-  echo "[FAIL] init did not fail on a Ctrl+C byte delivered via file-redirected stdin"; cat "$TMP/nonpipe-stdin.log"; exit 1
-fi
+NONPIPE_RC=0
+CYPHER_BRAIN_HOME="$P_CB_HOME" HOME="$P_HOME" CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE=1 \
+  with_stdin_timeout 30 node "${BIN_DEV_ARGS[@]}" "$BIN" init < "$TMP/ctrlc-byte.bin" > "$TMP/nonpipe-stdin.log" 2>&1 || NONPIPE_RC=$?
+[ "$NONPIPE_RC" != "0" ] || { echo "[FAIL] init did not fail on a Ctrl+C byte delivered via file-redirected stdin"; cat "$TMP/nonpipe-stdin.log"; exit 1; }
+[ "$NONPIPE_RC" != "137" ] || { echo "[FAIL] init did not fail promptly on the Ctrl+C byte -- it hung until the 30s with_stdin_timeout watchdog SIGKILLed it"; cat "$TMP/nonpipe-stdin.log"; exit 1; }
 grep -qi "cypher-brain init: cancelled" "$TMP/nonpipe-stdin.log" || { echo "[FAIL] the real InitCancelledError was not surfaced (masked by something else?)"; cat "$TMP/nonpipe-stdin.log"; exit 1; }
 if grep -qi "is not a function" "$TMP/nonpipe-stdin.log"; then echo "[FAIL] process.stdin.unref() crashed and masked the real error — the P2 regression"; cat "$TMP/nonpipe-stdin.log"; exit 1; fi
 [ ! -f "$P_CB_HOME/identity.age" ] || { echo "[FAIL] primary identity survived the cancellation — rollback should still fire on this path"; exit 1; }
@@ -1611,6 +1668,11 @@ cp "$MISMATCH_CB_HOME/sign-recipient.pub" "$TMP/mismatch-recipient-a.pub"
 CYPHER_BRAIN_HOME="$MISMATCH_CB_HOME" cb keygen --sign --force > "$TMP/mismatch-setup-b.log" 2>&1 \
   || { echo "[FAIL] test setup: could not regenerate signing keypair B"; cat "$TMP/mismatch-setup-b.log"; exit 1; }
 cp "$TMP/mismatch-recipient-a.pub" "$MISMATCH_CB_HOME/sign-recipient.pub"
+# Checksummed BEFORE the run under test: "-f still exists" alone does not prove the
+# file is untouched -- a truncate-and-rewrite (even to identical-looking content, or
+# garbage) would still pass an existence check.
+MISMATCH_IDENTITY_SHA_BEFORE=$(sha "$MISMATCH_CB_HOME/sign-identity.key")
+MISMATCH_RECIPIENT_SHA_BEFORE=$(sha "$MISMATCH_CB_HOME/sign-recipient.pub")
 
 cat > "$TMP/qa-mismatch.json" <<JSON
 [
@@ -1632,6 +1694,8 @@ grep -qi "does not match" "$TMP/mismatch.log" || { echo "[FAIL] issue #736: no m
 [ ! -f "$MISMATCH_CB_HOME/identity.age" ] || { echo "[FAIL] issue #736: the primary identity this run created was not rolled back after the signing-pair mismatch was detected"; exit 1; }
 [ -f "$MISMATCH_CB_HOME/sign-identity.key" ] || { echo "[FAIL] issues #736/#719: the pre-existing (mismatched) signing identity was deleted — it must never be touched by this run"; exit 1; }
 [ -f "$MISMATCH_CB_HOME/sign-recipient.pub" ] || { echo "[FAIL] issues #736/#719: the pre-existing (mismatched) signing public key was deleted — it must never be touched by this run"; exit 1; }
+[ "$(sha "$MISMATCH_CB_HOME/sign-identity.key")" = "$MISMATCH_IDENTITY_SHA_BEFORE" ] || { echo "[FAIL] issues #736/#719: the pre-existing (mismatched) signing identity's bytes changed — it must never be touched by this run"; exit 1; }
+[ "$(sha "$MISMATCH_CB_HOME/sign-recipient.pub")" = "$MISMATCH_RECIPIENT_SHA_BEFORE" ] || { echo "[FAIL] issues #736/#719: the pre-existing (mismatched) signing public key's bytes changed — it must never be touched by this run"; exit 1; }
 echo "[PASS] init refuses to reuse a mismatched signing keypair, rolls back only what this run created, and leaves the pre-existing (mismatched) signing files untouched (issues #736, #719)"
 
 echo "== (r2) init also refuses a signing pair whose CRYPTOGRAPHIC keys match but whose recorded key ids disagree (issue #736, review-hardening) =="
@@ -1664,6 +1728,11 @@ assert new != old
 text = text.replace(f'# key id: {old}\n', f'# key id: {new}\n', 1)
 open(path, 'w').write(text)
 PY
+# Checksummed AFTER the python3 edit above (the actual pre-existing state the run under
+# test must leave untouched) -- "-f still exists" alone would also pass a truncate-and-
+# rewrite of either file.
+KEYID_IDENTITY_SHA_BEFORE=$(sha "$KEYID_CB_HOME/sign-identity.key")
+KEYID_RECIPIENT_SHA_BEFORE=$(sha "$KEYID_CB_HOME/sign-recipient.pub")
 
 cat > "$TMP/qa-keyid-mismatch.json" <<JSON
 [
@@ -1679,6 +1748,8 @@ fi
 grep -qi "does not match" "$TMP/keyid-mismatch.log" || { echo "[FAIL] issue #736: no mismatch-related error message found for the key-id-only mismatch"; cat "$TMP/keyid-mismatch.log"; exit 1; }
 [ -f "$KEYID_CB_HOME/sign-identity.key" ] || { echo "[FAIL] the pre-existing signing identity was deleted"; exit 1; }
 [ -f "$KEYID_CB_HOME/sign-recipient.pub" ] || { echo "[FAIL] the pre-existing signing public key was deleted"; exit 1; }
+[ "$(sha "$KEYID_CB_HOME/sign-identity.key")" = "$KEYID_IDENTITY_SHA_BEFORE" ] || { echo "[FAIL] the pre-existing signing identity's bytes changed"; exit 1; }
+[ "$(sha "$KEYID_CB_HOME/sign-recipient.pub")" = "$KEYID_RECIPIENT_SHA_BEFORE" ] || { echo "[FAIL] the pre-existing signing public key's bytes changed"; exit 1; }
 echo "[PASS] init also refuses a pair whose cryptographic keys match but whose recorded key ids disagree (issue #736, review-hardening)"
 
 echo "== (s) EOF on stdin mid-wizard (a closed pipe / Ctrl-D) triggers the SAME cancel+rollback path as Ctrl-C, not a silent exit 0 with orphaned key material (issue #718) =="
@@ -1835,7 +1906,11 @@ if [ "$TZDATE_LOCAL" != "$TZDATE_UTC" ]; then
   [ ! -f "$TZDATE_CB_HOME/brain-${TZDATE_UTC}.age" ] || { echo "[FAIL] issue #761: a brain-${TZDATE_UTC}.age (UTC date) snapshot was ALSO written — the old UTC-based dateStamp regression"; exit 1; }
   echo "[PASS] snapshot filename uses the LOCAL calendar day (${TZDATE_LOCAL}), not the UTC one (${TZDATE_UTC}) — issue #761"
 else
-  echo "[PASS] snapshot filename uses the LOCAL calendar day (${TZDATE_LOCAL}) — local and UTC coincide at this exact moment, so this run alone can't distinguish the two, but the filename is correct either way"
+  # BLOCKED != PASS: local and UTC coincide at this exact moment, so this run cannot
+  # distinguish a correct local-date implementation from the old UTC-based regression
+  # (#761) — both would produce the identical filename here. Say so as a [SKIP], not a
+  # [PASS] that would otherwise silently claim to have verified something it did not.
+  echo "[SKIP] issue #761 coverage: local and UTC dates coincide at this exact moment (both ${TZDATE_LOCAL}), so this run cannot distinguish a correct local-date implementation from the old UTC-based regression — re-run to exercise the divergent window"
 fi
 
 echo "== (w) a snapshot already sitting at today's dated --out path is NEVER deleted by rollback — snapshot()'s own no-clobber refusal must not look like something THIS run created (issue #733, review-hardening) =="
