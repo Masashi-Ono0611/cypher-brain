@@ -113,6 +113,13 @@ const VALUE_FLAGS = new Set([
   'plan',
 ]);
 
+// Flags whose value can itself embed a credential (--pg's connection string carries a
+// password inline, e.g. postgresql://user:pass@host/db). The "did you mean" hint below
+// otherwise echoes the offending "--flag=value" token's value verbatim; for these flags
+// that would print the secret to stderr (and, under --json, to stdout too). Redacted
+// there only — the flag's actual value, once accepted normally, is unaffected.
+const REDACT_VALUE_FLAGS = new Set(['pg']);
+
 // Every flag name an "unknown flag" error can plausibly suggest (#425 — generalizing
 // #253's own "would be nice-to-have" mention of a did-you-mean suggestion beyond
 // restore's --out/--out-dir special case). Includes the four repeatable array flags
@@ -209,14 +216,19 @@ function parseArgs(argv: string[], cmd: string | undefined): CliOptions {
         const eq = a.indexOf('=');
         const eqFlagName = eq > 2 ? a.slice(2, eq) : undefined;
         if (eqFlagName !== undefined && KNOWN_FLAG_NAMES.includes(eqFlagName)) {
-          const eqValue = a.slice(eq + 1);
+          // REDACT_VALUE_FLAGS: neither the offending token nor the corrected form may
+          // echo the real value here — both would otherwise put the credential (e.g.
+          // --pg's connection string) on stderr, and under --json on stdout too.
+          const redact = REDACT_VALUE_FLAGS.has(eqFlagName.replace(/-/g, '_'));
+          const eqValue = redact ? '<redacted>' : a.slice(eq + 1);
+          const offendingToken = redact ? `${eqFlagName}=<redacted>` : a.slice(2);
           const spaceForm = BOOL_FLAGS.has(eqFlagName.replace(/-/g, '_'))
             ? `'--${eqFlagName}' (it takes no value — drop the '=')`
             : `'--${eqFlagName} ${eqValue.length > 0 ? eqValue : '<value>'}' (space-separated, not '=')`;
           // #779: UsageError — a parser-level refusal, same class as the unknown-command
           // replies below (exit 2, not the generic-failure 1).
           throw new UsageError(
-            `unknown flag: --${a.slice(2)} (${didYouMean(spaceForm)} — run 'cypher-brain --help' or '<command> --help' to see valid flags)`,
+            `unknown flag: --${offendingToken} (${didYouMean(spaceForm)} — run 'cypher-brain --help' or '<command> --help' to see valid flags)`,
           );
         }
         const suggestion = nearestName(a.slice(2), KNOWN_FLAG_NAMES);
@@ -1232,9 +1244,16 @@ function commandNames(): string[] {
 function helpForCommand(cmd: string): string | null {
   const lines = HELP.split('\n');
   const isSectionStart = (line: string) => /^ {2}cypher-brain \S/.test(line);
-  // The trailing Env:/Storage:/Spend:/Consent: block starts at column 0 and is
-  // command-agnostic, so every scoped help ends with it.
-  const trailerStart = lines.findIndex((line) => line.startsWith('Env:'));
+  // The trailing Config file:/Env:/Storage:/Spend:/Consent: block starts at column 0
+  // and is command-agnostic, so every scoped help ends with it. This used to search
+  // for 'Env:' specifically, which put the "Config file:" paragraph (immediately
+  // BEFORE 'Env:' in HELP) outside the trailer slice — inMatch then only carried it
+  // into the one command section that happens to sit directly above it in HELP
+  // (currently 'schedule uninstall', the last section before the trailer), so every
+  // OTHER command's scoped `--help` silently omitted the config-file precedence
+  // documentation. Starting the search at 'Config file:' makes it part of the shared
+  // trailer for every command, matching the comment's own stated intent.
+  const trailerStart = lines.findIndex((line) => line.startsWith('Config file:'));
   const sectionsEnd = trailerStart === -1 ? lines.length : trailerStart;
 
   const matched: string[] = [];
