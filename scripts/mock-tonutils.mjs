@@ -126,7 +126,15 @@ if (!apiAddr) {
     });
     req.on('end', () => {
       try {
-        if (url.pathname === '/api/v1/list') return reply(200, { bags: [...local.keys()].map((id) => details(id)) });
+        // Mirrors the real binary's `var bags []Bag` + append-per-torrent handleList()
+        // (api/api.go): a bag-less daemon's `bags` stays a nil Go slice, which
+        // encoding/json marshals as `null`, not `[]`. Returning `[]` here unconditionally
+        // would let this mock's readiness answer diverge from the real daemon's on the
+        // exact state (freshly started, zero bags) every ephemeral local daemon passes
+        // through right after boot — the case that hid the #858 readiness-check
+        // regression (issue: rejecting `{"bags":null}` as "unready").
+        if (url.pathname === '/api/v1/list')
+          return reply(200, { bags: local.size === 0 ? null : [...local.keys()].map((id) => details(id)) });
         if (url.pathname === '/api/v1/details') {
           const d = details(url.searchParams.get('bag_id')?.toLowerCase());
           return d ? reply(200, d) : reply(500, { error: 'bag not found' });
