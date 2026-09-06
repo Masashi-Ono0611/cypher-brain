@@ -103,6 +103,18 @@ const ACTIVE_TON_TMP_DIRS = new Set<string>();
 // on restore()), so the long-lived MCP server can have more than one restore_now
 // (each running its own expandComponents() loop) in flight at once.
 const ACTIVE_EXPAND_SCRATCH_DIRS = new Set<string>();
+// keys.ts's writeKeyFile() (--force branch): the sibling `<path>.<pid>.<hex>.tmp` file
+// it writes the new payload into BEFORE renaming over `path` holds a complete,
+// unencrypted secret (an age identity, a minisign signing key, or an Arweave JWK —
+// writeKeyFile() is the single shared write path keys.ts/minisign.ts/wallet.ts all
+// use) for the whole write+sync+close+rename window. A signal landing anywhere in
+// that window previously left this file behind, untracked — the SAME class of gap
+// every add*ScratchDir Set above exists to close, just for a single FILE rather than
+// a directory tree. A Set, not a scalar slot, for the same "two unrelated resources
+// must not share one slot" reason ACTIVE_MCP_FETCH_DIRS is one: the MCP server's
+// keygen tool (mcp.ts) can have more than one keygenAt()/keygenSignAt()/wallet
+// create call in flight at once, each with its own tmp file.
+const ACTIVE_KEY_SCRATCH_FILES = new Set<string>();
 // #734: the init wizard (src/lib/wizard.ts) creates secret key material (the primary
 // identity, an optional offline backup keypair, an optional signing keypair) BEFORE
 // its own long snapshot()/push() phase runs, and its normal rollback (an async
@@ -378,6 +390,25 @@ export const addActiveExpandScratchDir = (dir: string): void => {
 export const removeActiveExpandScratchDir = (dir: string): void => {
   ACTIVE_EXPAND_SCRATCH_DIRS.delete(dir);
 };
+// keys.ts's writeKeyFile() calls these differently from every add/remove-Set pair
+// above (a second Codex review pass of that fix, see its own header comment there for
+// the two reasons): add() runs BEFORE `open(tmp, 'wx', ...)` even starts (not after it
+// resolves) — a synchronous, in-memory Set insert for a not-yet-existent path is free,
+// and closes the narrow window an "add after creation" pattern would otherwise leave
+// between the file coming into existence and its own registration. delete() is NOT a
+// blanket `finally` — it runs only at the two points the file is CONFIRMED gone: right
+// after a successful rename() (moved away from `tmp`), or after the catch block's own
+// `rm(tmp, {force:true})` itself resolves without throwing. If that rm() throws for a
+// real reason (not the ENOENT `force` already swallows), delete() is deliberately
+// skipped — leaving the file tracked is what gives a LATER signal a further chance at
+// cleaning it up via this handler's own (separate) rmSync, instead of the bookkeeping
+// wrongly saying it was already handled.
+export const addActiveKeyScratchFile = (file: string): void => {
+  ACTIVE_KEY_SCRATCH_FILES.add(file);
+};
+export const removeActiveKeyScratchFile = (file: string): void => {
+  ACTIVE_KEY_SCRATCH_FILES.delete(file);
+};
 // #734: init() (wizard.ts) registers a synchronous rollback callback right after its
 // own primary keygen succeeds, and clears it (v=null) in its own `finally` block —
 // covering steps 2-7 of the wizard, i.e. exactly the window during which this run's
@@ -530,6 +561,17 @@ export function installStageSignalGuard(): void {
       // it was extracted from.
       for (const dir of ACTIVE_EXPAND_SCRATCH_DIRS) forceRmSync(dir);
       ACTIVE_EXPAND_SCRATCH_DIRS.clear();
+      // Every writeKeyFile() tmp file currently in flight (see ACTIVE_KEY_SCRATCH_FILES
+      // above) — a set, so concurrent MCP keygen/wallet-create calls are each erased
+      // rather than only whichever registered last. A plain rmSync (like ACTIVE_OUT_PART
+      // above), not forceRmSync's directory-tree walk: this is always a single regular
+      // file writeKeyFile() itself just created with 'wx', never a directory.
+      for (const f of ACTIVE_KEY_SCRATCH_FILES) {
+        try {
+          rmSync(f, { force: true });
+        } catch {}
+      }
+      ACTIVE_KEY_SCRATCH_FILES.clear();
       // #734: run the init wizard's own key rollback (if one is currently registered)
       // BEFORE re-raising the signal below — this is the only chance it gets, since
       // re-raising terminates the process without ever unwinding back into wizard.ts's
