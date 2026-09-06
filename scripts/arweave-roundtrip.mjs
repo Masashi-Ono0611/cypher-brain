@@ -955,6 +955,191 @@ try {
         `CYPHER_BRAIN_PULL_RETRY_MS=0 did not behave as an immediate retry: status=${z.status} attempts=${zAttempts} stderr=${(z.stderr || '').slice(0, 200)}`,
       );
 
+  // recovery-kit --wait (regression, follow-up to #873/#876's decrypt-verify pull): that
+  // internal pull used to have NO --wait — a kit regenerated right after the push it
+  // points at could fail on nothing more than normal Turbo/Arweave gateway propagation
+  // delay, a workflow that worked fine before decrypt-verify existed (the old code never
+  // fetched the upload at all). "Not yet retrievable" is reproduced with a real,
+  // genuinely-mined artifact sitting behind a DELAY PROXY (same technique as the
+  // drop/blind proxies above) rather than an unmined arlocal tx: arlocal serves a
+  // just-posted tx's bytes immediately regardless of mining (measured — mining only
+  // advances arlocal's own block height bookkeeping), so an unmined tx would not
+  // actually reproduce "not yet retrievable" here. The proxy 404s GET requests naming
+  // this specific tx id until a release sentinel file appears, which blocks BOTH read
+  // paths get() can take (the HTTP gateway fetch AND the L1 arweave-js chunk-read
+  // fallback both go through CYPHER_BRAIN_AR_HOST/PORT/PROTOCOL, so pointing both at the
+  // proxy — rather than only overriding CYPHER_BRAIN_AR_GATEWAYS — closes off the
+  // fallback too), then forwards through to the real, already-mined artifact once
+  // released. Proves BOTH halves: the unset default still fails fast (unchanged
+  // behavior), and --wait tolerates the exact same delayed artifact once it clears.
+  log('recovery-kit --wait: default still fails fast; --wait tolerates a delayed-retrievable artifact');
+  const kitBackupHome = join(tmp, 'kit-backup-keys');
+  const kitCb = (kitEnv, ...args) => {
+    const r = spawnSync('node', [...DEV_ARGS, BIN, ...args], { env: kitEnv, encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(`kit-setup cb ${args.join(' ')} failed (${r.status}): ${r.stderr || r.stdout}`);
+    return r.stdout.trim();
+  };
+  kitCb({ ...env, CYPHER_BRAIN_HOME: kitBackupHome }, 'keygen');
+  const kitSrc = join(tmp, 'kit-brain');
+  await mkdir(kitSrc, { recursive: true });
+  await writeFile(join(kitSrc, 'note.txt'), `kit-wait-marker-${randomBytes(6).toString('hex')}\n`);
+  const kitSnap = join(tmp, 'kit-snap.age');
+  kitCb(
+    env,
+    'snapshot',
+    '--dir',
+    kitSrc,
+    '--recipient',
+    join(env.CYPHER_BRAIN_HOME, 'recipient.txt'),
+    '--recipient',
+    join(kitBackupHome, 'recipient.txt'),
+    '--out',
+    kitSnap,
+  );
+  const kitLocFile = join(tmp, 'kit-loc.tsv');
+  const kitTx = kitCb(env, 'push', '--in', kitSnap, '--backend', 'arweave', '--save-locator', kitLocFile);
+  TX_RE.test(kitTx)
+    ? pass(`recovery-kit --wait setup: pushed tx ${kitTx}`)
+    : fail(`recovery-kit --wait setup: locator is not a tx id: ${kitTx}`);
+  await mine(); // genuinely confirmed — the delay below comes entirely from the proxy, not from mining state
+  const kitBackupIdentity = join(kitBackupHome, 'identity.age');
+
+  const kitReleaseFile = join(tmp, 'kit-wait-release');
+  const kitDelayProxyFile = join(tmp, 'kit-wait-delay-proxy.mjs');
+  await writeFile(
+    kitDelayProxyFile,
+    "import {createServer,request} from 'node:http';\n" +
+      "import {existsSync} from 'node:fs';\n" +
+      'const UP=Number(process.argv[2]);\n' +
+      'const ID=process.argv[3];\n' +
+      'const RELEASE=process.argv[4];\n' +
+      'const s=createServer((q,res)=>{\n' +
+      "  const blocked=q.method==='GET'&&(q.url||'').includes(ID)&&!existsSync(RELEASE);\n" +
+      "  if(blocked){res.writeHead(404);res.end('Not Found (delayed on purpose, for the --wait test)');return;}\n" +
+      "  const up=request({host:'127.0.0.1',port:UP,path:q.url,method:q.method,headers:q.headers},(r)=>{\n" +
+      '    res.writeHead(r.statusCode||502,r.headers);r.pipe(res);\n' +
+      '  });\n' +
+      "  up.on('error',()=>res.socket&&res.socket.destroy());\n" +
+      '  q.pipe(up);\n' +
+      '});\n' +
+      "s.listen(0,'127.0.0.1',()=>console.log('READY:'+s.address().port));\n",
+  );
+  const kitDelayProxy = spawn('node', [kitDelayProxyFile, String(PORT), kitTx, kitReleaseFile], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  stubProcs.push(kitDelayProxy);
+  const kitDelayProxyPort = await waitForReady(kitDelayProxy, 'recovery-kit delay proxy');
+  const kitProxyEnv = {
+    ...env,
+    CYPHER_BRAIN_AR_HOST: '127.0.0.1',
+    CYPHER_BRAIN_AR_PORT: String(kitDelayProxyPort),
+    CYPHER_BRAIN_AR_PROTOCOL: 'http',
+  };
+
+  const kitNoWaitOut = join(tmp, 'kit-nowait.txt');
+  const kitNoWaitT0 = Date.now();
+  const kitNoWait = spawnSync(
+    'node',
+    [
+      ...DEV_ARGS,
+      BIN,
+      'recovery-kit',
+      '--from-locator-file',
+      kitLocFile,
+      '--backup-identity',
+      kitBackupIdentity,
+      '--out',
+      kitNoWaitOut,
+    ],
+    { env: kitProxyEnv, encoding: 'utf8', timeout: 15000 }, // hard safety net — must NOT be what actually stops this
+  );
+  const kitNoWaitElapsed = Date.now() - kitNoWaitT0;
+  // Codex re-review (Suggestion): assert the SPECIFIC not-yet-retrievable diagnostic
+  // (naming this exact tx id, via the util.ts RetryableError arweave.ts's get() throws),
+  // not merely "some nonzero exit happened fast" — a fast failure for an unrelated
+  // reason (a typo'd flag, a crashed proxy) would otherwise also satisfy this check.
+  kitNoWait.status !== 0 &&
+  kitNoWait.signal == null &&
+  kitNoWaitElapsed < 8000 &&
+  !existsSync(kitNoWaitOut) &&
+  kitNoWait.stderr.includes(kitTx)
+    ? pass(
+        `recovery-kit without --wait fails fast on a delayed-retrievable artifact (${kitNoWaitElapsed}ms), naming the exact tx — unchanged default behavior`,
+      )
+    : fail(
+        `recovery-kit without --wait did not fail fast as expected: status=${kitNoWait.status} signal=${kitNoWait.signal} elapsed=${kitNoWaitElapsed}ms stderr=${(kitNoWait.stderr || '').slice(0, 200)}`,
+      );
+
+  const kitWaitOut = join(tmp, 'kit-wait.txt');
+  const kitWaitEnv = { ...kitProxyEnv, CYPHER_BRAIN_PULL_RETRY_MS: '300' };
+  const kitWaitProc = spawn(
+    'node',
+    [
+      ...DEV_ARGS,
+      BIN,
+      'recovery-kit',
+      '--from-locator-file',
+      kitLocFile,
+      '--backup-identity',
+      kitBackupIdentity,
+      '--out',
+      kitWaitOut,
+      '--wait',
+      '20',
+    ],
+    { env: kitWaitEnv, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  // Codex re-review (Warning): the exit listener is registered IMMEDIATELY after spawn,
+  // before the retry-observation poll and the release below — a child that exited
+  // (crashed, or a regression that returns instantly) DURING that poll must still be
+  // caught by this promise, not missed until the 25s hard-timeout below fires and
+  // misreports a crash as a hang.
+  const kitWaitExit = new Promise((resolve) => kitWaitProc.once('exit', (code, signal) => resolve({ code, signal })));
+  let kitWaitStderr = '';
+  kitWaitProc.stderr.on('data', (d) => {
+    kitWaitStderr += d;
+  });
+  // Codex re-review (Warning): a blind sleep does not PROVE the child actually attempted
+  // retrieval before release — a slow-starting child could still be before its first
+  // attempt when an 800ms sleep elapses, letting the release race ahead and pass even
+  // with `wait: o.wait` (this PR's actual fix) reverted. Poll for pushpull.ts's own
+  // retry diagnostic ("pull attempt N not ready …", pushpull.ts's pull()) instead —
+  // proof the child hit the proxy's 404 and is genuinely retrying, not merely that time
+  // passed.
+  const kitWaitRetryDeadline = Date.now() + 10_000;
+  while (!/pull attempt \d+ not ready/.test(kitWaitStderr) && Date.now() < kitWaitRetryDeadline) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  /pull attempt \d+ not ready/.test(kitWaitStderr)
+    ? pass('recovery-kit --wait: observed a real retry attempt against the delayed artifact before releasing it')
+    : fail(
+        `recovery-kit --wait: never observed a retry attempt before the release deadline — stderr=${kitWaitStderr.slice(0, 300)}`,
+      );
+  await writeFile(kitReleaseFile, ''); // "propagation" completes — the proxy now forwards through
+  const kitWaitHardTimeoutMs = 25_000; // must NOT be what actually stops this either
+  let kitWaitTimedOut = false;
+  const kitWaitResult = await Promise.race([
+    kitWaitExit,
+    new Promise((resolve) =>
+      setTimeout(() => {
+        kitWaitTimedOut = true;
+        kitWaitProc.kill('SIGKILL');
+        resolve({ code: null, signal: 'TIMEOUT' });
+      }, kitWaitHardTimeoutMs),
+    ),
+  ]);
+  kitDelayProxy.kill('SIGKILL');
+  !kitWaitTimedOut &&
+  kitWaitResult.code === 0 &&
+  existsSync(kitWaitOut) &&
+  (await readFile(kitWaitOut, 'utf8')).includes('Decrypt-verified: YES')
+    ? pass(
+        'recovery-kit --wait tolerates a delayed-retrievable artifact and completes once released, with the embedded key proven',
+      )
+    : fail(
+        `recovery-kit --wait did not tolerate the delay as expected: code=${kitWaitResult.code} signal=${kitWaitResult.signal} stderr=${kitWaitStderr.slice(0, 300)}`,
+      );
+
   // multi-gateway (#21): the first gateway is dead, the second (arlocal) serves — the
   // read loop must move past the dead gateway to produce the bytes. AR_PORT=1 dead-ends
   // the L1 chunk fallback so ONLY gateway-2's HTTP read can satisfy this (otherwise the
