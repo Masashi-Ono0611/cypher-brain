@@ -1281,6 +1281,7 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
 
   cypher-brain recovery-kit --from-locator-file <path> [--out <file>] [--force]
                             [--inline-identity] [--backup-identity <path>] [--backup-recipient <age1…|file>]
+                            [--wait <seconds>]
       Regenerate the printable recovery kit "init" prints once — pointed at the CURRENT
       latest push instead of the first one (#364: every push changes the locator/sha the
       kit exists to carry, so a printed kit goes stale each cycle). Renders through the
@@ -1311,6 +1312,15 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       work. Each embedded block records "Decrypt-verified: YES/NO" — NO means the proof
       could not be attempted non-interactively (no TTY/CYPHER_BRAIN_PASSPHRASE), not
       that it failed.
+      --wait <seconds> (default 0 — fails fast, unchanged from before this flag existed)
+      is forwarded to that internal pull, exactly like pull's own --wait: a fresh
+      Turbo/Arweave upload takes ~5-8 min to propagate to the gateway, so regenerating a
+      kit immediately after the push it points at can otherwise fail with "not yet
+      retrievable" even though the push itself succeeded. Only has an effect when an
+      identity is actually embedded (no --inline-identity/--backup-identity means no
+      pull happens at all, so nothing to wait on) and, like pull's own --wait, only for
+      --backend arweave/turbo (the locator file's recorded backend) — every other
+      backend fails immediately regardless of this value.
       A regenerated kit marks the profile/Postgres columns "unknown" rather than guessing —
       the locator file does not record them.
       CLI-only by design: no MCP tool exposes this (the kit can embed PRIVATE key blocks,

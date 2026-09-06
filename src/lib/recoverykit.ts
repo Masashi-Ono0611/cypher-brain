@@ -645,6 +645,13 @@ export async function recoveryKit(o: CliOptions): Promise<void> {
         dirs: [],
         tables: [],
         recipients: [],
+        // --wait (additive, default 0/fail-fast — CLI help above and pull()'s own
+        // --wait doc comment, pushpull.ts): forwarded as-is so a caller regenerating a
+        // kit right after the push it points at can tolerate normal Arweave/Turbo
+        // gateway propagation delay instead of this decrypt-verify step's own pull
+        // rethrowing RetryableError immediately. Unset stays exactly as fast/offline as
+        // before this flag existed.
+        wait: o.wait,
       });
       // Codex review (Critical): verify against the EXACT at-rest bytes already
       // captured above (`backupAtRest`/`primaryAtRest`), never a fresh path re-read —
