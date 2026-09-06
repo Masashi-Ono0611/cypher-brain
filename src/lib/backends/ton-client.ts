@@ -13,7 +13,11 @@
 //   POST /api/v1/create  {path, description}            -> BagDetailed (bag_id assigned)
 //   POST /api/v1/add     {bag_id, path, download_all}   -> Ok (starts a P2P download)
 //   GET  /api/v1/details?bag_id=<hex>                   -> BagDetailed (progress/files)
-//   GET  /api/v1/list                                   -> {bags: [...]} (used as a ready probe)
+//   GET  /api/v1/list                                   -> {bags: [...] | null} (ready probe;
+//                                                          Go's `var bags []Bag` + no `append()`
+//                                                          calls on a bag-less daemon marshals
+//                                                          to JSON `null`, not `[]` — see api.go's
+//                                                          handleList())
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createSocket } from 'node:dgram';
@@ -228,12 +232,21 @@ export async function startLocalTonDaemon(
       // `r.ok` alone only proves SOMETHING answered on this loopback port (Codex review):
       // freeTcpPort()'s allocation is inherently racy by its own doc comment, so another
       // process could win the freed port before this daemon binds it. Requiring the
-      // documented `/api/v1/list` shape (`{bags: [...]}`, per this file's own API-contract
-      // comment above) before trusting the probe is a cheap way to confirm it is actually
-      // tonutils-storage answering, not just any HTTP 200.
+      // documented `/api/v1/list` shape (`{bags: [...] | null}`, per this file's own
+      // API-contract comment above) before trusting the probe is a cheap way to confirm it
+      // is actually tonutils-storage answering, not just any HTTP 200. `bags` MUST be an
+      // array or exactly `null` — a genuinely healthy, freshly-started daemon with no bags
+      // yet answers `{"bags":null}` (Go's `var bags []Bag` with no `append()` calls
+      // marshals to JSON `null`, not `[]`; verified against xssnick/tonutils-storage
+      // api/api.go's handleList()), so requiring Array.isArray() alone would reject that
+      // daemon and time out. Any other shape (missing `bags`, a string, a number, ...) is
+      // still rejected — that is the "not just any HTTP 200" guard this comment protects.
       const body: unknown = r.ok ? await r.json().catch(() => null) : null;
-      if (body !== null && typeof body === 'object' && Array.isArray((body as { bags?: unknown }).bags)) {
-        return { apiUrl, stop };
+      if (body !== null && typeof body === 'object') {
+        const bags = (body as { bags?: unknown }).bags;
+        if (Array.isArray(bags) || bags === null) {
+          return { apiUrl, stop };
+        }
       }
     } catch {
       /* not ready yet */
