@@ -1536,11 +1536,49 @@ if [ "${1:-}" = "-l" ]; then
       exit 1
       ;;
     busybox-missing)
-      # BusyBox's crontab -l does xchdir(spool_dir) then bb_cat({pw_name, NULL}) — no
-      # "no crontab for" message at all, just an applet-prefixed missing-file error whose
-      # filename portion is the bare current username (not a path — chdir() already
-      # happened). Verified against BusyBox's own miscutils/crontab.c.
+      # A bare (unquoted) trailing missing-file segment, exercising the generic
+      # last-colon-segment fallback in looksLikeNoCrontabYet() rather than BusyBox's own
+      # (quoted) diagnostic shape — see busybox-missing-quoted below for BusyBox's actual
+      # text. Kept as its own case since some other, non-BusyBox `crontab` shim could
+      # plausibly report a missing file this way.
       echo "crontab: $(whoami): No such file or directory" >&2
+      exit 1
+      ;;
+    busybox-missing-quoted)
+      # BusyBox's ACTUAL crontab -l diagnostic (verified against its source,
+      # libbb/xfuncs_printf.c's open helper as used by miscutils/crontab.c's `-l` path):
+      # `can't open '<file>': <strerror>`, applet-prefixed and SINGLE-QUOTED — not the
+      # bare trailing segment the busybox-missing case above (incorrectly) assumed. A
+      # whole-session accumulated-diff Codex review of PR #875 found this exact shape was
+      # being misclassified as a genuine error because the quoted "can't open '<user>'"
+      # segment doesn't equal the bare username.
+      echo "crontab: can't open '$(whoami)': No such file or directory" >&2
+      exit 1
+      ;;
+    busybox-quoted-wrong-file)
+      # A BusyBox-shaped ("can't open '<file>'") diagnostic whose quoted file is NOT the
+      # current username — an unrelated failure that happens to be quoted the same way
+      # BusyBox quotes its own missing-spool-file error must still be a real failure; the
+      # quoted segment needs an EXACT username match, not merely BusyBox's message shape.
+      echo "crontab: can't open '/etc/some-other-file': No such file or directory" >&2
+      exit 1
+      ;;
+    busybox-permission-denied)
+      # Codex re-review suggestion (this session's PR #875 accumulated-diff regression
+      # review): BusyBox reporting the SAME quoted-username file but a DIFFERENT
+      # strerror() tail ("Permission denied", not "No such file or directory") is a real,
+      # actionable failure (a crontab spool permission problem) and must still refuse —
+      # the busybox regex requires the exact "No such file or directory" suffix, not just
+      # the "can't open '<user>'" prefix.
+      echo "crontab: can't open '$(whoami)': Permission denied" >&2
+      exit 1
+      ;;
+    busybox-spool-missing)
+      # Codex re-review suggestion: BusyBox's OTHER "no such file or directory" shape —
+      # the crontab SPOOL DIRECTORY itself missing (xchdir(spool_dir) failing, before
+      # bb_cat() is even reached) — reports the spool path, not the username, and must
+      # still refuse rather than being read as "no crontab yet" for this user.
+      echo "crontab: can't change directory to '/var/spool/cron/crontabs': No such file or directory" >&2
       exit 1
       ;;
     generic-missing-file)
@@ -1619,6 +1657,18 @@ EOF
   [ "$RC3" -eq 0 ] || { echo "[FAIL] install failed on BusyBox's \"No such file or directory\" first-time-install shape"; echo "$OUT3"; exit 1; }
   echo "[PASS] BusyBox's \"No such file or directory\" first-time-install shape also installs cleanly"
 
+  # negative control (whole-session accumulated-diff Codex review of PR #875): BusyBox's
+  # REAL crontab -l diagnostic quotes the missing filename ("can't open '<user>': No such
+  # file or directory"), which the busybox-missing case above does not actually exercise.
+  # A first-time install on real BusyBox must ALSO install cleanly against this exact text.
+  CE_SCHED3B="$TMP/cronerr-sched3b"
+  RC3B=0
+  OUT3B="$(CYPHER_BRAIN_HOME="$CE_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$CE_SCHED3B" CYPHER_BRAIN_LAUNCHD_DIR="$TMP/cronerr-launchagents3b" \
+    PATH="$CRONSTUB:$PATH" CRONTAB_STUB_MODE=busybox-missing-quoted \
+    cb schedule install --backend file --dir "$CE_SRC" 2>&1)" || RC3B=$?
+  [ "$RC3B" -eq 0 ] || { echo "[FAIL] install failed on BusyBox's actual quoted \"can't open '<user>'\" first-time-install shape"; echo "$OUT3B"; exit 1; }
+  echo "[PASS] BusyBox's actual quoted \"can't open '<user>'\" first-time-install shape also installs cleanly"
+
   # negative control (Codex re-review, round 2 — this exact example): an unrelated
   # internal failure whose OWN wrapper happens to be named "crontab" (so a bare "cron"
   # substring check would be fooled) must still REFUSE — the missing FILENAME here is not
@@ -1644,6 +1694,45 @@ EOF
   [ "$RC5" -ne 0 ] || { echo "[FAIL] install succeeded despite a failure whose path merely contains the current username"; echo "$ERR5"; exit 1; }
   printf '%s' "$ERR5" | grep -q "crontab -l failed" || { echo "[FAIL] wrong message for a path-contains-username crontab -l failure"; echo "$ERR5"; exit 1; }
   echo "[PASS] a failure whose path merely contains the current username (not the bare missing-file segment) is still refused"
+
+  # negative control (this session's PR #875 accumulated-diff regression review): a
+  # BusyBox-shaped ("can't open '<file>'") diagnostic whose quoted file is NOT the current
+  # username must still REFUSE — the new BusyBox regex needs an exact username match, not
+  # merely BusyBox's quoting shape.
+  CE_SCHED6="$TMP/cronerr-sched6"
+  RC6=0
+  ERR6="$(CYPHER_BRAIN_HOME="$CE_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$CE_SCHED6" CYPHER_BRAIN_LAUNCHD_DIR="$TMP/cronerr-launchagents6" \
+    PATH="$CRONSTUB:$PATH" CRONTAB_STUB_MODE=busybox-quoted-wrong-file \
+    cb schedule install --backend file --dir "$CE_SRC" 2>&1)" || RC6=$?
+  [ "$RC6" -ne 0 ] || { echo "[FAIL] install succeeded despite a BusyBox-shaped failure whose quoted file is not the current username"; echo "$ERR6"; exit 1; }
+  printf '%s' "$ERR6" | grep -q "crontab -l failed" || { echo "[FAIL] wrong message for a busybox-quoted-wrong-file crontab -l failure"; echo "$ERR6"; exit 1; }
+  echo "[PASS] a BusyBox-shaped failure whose quoted file is not the current username is still refused"
+
+  # negative control (Codex re-review suggestion, this session): BusyBox reporting the
+  # SAME quoted username but a DIFFERENT strerror() tail ("Permission denied") is a real,
+  # actionable failure and must still REFUSE — the busybox regex requires the exact
+  # "No such file or directory" suffix, not just the "can't open '<user>'" prefix.
+  CE_SCHED7="$TMP/cronerr-sched7"
+  RC7=0
+  ERR7="$(CYPHER_BRAIN_HOME="$CE_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$CE_SCHED7" CYPHER_BRAIN_LAUNCHD_DIR="$TMP/cronerr-launchagents7" \
+    PATH="$CRONSTUB:$PATH" CRONTAB_STUB_MODE=busybox-permission-denied \
+    cb schedule install --backend file --dir "$CE_SRC" 2>&1)" || RC7=$?
+  [ "$RC7" -ne 0 ] || { echo "[FAIL] install succeeded despite a BusyBox 'Permission denied' failure for the current user's own crontab"; echo "$ERR7"; exit 1; }
+  printf '%s' "$ERR7" | grep -q "crontab -l failed" || { echo "[FAIL] wrong message for a busybox-permission-denied crontab -l failure"; echo "$ERR7"; exit 1; }
+  echo "[PASS] a BusyBox 'Permission denied' failure (same quoted username, different strerror) is still refused"
+
+  # negative control (Codex re-review suggestion, this session): BusyBox's OTHER
+  # "no such file or directory" shape — the crontab SPOOL DIRECTORY itself missing,
+  # before bb_cat() is even reached — reports the spool path, not the username, and must
+  # still REFUSE rather than being read as "no crontab yet" for this user.
+  CE_SCHED8="$TMP/cronerr-sched8"
+  RC8=0
+  ERR8="$(CYPHER_BRAIN_HOME="$CE_HOME" CYPHER_BRAIN_SCHEDULE_DIR="$CE_SCHED8" CYPHER_BRAIN_LAUNCHD_DIR="$TMP/cronerr-launchagents8" \
+    PATH="$CRONSTUB:$PATH" CRONTAB_STUB_MODE=busybox-spool-missing \
+    cb schedule install --backend file --dir "$CE_SRC" 2>&1)" || RC8=$?
+  [ "$RC8" -ne 0 ] || { echo "[FAIL] install succeeded despite BusyBox's missing-spool-directory failure"; echo "$ERR8"; exit 1; }
+  printf '%s' "$ERR8" | grep -q "crontab -l failed" || { echo "[FAIL] wrong message for a busybox-spool-missing crontab -l failure"; echo "$ERR8"; exit 1; }
+  echo "[PASS] BusyBox's missing-spool-directory failure (reports the spool path, not the username) is still refused"
 fi
 
 echo

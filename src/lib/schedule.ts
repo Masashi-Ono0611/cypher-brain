@@ -615,35 +615,40 @@ function loadLaunchd(): void {
 // vixie-cron/cronie/macOS's own bsd cron (all derived from the same lineage) print
 // exactly "no crontab for <user>"; BusyBox's crontab (common on Alpine-based containers)
 // has no such dedicated message at all — verified against its source
-// (miscutils/crontab.c): `-l` does `xchdir(crontab_dir)` then `bb_cat({pw_name, NULL})`,
-// so a first-time install there fails with an ordinary applet-prefixed "No such file or
-// directory" whose FILENAME portion is the bare current username (not a path — the
-// chdir() already happened).
+// (libbb/xfuncs_printf.c's open helper, used by miscutils/crontab.c's `-l` path): it
+// reports the missing file as `can't open '<file>': <strerror>`, so a first-time install
+// there fails with an applet-prefixed, SINGLE-QUOTED "can't open '<user>': No such file
+// or directory" — the quoted segment is the bare current username (not a path — the
+// crontab spool dir chdir already happened), not merely a bare trailing segment the way
+// an earlier round of this fix assumed.
 //
 // A first Codex re-review round suggested matching "no such file or directory" plus a
 // bare "cron" substring; a second round correctly rejected that too — BusyBox's own
-// error is *itself* prefixed with its applet name ("crontab: <user>: No such file or
-// directory"), so an UNRELATED failure from a wrapper whose own path/name happens to
-// contain "cron" (e.g. a wrapper literally named /usr/local/bin/crontab hitting some
+// error is *itself* prefixed with its applet name ("crontab: can't open '<user>': No such
+// file or directory"), so an UNRELATED failure from a wrapper whose own path/name happens
+// to contain "cron" (e.g. a wrapper literally named /usr/local/bin/crontab hitting some
 // other missing internal dependency) would satisfy that same bare substring check just
 // as easily as the genuine case — reopening the exact silent-overwrite risk this whole
 // function exists to close. The one signal that actually distinguishes them is the
-// MISSING FILENAME itself: BusyBox's bb_cat() receives exactly `pw_name` — a bare
-// username with NO path, since `xchdir(crontab_dir)` already happened — so the message's
-// filename SEGMENT (not merely a substring anywhere in the line) must be EXACTLY the
-// current username. A sixth Codex re-review round found that a word-boundary substring
-// match still passed a path like "/home/<user>/bin/helper" (an unrelated failure whose
-// path merely CONTAINS the username as one of its own components, bounded by "/" on
-// both sides) — this parses out the actual filename segment between the last ": " and
-// the "No such file or directory" suffix and requires an EXACT match instead.
+// MISSING FILENAME itself: BusyBox's open helper receives exactly `pw_name` — a bare
+// username with NO path, since the spool-dir chdir already happened — so the message's
+// quoted filename must be EXACTLY the current username. A sixth Codex re-review round
+// found that a word-boundary substring match still passed a path like
+// "/home/<user>/bin/helper" (an unrelated failure whose path merely CONTAINS the username
+// as one of its own components, bounded by "/" on both sides); a later whole-session
+// accumulated-diff review (PR #875, this session) found that the non-quoted fallback
+// below — added to cover other, non-BusyBox implementations that print a bare trailing
+// filename segment without quotes — was being matched against BusyBox's REAL diagnostic
+// too, and failed: the segment after the last ':' in "can't open '<user>'" is
+// `can't open '<user>'`, not the bare username, since BusyBox wraps it in single quotes
+// and prefixes it with "can't open". BusyBox's quoted shape is therefore checked FIRST,
+// with its own dedicated regex extracting exactly the quoted segment; the non-quoted,
+// last-colon-segment fallback stays in place for any other implementation that reports a
+// bare (unquoted) missing-filename segment instead.
 function looksLikeNoCrontabYet(stderr: string): boolean {
   const s = stderr.toLowerCase();
   if (s.includes('no crontab for')) return true;
-  const m = /(.*):\s*no such file or directory\s*$/i.exec(stderr.trimEnd());
-  if (!m) return false;
-  const beforeSuffix = m[1];
-  const lastColon = beforeSuffix.lastIndexOf(':');
-  const filenameSegment = (lastColon === -1 ? beforeSuffix : beforeSuffix.slice(lastColon + 1)).trim();
+
   let username: string;
   try {
     username = userInfo().username;
@@ -651,6 +656,19 @@ function looksLikeNoCrontabYet(stderr: string): boolean {
     return false; // cannot determine who we are — do not guess
   }
   if (!username) return false;
+
+  const trimmed = stderr.trimEnd();
+
+  // BusyBox's actual diagnostic: `crontab: can't open '<user>': No such file or
+  // directory` — the missing filename is single-quoted, not a bare trailing segment.
+  const busybox = /can't open '([^']*)':\s*no such file or directory\s*$/i.exec(trimmed);
+  if (busybox) return busybox[1] === username;
+
+  const m = /(.*):\s*no such file or directory\s*$/i.exec(trimmed);
+  if (!m) return false;
+  const beforeSuffix = m[1];
+  const lastColon = beforeSuffix.lastIndexOf(':');
+  const filenameSegment = (lastColon === -1 ? beforeSuffix : beforeSuffix.slice(lastColon + 1)).trim();
   return filenameSegment === username;
 }
 
