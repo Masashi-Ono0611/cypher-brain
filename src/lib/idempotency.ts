@@ -334,10 +334,115 @@ async function readLockHolder(lockPath: string): Promise<LockHolder | null> {
 // the token does not parse at all AND it has sat past the staleness window (an
 // unparseable-but-fresh lock is only ever the tiny window between another process's
 // exclusive-create and its own fsync'd write completing).
+//
+// Regression review (Finding 1, PR #871 fsync durability hardening): the code here used
+// to OR the staleness check into the confirmed-alive-pid branch too (`!pidAlive(pid) ||
+// stale`), even though the comment above already documented the intended behavior
+// correctly — pure staleness was never supposed to be enough when the recorded pid IS
+// confirmed alive. That bug did not matter while this lock only ever guarded a fast
+// mkdir+write+rename (nothing legitimate could hold it anywhere near LOCK_STALE_MS). It
+// started to matter the moment #871 put real fsync calls INSIDE the critical section this
+// lock guards (both this lock's own claim-write above and, more importantly,
+// recordIdempotencyResult's actual data write) — a genuinely slow-but-legitimate fsync
+// (disk pressure, a network filesystem) can now push a LIVE holder's total lock-hold time
+// past LOCK_STALE_MS, and the old code would let a waiter steal that live process's lock
+// out from under it mid-write. A live process that never releases its lock at all is a
+// different, already-accepted tradeoff this codebase documents elsewhere (see
+// push-lock.ts's own module-header comment on the identical choice, backstopped there by
+// its own much longer MAX_AGE_MS) — this function does not attempt that; it only stops
+// treating a confirmed-alive holder as abandoned by staleness alone. A waiter contending
+// with a live holder that is not actually abandoned still cannot wait forever: it fails
+// closed via the LOCK_MAX_WAIT_MS timeout in withLogLock below instead.
 function isLockAbandoned(holder: LockHolder): boolean {
   const pid = lockTokenPid(holder.text);
-  const stale = Date.now() - holder.mtimeMs > LOCK_STALE_MS;
-  return pid === null ? stale : !pidAlive(pid) || stale;
+  if (pid === null) return Date.now() - holder.mtimeMs > LOCK_STALE_MS;
+  return !pidAlive(pid);
+}
+
+// Regression review round 4 (Critical, Codex re-review): process-local coordination so a
+// caller that WINS a claim/lock does not report success to ITS OWN caller before a
+// CONCURRENT caller's ancestor-directory sync (for the SAME `dir`) has actually completed.
+// Round 3's fix made whichever caller's own `mkdir()` reports a new `firstCreated`
+// discharge that sync EVENTUALLY, regardless of who wins — but "eventually" was not good
+// enough: Codex reproduced caller A creating a fresh multi-level directory tree, pausing
+// in its own (legitimately slow, no fault) staging fsync, while caller B — for the SAME
+// key, finding `dir` already existing — wins the claim and returns success HAVING SYNCED
+// ONLY `dir` ITSELF, before A's ancestor sync (for the levels A actually created) has even
+// started. A crash in that window can still lose the directory tree containing B's live
+// claim. Mirrors the SAME in-process coordination shape mcp.ts's own `idempotencyInFlight`
+// Set already uses for concurrent same-key calls (see claimIdempotencyKey's own doc
+// comment above) — a technique already established in this codebase's threat model, not a
+// new one introduced here.
+//
+// A caller whose own `firstCreated` is non-undefined REGISTERS its own sync attempt here
+// — via a plain, synchronous `Map.set()` immediately after `mkdir()` resolves, before any
+// further `await` — so a CONCURRENT caller for the same `dir` that checks this map even
+// moments later observes it and awaits the SAME promise instead of independently syncing
+// only `dir` and reporting success early. RESIDUAL, stated rather than silently assumed
+// away: this narrows, not fully closes, the race — two callers' own `mkdir()` calls can in
+// principle both resolve, and both check this map, before either has had a chance to
+// register (Node's underlying threadpool can complete BOTH callers' syscalls before either
+// caller's own JS continuation runs), so registering "immediately after mkdir, before any
+// other await" bounds the window to roughly one microtask rather than the (much longer,
+// and outright reproduced) window of "however long this call's own staging fsync takes" —
+// closing it fully would need cross-process coordination (a marker file, effectively
+// re-introducing everything the last three rounds of this file's own review were spent
+// closing) or accepting that a purely path-based, dependency-free mechanism cannot make
+// two independent async operations atomic (the same limit this file's other TOCTOU-
+// narrowing comments already state for their own residuals).
+const pendingAncestorSyncs = new Map<string, Promise<void>>();
+
+// Called SYNCHRONOUSLY (no `await` in between) immediately after `mkdir()` resolves, by
+// whichever caller's own `firstCreated` is non-undefined — registers the sync of the
+// ancestors THIS call's own mkdir just created, so a CONCURRENT caller checking
+// `awaitPendingAncestorSync` for the SAME `dir` at any point before this promise settles
+// observes and waits for it too. Returns undefined (nothing registered) when
+// `firstCreated` is undefined (this call did not itself create anything new).
+//
+// Regression review round 5 (Critical, Codex re-review): returns the promise to its own
+// caller — who MUST hold onto it and `await` it DIRECTLY, never solely via a later
+// `pendingAncestorSyncs` lookup for `dir` — rather than only registering it and expecting
+// the registrant itself to re-discover it through the map later. Codex reproduced why
+// that mattered: the cleanup below removes a SETTLED promise from the map (success OR
+// failure) as soon as it settles, which can complete well before this SAME caller's own
+// staging+link work finishes and it comes back to check `dir`'s status — at that point
+// the map has NOTHING for `dir` (already cleaned), so a lookup-only check silently reads
+// as "nothing to wait for", swallowing this call's OWN sync failure with no concurrent
+// caller or scheduler edge case required at all. Holding this returned promise directly
+// sidesteps the map (and its cleanup timing) entirely for the one case that must never be
+// missed: a caller's own registered work.
+function registerAncestorSync(dir: string, firstCreated: string | undefined): Promise<void> | undefined {
+  if (!firstCreated) return undefined;
+  const resolvedDir = resolve(dir);
+  const promise = syncDirectoryChain(dir, firstCreated);
+  pendingAncestorSyncs.set(resolvedDir, promise);
+  // Cleanup is memory hygiene only for OTHER (concurrent) callers' own map lookups, not a
+  // substitute for this call's own direct reference above: a late CONCURRENT arrival
+  // awaiting a just-deleted entry's own reference (captured in its own closure before the
+  // delete) is unaffected, but an arrival that only checks the map AFTER cleanup has run
+  // sees nothing — the SAME class of narrowing-not-closing residual already documented
+  // for this map's cross-caller coordination (see the module-level comment above), now
+  // stated for this angle of it too: only the direct-reference path this function returns
+  // is exempt from that residual.
+  promise
+    .catch(() => {})
+    .finally(() => {
+      if (pendingAncestorSyncs.get(resolvedDir) === promise) pendingAncestorSyncs.delete(resolvedDir);
+    });
+  return promise;
+}
+
+// Called by EVERY caller — regardless of whether it itself registered anything, and
+// regardless of whether it wins or loses whatever exclusive step (link) it is attempting
+// for `dir` — right before that caller finalizes ANY outcome (a reported success, an
+// EEXIST refusal, or a genuine failure). This is the other half of the round-4 fix: it is
+// what lets a WINNER (B) that never itself created any ancestors still wait for a
+// CONCURRENT caller's (A's) registered sync before B tells its own caller "claimed",
+// rather than B independently syncing only `dir` and returning immediately. A no-op
+// (resolves instantly) when nothing is currently registered for `dir`.
+async function awaitPendingAncestorSync(dir: string): Promise<void> {
+  const pending = pendingAncestorSyncs.get(resolve(dir));
+  if (pending) await pending;
 }
 
 async function withLogLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
@@ -352,126 +457,240 @@ async function withLogLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   // syncDirectoryChain call would never reach the ancestors THIS call is the one that
   // actually created. Syncing here, right after creating them, is what keeps a crash on
   // a brand-new CYPHER_BRAIN_HOME from losing the directory ENTRIES the lock file (and
-  // the log file fn() writes) depend on.
-  await syncDirectoryChain(dir, firstCreated);
+  // the log file fn() writes) depend on. Registered (round 4) rather than a bare
+  // `syncDirectoryChain` call, so a CONCURRENT caller for the same `dir` (see
+  // `awaitPendingAncestorSync` below, right before this loop reports success) waits for
+  // THIS sync too, instead of independently syncing only `dir` itself and reporting
+  // success before this one completes. Awaited directly off the returned promise (round
+  // 5), not via a map lookup — see registerAncestorSync's own doc comment for why a
+  // lookup-only check can miss this call's OWN sync failing.
+  const myAncestorSync = registerAncestorSync(dir, firstCreated);
+  if (myAncestorSync) await myAncestorSync;
   const token = newLockToken();
   const deadline = Date.now() + LOCK_MAX_WAIT_MS;
   for (;;) {
+    // Regression review round 3 (Codex re-review of round 2's own fix, elevated-caution,
+    // PR #871): write-then-link, the SAME pattern push-lock.ts's own publishLock() uses
+    // (see its own doc comment for the full rationale) — a private, uniquely-named
+    // staging file is written and fsync'd FIRST, and only THEN atomically PUBLISHED to
+    // the shared `lockPath` via `link`, which — unlike `open(lockPath, 'wx')` followed by
+    // a separate write+sync — publishes a file that is ALREADY COMPLETE. This closes
+    // every gap round 2's own fix (a "capture an fstat identity, then clean up by
+    // dev+ino" approach) still had, all found by the SAME bounded Codex re-review:
+    //   - Round 2's cleanup compared (dev, ino) via a separate stat() THEN rm() — still a
+    //     TOCTOU: a replacement lock landing between those two calls got deleted anyway.
+    //     Here, any failure before `link()` succeeds needs NO path-based cleanup at all —
+    //     `staging` is a name nothing else could ever be racing for, so removing it is
+    //     unconditionally safe regardless of what state the write/sync failed in.
+    //   - Round 2 also captured identity via `fh.stat()`, itself a NEW failure point: if
+    //     THAT call failed, identity stayed null and cleanup was skipped entirely,
+    //     leaking an empty lock forever. There is no separate identity-capture step here
+    //     to fail.
+    // The concrete trigger Codex originally reproduced still applies to whichever step
+    // fails now (writeFile, fsync, or link itself, all handled below): the throw
+    // propagates straight out of withLogLock (the release `finally` further down is never
+    // reached, since it only wraps `fn()` — this loop's own acquisition never got that
+    // far), and the process stays alive (this guards a long-running MCP server's
+    // idempotency log, not a short-lived CLI invocation) — Finding 1's own live-pid fix
+    // above makes an UN-cleaned-up dangling lock unstealable for as long as this process
+    // lives, so cleaning up here is what keeps that fix from also making a transient
+    // fault permanent.
+    //
+    // Residual, stated rather than silently assumed away (Codex's own Warning, "PID reuse
+    // creates another case"): this closes the CONCRETE trigger above (self-cleanup of a
+    // staging file this SAME attempt owns outright), not every path to a leaked lock — if
+    // `link()` itself SUCCEEDS but this process then crashes before ever reaching the
+    // release `finally` (a genuinely different failure than any of the ones this fix
+    // handles), the lock leaks exactly as it always could, and if this process's pid is
+    // later reused by an unrelated process after that crash, Finding 1's live-pid check
+    // would misjudge that unrelated process as the original (still-alive) holder. Codex's
+    // own guidance applies here verbatim: blindly restoring age-based stealing to cover
+    // this would revive the exact lost-update bug Finding 1 exists to fix. A bounded
+    // last-resort backstop (mirroring push-lock.ts's own MAX_AGE_MS) is a real option for
+    // this residual, but is a deliberate, separately-reviewed design change (how long is
+    // safe for THIS lock's legitimate hold times, whether it needs its own positive
+    // control) rather than a mechanical extension of this fix — left for a follow-up
+    // rather than rushed in here.
+    const staging = `${lockPath}.staging.${randomBytes(8).toString('hex')}`;
     try {
-      // Exclusive create: succeeds only if no OTHER holder currently owns the lock —
-      // this (not the read-modify-rename itself) is the actual mutual-exclusion
-      // primitive. fsync'd before this process ever treats itself as the holder, so
-      // the claim itself is durable (and so a concurrent reader can never observe an
-      // exclusively-created-but-still-empty lock file as "unparseable").
-      const fh = await open(lockPath, 'wx');
+      // Exclusive create of the STAGING file only — never contended, since its name is
+      // unique to this attempt. fsync'd before this process ever tries to publish it, so
+      // the content `link` is about to make visible at `lockPath` is already durable.
+      const fh = await open(staging, 'wx');
       try {
         await fh.writeFile(token, 'utf8');
         await fh.sync();
       } finally {
         await fh.close();
       }
-      break;
     } catch (e) {
-      if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') throw e;
-      let holder: LockHolder | null;
-      try {
-        holder = await readLockHolder(lockPath);
-      } catch (readErr) {
-        // See finding 2 above: a persistent error recurs on every immediate retry
-        // too, so this falls back to the same bounded wait/backoff a held lock gets
-        // rather than busy-looping.
-        if (Date.now() > deadline) {
-          throw new IdempotencyStoreError(
-            `cannot read the idempotency log lock at ${lockPath} ` +
-              `(${(readErr as NodeJS.ErrnoException)?.code ?? 'unknown error'}) — refusing to write without it ` +
-              'rather than risk a lost update.',
-            { cause: readErr },
-          );
-        }
-        await new Promise((r) => setTimeout(r, LOCK_RETRY_DELAY_MS));
-        continue;
+      // Unconditional and safe: `staging`'s name is unique to this attempt, so nothing
+      // else could ever have created, replaced, or be relying on a file at this path.
+      await rm(staging, { force: true }).catch(() => {});
+      throw e;
+    }
+    let acquired = false;
+    try {
+      // The actual mutual-exclusion primitive, now that content durability is already
+      // established: `link` succeeds only if no OTHER holder currently owns the lock,
+      // and — unlike the old open('wx')-then-write-then-sync sequence — the instant it
+      // succeeds, `lockPath` already holds fully-written, already-synced content; a
+      // concurrent reader can never observe a freshly-published lock as "unparseable" or
+      // racing this call's own write.
+      await link(staging, lockPath);
+      acquired = true;
+    } catch (e) {
+      // Regression review round 4 (Warning, Codex re-review): reconciliation now applies
+      // to EEXIST too, not only other error codes — on some filesystems (an NFS client's
+      // transparent RPC retry, in particular) a client-visible EEXIST can mean "MY OWN
+      // earlier, lower-level retry of this exact link() already landed" rather than "a
+      // different holder already exists". Read back BEFORE branching on the error code —
+      // see claimIdempotencyKey's identical check for the full rationale — so a genuinely
+      // different holder's EEXIST still falls through to the steal-checking logic below,
+      // unchanged from round 3.
+      const maybeOurs = await readFile(lockPath, 'utf8').catch(() => null);
+      if (maybeOurs === token) {
+        acquired = true;
+      } else if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') {
+        await rm(staging, { force: true }).catch(() => {});
+        throw e;
       }
-      if (holder === null) continue; // released between our failed create and this read — retry now, no backoff needed
-      if (isLockAbandoned(holder)) {
-        // Re-read IMMEDIATELY before the rename and re-judge (elevated-caution
-        // review, Codex round 2, Critical: "the lock rewrite still permits
-        // concurrent owners" — this file's first pass at this fix judged abandoned
-        // from `holder` above and went straight to the rename, with no adjacent
-        // re-check; mirroring push-lock.ts's stealLock() exactly, as intended,
-        // means ALSO doing this second read right before acting, narrowing the
-        // window between "judged abandoned" and "acted on it" to two adjacent
-        // syscalls rather than however long this iteration's earlier work took).
-        // Without it, a SEPARATE waiter that already completed its own steal-and-
-        // reacquire cycle in the time since `holder` was read would have its
-        // fresh, LIVE lock renamed away here instead — reopening, for a narrower
-        // window, the exact concurrent-owners race this rewrite exists to close.
-        // A failed re-read (including ENOENT, meaning someone else already
-        // resolved it) is treated as "cannot confirm — do not steal", not as
-        // license to proceed; the next loop iteration re-evaluates from scratch,
-        // and a PERSISTENT read failure still gets the bounded backoff above on
-        // its next pass through the primary read.
-        const fresh = await readLockHolder(lockPath).catch(() => null);
-        if (!fresh || fresh.text !== holder.text || !isLockAbandoned(fresh)) continue;
-        // Steal via rename, not a blind rm (see finding 1 above): of two waiters
-        // that both judge the SAME lock abandoned, exactly one moves it aside — the
-        // other's rename fails ENOENT instead of unlinking the winner's fresh claim.
-        const side = `${lockPath}.stale.${token}`;
-        try {
-          await rename(lockPath, side);
-        } catch (renameErr) {
-          if ((renameErr as NodeJS.ErrnoException)?.code === 'ENOENT') continue; // someone else already took/freed it
-          throw renameErr;
-        }
-        // A read failure here is NOT "it matched" (push-lock.ts's own stealLock()
-        // documents the same rule): treating it as one would discard whatever was
-        // moved aside, which — if it was in fact a NEW holder's lock claimed in the
-        // gap between the read above and this rename — leaves that holder running
-        // with nothing recording that it holds anything. Unknown goes down the
-        // restore path below, same as a known mismatch.
-        const moved = await readFile(side, 'utf8').catch(() => null);
-        if (moved === null || moved !== holder.text) {
-          // Not (provably) the lock just judged abandoned. Put it back rather than
-          // discard it: `link` (not a re-write) restores the ORIGINAL bytes even
-          // when they could not be read, and fails with EEXIST rather than
-          // clobbering if a third party has since created its own lock at that
-          // path. If it fails, the side file is deliberately KEPT (not removed) —
-          // a holder whose lock is missing is a holder nobody can see, so leaving
-          // the evidence beats deleting it silently.
-          //
-          // Residual, stated rather than silently assumed away (Codex round 2):
-          // this restore is itself two separate syscalls (rename-away, then
-          // link-back), during which `lockPath` briefly does not exist at all — a
-          // THIRD process racing to acquire in that exact instant can create its
-          // own lock there before this restore runs, in which case `link` below
-          // fails EEXIST and this branch's warn() fires. That is the same class of
-          // narrowing-not-closing residual push-lock.ts's own module header
-          // documents for this identical rename-then-maybe-restore pattern
-          // ("no path-based lock can make [check-then-act] atomic... a guarantee
-          // stronger than that needs an OS-level lock... a different change from
-          // this one") — closing it fully needs the same OS-level advisory lock
-          // that file already rules out of scope for this codebase.
-          try {
-            await link(side, lockPath);
-            await rm(side, { force: true });
-          } catch {
-            warn(
-              `could not restore an idempotency log lock that was moved aside while recovering a stale one — ` +
-                `${side} holds its contents; remove that file once no push/paid call is running`,
-            );
-          }
-          continue; // re-evaluate from scratch — this may or may not be resolved now
-        }
-        await rm(side, { force: true }).catch(() => {});
-        continue; // the path is now clear — the top of the loop's open('wx') retries
-      }
+      // else: genuinely EEXIST, held by someone else — falls through to the steal-
+      // checking logic below with acquired still false.
+    }
+    // Best-effort, and deliberately not wrapped in the same try/catch as the `link()`
+    // above (mirrors push-lock.ts's own publishLock(): once `link` has succeeded — or is
+    // reconciled as having succeeded — this process HOLDS the lock, so a failure tidying
+    // up the now-redundant staging file must not be treated as an acquisition failure).
+    await rm(staging, { force: true }).catch(() => {});
+    if (acquired) {
+      // Regression review round 4 (Critical, Codex re-review): wait for a CONCURRENT
+      // caller's ancestor sync too — not only whatever this call itself registered above
+      // — before reporting success. Without this, a caller that never itself created any
+      // ancestors (this loop's own `registerAncestorSync` above was a no-op for it) could
+      // win the lock and return before a DIFFERENT, slower concurrent caller's sync (for
+      // the SAME `dir`) has actually completed. See awaitPendingAncestorSync's own doc
+      // comment for what this does and does not close.
+      await awaitPendingAncestorSync(dir);
+      // Regression review round 5 (Critical, Codex re-review): `dir` itself must ALWAYS
+      // be synced here, unconditionally — the round-4 rewrite above replaced the
+      // unconditional `syncDirectoryChain` call this loop used to make with the map-based
+      // ancestor coordination, which is a no-op whenever NEITHER this call NOR any
+      // concurrent one had new ancestors to report (the common case: `dir` already
+      // existed durably from a previous session). That left the lock's own brand-new
+      // directory ENTRY — the one `link()` just added — never synced at all on that path.
+      // Cheap and idempotent even when an ancestor sync already covered `dir` (it is
+      // always included in `syncDirectoryChain`'s own `toSync`, per that function's
+      // contract) — this call is what makes sure it happens at least once regardless.
+      // (For THIS lock specifically the lock file's own entry does not itself need to
+      // survive a crash — see this function's own module-level context on why an
+      // ephemeral coordination lock's absence after a crash is the desired recovery
+      // state, not a hazard — but `dir` matters regardless for `path`'s own data file,
+      // which recordIdempotencyResult's own separate write+rename dance inside `fn()`
+      // below already syncs on its own. This call keeps withLogLock symmetric with
+      // claimIdempotencyKey's identical fix rather than relying on that caller-specific
+      // fact, since withLogLock has no way to know every future `fn()` will do the same.)
+      await syncDirectoryChain(dir, undefined);
+      break;
+    }
+    let holder: LockHolder | null;
+    try {
+      holder = await readLockHolder(lockPath);
+    } catch (readErr) {
+      // See finding 2 above: a persistent error recurs on every immediate retry
+      // too, so this falls back to the same bounded wait/backoff a held lock gets
+      // rather than busy-looping.
       if (Date.now() > deadline) {
         throw new IdempotencyStoreError(
-          `timed out after ${LOCK_MAX_WAIT_MS}ms waiting for the idempotency log lock at ${lockPath} ` +
-            `(held by another process) — refusing to write without it rather than risk a lost update.`,
+          `cannot read the idempotency log lock at ${lockPath} ` +
+            `(${(readErr as NodeJS.ErrnoException)?.code ?? 'unknown error'}) — refusing to write without it ` +
+            'rather than risk a lost update.',
+          { cause: readErr },
         );
       }
       await new Promise((r) => setTimeout(r, LOCK_RETRY_DELAY_MS));
+      continue;
     }
+    if (holder === null) continue; // released between our failed create and this read — retry now, no backoff needed
+    if (isLockAbandoned(holder)) {
+      // Re-read IMMEDIATELY before the rename and re-judge (elevated-caution
+      // review, Codex round 2, Critical: "the lock rewrite still permits
+      // concurrent owners" — this file's first pass at this fix judged abandoned
+      // from `holder` above and went straight to the rename, with no adjacent
+      // re-check; mirroring push-lock.ts's stealLock() exactly, as intended,
+      // means ALSO doing this second read right before acting, narrowing the
+      // window between "judged abandoned" and "acted on it" to two adjacent
+      // syscalls rather than however long this iteration's earlier work took).
+      // Without it, a SEPARATE waiter that already completed its own steal-and-
+      // reacquire cycle in the time since `holder` was read would have its
+      // fresh, LIVE lock renamed away here instead — reopening, for a narrower
+      // window, the exact concurrent-owners race this rewrite exists to close.
+      // A failed re-read (including ENOENT, meaning someone else already
+      // resolved it) is treated as "cannot confirm — do not steal", not as
+      // license to proceed; the next loop iteration re-evaluates from scratch,
+      // and a PERSISTENT read failure still gets the bounded backoff above on
+      // its next pass through the primary read.
+      const fresh = await readLockHolder(lockPath).catch(() => null);
+      if (!fresh || fresh.text !== holder.text || !isLockAbandoned(fresh)) continue;
+      // Steal via rename, not a blind rm (see finding 1 above): of two waiters
+      // that both judge the SAME lock abandoned, exactly one moves it aside — the
+      // other's rename fails ENOENT instead of unlinking the winner's fresh claim.
+      const side = `${lockPath}.stale.${token}`;
+      try {
+        await rename(lockPath, side);
+      } catch (renameErr) {
+        if ((renameErr as NodeJS.ErrnoException)?.code === 'ENOENT') continue; // someone else already took/freed it
+        throw renameErr;
+      }
+      // A read failure here is NOT "it matched" (push-lock.ts's own stealLock()
+      // documents the same rule): treating it as one would discard whatever was
+      // moved aside, which — if it was in fact a NEW holder's lock claimed in the
+      // gap between the read above and this rename — leaves that holder running
+      // with nothing recording that it holds anything. Unknown goes down the
+      // restore path below, same as a known mismatch.
+      const moved = await readFile(side, 'utf8').catch(() => null);
+      if (moved === null || moved !== holder.text) {
+        // Not (provably) the lock just judged abandoned. Put it back rather than
+        // discard it: `link` (not a re-write) restores the ORIGINAL bytes even
+        // when they could not be read, and fails with EEXIST rather than
+        // clobbering if a third party has since created its own lock at that
+        // path. If it fails, the side file is deliberately KEPT (not removed) —
+        // a holder whose lock is missing is a holder nobody can see, so leaving
+        // the evidence beats deleting it silently.
+        //
+        // Residual, stated rather than silently assumed away (Codex round 2):
+        // this restore is itself two separate syscalls (rename-away, then
+        // link-back), during which `lockPath` briefly does not exist at all — a
+        // THIRD process racing to acquire in that exact instant can create its
+        // own lock there before this restore runs, in which case `link` below
+        // fails EEXIST and this branch's warn() fires. That is the same class of
+        // narrowing-not-closing residual push-lock.ts's own module header
+        // documents for this identical rename-then-maybe-restore pattern
+        // ("no path-based lock can make [check-then-act] atomic... a guarantee
+        // stronger than that needs an OS-level lock... a different change from
+        // this one") — closing it fully needs the same OS-level advisory lock
+        // that file already rules out of scope for this codebase.
+        try {
+          await link(side, lockPath);
+          await rm(side, { force: true });
+        } catch {
+          warn(
+            `could not restore an idempotency log lock that was moved aside while recovering a stale one — ` +
+              `${side} holds its contents; remove that file once no push/paid call is running`,
+          );
+        }
+        continue; // re-evaluate from scratch — this may or may not be resolved now
+      }
+      await rm(side, { force: true }).catch(() => {});
+      continue; // the path is now clear — the top of the loop's open('wx') retries
+    }
+    if (Date.now() > deadline) {
+      throw new IdempotencyStoreError(
+        `timed out after ${LOCK_MAX_WAIT_MS}ms waiting for the idempotency log lock at ${lockPath} ` +
+          `(held by another process) — refusing to write without it rather than risk a lost update.`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, LOCK_RETRY_DELAY_MS));
   }
   try {
     return await fn();
@@ -585,31 +804,192 @@ export async function claimIdempotencyKey(path: string, tool: string, key: strin
   const dir = dirname(resolve(path));
   const firstCreated = await mkdir(dir, { recursive: true });
   const token = newLockToken();
+  // Regression review round 3 (Codex re-review of round 2's own fix, elevated-caution,
+  // PR #871): write-then-link, the SAME pattern push-lock.ts's own publishLock() uses
+  // (see its own doc comment for the full rationale, and withLogLock's matching call site
+  // above for the identical rewrite there) — a private, uniquely-named staging file is
+  // written and fsync'd FIRST, and only THEN atomically PUBLISHED to the shared
+  // `lockPath` via `link`. This replaces round 2's own fix, which had two gaps Codex's
+  // re-review found by fault injection:
+  //   - Round 2's cleanup captured an fstat (dev, ino) "identity" the instant the
+  //     exclusive create succeeded, then on a later failure compared it via a separate
+  //     stat()-then-rm() before deleting `lockPath` — still a TOCTOU: a replacement claim
+  //     landing in the gap between that stat() and that rm() got deleted anyway. Here, a
+  //     failure before `link()` succeeds needs NO path-based cleanup logic — `staging`'s
+  //     name is unique to this call, so nothing else could ever be racing for it.
+  //   - Round 2's identity capture was itself a NEW failure point (a bare `fh.stat()`
+  //     call): if THAT failed, identity stayed null and cleanup was skipped entirely,
+  //     leaking an EMPTY claim forever. There is no separate identity-capture step here.
+  //
+  // Round 2 also tried moving the ancestor-directory sync (below, after the claim is
+  // published) EARLIER — before the claim's own exclusive step — on the theory that
+  // decoupling it from the claim's own outcome would close the "ancestor sync silently
+  // never retried" gap. Codex's re-review reproduced why that is WRONG rather than just
+  // incomplete: the exclusive-create/link IS this function's mutual-exclusion primitive
+  // for (tool, key) — running anything durability-related BEFORE it removes exclusion for
+  // whatever runs there. Two callers for the SAME key could both pass the now-unguarded
+  // early sync and race each other to publish a claim, with the LOSER of that race
+  // reporting "authorized to spend" while the WINNER's own ancestor sync might still be
+  // in flight or about to fail. That reorder is reverted: the sync stays AFTER `link()`
+  // succeeds, so nothing may run before the step that must fail closed for a second
+  // caller. The "a failed ancestor sync is not independently retried by a later, separate
+  // call" residual is therefore still present, unchanged from before this whole
+  // regression-fix round — see the syncDirectoryChain call below for why that is the SAME
+  // accepted tradeoff withLogLock's own early sync and recordIdempotencyResult's second
+  // mkdir already document, not a new gap this fix introduces. A further, DIFFERENT gap
+  // Codex's re-review DID find in this reorder (a race that can hand a concurrent SAME-
+  // key caller a "claimed" outcome before this call's own ancestor sync has run, purely
+  // from ordinary contention, no fault involved) is fixed below by having whichever
+  // caller's OWN `firstCreated` is non-undefined discharge that sync itself, regardless
+  // of which caller ends up holding the claim — see the syncDirectoryChain call's own
+  // comment near the end of this function.
+  //
+  // Accepted limitation (Warning, Codex re-review), not fixed here: this function now
+  // requires the filesystem holding `path` to support hard links (`link()`, used for the
+  // write-then-link publish below). Unlike push-lock.ts's own publishLock() — which
+  // falls back to a direct `writeFile(path, body, {flag:'wx'})` on ENOTSUP/EOPNOTSUPP/
+  // EPERM/ENOSYS/EXDEV — this file does not implement an equivalent fallback: doing so
+  // safely would reintroduce a SEPARATE, separately-reviewed acquisition path with its
+  // own cleanup-on-failure logic (the exact complexity the last two regression-review
+  // rounds were spent closing for the PRIMARY path), for a narrow, environment-specific
+  // edge case (CYPHER_BRAIN_HOME sitting on a filesystem without hard-link support —
+  // uncommon for the local-disk deployments this tool targets, though not impossible for
+  // a network mount). On such a filesystem, every claimIdempotencyKey/withLogLock
+  // acquisition fails with EOPNOTSUPP (or similar) on every attempt, with no dangling
+  // state left behind (verified: staging cleanup still runs) rather than a decision
+  // paying twice — a real limitation on that class of filesystem, stated rather than
+  // silently assumed away, not a silent correctness gap.
+  //
+  // Regression review round 4 (Critical, Codex re-review): registered HERE, immediately
+  // after `mkdir`, before any other `await` — not merely performed later, whenever this
+  // call happens to reach the ancestor-sync step below. Round 3's fix made whichever
+  // caller's own `firstCreated` is non-undefined discharge that sync EVENTUALLY, but
+  // Codex reproduced that "eventually" is not good enough: caller B (finding `dir`
+  // already existing, since caller A got there first) could WIN the claim and report
+  // success to ITS OWN caller — having synced only `dir` itself — before caller A's
+  // ancestor sync (for the levels A actually created) had even STARTED, since nothing
+  // made B wait for it. Registering the promise here, and AWAITING whatever is currently
+  // registered (see `awaitPendingAncestorSync` below, called again right before this
+  // function reports ANY final outcome) closes that: B's own later check observes A's
+  // in-flight promise and waits for it, rather than independently syncing only `dir` and
+  // returning immediately. See `registerAncestorSync`'s own doc comment for what this
+  // does and does not close (a narrowing, not a full close, of the underlying race).
+  //
+  // Held as a local reference (round 5, Critical, Codex re-review), not re-discovered
+  // later via a map lookup: see registerAncestorSync's own doc comment for why a
+  // lookup-only check can miss THIS call's own sync failing (the map's cleanup can
+  // remove a settled entry before this same call comes back to check on it, with no
+  // concurrent caller or scheduler edge case required).
+  const myAncestorSync = registerAncestorSync(dir, firstCreated);
+  const staging = `${lockPath}.staging.${randomBytes(8).toString('hex')}`;
   try {
-    // fsync'd (elevated-caution review) before this call ever returns a release
-    // function to its caller: the claim is what stands between a retried paid MCP
-    // call and paying twice, so the claim itself must be durable, not merely
-    // reached the kernel page cache, the instant this call reports success.
-    const fh = await open(lockPath, 'wx');
+    // fsync'd (elevated-caution review) before this call ever tries to publish it: the
+    // claim is what stands between a retried paid MCP call and paying twice, so its
+    // content must be durable BEFORE it becomes visible at the shared `lockPath`, not
+    // merely reached the kernel page cache the instant this call reports success.
+    const fh = await open(staging, 'wx');
     try {
       await fh.writeFile(token, 'utf8');
       await fh.sync();
     } finally {
       await fh.close();
     }
-    // Elevated-caution review, Codex round 2 (Critical: "claim durability remains
-    // incomplete") — syncing the fd's CONTENT is not enough: the DIRECTORY ENTRY this
-    // exclusive create just added is a separate durability fact, and an fsync'd file
-    // whose creation is still only in the page cache can come back missing entirely
-    // after a crash. For a claim specifically, "missing entirely" means a retry after
-    // the crash sees no claim at all and is free to spend again — exactly the
-    // double-spend window this function exists to close. Also covers the (rare)
-    // case where `dir` itself did not exist yet: `firstCreated` carries every
-    // ancestor this call's own mkdir just created, so those directory entries are
-    // synced too, not only the immediate one.
-    await syncDirectoryChain(dir, firstCreated);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') throw e;
+    // Unconditional and safe: `staging`'s name is unique to this attempt, so nothing else
+    // could ever have created, replaced, or be relying on a file at this path.
+    await rm(staging, { force: true }).catch(() => {});
+    throw e;
+  }
+  // `claimed`: this call IS the (tool, key) holder, either because `link()` itself
+  // succeeded, or because a NON-EEXIST `link()` failure turned out to be ambiguous (see
+  // below) and this call's own token is what is actually sitting at `lockPath`.
+  // `genuineFailure`: a NON-EEXIST `link()` failure that reconciliation could NOT
+  // attribute to this call — a real fault, propagated once ancestor durability (below)
+  // has had its chance to run regardless.
+  let claimed = false;
+  let genuineFailure: unknown;
+  try {
+    // The actual mutual-exclusion primitive for (tool, key) — succeeds only if no OTHER
+    // holder currently owns the claim, and — unlike the old open('wx')-then-write-then-
+    // sync sequence — the instant it succeeds, `lockPath` already holds fully-written,
+    // already-synced content.
+    await link(staging, lockPath);
+    claimed = true;
+  } catch (e) {
+    // Regression review round 3 (Warning) + round 4 (Warning, Codex re-review): a
+    // `link()` error is not proof the operation never landed, and this now applies to
+    // EEXIST too, not only other error codes — some filesystems (NFS in particular, one
+    // of this whole hardening's own motivating scenarios per this file's header comment)
+    // can report a failed RPC for an operation the SERVER actually completed, and an NFS
+    // client's own transparent RPC retry can specifically surface that as EEXIST ("my own
+    // earlier, lower-level retry of this exact link() already landed"), not only as some
+    // other code. Codex reproduced both shapes: "perform the link, then report EIO" left
+    // a REAL claim at `lockPath` while this call believed it had failed; "perform the
+    // link, then report EEXIST" did too, this time falling into what used to be treated
+    // as unconditionally "someone else's live claim". Abandoning either here would leak a
+    // claim nobody else knows to release, indistinguishable from the exact leaked-claim
+    // bug this whole regression-fix round exists to close, just triggered by an ambiguous
+    // RPC instead of a genuine durability-check failure. Reconciling by reading `lockPath`
+    // back and comparing to `token` BEFORE branching on the error code narrows this (does
+    // not fully close it — the read-back is itself a separate syscall from the failed
+    // `link`, so a THIRD party replacing `lockPath` in between could in principle still
+    // confuse this check; narrower than, and independent of, releaseLockFileIfOwned's own
+    // pre-existing, already-documented read-then-remove residual, which this reuses the
+    // same shape of check for on the release path, not the acquire path).
+    const maybeOurs = await readFile(lockPath, 'utf8').catch(() => null);
+    if (maybeOurs === token) claimed = true;
+    else if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') genuineFailure = e;
+    // A genuine EEXIST (not reconciled as ours) falls through with claimed=false,
+    // genuineFailure=undefined — handled below as someone else's live claim.
+  }
+  // Best-effort, and deliberately not inside the same try/catch as `link()` above
+  // (mirrors push-lock.ts's own publishLock(): once `link` has succeeded — or is
+  // reconciled as having succeeded — this call holds the claim, so a failure tidying up
+  // the now-redundant staging file must not be treated as an acquisition failure).
+  await rm(staging, { force: true }).catch(() => {});
+
+  // Regression review round 3 (Critical) + round 4 (Critical) + round 5 (Critical, all
+  // Codex re-review): every caller — regardless of whether IT wins, loses, or genuinely
+  // fails its own exclusion attempt above — waits here for (a) whichever caller's `mkdir`
+  // actually discovered new ancestors to finish syncing them, and (b), on the WINNING
+  // path only, for `dir` itself to be synced for the brand-new directory ENTRY `link()`
+  // just added. Round 3's fix made the ancestor-creator discharge (a) EVENTUALLY, on its
+  // own; round 4 made the WINNER (who may not be the ancestor-creator at all) also wait
+  // for it before reporting success. Round 5 fixes two remaining gaps Codex found in that:
+  //   - `myAncestorSync` (this call's OWN registered promise, if any) is awaited
+  //     DIRECTLY, not solely via `awaitPendingAncestorSync`'s map lookup — see
+  //     `registerAncestorSync`'s own doc comment for why a lookup-only check can miss
+  //     THIS call's own sync failing, deterministically, no concurrent caller needed.
+  //   - `dir` itself is now synced UNCONDITIONALLY on the winning path (below), not only
+  //     as a side effect of an ancestor sync that may never have run at all (the common
+  //     case: `dir` already existed durably, so NEITHER `myAncestorSync` NOR any
+  //     concurrent caller's registration exists to sync anything, and the claim's own
+  //     brand-new link entry would otherwise never be synced by anyone).
+  try {
+    if (myAncestorSync) await myAncestorSync;
+    await awaitPendingAncestorSync(dir);
+    if (claimed) await syncDirectoryChain(dir, undefined);
+  } catch (syncErr) {
+    // WINNING path: propagate, unchanged from before this fix — mcp.ts's own caller
+    // treats a durability-check failure as grounds to RETAIN rather than release the
+    // claim (see this function's own doc comment above), so this must still surface.
+    if (claimed) throw syncErr;
+    // Losing/failed path: this call holds no claim to retain regardless of this outcome,
+    // so best-effort only — warn for operator visibility rather than masking the more
+    // actionable claim-outcome error already about to be reported below. Wording avoids
+    // asserting "a concurrent caller claimed it" (Suggestion, Codex re-review): a
+    // genuinely failed link() with no reconciled owner means no valid claim may exist at
+    // all, so the warning states only what is actually known — this attempt itself did
+    // not retain the ancestor structure's durability.
+    warn(
+      `failed to sync a newly-created ancestor directory for ${dir} while this attempt to claim ` +
+        `idempotency_key ${JSON.stringify(key)} for tool ${JSON.stringify(tool)} did not itself succeed (${errMsg(syncErr)}) ` +
+        '— a crash before this directory structure is next retried could still lose it',
+    );
+  }
+
+  if (genuineFailure) throw genuineFailure;
+  if (!claimed) {
     // Best-effort age hint for the operator only — never used to decide anything (see
     // this function's own doc comment for why auto-recovery is deliberately not
     // attempted). A failure here just omits the hint from the message below.

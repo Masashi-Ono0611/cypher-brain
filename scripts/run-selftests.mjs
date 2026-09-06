@@ -142,6 +142,12 @@ const PARALLEL = [
   npmTest('selftest:properties'),
   npmTest('selftest:ledger'),
   npmTest('selftest:idempotency-lib'),
+  // Same isolation shape as selftest:idempotency-lib right above (no CYPHER_BRAIN_HOME, no
+  // port, no LaunchAgent write, everything under its own mkdtemp beneath the per-test
+  // TMPDIR). It reassigns `node:fs/promises`'s `open` for its fault injection, but only for
+  // the lifetime of ITS OWN process — spawned fresh by this runner, so no other test's
+  // process can observe that mock, and it restores the original before exiting regardless.
+  npmTest('selftest:idempotency-claim-durability'),
   // #818. Parallel-safe by the same findings as mcp-smoke: its own temp
   // CYPHER_BRAIN_HOME, its mock Arweave gateway on `listen(0, '127.0.0.1')`, and it
   // only READS dist/.

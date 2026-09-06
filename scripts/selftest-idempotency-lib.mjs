@@ -36,9 +36,22 @@
 //     is deliberately no AUTOMATIC steal) can be re-claimed; and releasing a claim after
 //     it was manually removed and re-claimed by someone else must NOT delete that new
 //     holder's live claim.
-import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
+//   - elevated-caution regression review (PR #871 fsync durability hardening), Finding 1:
+//     withLogLock's isLockAbandoned() used to treat pure mtime staleness as abandonment
+//     REGARDLESS of whether the recorded pid was confirmed alive, which only became
+//     reachable once #871 put real fsync calls inside the critical section this lock
+//     guards (a genuinely slow-but-legitimate fsync can now outlast LOCK_STALE_MS). A
+//     POSITIVE CONTROL that a lock naming a CONFIRMED-ALIVE pid is never stolen by
+//     staleness alone: a waiter contending with it must wait out the full timeout and fail
+//     closed (IdempotencyStoreError) rather than silently steal the lock mid-operation.
+//     (Finding 2 — claimIdempotencyKey leaving a dangling claim file behind a failed
+//     durability check — has its own dedicated process,
+//     scripts/selftest-idempotency-claim-durability.mjs, because verifying it needs a
+//     fault-injected `node:fs/promises`, and that only works reliably in a process where
+//     nothing has imported it via ESM yet — see that file's own header comment.)
+import { mkdtemp, mkdir, rm, writeFile, readFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
   lookupIdempotencyResult,
@@ -635,6 +648,61 @@ try {
       staleResult === undefined,
       JSON.stringify(staleResult),
     );
+  }
+
+  // ---------- elevated-caution regression review (PR #871, Finding 1): a lock naming a
+  // CONFIRMED-ALIVE pid is never stolen by staleness alone ----------
+  {
+    // Simulates a writer whose fsync inside the critical section genuinely runs past
+    // LOCK_STALE_MS (10s) while it is still alive and working — the exact scenario #871's
+    // fsync durability hardening introduced (recordIdempotencyResult's own fh.sync() now
+    // runs INSIDE the lock). Before this fix, isLockAbandoned() judged a lock abandoned
+    // from staleness ALONE, regardless of whether the recorded pid was still alive — so a
+    // second caller here would silently STEAL this "held" lock mid-operation instead of
+    // waiting for it, exactly the double-spend-enabling race this positive control exists
+    // to catch (verified against the pre-fix code: it stole the lock in under 100ms).
+    const logPath = join(tmp, 'live-holder-not-stolen-log.jsonl');
+    const lockPath = `${logPath}.lock`;
+    await mkdir(dirname(logPath), { recursive: true });
+    // A lock token naming THIS test process's own pid (confirmed alive via
+    // process.kill(pid, 0), the exact liveness check isLockAbandoned uses) — simulating
+    // another process's still-live, still-working claim on this same log's write lock.
+    const fakeHolderToken = `${process.pid}.${Date.now() - 20_000}.${'a'.repeat(32)}`;
+    await writeFile(lockPath, fakeHolderToken, 'utf8');
+    // Back-date the lock file's mtime past LOCK_STALE_MS (10s) — the on-disk fact
+    // isLockAbandoned's staleness check reads — while its recorded pid stays alive.
+    const staleMtime = new Date(Date.now() - 20_000);
+    await utimes(lockPath, staleMtime, staleMtime);
+
+    const start = Date.now();
+    let threw;
+    try {
+      await recordIdempotencyResult(logPath, 'snapshot_now', 'live-holder-key', 'fp-live', { pushed: true }, 86400);
+    } catch (e) {
+      threw = e;
+    }
+    const elapsedMs = Date.now() - start;
+
+    check(
+      'a lock naming a CONFIRMED-ALIVE pid is never stolen by staleness alone — the waiter ' +
+        'waits out the full timeout and fails closed instead of silently overwriting it',
+      threw instanceof IdempotencyStoreError && /timed out/i.test(threw.message) && elapsedMs >= 10_000,
+      threw
+        ? `${threw.constructor.name}: ${threw.message} (waited ${elapsedMs}ms)`
+        : `no throw (BUG — the lock was stolen), waited ${elapsedMs}ms`,
+    );
+
+    // The fake holder's own lock must survive completely untouched — proof this call
+    // genuinely never stole it, rather than stealing it and independently timing out some
+    // other way.
+    const survivingLock = await readFile(lockPath, 'utf8').catch(() => null);
+    check(
+      "the confirmed-alive holder's own lock file is untouched after the waiter gives up",
+      survivingLock === fakeHolderToken,
+      survivingLock,
+    );
+
+    await rm(lockPath, { force: true });
   }
 } finally {
   await rm(tmp, { recursive: true, force: true });
