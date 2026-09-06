@@ -55,7 +55,7 @@
 // rather than hanging or behaving unpredictably under a CI/pipe invocation.
 import { text, confirm, select, isCancel } from '@clack/prompts';
 import { readFile, writeFile, rm, stat, access, realpath } from 'node:fs/promises';
-import { rmSync, constants as fsConstants } from 'node:fs';
+import { rmSync, lstatSync, constants as fsConstants } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import {
@@ -77,7 +77,7 @@ import { keygenSignAt, loadSignIdentity, parsePubkeyFile, signingKeypairMatches 
 import { detectGbrainEngine, pathCoveredBy, resolveGbrainConfigPath } from './gbrain.js';
 import { PROFILE_NAMES } from './profiles.js';
 import { snapshot } from './snapshot.js';
-import { push, PushPartialSuccessError } from './pushpull.js';
+import { push, PushPartialSuccessError, PushUncertainSpendError } from './pushpull.js';
 import { estimateCost, formatEstimate } from './estimate.js';
 import { BACKEND_NAMES } from './backends/index.js';
 import { walletConfigured, tonWalletConfigured, WALLET_DEFAULT_PATH } from './wallet.js';
@@ -234,6 +234,36 @@ function expandHome(path: string): string {
   if (path === '~') return homedir();
   if (path.startsWith('~/')) return join(homedir(), path.slice(2));
   return path;
+}
+
+// #720/#786/keygen --force races (Codex regression review, this pass): an EEXIST from
+// an O_CREAT|O_EXCL open proves ONLY that open() saw SOMETHING already at that exact
+// path — a symlink (dangling or not) sitting there throws the identical EEXIST for ANY
+// exclusive-create open, per POSIX, regardless of what it points at or whether its
+// target even exists. That is not "a concurrent process already won and left a real
+// identity/recipient pair" — there may be no real content there at all, just a stray or
+// planted symlink — so the keygen race checks below (primary identity, backup keypair,
+// signing keypair) must not classify it as a winning race. lstat, unlike the exists()/
+// access() checks used earlier in this flow (which FOLLOW a symlink and would report a
+// dangling one as absent), tells the two apart without following the link.
+//
+// Deliberately SYNCHRONOUS — `lstatSync`, not the async `lstat` an earlier version of
+// this fix used (2nd-round Codex regression review, Critical): every caller below runs
+// this check while `inFlightSecretWrites` (this file's own signal-handler visibility
+// list, see its own doc comment) still lists the CONTESTED path as "safe to delete",
+// cleared only in the calling try's own `finally` — AFTER this check returns. An `await`
+// here opens a real window for a fatal signal to land mid-classification and have the
+// SYNCHRONOUS signal rollback (rollbackKeysAndSnapshotSync) delete a concurrent winner's
+// files this very check exists to protect, via a code path this function's own async
+// result can never reach in time to prevent. A single lstat syscall is negligible cost
+// to run synchronously (rollbackKeysAndSnapshotSync itself already uses `rmSync` for the
+// identical reason — see its own doc comment).
+function eexistCollidesWithSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
 }
 
 // #761: the per-day snapshot filename below (step 7) is meant to reflect the
@@ -459,12 +489,39 @@ export async function init(_o: CliOptions): Promise<boolean> {
       // was written but went stale the moment #786 reordered keygenAt()'s two writes
       // — checking the wrong path meant a genuine race here fell through to the
       // unconditional `rm(IDENTITY, ...)` below instead of backing off, silently
-      // reopening the exact corruption #720 exists to prevent.) Back off cleanly
-      // instead: touch neither IDENTITY nor RECIPIENT, and let the operator re-run
-      // once the winning process finishes (it will then either see "an identity
-      // already exists", if the winner succeeded, or a fresh, writable
-      // CYPHER_BRAIN_HOME again, if the winner itself failed later).
-      const raced = (e as NodeJS.ErrnoException)?.code === 'EEXIST' && (e as NodeJS.ErrnoException)?.path === RECIPIENT;
+      // reopening the exact corruption #720 exists to prevent.)
+      //
+      // A SECOND, DIFFERENT race shape (Codex regression review, this pass) reopens
+      // the same corruption via a path #720/#786 never covered: `keygen --force` is a
+      // separate call path that does NOT follow the "exclusive create, RECIPIENT then
+      // IDENTITY" contract above — keygenAt()'s --force branch (writeKeyFile with
+      // force=true) writes each target via a write-new-then-RENAME onto the final
+      // path, which succeeds unconditionally regardless of what is already there. So:
+      // this call's own plain (non-force) keygen() can win the RECIPIENT write (its
+      // exclusive create sees nothing there yet and succeeds), then — before this
+      // call's own exclusive IDENTITY write runs — a concurrent `keygen --force`
+      // completes BOTH of its overwriting writes (replacing RECIPIENT with its own,
+      // then creating IDENTITY). This call's own IDENTITY write then fails EEXIST too
+      // — but on IDENTITY, not RECIPIENT, because this time the loser is the one
+      // whose *second* write lost, not its first. Checking only RECIPIENT here missed
+      // this shape entirely: it fell through to the unconditional cleanup below,
+      // deleting the concurrent `keygen --force`'s just-written (and already-current)
+      // identity/recipient pair out from under it — with no backup file to recover it
+      // from if that forced keygen started against an empty CYPHER_BRAIN_HOME. An
+      // EEXIST on EITHER path here means the same thing: some other process — whether
+      // racing the same exclusive-create contract this call uses, or overwriting via
+      // --force — already won and left a complete, current identity/recipient pair on
+      // disk; this call's own write is the one that lost, and never got to finish its
+      // own pair. Back off cleanly in both cases: touch neither IDENTITY nor
+      // RECIPIENT, and let the operator re-run once the winning process finishes (it
+      // will then either see "an identity already exists", if the winner succeeded, or
+      // a fresh, writable CYPHER_BRAIN_HOME again, if the winner itself failed later).
+      const racedPath =
+        (e as NodeJS.ErrnoException)?.code === 'EEXIST' ? (e as NodeJS.ErrnoException)?.path : undefined;
+      // (Codex regression review, this pass): a symlink at the colliding path is a
+      // DIFFERENT failure, not a winning race — see eexistCollidesWithSymlink's own
+      // doc comment above.
+      const raced = (racedPath === RECIPIENT || racedPath === IDENTITY) && !eexistCollidesWithSymlink(racedPath);
       if (raced) {
         throw new Error(
           `another "cypher-brain init" (or "keygen") process just won a race to create the identity at ${IDENTITY} ` +
@@ -543,6 +600,25 @@ export async function init(_o: CliOptions): Promise<boolean> {
     let pushSucceeded = false;
     let pushedBackend: string | null = null;
     let pushedLocatorPath: string | null = null;
+    // (Codex regression review, this pass): set instead of pushSucceeded when push()
+    // throws a PushUncertainSpendError with NO confirmedCiphertextLocator — the
+    // ciphertext's OWN upload (not just a signed push's ".minisig" sidecar) is what went
+    // ambiguous, so unlike pushSucceeded above this is NOT proof anything durable
+    // exists. But PushUncertainSpendError's own doc comment (push-uncertain-spend.ts) is
+    // explicit that "absence of an observation is NOT proof of absence" — an unconfirmed
+    // "maybe uploaded and paid for" is not the same as a confirmed "definitely did not
+    // happen", and rolling back (deleting) the only keys able to ever decrypt an upload
+    // that DID land would be strictly worse than leaving an identity behind pending
+    // manual verification (the operator checks PushUncertainSpendError's own
+    // checkIdentifier — an Arweave tx id, a TON contract address, a Turbo wallet — same
+    // posture mcp.ts's idempotency claim already takes for this identical error class:
+    // retain rather than release on ambiguity, never assume "safe to redo"). The outer
+    // catch below reads this the same way it reads pushSucceeded — preserve everything —
+    // but with its own honestly-worded message: it must never claim the push
+    // "succeeded", only that its outcome is unknown.
+    let pushUncertain = false;
+    let pushUncertainBackend: string | null = null;
+    let pushUncertainErr: Error | null = null;
     // #734 (review-hardened): true from the moment push() below is CALLED, not only
     // once it resolves. A normal thrown error (network failure, declined consent, a
     // genuine PushPartialSuccessError, ...) still reaches the async catch below via
@@ -596,8 +672,12 @@ export async function init(_o: CliOptions): Promise<boolean> {
       // #734 (review-hardened): `pushAttemptStarted` too, not only `pushSucceeded` —
       // see that variable's own doc comment above for why an in-flight push must be
       // treated as ambiguous (possibly-already-committed), never as "definitely not
-      // pushed yet", from a signal handler's point of view.
-      if (pushSucceeded || pushAttemptStarted) return;
+      // pushed yet", from a signal handler's point of view. `pushUncertain` too (Codex
+      // regression review, this pass) — same reasoning as pushSucceeded, defense in
+      // depth: nothing here actually awaits between setting it and the outer catch's
+      // own throw, so this branch should be unreachable with it set, but a signal
+      // handler must never rely on "should be unreachable" for an irreversible delete.
+      if (pushSucceeded || pushAttemptStarted || pushUncertain) return;
       try {
         rmSync(IDENTITY, { force: true });
       } catch {}
@@ -763,8 +843,21 @@ export async function init(_o: CliOptions): Promise<boolean> {
           // an exclusive create, so a concurrent process racing THIS SAME backupHome
           // throws EEXIST on recipientPath specifically when it loses — meaning this
           // call created nothing and must not delete whatever the winner wrote.
+          //
+          // Third sibling of the same widened fix (2nd-round Codex regression review —
+          // this call site was still on the ORIGINAL, narrower shape): a concurrent
+          // `keygen --force` pointed at this SAME backupHome (this call itself never
+          // passes force, but nothing stops a SEPARATE process from doing so against
+          // the identical path) can win this call's own identityPath write the same way
+          // it can for the primary/signing keypairs above — failing with EEXIST on
+          // identityPath, not recipientPath. A symlink at either path also throws this
+          // same EEXIST without a real winning process — see eexistCollidesWithSymlink's
+          // own doc comment above.
+          const racedBackupPath =
+            (e as NodeJS.ErrnoException)?.code === 'EEXIST' ? (e as NodeJS.ErrnoException)?.path : undefined;
           const raced =
-            (e as NodeJS.ErrnoException)?.code === 'EEXIST' && (e as NodeJS.ErrnoException)?.path === recipientPath;
+            (racedBackupPath === recipientPath || racedBackupPath === identityPath) &&
+            !eexistCollidesWithSymlink(racedBackupPath);
           if (raced) {
             throw new Error(
               `another process just won a race to create the backup identity at ${identityPath} — this run is ` +
@@ -855,8 +948,25 @@ export async function init(_o: CliOptions): Promise<boolean> {
           // this SAME CYPHER_BRAIN_HOME throws EEXIST on SIGN_RECIPIENT specifically
           // when it loses — meaning this call created nothing and must not delete
           // whatever the winner wrote.
+          //
+          // Sibling of the primary identity's own EEXIST-widening fix above (Codex
+          // regression review, this pass — same defect, same code shape, just for the
+          // signing keypair): `keygen --sign --force` is a separate call path that
+          // does NOT follow the "exclusive create, recipient then identity" contract
+          // (keygenSignAt's --force branch overwrites unconditionally, same as
+          // keygenAt's own does for the primary identity). This call's own SIGN_RECIPIENT
+          // write can win, then a concurrent `keygen --sign --force` completes BOTH its
+          // writes before this call's own SIGN_IDENTITY write runs — failing THAT write
+          // with EEXIST on SIGN_IDENTITY, not SIGN_RECIPIENT. Checking only
+          // SIGN_RECIPIENT missed this shape, exactly like the primary identity's own
+          // pre-fix check did. A symlink (dangling or not) at either path also throws
+          // this same EEXIST without a real winning process — see
+          // eexistCollidesWithSymlink's own doc comment above.
+          const racedSignPath =
+            (e as NodeJS.ErrnoException)?.code === 'EEXIST' ? (e as NodeJS.ErrnoException)?.path : undefined;
           const raced =
-            (e as NodeJS.ErrnoException)?.code === 'EEXIST' && (e as NodeJS.ErrnoException)?.path === SIGN_RECIPIENT;
+            (racedSignPath === SIGN_RECIPIENT || racedSignPath === SIGN_IDENTITY) &&
+            !eexistCollidesWithSymlink(racedSignPath);
           if (raced) {
             throw new Error(
               `another process just won a race to create the signing identity at ${SIGN_IDENTITY} — this run is ` +
@@ -1450,28 +1560,87 @@ export async function init(_o: CliOptions): Promise<boolean> {
         pushedLocatorPath = locatorPath;
         savedLocatorLine = (await readFile(locatorPath, 'utf8')).split('\n').find((l) => l.trim()) ?? '';
       } catch (pushErr) {
-        if (pushErr instanceof PushPartialSuccessError) {
-          // The ciphertext upload itself (backend.put()) already succeeded — see
-          // PushPartialSuccessError's own doc comment in pushpull.ts, covering BOTH the
-          // ".minisig" sidecar upload failing (PushSignatureUploadError) and the LOCAL
-          // --save-locator bookkeeping failing after everything durably uploaded
-          // (PushLocatorWriteError). Either way the remote artifact durably exists
-          // (permanently, on arweave/turbo) even though locatorPath was never reached
-          // and never written, so this is exactly as unrollbackable as an ordinary
-          // successful push: flip pushSucceeded so the outer catch below preserves the
+        // #869 (Codex regression review, this pass): a signed push's Turbo ".minisig"
+        // SIDECAR upload — its own separate backend.put() call, made strictly AFTER the
+        // ciphertext's own upload has already fully succeeded (pushpull.ts) — can now
+        // throw PushUncertainSpendError instead of PushPartialSuccessError. (This is
+        // NOT the same thing as turbo.ts's own onReceipt-callback-failure handling,
+        // which already warns-and-returns-normally without throwing at all — it never
+        // reaches this catch. The mechanism here is the SIDECAR's own upload itself
+        // coming back ambiguous.) pushpull.ts's own ".minisig" catch re-throws that
+        // exactly this way — `e.withConfirmedCiphertextLocator(locator)` — attaching
+        // the CIPHERTEXT's own already-known, already-confirmed locator, since by
+        // definition the sidecar only runs once the ciphertext's own upload settled.
+        // PushUncertainSpendError is deliberately NOT a PushPartialSuccessError
+        // subclass (see its own doc comment in push-uncertain-spend.ts) — it ALSO
+        // covers a second, genuinely-ambiguous shape with no confirmed locator at all
+        // (the CIPHERTEXT's own upload, not just the sidecar's, is what went
+        // ambiguous). Before this fix, this catch recognized only
+        // PushPartialSuccessError, so a confirmed-locator PushUncertainSpendError fell
+        // through to the unconditional rollback below, deleting IDENTITY/RECIPIENT/the
+        // signing keypair even though the ciphertext this run already paid for and
+        // durably uploaded cannot be recovered without them.
+        //
+        // Narrowed via a local instead of inline in the throw below (TS's catch
+        // variable is `unknown` under strict mode — `pushErr.message` is not valid
+        // until pushErr itself, not just a value derived from it, is narrowed to one
+        // of the two Error subclasses that actually carry a confirmed locator).
+        const confirmedPushErr =
+          pushErr instanceof PushPartialSuccessError
+            ? pushErr
+            : pushErr instanceof PushUncertainSpendError && pushErr.confirmedCiphertextLocator !== undefined
+              ? pushErr
+              : undefined;
+        const confirmedLocator =
+          confirmedPushErr instanceof PushPartialSuccessError
+            ? confirmedPushErr.locator
+            : confirmedPushErr?.confirmedCiphertextLocator;
+        if (confirmedPushErr !== undefined && confirmedLocator !== undefined) {
+          // The ciphertext upload itself (backend.put()) already durably succeeded —
+          // see PushPartialSuccessError's own doc comment in pushpull.ts, covering
+          // BOTH the ".minisig" sidecar upload failing (PushSignatureUploadError) and
+          // the LOCAL --save-locator bookkeeping failing after everything durably
+          // uploaded (PushLocatorWriteError), and PushUncertainSpendError's own
+          // confirmedCiphertextLocator doc comment, covering the sidecar's spend
+          // itself going ambiguous while the ciphertext's own upload is still
+          // confirmed. Either way the remote artifact durably exists (permanently, on
+          // arweave/turbo) even though locatorPath was never reached and never
+          // written, so this is exactly as unrollbackable as an ordinary successful
+          // push: flip pushSucceeded so the outer catch below preserves the
           // identities/snapshot instead of deleting them, but leave pushedLocatorPath
-          // null (there genuinely is no locator FILE on disk this time — only the value
-          // inside pushErr.locator, which the thrown error below surfaces for the
-          // operator to record by hand).
+          // null (there genuinely is no locator FILE on disk this time — only the
+          // confirmed locator value itself, which the thrown error below surfaces for
+          // the operator to record by hand).
           pushSucceeded = true;
           pushedBackend = backend;
           pushedLocatorPath = null;
           throw new Error(
-            `${pushErr.message}\nACTION REQUIRED: the upload already happened and cannot be undone — hand-record ` +
-              `this locator now, since --save-locator itself never ran (or failed) for it: locator="${pushErr.locator}" ` +
+            `${confirmedPushErr.message}\nACTION REQUIRED: the upload already happened and cannot be undone — hand-record ` +
+              `this locator now, since --save-locator itself never ran (or failed) for it: locator="${confirmedLocator}" ` +
               `backend="${backend}". Without recording it, this snapshot is unrecoverable even though it durably ` +
               `exists in the backend.`,
           );
+        }
+        // (Codex regression review, this pass): a PushUncertainSpendError with NO
+        // confirmedCiphertextLocator — the CIPHERTEXT's own upload itself is what went
+        // ambiguous, not just a signed push's sidecar. Nothing here is confirmed
+        // durable, so this is NOT treated identically to the confirmed branch above —
+        // but it is also not a confirmed FAILURE, and must not fall through to the
+        // unconditional rollback below the way an ordinary, unambiguous push() failure
+        // does: PushUncertainSpendError's own doc comment (push-uncertain-spend.ts) is
+        // explicit that "absence of an observation is NOT proof of absence" — the
+        // payment/upload MAY have landed. Deleting the only keys able to ever decrypt
+        // it, on the strength of an outcome that is merely UNKNOWN rather than
+        // confirmed-failed, would be strictly worse than leaving an identity behind
+        // pending manual verification (see pushUncertain's own declaration above for
+        // the full reasoning — same posture mcp.ts's idempotency claim retention
+        // already takes for this identical error class).
+        if (pushErr instanceof PushUncertainSpendError) {
+          pushUncertain = true;
+          pushUncertainBackend = backend;
+          pushUncertainErr = pushErr;
+          pushAttemptStarted = false; // settled now — see pushAttemptStarted's own comment for why this still matters
+          throw pushErr;
         }
         // Any other push() failure (declined paid-backend consent, a network error
         // during backend.put() itself, etc.) means the upload never happened —
@@ -1628,6 +1797,55 @@ export async function init(_o: CliOptions): Promise<boolean> {
       // actually created AND pushed by this point.
       return true;
     } catch (err) {
+      // Shared by both preserve-branches below (pushSucceeded and pushUncertain) — the
+      // exact list of what THIS run's own artifacts are, kept in ONE place so an
+      // artifact added to one branch's message is never silently missing from the
+      // other's (Codex regression review, this pass — extracted when pushUncertain's
+      // branch below needed the identical list a second time).
+      const preservedList = (): string =>
+        [
+          `primary identity: ${IDENTITY}`,
+          `primary recipient: ${RECIPIENT}`,
+          ...(backup ? [`backup identity: ${backup.identityPath}`, `backup recipient: ${backup.recipientPath}`] : []),
+          ...(signing
+            ? [`signing identity: ${signing.identityPath}`, `signing public key: ${signing.recipientPath}`]
+            : []),
+          ...(snapshotOutPath ? [`snapshot: ${snapshotOutPath}`] : []),
+        ].join('; ');
+      // Used ONLY by the pushUncertain branch's own "if nothing happened, remove these
+      // yourself" advice below (2nd-round Codex regression review, Warning) — mirrors
+      // EXACTLY what the ordinary rollback path further down would delete on its own,
+      // deliberately narrower than preservedList() above: a REUSED signing keypair
+      // (`signingGeneratedThisRun` false — this run never created it; an earlier
+      // `keygen --sign` or a previous `init` did) must never be suggested for removal
+      // here, the same protection the ordinary rollback path already gives it (`if
+      // (signing && signingGeneratedThisRun)`) — other backups may still depend on it.
+      // Snapshot sidecars listed individually (3rd-round Codex regression review,
+      // Warning): omitting them left a stale `.digest`/`.recipients-fingerprint`/
+      // `.minisig` behind after following this advice literally (rm the listed
+      // files, then re-run) — snapshot()'s own no-clobber check on THOSE sidecars
+      // would then refuse a same-day retry. Each one only if THIS run did not
+      // inherit it from before (`!snapshotSidecarsPreExisted.*`), same condition the
+      // ordinary rollback path below already applies.
+      const removableIfUnconfirmed = (): string =>
+        [
+          `primary identity: ${IDENTITY}`,
+          `primary recipient: ${RECIPIENT}`,
+          ...(backup ? [`backup identity: ${backup.identityPath}`, `backup recipient: ${backup.recipientPath}`] : []),
+          ...(signing && signingGeneratedThisRun
+            ? [`signing identity: ${signing.identityPath}`, `signing public key: ${signing.recipientPath}`]
+            : []),
+          ...(snapshotOutPath
+            ? [
+                `snapshot: ${snapshotOutPath}`,
+                ...(!snapshotSidecarsPreExisted.digest ? [`snapshot digest: ${snapshotOutPath}.digest`] : []),
+                ...(!snapshotSidecarsPreExisted.fingerprint
+                  ? [`snapshot recipients fingerprint: ${snapshotOutPath}.recipients-fingerprint`]
+                  : []),
+                ...(!snapshotSidecarsPreExisted.minisig ? [`snapshot signature: ${snapshotOutPath}.minisig`] : []),
+              ]
+            : []),
+        ].join('; ');
       if (pushSucceeded) {
         // Push already happened — see the pushSucceeded declaration above. The
         // ciphertext is now durably stored (permanently and irreversibly if the
@@ -1641,15 +1859,6 @@ export async function init(_o: CliOptions): Promise<boolean> {
           pushedBackend === 'arweave' || pushedBackend === 'turbo'
             ? ' That backend is PAID and PERMANENT — the upload already happened and cannot be undone or refunded.'
             : '';
-        const preserved = [
-          `primary identity: ${IDENTITY}`,
-          `primary recipient: ${RECIPIENT}`,
-          ...(backup ? [`backup identity: ${backup.identityPath}`, `backup recipient: ${backup.recipientPath}`] : []),
-          ...(signing
-            ? [`signing identity: ${signing.identityPath}`, `signing public key: ${signing.recipientPath}`]
-            : []),
-          ...(snapshotOutPath ? [`snapshot: ${snapshotOutPath}`] : []),
-        ].join('; ');
         // pushedLocatorPath is null exactly when a PushPartialSuccessError fired above:
         // the upload succeeded but --save-locator's own file was never reached/written,
         // so there is no path to print here — printing the literal `null` would read as
@@ -1660,12 +1869,48 @@ export async function init(_o: CliOptions): Promise<boolean> {
         throw new Error(
           `cypher-brain init: the snapshot was already created and pushed to "${pushedBackend}" successfully ` +
             `(${locatorNote}).${permanentNote} A LATER step then failed: ` +
-            `${errMsg(err)}\nNothing was rolled back — these files are PRESERVED and must NOT be deleted: ${preserved}. ` +
+            `${errMsg(err)}\nNothing was rolled back — these files are PRESERVED and must NOT be deleted: ${preservedList()}. ` +
             `Fix the cause above, then either construct the recovery kit by hand from those paths (see ` +
             `MANAGEMENT.md), or re-run "cypher-brain init" once you have moved/backed up the above yourself — it ` +
             `will refuse immediately because an identity already exists at ${IDENTITY}; that refusal is expected ` +
             `and correct here, since your snapshot+push already succeeded and these keys must stay exactly where ` +
             `they are.`,
+        );
+      }
+      if (pushUncertain) {
+        // (Codex regression review, this pass): see pushUncertain's own declaration
+        // above for the full reasoning — this is NOT a confirmed success (unlike the
+        // pushSucceeded branch above, the message below must never claim the push
+        // "succeeded"), but an unconfirmed "maybe" must not be treated as a confirmed
+        // "no" either. Preserve everything, exactly like the pushSucceeded branch does,
+        // but tell the operator to VERIFY the outcome (via PushUncertainSpendError's
+        // own checkIdentifier, already inside err's own message) before deciding
+        // whether to retry or to build a recovery kit by hand.
+        const permanentNote =
+          pushUncertainBackend === 'arweave' || pushUncertainBackend === 'turbo'
+            ? ' If that backend did accept it, the spend is PAID and PERMANENT.'
+            : '';
+        // #719-consistent reuse note (Codex regression review, this pass): only spelled
+        // out when it actually applies — a signing keypair this run REUSED rather than
+        // generated is never part of removableIfUnconfirmed()'s own list above, but a
+        // silent omission there could read as an oversight rather than a deliberate
+        // protection, so say so explicitly whenever it is the reason a signing keypair
+        // is missing from the "remove these" list despite being in the "preserved" one.
+        const reusedSigningNote =
+          signing && !signingGeneratedThisRun
+            ? ` (the signing keypair at ${signing.identityPath} is intentionally NOT included — it predates this ` +
+              'run, and other backups may still depend on it)'
+            : '';
+        throw new Error(
+          `cypher-brain init: the push to "${pushUncertainBackend}" ended with an UNCERTAIN outcome — the ` +
+            `payment/upload may or may not have happened: ${errMsg(pushUncertainErr)}${permanentNote}\nNothing ` +
+            `was rolled back — these files are PRESERVED and must NOT be deleted until you have verified the ` +
+            `outcome above: ${preservedList()}. Once verified: if the upload/payment did NOT happen, remove ` +
+            `THIS RUN's OWN artifacts yourself${reusedSigningNote}: ${removableIfUnconfirmed()} — then re-run ` +
+            `"cypher-brain init" (it refuses immediately as-is, because an identity already exists at ` +
+            `${IDENTITY}); if it DID happen, use the preserved identity/snapshot above to build a recovery kit ` +
+            `by hand instead (see MANAGEMENT.md) — do not retry with a NEW identity, which could never decrypt ` +
+            `what may already be durably stored.`,
         );
       }
       // Roll back exactly what THIS run wrote — the primary identity/recipient this
