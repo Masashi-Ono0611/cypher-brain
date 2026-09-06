@@ -16,6 +16,7 @@ import {
 import { generateKeypair, identityFileText, askNewPassphrase, wrapIdentity } from './crypt.js';
 import { keygenSignAt } from './minisign.js';
 import { exists, syncDirectoryChain } from './util.js';
+import { installStageSignalGuard, addActiveKeyScratchFile, removeActiveKeyScratchFile } from './signal-guard.js';
 import type { CliOptions } from './types.js';
 
 // Core of keygen(), parameterized over WHERE to write (home dir + identity/recipient
@@ -92,6 +93,63 @@ function elideRecipient(recipient: string): string {
 // is always an already-existing directory by the time writeKeyFile runs (keygenAt/
 // keygenSignAt/wallet.ts's createKeyFile all mkdir it first), so there is no newly-created
 // ancestor chain to walk — only `dirname(path)` itself needs syncing.
+// Regression from #871's fsync discipline (found via a post-merge Codex regression
+// review of the accumulated diff; elevated-caution key-handling review): the --force
+// branch's cleanup-on-error used to sit ONLY around the rename() call, not around the
+// write()/sync()/close() sequence above it. `tmp` already holds the complete, unencrypted
+// secret payload the instant fh.writeFile() returns — a failure in fh.sync() (or, in
+// principle, fh.close()) AFTER that point closed the handle via its own try/finally but
+// then propagated straight out of writeKeyFile(), past the rename's catch block entirely,
+// leaving `tmp` (full secret content) sitting on disk forever with nothing to clean it up
+// — neither this function's own error path nor signal-guard.ts's cleanup-on-signal
+// mechanism (which never knew the file existed). The fix widens the covered scope to
+// EVERY step from `open(tmp, ...)` onward through the rename: one outer try/catch now
+// wraps write+sync+close (still its own inner try/finally, so `fh` is always closed
+// before the outer catch's rm() tries to unlink it) AND the rename, so a failure at any
+// of those points removes `tmp` before the error propagates.
+//
+// `tmp` is also registered with signal-guard.ts (addActiveKeyScratchFile) for the
+// file's ENTIRE on-disk lifetime, so a signal landing anywhere in this window is swept
+// the same way restore.ts's ACTIVE_EXPAND_SCRATCH_DIRS covers its own per-component
+// scratch dirs (#786's own PR review; established pattern per that PR's own doc
+// comment) — TWO further points here, both raised by a second Codex review pass of
+// this very fix, that the sibling add*ScratchDir call sites this pattern is modeled on
+// do not have to deal with (a plain directory is empty either way at creation time; a
+// FILE here is what actually carries the secret):
+//   1. Registered BEFORE `open()`, not after it resolves: `addActiveKeyScratchFile` is a
+//      synchronous, in-memory Set insert with no observable effect until the path
+//      actually exists, so calling it EARLY is free — but calling it only AFTER `await
+//      open(...)` resolves would leave a window, however narrow, where the file exists
+//      on disk (the open() itself is what creates it) but is not yet in the tracked
+//      Set, and a signal landing in exactly that window would find nothing to clean up.
+//      Registering the (randomized, so this can never collide with the eventual real
+//      name of a concurrent call) filename before it exists closes MOST of that window
+//      — a signal-guard rmSync() on a not-yet-created path is an ENOENT that this
+//      handler's own per-file removal already tolerates as "nothing to do". A THIRD
+//      Codex review pass on this exact reordering flagged the residual sliver still
+//      left: `open()` itself is still async, so a signal could in principle land, run
+//      signal-guard's rmSync (an ENOENT no-op) and clear the Set entry, and THEN have
+//      the in-flight open() syscall complete moments later — leaving an ORPHANED,
+//      EMPTY tmp file that is once again untracked. Accepted as-is rather than
+//      rewritten to synchronous (openSync/writeSync/fsyncSync/closeSync) I/O: unlike
+//      the bug this fix exists for, the file in this residual window is provably EMPTY
+//      (fh.writeFile(payload) — the earliest point the secret ever reaches it — cannot
+//      run until AFTER open() itself has already resolved), so the worst case is a
+//      stray empty file, not a secret leak. Revisit if this ever needs to become a
+//      zero-residual guarantee (a synchronous rewrite of just this write path would
+//      close it, at the cost of consistency with the rest of this async codebase).
+//   2. Deregistered ONLY once the file is CONFIRMED gone — after a successful rename()
+//      (which moves it out from under `tmp`), or after the catch block's own
+//      `rm(tmp, {force:true})` itself resolves WITHOUT throwing. If that rm() throws
+//      (e.g. a transient EACCES/EIO unlinking it, as opposed to the ENOENT `force`
+//      already swallows), deregistering unconditionally in a blanket `finally` — the
+//      first-cut shape of this fix — would silently drop the ONLY remaining safety net
+//      for the secret still sitting at `tmp`: no later signal-guard SIGTERM/SIGINT/
+//      SIGHUP would ever attempt to clean it up again, because bookkeeping already
+//      (wrongly) said it was handled. Deregistering only on confirmed success means a
+//      failed rm() here leaves the file tracked, so signal-guard's OWN cleanup pass
+//      (a plain synchronous `rmSync`, from a completely different, unmocked code path
+//      than whatever made THIS rm() fail) gets a real further chance at it later.
 export async function writeKeyFile(
   path: string,
   payload: string | Uint8Array,
@@ -109,20 +167,31 @@ export async function writeKeyFile(
     await syncDirectoryChain(dirname(path), undefined);
     return;
   }
+  installStageSignalGuard();
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  const fh = await open(tmp, 'wx', mode);
+  addActiveKeyScratchFile(tmp);
   try {
-    await fh.writeFile(payload);
-    await fh.sync();
-  } finally {
-    await fh.close();
-  }
-  try {
+    const fh = await open(tmp, 'wx', mode);
+    try {
+      await fh.writeFile(payload);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
     await rename(tmp, path);
   } catch (e) {
+    // rm() with force:true is a safe no-op even if `open()` itself is what threw (tmp was
+    // never created — ENOENT is exactly what `force` swallows), so this one call correctly
+    // covers every failure point above, not just a post-creation one. If rm() itself
+    // throws for a REAL reason (not ENOENT) — a transient EACCES/EIO actually unlinking a
+    // file that DOES exist — the deregister below is skipped ON PURPOSE (see this
+    // function's own header comment, point 2): leaving `tmp` tracked is what gives
+    // signal-guard's own (separate, unmocked) rmSync a further chance at it later.
     await rm(tmp, { force: true });
+    removeActiveKeyScratchFile(tmp);
     throw e;
   }
+  removeActiveKeyScratchFile(tmp); // tmp confirmed gone (renamed away)
   await syncDirectoryChain(dirname(path), undefined);
 }
 

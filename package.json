@@ -96,6 +96,7 @@
     "selftest:config-file": "bash scripts/selftest-config-file.sh",
     "selftest:doctor": "bash scripts/selftest-doctor.sh",
     "selftest:keygen-force": "bash scripts/selftest-keygen-force.sh",
+    "selftest:keyfile-fsync-cleanup": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-keyfile-fsync-cleanup.mjs",
     "selftest:properties": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-properties.mjs",
     "selftest:cctv-age": "node scripts/selftest-cctv-age.mjs",
     "selftest:plan": "bash scripts/selftest-plan.sh",

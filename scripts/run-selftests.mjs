@@ -124,6 +124,7 @@ const PARALLEL = [
   npmTest('selftest:cypherbrainignore'),
   npmTest('selftest:pq'),
   npmTest('selftest:keygen-force'),
+  npmTest('selftest:keyfile-fsync-cleanup'),
   npmTest('selftest:restore-security'),
   // ~7s measured in the pool. Parallel-safe under this list's own bar (a positive
   // finding, not the absence of a reason to suspect it): everything it creates lives
