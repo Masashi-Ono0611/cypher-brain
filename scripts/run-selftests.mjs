@@ -125,6 +125,14 @@ const PARALLEL = [
   npmTest('selftest:pq'),
   npmTest('selftest:keygen-force'),
   npmTest('selftest:keyfile-fsync-cleanup'),
+  // Parallel-safe by the same findings as mcp-uncertain-spend below: each scenario
+  // spawns its OWN `node` child process (spawnSync) with its own mkdtemp-based
+  // CYPHER_BRAIN_HOME/HOME, binds no port, writes no LaunchAgent, and only reads
+  // src/lib/*.ts (never dist/). Module-mocking (`--experimental-test-module-mocks`)
+  // is scoped to each child process's own module registry — it cannot leak into, or
+  // be affected by, any other test running concurrently in this pool.
+  npmTest('selftest:init-keygen-force-race'),
+  npmTest('selftest:init-turbo-uncertain-spend'),
   npmTest('selftest:restore-security'),
   // ~7s measured in the pool. Parallel-safe under this list's own bar (a positive
   // finding, not the absence of a reason to suspect it): everything it creates lives
