@@ -2,7 +2,7 @@
 import { mkdir, open, rename, rm, chmod, readFile, type FileHandle } from 'node:fs/promises';
 import { constants as FS_CONST } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import {
   HOME,
   IDENTITY,
@@ -331,13 +331,17 @@ export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
     // explanation). Two share paths aliased to each other, or to the identity/
     // recipient path, would otherwise let --force silently overwrite one share (or
     // the just-written identity itself) with another, while still reporting success.
-    const seen = new Set<string>([opts.identityPath, opts.recipientPath]);
+    // resolve() (lexical normalization only — it does NOT touch the filesystem or
+    // follow symlinks, so this adds no TOCTOU window) catches "./identity.age" vs
+    // "identity.age" vs an absolute path all naming the same file, which plain
+    // string equality would miss.
+    const seen = new Set<string>([resolve(opts.identityPath), resolve(opts.recipientPath)]);
     for (const p of opts.sss.outPaths) {
-      if (seen.has(p))
+      if (seen.has(resolve(p)))
         throw new Error(
           `--sss-out-dir paths must be distinct from each other and from the identity/recipient paths — ${p} is used more than once`,
         );
-      seen.add(p);
+      seen.add(resolve(p));
     }
     if (!opts.force) {
       for (const p of opts.sss.outPaths) {
@@ -632,18 +636,21 @@ export async function keygen(o: CliOptions): Promise<void> {
     // would silently leave only the LAST one written (destroying the other share of
     // the set while reporting success), and a share aliased to the identity/recipient
     // path would silently clobber the just-written identity/recipient with share
-    // data. Deduplicated by realpath-independent string equality — deliberately not
-    // resolving symlinks here, since a caller who WANTS a symlinked path is still
-    // protected by keygenAt()'s existing writeKeyFile() call, and resolving here would
-    // only add a TOCTOU window (resolve now, symlink swapped before the actual write)
+    // data. Deduplicated after path.resolve() (lexical only — normalizes "./x" vs "x"
+    // vs an absolute path; it does NOT touch the filesystem or follow symlinks, so it
+    // adds no TOCTOU window) rather than plain string equality, so differently-spelled
+    // paths naming the same file are still caught. Deliberately not resolving
+    // symlinks (no realpath): a caller who WANTS a symlinked path is still protected
+    // by keygenAt()'s existing writeKeyFile() call, and following symlinks here would
+    // add a real TOCTOU window (resolve now, symlink swapped before the actual write)
     // without closing anything this check exists to close.
-    const seen = new Set<string>([IDENTITY, RECIPIENT]);
+    const seen = new Set<string>([resolve(IDENTITY), resolve(RECIPIENT)]);
     for (const p of outPaths) {
-      if (seen.has(p))
+      if (seen.has(resolve(p)))
         throw new Error(
           `--sss-out-dir paths must be distinct from each other and from the identity/recipient paths — ${p} is used more than once`,
         );
-      seen.add(p);
+      seen.add(resolve(p));
     }
     sssRequest = { policy, outPaths };
   }
@@ -693,21 +700,23 @@ export async function sssCombineCommand(o: CliOptions): Promise<void> {
   if (!o.sss_shares || o.sss_shares.length < 2)
     throw new Error(`sss-combine needs at least 2 "--share <path>" flags, got ${o.sss_shares?.length ?? 0}`);
   if (!o.out) throw new Error('sss-combine requires --out <path> (where to write the reconstructed identity)');
-  // Same collision reasoning as keygen --sss's own out-path check: with --force,
-  // writing --out on top of one of the --share inputs would silently destroy that
-  // physical share backup (the read already happened by the time of the write below,
-  // so the reconstruction itself would still succeed — this guards the share FILE,
-  // not correctness).
-  if (o.sss_shares.includes(o.out))
-    throw new Error(`--out must be distinct from every --share path — ${o.out} is used as both`);
-  if ((await exists(o.out)) && !o.force)
-    throw new Error(`${o.out} already exists (refusing to overwrite). Pass --force, or pick a different path.`);
+  const out = o.out; // narrowed to a definite string for the closures below
+  // Same collision reasoning as keygen --sss's own out-path check (including the
+  // path.resolve() normalization — lexical only, no symlink following, no TOCTOU
+  // window): with --force, writing --out on top of one of the --share inputs would
+  // silently destroy that physical share backup (the read already happened by the
+  // time of the write below, so the reconstruction itself would still succeed — this
+  // guards the share FILE, not correctness).
+  if (o.sss_shares.some((s) => resolve(s) === resolve(out)))
+    throw new Error(`--out must be distinct from every --share path — ${out} is used as both`);
+  if ((await exists(out)) && !o.force)
+    throw new Error(`${out} already exists (refusing to overwrite). Pass --force, or pick a different path.`);
   const inputs = await Promise.all(
     o.sss_shares.map(async (path) => ({ text: await readFile(path, 'utf8'), sourceLabel: path })),
   );
   const { identity, recipient } = await combineShares(inputs);
-  await writeKeyFile(o.out, identityFileText(identity, recipient), 0o600, !!o.force);
-  console.log(`reconstructed identity written to: ${o.out}`);
+  await writeKeyFile(out, identityFileText(identity, recipient), 0o600, !!o.force);
+  console.log(`reconstructed identity written to: ${out}`);
   console.log(`recipient = ${recipient}`);
   console.log(
     '\nVerify this matches the recipient you expect before relying on it, and confirm it decrypts a real ' +
