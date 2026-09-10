@@ -658,6 +658,63 @@ so a verification cron wires its own dead man's switch the same way that runner 
 bakes into the nightly runner — `verify` does not implement it itself, so the cron line
 pipes to a tool that does, or you wire your own healthcheck around it.)
 
+### Manual application-level drill (beyond `verify --level drill`)
+
+`verify --level drill` proves the archive extracts — it never runs `pg_restore` or
+opens a PGLite data directory, even with `--pg` given (see above: "a verification
+drill must not touch a live database"). That is deliberate, not a gap this tool
+plans to close with automation: PostgreSQL's own docs note that restoring a dump
+executes source-controlled code (functions/triggers can run arbitrary SQL) —
+https://www.postgresql.org/docs/current/app-pgrestore.html — so an automated
+"does it actually open and query" check needs a genuinely isolated, disposable
+database runtime (no production credentials, no network access), which this repo
+does not orchestrate today. Adding that orchestration (Docker or an equivalent) was
+considered and deliberately deferred — it would be this project's first new
+operational/runtime dependency, its cross-platform CI story (`macos-latest` runners
+historically lack a usable Docker daemon) is uncertain, and a half-tested "drill"
+checked into CI risks reading safer than it is. Rather than ship that uncertainty,
+here is the manual runbook — the honest current state is: **run this yourself, on a
+cadence you choose; there is no automated substitute, and none is silently assumed**.
+
+For a **PGLite**-engine snapshot (the shape covered above under "On PGLite, the
+write window is the whole story"):
+
+1. Restore the snapshot normally (`restore`/`verify --level drill`) into a scratch
+   directory you are prepared to discard.
+2. In an environment you are comfortable running untrusted code in — a disposable
+   VM, or a container with no host-credential/Docker-socket mounts, restricted
+   privileges, and **outbound network access blocked too** (not just inbound —
+   a throwaway OS user alone is NOT sufficient isolation on its own: it still
+   shares the host's filesystem, kernel, and any world-readable resources) —
+   **never on the machine that holds your real gbrain data or wallet/identity
+   files** — open the restored PGLite data directory with the *same*
+   `@electric-sql/pglite` version gbrain itself pins (check gbrain's own
+   `package.json`; an unmatched version is not a representative test).
+3. Check, at minimum: the tables your gbrain deployment actually depends on exist;
+   any extensions gbrain's schema uses actually load; a representative read against
+   real recovered data succeeds (a bare `SELECT 1`, or only checking that extension
+   catalog entries exist, proves nothing about your actual data — read something).
+4. Discard the disposable environment afterward. Treat any failure here as
+   "recovery is unverified" and investigate immediately, not as definitive proof
+   the backup itself is bad — a missing extension or a misconfigured drill
+   environment can fail this drill too; don't file it away for the next scheduled
+   drill until the actual cause is known and either fixed or ruled out.
+
+For a real **PostgreSQL-server** snapshot (`--pg`), the same idea applies with
+`pg_restore`, but the privilege boundary has two layers, not one: the restored
+SQL initially runs under whatever role performs the restore, AND a sufficiently
+privileged role executing restore-time code (a malicious extension, a function
+with elevated rights) can reach OS-level command execution as the PostgreSQL
+service account — a fresh, low-privilege database role alone is not enough.
+Use a throwaway Postgres instance with no production credentials, blocked
+outbound network access (not just "no exposure" — that alone only stops
+inbound connections), and no shared storage with anything that matters, then
+discard it.
+
+This is explicitly a manual, best-effort practice — `doctor` and `verify` do not
+check whether you have actually run it, and there is no `--ping-url`-style dead
+man's switch for it the way there is for the automated `verify` levels above.
+
 ## MCP snapshot policy
 
 > **Upgrading an existing MCP setup?** This is a breaking change, and the only one in
