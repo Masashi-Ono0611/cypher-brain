@@ -28,7 +28,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { IDENTITY, CONFIG_FILE_ERROR, AR_MAX_SPEND_ERROR, TON_PROVIDER_MAX_SPEND_ERROR } from './lib/config.js';
-import { keygen } from './lib/keys.js';
+import { keygen, sssCombineCommand } from './lib/keys.js';
 import { snapshot } from './lib/snapshot.js';
 import { restore, verify } from './lib/restore.js';
 import { push, pull } from './lib/pushpull.js';
@@ -111,6 +111,7 @@ const VALUE_FLAGS = new Set([
   'domain',
   'chain',
   'plan',
+  'sss',
 ]);
 
 // Flags whose value can itself embed a credential (--pg's connection string carries a
@@ -134,6 +135,8 @@ const KNOWN_FLAG_NAMES: string[] = [
   'pg-table',
   'pg-exclude-table-data',
   'recipient',
+  'sss-out-dir',
+  'share',
   ...BOOL_FLAGS,
   ...VALUE_FLAGS,
 ].map((k) => k.replace(/_/g, '-'));
@@ -151,7 +154,14 @@ const POSITIONAL_COMMANDS = new Set(['schedule', 'wallet']);
 // out to a Set (rather than left as the four `a === '--dir'`-style literals below) so
 // isValueConsumingFlag() just below can recognize them too, without parseArgs()'s own
 // per-flag branches needing to change at all.
-const ARRAY_VALUE_FLAGS = new Set(['--dir', '--pg-table', '--pg-exclude-table-data', '--recipient']);
+const ARRAY_VALUE_FLAGS = new Set([
+  '--dir',
+  '--pg-table',
+  '--pg-exclude-table-data',
+  '--recipient',
+  '--sss-out-dir',
+  '--share',
+]);
 
 // Does `token` consume the argv slot right after it as a VALUE (as opposed to a
 // standalone bool flag, an unrecognized flag, or a bare positional)? Mirrors — but is
@@ -240,7 +250,13 @@ function parseArgs(argv: string[], cmd: string | undefined): CliOptions {
       o.pg_exclude_table_data.push(valueAt(++i, a));
     } else if (a === '--recipient')
       o.recipients.push(valueAt(++i, a)); // repeatable: key recovery
-    else if (a.startsWith('--')) {
+    else if (a === '--sss-out-dir') {
+      if (!o.sss_out_dir) o.sss_out_dir = [];
+      o.sss_out_dir.push(valueAt(++i, a)); // repeatable: one per SSS share (#207)
+    } else if (a === '--share') {
+      if (!o.sss_shares) o.sss_shares = [];
+      o.sss_shares.push(valueAt(++i, a)); // repeatable: sss-combine's input shares (#207)
+    } else if (a.startsWith('--')) {
       const key = a.slice(2).replace(/-/g, '_');
       // issue #253: an unrecognized/mistyped --flag used to be silently stored
       // on `o` and then just never read by any command — no error, just quiet
@@ -368,7 +384,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       --force, or drive the commands below by hand, to redo it) and requires a TTY
       on stdin (it is interactive, not automatable).
 
-  cypher-brain keygen [--passphrase] [--force] [--pq] | keygen --wrap-in-place | keygen --sign
+  cypher-brain keygen [--passphrase] [--force] [--pq] [--sss <m>-of-<n> --sss-out-dir <path> ...] | keygen --wrap-in-place | keygen --sign
       Create your age keypair: identity (PRIVATE) + recipient (PUBLIC).
       --passphrase wraps the identity at rest with a scrypt passphrase (prompted on the
       TTY); restore/verify then prompt for it. Identity = ${IDENTITY}
@@ -401,6 +417,38 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       they do to the age identity above, INCLUDING the --force backup (sign-identity.key
       backed up to "sign-identity.key.bak-<timestamp>-<random>", #786); --wrap-in-place
       does not (age-only).
+      --sss <m>-of-<n> (#207) ADDITIONALLY encrypts the identity (AES-256-GCM, a fresh
+      random key) and splits that key into <n> Shamir shares, any <m> of which
+      reconstruct it — a disaster-recovery mechanism alongside (never instead of) the
+      normal identity.age this command already writes. No single share reveals
+      anything about the identity, so no single lost or compromised location causes
+      total lockout, and it is still recoverable even if some locations are lost, as
+      long as <m> remain. Requires exactly <n> "--sss-out-dir <path>" flags (one per
+      share, each distinct from every other and from the identity/recipient paths;
+      there is no default policy or output location — both must always be explicit).
+      Encrypts the PLAIN identity, never a --passphrase-wrapped payload, so
+      reconstruction never also needs the passphrase. Works identically with --pq (an
+      identity is encrypted as opaque bytes; #205's hybrid keypairs need no special
+      handling) and composes with --recipient/multi-recipient backup keys (#99) — that
+      mechanism holds independent keypairs, this one splits a single keypair, so a
+      setup can use both. Reconstruct with "sss-combine" below.
+
+  cypher-brain sss-combine --share <path> --share <path> ... --out <path> [--force]
+      Reconstructs an age identity from >= threshold Shamir shares written by
+      "keygen --sss" (#207). Refuses (never writes a wrong-but-plausible identity) if:
+      fewer than 2 --share paths are given, the shares disagree on recipient/blob/
+      threshold (mixing shares from different "keygen --sss" runs), fewer shares are
+      given than the split's own threshold, the reconstructed key fails to
+      AES-GCM-authenticate the encrypted identity (a real cryptographic check, not a
+      heuristic — this is what closes the underlying Shamir library's own documented
+      gap that it does not verify reconstruction on its own), or the decrypted
+      identity's derived recipient does not match the recipient recorded on the
+      shares (catches a forged header on an otherwise-genuine, correctly-decrypting
+      set). --out is a normal identity file, usable with "restore --identity"/
+      "verify" exactly like any "keygen"-produced one, no special handling needed.
+      Refuses to overwrite an existing --out path unless --force. Confirm the printed
+      recipient matches what you expect, then verify it actually decrypts a real
+      snapshot (e.g. "verify --level drill") before relying on it.
 
   cypher-brain wallet create [--out <path>] [--force] [--chain arweave|ton]
       Generate a fresh signing credential. --chain arweave (default) generates an
@@ -1424,6 +1472,9 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
     { flag: 'backend', because: 'keygen never touches a storage backend' },
     { flag: 'json', because: 'keygen has no JSON success output — only the failure path is JSON-shaped' },
   ],
+  // sssCombineCommand() reads all three of its COMMAND_FLAGS entries (sss_shares, out,
+  // force) — nothing to declare irrelevant.
+  'sss-combine': [],
   // estimate.ts reads o.backend but never o.yes: pricing spends nothing, so there is no
   // consent to give.
   estimate: [
@@ -1640,7 +1691,18 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
   // wizard that asks for everything. Empty is the honest answer, and now a load-bearing
   // one: under the deny-list, `init --pq` was accepted and dropped.
   init: [],
-  keygen: ['passphrase', 'force', 'pq', 'wrap_in_place', 'sign', 'sign_identity', 'sign_recipient'],
+  keygen: [
+    'passphrase',
+    'force',
+    'pq',
+    'wrap_in_place',
+    'sign',
+    'sign_identity',
+    'sign_recipient',
+    'sss',
+    'sss_out_dir',
+  ],
+  'sss-combine': ['share', 'out', 'force'],
   snapshot: [
     'out',
     'dir',
@@ -1768,12 +1830,14 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
 // speaks ONE vocabulary (the flag as typed, in snake_case) across BOOL_FLAGS, VALUE_FLAGS
 // and these, which is also what COMMAND_FLAGS above is written in.
 const REPEATABLE_FLAG_FIELDS: ReadonlyArray<
-  readonly [string, 'dirs' | 'tables' | 'recipients' | 'pg_exclude_table_data']
+  readonly [string, 'dirs' | 'tables' | 'recipients' | 'pg_exclude_table_data' | 'sss_out_dir' | 'sss_shares']
 > = [
   ['dir', 'dirs'],
   ['pg_table', 'tables'],
   ['recipient', 'recipients'],
   ['pg_exclude_table_data', 'pg_exclude_table_data'],
+  ['sss_out_dir', 'sss_out_dir'],
+  ['share', 'sss_shares'],
 ];
 
 /** The flags this invocation actually set, in the same vocabulary. */
@@ -1955,6 +2019,8 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
     }
     case 'keygen':
       return keygen(o);
+    case 'sss-combine':
+      return sssCombineCommand(o);
     case 'snapshot':
       return snapshot(o);
     case 'restore':

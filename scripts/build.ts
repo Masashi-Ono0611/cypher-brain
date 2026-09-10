@@ -33,6 +33,13 @@
 //     just `init` itself), so leaving it external would break the same nodeps
 //     property `ignore` was inlined to preserve — an isolated dist/cli.mjs copy with no
 //     node_modules would fail to even start `pull`, not just `init`.
+//   - `shamir-secret-sharing` (#207's SSS threshold recovery) is the same shape again:
+//     zero-dependency and small, and imported at cli.ts -> keys.ts -> sss.ts's own top
+//     level (every command needs the chain resolvable, not just `keygen --sss`/
+//     `sss-combine`) — left external, an isolated dist/cli.mjs copy with no
+//     node_modules would fail to even start ANY command (caught by
+//     selftest-otel.mjs's own isolated-dir copy of dist/cli.mjs, the same nodeps shape
+//     selftest-arweave-nodeps.mjs's copy is for the arweave/turbo backends below).
 //   - the lazily-imported optional backends — `arweave` (optional peer) and
 //     `@ardrive/turbo-sdk` (optionalDependency since #363) — stay external:
 //     bundling them would break the documented "a gateway pull needs no npm
@@ -58,7 +65,13 @@ const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
   optionalDependencies?: Record<string, string>;
 };
 
-const INLINE = new Set(['age-encryption', '@modelcontextprotocol/sdk', 'ignore', '@clack/prompts']);
+const INLINE = new Set([
+  'age-encryption',
+  '@modelcontextprotocol/sdk',
+  'ignore',
+  '@clack/prompts',
+  'shamir-secret-sharing',
+]);
 
 const external = [
   ...Object.keys(pkg.dependencies ?? {}),

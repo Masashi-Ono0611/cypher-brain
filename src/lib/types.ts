@@ -30,6 +30,8 @@ export interface CliOptions {
   tables: string[];
   recipients: string[];
   pg_exclude_table_data?: string[]; // repeatable --pg-exclude-table-data <table>: passed through verbatim to pg_dump
+  sss_out_dir?: string[]; // repeatable keygen --sss-out-dir <path>: one per share, exactly N of them (#207)
+  sss_shares?: string[]; // repeatable sss-combine --share <path>: >= threshold share files to reconstruct from (#207)
 
   // boolean flags (BOOL_FLAGS in cli.ts) — absent when not passed
   force?: boolean;
@@ -87,6 +89,7 @@ export interface CliOptions {
   domain?: string; // publish-latest --domain <name>.ton: the operator's .ton domain to point at the latest ton bag
   chain?: string; // wallet create/address/balance --chain arweave|ton (default arweave, #396 PR2): which credential type wallet.ts operates on
   plan?: string; // push --plan <path.json>: re-validate a plan file written by "estimate --out" before proceeding (#231)
+  sss?: string; // keygen --sss <m>-of-<n>: Shamir threshold policy for a disaster-recovery share set (#207) — no default, always explicit
 }
 
 /**

@@ -9,6 +9,7 @@
         "@modelcontextprotocol/sdk": "^1.29.0",
         "age-encryption": "^0.3.0",
         "ignore": "^7.0.6",
+        "shamir-secret-sharing": "^0.0.4",
       },
       "devDependencies": {
         "@biomejs/biome": "^2.4.16",
@@ -27,6 +28,7 @@
         "@ardrive/turbo-sdk": "^1.42.0",
         "@opentelemetry/api": "^1.9.1",
         "@opentelemetry/exporter-trace-otlp-http": "^0.221.0",
+        "@opentelemetry/resources": "^2.10.0",
         "@opentelemetry/sdk-trace-base": "^2.10.0",
         "@opentelemetry/sdk-trace-node": "^2.10.0",
         "@ton/crypto": "^3.2.0",
@@ -1948,6 +1950,8 @@
     "setprototypeof": ["setprototypeof@1.2.0", "", {}, "sha512-E5LDX7Wrp85Kil5bhZv46j8jOeboKq5JMmYM3gVGdGH8xFpPWXUMsNrlODCrkoxMEeNi/XZIwuRvY4XNwYMJpw=="],
 
     "sha.js": ["sha.js@2.4.12", "", { "dependencies": { "inherits": "^2.0.4", "safe-buffer": "^5.2.1", "to-buffer": "^1.2.0" }, "bin": { "sha.js": "bin.js" } }, "sha512-8LzC5+bvI45BjpfXU8V5fdU2mfeKiQe1D1gIMn7XUlF3OTUrpdJpPPH4EMAnF0DsHHdSZqCdSss5qCmJKuiO3w=="],
+
+    "shamir-secret-sharing": ["shamir-secret-sharing@0.0.4", "", {}, "sha512-ui8u/cIg2j16b9on/LH3V/glL6wHdwiTo/Iajzqx0STniBvuOzl6VYUxhrow3waF0dggovJfYiBZSWfTAN4XLQ=="],
 
     "shebang-command": ["shebang-command@2.0.0", "", { "dependencies": { "shebang-regex": "^3.0.0" } }, "sha512-kHxr2zZpYtdmrN1qDjrrX/Z1rR1kG8Dx+gkpK1G4eXmvXswmcE1hTWBWYUzlraYw1/yZp6YuDY77YtvbN0dmDA=="],
 
