@@ -50,6 +50,18 @@ stderr is load-bearing, not decoration. If you run cypher-brain on a human's beh
   comes from the call. Relay the message to your human; it names the variable to set. The
   CLI `snapshot` has no such gate.
 
+## Cumulative spend caps
+
+Paid pushes can additionally be bounded by `CYPHER_BRAIN_MAX_SPEND_DAILY` /
+`CYPHER_BRAIN_MAX_SPEND_MONTHLY` (shared arweave/turbo native units) and independent
+`CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY` /
+`CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY` (nanoTON). Each uses UTC calendar
+windows; 0/unset disables it. A positive matching per-push cap is required as the
+reservation upper bound. This is single-machine admission against a shared local
+receipt ledger; open/uncertain reservations keep counting until resolved. See
+MANAGEMENT.md for configuration and recovery. No new MCP tool is needed.
+
+
 ## Key concepts
 
 - **identity** (private key) — the only thing that can decrypt. Lives off the
