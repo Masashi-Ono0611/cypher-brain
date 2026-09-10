@@ -1437,7 +1437,17 @@ async function restoreImpl(
       if (sigCheck.status === 'verified') {
         console.log(`[PASS] minisign authenticity signature verified (${o.in}.minisig)`);
       } else if (o.require_signature) {
-        throw new Error(`refusing to restore ${o.in}: --require-signature was given but ${sigCheck.reason}`);
+        // #902 dogfooding: `o.require_signature` is true either from an explicit
+        // --require-signature OR from CYPHER_BRAIN_REQUIRE_SIGNATURE=1's default (cli.ts's
+        // `o.require_signature ?? REQUIRE_SIGNATURE`) — the old wording claimed the flag
+        // was passed even on the latter path, which is simply false and left an operator
+        // hunting for a flag that was never on their command line. Name both possible
+        // sources and the actual escape hatch instead.
+        throw new Error(
+          `refusing to restore ${o.in}: a signature is required (--require-signature, or ` +
+            `CYPHER_BRAIN_REQUIRE_SIGNATURE=1) but ${sigCheck.reason} — pass --no-require-signature ` +
+            'to accept a known unsigned/legacy artifact',
+        );
       } else {
         console.error(`warning: ${sigCheck.reason}`);
       }
