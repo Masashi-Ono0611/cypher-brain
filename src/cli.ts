@@ -42,6 +42,7 @@ import { keygen, sssSplitCommand, sssCombineCommand } from './lib/keys.js';
 import { snapshot } from './lib/snapshot.js';
 import { restore, verify } from './lib/restore.js';
 import { push, pull } from './lib/pushpull.js';
+import { pushStatus } from './lib/push-status.js';
 import { publishLatest } from './lib/ton-dns.js';
 import { schedule } from './lib/schedule.js';
 import { wallet } from './lib/wallet.js';
@@ -1048,6 +1049,21 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       LATER --skip-unchanged run) requires --save-locator, so passing --digest without
       it is refused up front rather than silently doing nothing (#723).
 
+  cypher-brain push-status --locator <data-item-id> [--json]
+      Look up Turbo's own self-reported upload-processing status, on demand.
+      Use the same data-item id printed by push --backend turbo. No wallet or SDK
+      required. The locator alone cannot identify its backend: any usable locator
+      is tried against Turbo, including one that was never a Turbo upload.
+      Prints the raw status with a caveat: this is NOT independent Arweave-network
+      confirmation. Even "CONFIRMED" is Turbo's report; its exact meaning is not
+      fully documented. No containing L1 transaction or confirmation count is checked.
+      --json prints {found, status, raw}, preserving Turbo's full parsed JSON body;
+      a genuine "TX doesn't exist" 404 prints {found:false} (optional fields omitted).
+      Exit 0 means the lookup succeeded, including not found; lookup failures
+      (network/timeout, HTTP errors, malformed responses) exit 1 with status unknown.
+      Missing/invalid --locator exits 2. No automatic reconciliation, background
+      polling, per-push check, or persistent status file; this command looks up once.
+
   cypher-brain estimate --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--json] [--out <path.json>] [--remote <name>:<path>] [--force]
       Read-only preview: print what pushing --in to --backend would cost WITHOUT
       uploading anything. turbo/arweave show the native unit (winc/winston) plus
@@ -1333,6 +1349,7 @@ Env: CYPHER_BRAIN_HOME (default ~/.cypher-brain; an existing ~/.cipher-brain is 
 Storage: CYPHER_BRAIN_RECEIPT_LEDGER (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl — every arweave/turbo/ton-provider push that actually spent and finished recording it writes a RECEIPT here, #232; see 'ledger' above, and 'doctor's receipt-ledger-readability check, #456. A push whose outcome is UNCERTAIN (CB-E027), or that was killed after confirming a ton-provider spend but before the receipt reached disk, may have spent without one yet — see the pending-spends sidecar below for the ton-provider case. A '<ledger-name>.pending-spends.jsonl' sidecar is kept beside it (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl.pending-spends.jsonl): a ton-provider deploy records its contract address, provider and amount there BEFORE broadcasting and settles it once the receipt is on disk, so a spend confirmed by a run that then died is recovered by the next push instead of vanishing from the ledger — #808; see 'doctor's pending-spend-intents check).
          CYPHER_BRAIN_AUDIT_LOG (default $CYPHER_BRAIN_HOME/audit-log.jsonl — hash-chained record of every push/restore/verify run, #226; see 'audit' above, and 'doctor's audit-chain-integrity check, #456).
          CYPHER_BRAIN_FILE_DIR (file);
+         CYPHER_BRAIN_TURBO_STATUS_URL (push-status endpoint base; default https://upload.ardrive.io/v1/tx; queried as <base>/<data-item-id>/status with CYPHER_BRAIN_AR_HTTP_TIMEOUT in ms, default 60000);
          CYPHER_BRAIN_AR_{HOST,PORT,PROTOCOL,WALLET,GATEWAY,GATEWAYS,HTTP_TIMEOUT,USD_RATE_URL,TURBO_RATES_URL,BALANCE_URL,L1_MAX} (arweave; CYPHER_BRAIN_AR_WALLET is a path to a JWK key file — 'cypher-brain wallet create' generates one, 'wallet address' shows what to fund; when unset, push/estimate's payer resolution and 'wallet address'/'balance' all fall back to $CYPHER_BRAIN_HOME/wallet.json (the default 'wallet create' path, #472) — only required when the wallet lives somewhere else; the 'arweave' npm package is needed only to PUSH or for the rare L1 chunk fallback — a gateway pull needs none; the approximate-USD lines price each backend in its own truthful unit: the raw arweave L1 backend at AR SPOT (CYPHER_BRAIN_AR_USD_RATE_URL — the spend is real AR at market value), the turbo backend and 'wallet balance' at Turbo's own credit rate, fees included (CYPHER_BRAIN_AR_TURBO_RATES_URL — a turbo upload spends credits, and credits sell at Turbo's price, not AR spot; pricing them at spot understated a real push's cost by ~35%), falling back to labeled AR spot only when that price sheet is unavailable or unusable; a dead rate endpoint just omits the USD line, it never blocks a push; CYPHER_BRAIN_AR_BALANCE_URL overrides the payment-service account endpoint 'wallet balance' queries as '<url>?address=<addr>'; CYPHER_BRAIN_AR_L1_MAX overrides the raw-arweave-L1 backend's max single-tx size in bytes (default 10485760 ≈ 10 MiB — push/estimate refuse a larger raw-L1 tx and suggest --backend turbo instead, unless this is raised); 'schedule install' bakes the value in effect at install time into the generated nightly runner, same as the other AR_* settings);
          turbo: CYPHER_BRAIN_AR_WALLET (JWK signer) + optional CYPHER_BRAIN_AR_PAID_BY (an address sharing Turbo Credits to that signer); needs '@ardrive/turbo-sdk' to PUSH (a pull reuses the arweave gateway read, no SDK). Funding/credit-share details: docs/arweave-upload-runbook.md.
          rclone: CYPHER_BRAIN_RCLONE_BIN (path to the rclone binary; default 'rclone' on PATH) — the remote itself is whatever --remote <name>:<path> names in your own 'rclone config'.
@@ -1502,6 +1519,7 @@ interface FlagIrrelevance {
 }
 
 const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
+  'push-status': [],
   witness: [],
   // restore's destination is --out-dir; src/lib/restore.ts's restore() never reads o.out.
   // The single highest-traffic instance, since --out means the output on snapshot, pull and
@@ -1827,6 +1845,7 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     'wallet',
   ],
   pull: ['out', 'locator', 'backend', 'remote', 'from_locator_file', 'wait', 'sha256', 'sig_locator', 'force'],
+  'push-status': ['locator', 'json'],
   estimate: ['in', 'backend', 'json', 'out', 'remote', 'force', 'wallet'],
   'publish-latest': ['domain', 'from_locator_file', 'yes', 'wait'],
   'recovery-kit': [
@@ -2143,6 +2162,8 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
     }
     case 'pull':
       return pull(o);
+    case 'push-status':
+      return pushStatus(o);
     case 'publish-latest':
       return publishLatest(o);
     case 'recovery-kit':

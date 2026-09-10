@@ -50,6 +50,18 @@ stderr is load-bearing, not decoration. If you run cypher-brain on a human's beh
   comes from the call. Relay the message to your human; it names the variable to set. The
   CLI `snapshot` has no such gate.
 
+## Turbo upload status (CLI only)
+
+`push-status --locator <data-item-id> [--json]` performs one manual public lookup
+of Turbo's own upload-processing status, using the locator returned by a Turbo
+push. Even `CONFIRMED` is self-reported, not independent Arweave L1 finality;
+resolving/checking the containing L1 transaction is outside this command.
+No automatic reconciliation, background polling, or persistent status file.
+JSON is `{found:true,status,raw}` or `{found:false}` for Turbo's genuine missing-item
+404. Both exit 0. Lookup failures report status unknown and exit 1; bad input exits 2.
+A locator cannot prove its backend; other backends' locators are also tried against
+Turbo. No wallet or SDK needed. See MANAGEMENT.md for endpoint/timeout overrides.
+
 ## Cumulative spend caps
 
 Paid pushes can additionally be bounded by `CYPHER_BRAIN_MAX_SPEND_DAILY` /

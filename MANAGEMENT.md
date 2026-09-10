@@ -658,6 +658,42 @@ so a verification cron wires its own dead man's switch the same way that runner 
 bakes into the nightly runner — `verify` does not implement it itself, so the cron line
 pipes to a tool that does, or you wire your own healthcheck around it.)
 
+### On-demand Turbo upload status
+
+A successful Turbo push means its upload service accepted the data item. To read
+what Turbo reports about that item now, use the same locator printed by push:
+
+```sh
+cypher-brain push-status --locator <data-item-id>
+cypher-brain push-status --locator <data-item-id> --json
+```
+
+This is **Turbo's own self-reported upload-processing status**, not independent
+Arweave L1 finality. The exact meaning of `CONFIRMED` and other status strings is
+not fully documented; the command preserves them verbatim. A stronger guarantee
+would require resolving the containing L1 transaction and checking its network
+confirmations separately, which this command does not do. Use `verify --level
+remote` for a separate check of retrievability and ciphertext integrity.
+
+This CLI-only command performs one manual lookup. There is no automatic
+reconciliation, background polling, per-push status check, or persistent lifecycle
+state file. No wallet credentials or Turbo SDK are needed. The locator string
+cannot establish which backend created it: a usable locator is always tried
+against Turbo, even if it originated from arweave L1, file, rclone, or TON.
+
+JSON success is `{found:true,status,raw}`, with the full parsed response in `raw`.
+A genuine HTTP 404 with Turbo's `{"error":"TX doesn't exist"}` body returns
+`{found:false}`: not found yet, or wrong id. Both exit 0; neither is a claim of
+settlement or failure of the upload. Network errors, timeouts, other HTTP errors,
+unexpected 404 bodies, and malformed responses exit 1 with status unknown (the
+standard `{error,code,exit_code}` object under `--json`). Missing or invalid
+`--locator` exits 2.
+
+`CYPHER_BRAIN_TURBO_STATUS_URL` overrides the endpoint base (default
+`https://upload.ardrive.io/v1/tx`); the request appends `/<data-item-id>/status`.
+`CYPHER_BRAIN_AR_HTTP_TIMEOUT` bounds the request and body read in milliseconds
+(default 60000). These settings also work in `config.env`.
+
 ### Manual application-level drill (beyond `verify --level drill`)
 
 `verify --level drill` proves the archive extracts — it never runs `pg_restore` or

@@ -47,6 +47,7 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_AR_HTTP_TIMEOUT',
   'CYPHER_BRAIN_AR_USD_RATE_URL',
   'CYPHER_BRAIN_AR_TURBO_RATES_URL', // #343: Turbo's credit price sheet (fiat per GiB) — turbo-backend USD lines price with this, not AR spot
+  'CYPHER_BRAIN_TURBO_STATUS_URL',
   'CYPHER_BRAIN_AR_BALANCE_URL',
   'CYPHER_BRAIN_AR_L1_MAX',
   'CYPHER_BRAIN_TON_SSH_HOST',
@@ -920,6 +921,8 @@ export const AR_USD_RATE_URL = readEnv('CYPHER_BRAIN_AR_USD_RATE_URL') || 'https
 // understated the observed real cost by ~35%: turbo spends credits, and credits sell at
 // Turbo's rate, not at AR spot. Same #170 posture: plain unauthenticated GET, no SDK.
 export const AR_TURBO_RATES_URL = readEnv('CYPHER_BRAIN_AR_TURBO_RATES_URL') || 'https://payment.ardrive.io/v1/rates';
+// Public upload-processing status, queried on demand as <base>/<data-item-id>/status.
+export const TURBO_STATUS_URL = readEnv('CYPHER_BRAIN_TURBO_STATUS_URL') || 'https://upload.ardrive.io/v1/tx';
 // Public, unauthenticated account-balance endpoint on the same payment service, queried
 // as `<url>?address=<addr>` (#345). Same #170 reasoning as the rate URL above: the SDK
 // exposes this as turbo.getBalance(), but it is a plain GET keyed on a PUBLIC address —

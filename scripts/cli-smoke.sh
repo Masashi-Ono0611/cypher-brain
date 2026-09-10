@@ -347,7 +347,7 @@ grep -Fq "cypher-brain <command> --help" "$TMP/unknown-cmd.err" \
 # reordering HELP's sections is not a false failure; `\b` is avoided since word-boundary
 # support differs between GNU and BSD grep (multi-model review finding).
 LISTED=$(sed -n 's/^valid commands: //p' "$TMP/unknown-cmd.err" | tr ',' '\n' | tr -d ' ' | sort | tr '\n' ' ')
-EXPECTED=$(printf '%s\n' init keygen sss-split sss-combine wallet snapshot restore verify push pull publish-latest estimate recovery-kit schedule doctor ledger audit witness | sort | tr '\n' ' ')
+EXPECTED=$(printf '%s\n' init keygen sss-split sss-combine wallet snapshot restore verify push push-status pull publish-latest estimate recovery-kit schedule doctor ledger audit witness | sort | tr '\n' ' ')
 [ "$LISTED" = "$EXPECTED" ] \
   || { echo "[FAIL] valid-commands list is [$LISTED], expected [$EXPECTED]"; cat "$TMP/unknown-cmd.err"; exit 1; }
 UNKNOWN_LINES=$(wc -l < "$TMP/unknown-cmd.err" | tr -d ' ')
@@ -780,7 +780,9 @@ node -e "
     const argv = key.split(' ');
     for (const f of flags) {
       argv.push('--' + f.replace(/_/g, '-'));
-      if (!bools.has(f)) argv.push('$TMP/probe-' + f.replace(/_/g, '-'));
+      // push-status has no local file precheck: a dot segment is invalid input,
+      // so this flag-acceptance probe stays offline too (#905).
+      if (!bools.has(f)) argv.push(key === 'push-status' && f === 'locator' ? '..' : '$TMP/probe-' + f.replace(/_/g, '-'));
     }
     probes.push(argv.join('\t'));
   }
