@@ -15,7 +15,8 @@ exercised by `npm run selftest:recovery` (gated in CI).
 ## Key recovery — "losing the identity *or the locator* must not lose the brain"
 
 Recovery needs **two** things, and both can be lost. The private `identity.age` is the
-only thing that can *decrypt* — lose it and every snapshot is permanently unreadable.
+only thing that can *decrypt* — if you lose it, you need a backup identity or enough
+SSS shares to recover access.
 But the **locator** (which tx id / store path holds the latest ciphertext) is
 the only thing that tells a fresh machine *where to fetch from* — and today the full
 record of locators is a local `index.tsv` on the always-on box. If that box dies, an
@@ -92,13 +93,22 @@ then, it is the ONLY thing that can still `restore --identity <that backup>` a s
 taken before that `--force` run — do not delete it while any such snapshot is still
 something you might need.
 
-> **M-of-N (Shamir) split** — `sss-split --sss <m>-of-<n> --sss-out-dir <path> ...
-> [--identity <path>]` adds recovery shares to an existing identity without changing
-> either key file. Supply exactly *N* distinct, unused file paths in existing
-> directories, and keep the shares at separate physical locations. A protected
-> identity prompts for its passphrase; any *M* shares recover the plain identity
-> with `sss-combine --share <path> ... --out <path>` without that passphrase.
-> For a fresh keypair, `keygen --sss` creates compatible shares during generation.
+> **M-of-N (Shamir) recovery (built in)** — `keygen --sss <m>-of-<n>` writes
+> *N* shares alongside a freshly generated identity; `sss-split --sss <m>-of-<n>
+> --sss-out-dir <path> ... [--identity <path>]` adds recovery shares to an
+> **existing** identity instead, without changing either key file (a protected
+> identity prompts for its passphrase). Either way, pass exactly *N*
+> `--sss-out-dir <file-path>` flags — one full file path per share, in an
+> existing directory — and keep each share at a separate physical location.
+> Preserve every line, including those starting with `#`: the headers contain
+> required recovery data. Reconstruct with `sss-combine --share <path> --share
+> <path> ... --out <identity>` using at least *M* distinct shares. The
+> recovered identity is **not passphrase-protected**, even if the original
+> was. Check it with `verify --in <snapshot> --identity <identity>` before
+> relying on recovery. If `keygen --sss` writing shares fails partway, missing
+> shares cannot be regenerated alone: `keygen --force` creates a new identity
+> and a complete new share set. Keep the old identity for existing snapshots,
+> replace all distributed shares, and never mix shares from different runs.
 
 ### 3. Retain the latest locator off-box (built in)
 
@@ -793,4 +803,4 @@ hash) on every restore.
 | Post-quantum hybrid keypair (`keygen --pq`, ML-KEM-768 + X25519 — mitigates harvest-now-decrypt-later, see README Threat model) | **available** — `selftest:pq` (CI); combines with a plain-X25519 backup key and `CYPHER_BRAIN_PIN_RECIPIENTS`, but the recipient/ciphertext are much bigger than plain X25519 |
 | Authenticity signing (`keygen --sign`, a minisign-compatible Ed25519 detached signature over each `*.age` — mitigates age's lack of authenticity, see README Threat model #214) | **available** — `selftest:minisign` (CI, in-process round trip always; real `minisign` binary interop when it's on PATH); optional and additive — an unsigned artifact restores exactly as before |
 | Nightly cadence (`schedule install / status / uninstall`: generated runner + launchd/cron trigger, paid backends refused without a spend cap, end-to-end run of the generated runner) | **proven** — `selftest:schedule` (CI) |
-| Identity off-box backup, Shamir M-of-N | **available / recommended** — `keygen --sss` or `sss-split` for existing keys; `sss-combine` recovers; keep shares off-box at separate locations (`selftest:sss` in CI) |
+| Identity off-box backup, Shamir M-of-N | **available / recommended** — `keygen --sss` or `sss-split` for existing keys; `sss-combine` recovers; round-trip proven in `selftest:sss` (CI); physical separation and off-box retention are operator responsibilities |

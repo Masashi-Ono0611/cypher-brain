@@ -48,8 +48,8 @@ Arweave via the **`turbo`** backend is the recommended mainline; a local
   (gbrain, Claude Code memory, an Obsidian vault, a ChatGPT export) client-side and
   park it durably. See [`--profile`](#usage) for the sources it knows about.
 - Not a key management service — there is no server holding your keys. The
-  identity file is yours to keep offline; lose it and the snapshots are
-  unrecoverable (see Threat model below).
+  identity file is yours to keep offline; recovery after losing it requires a
+  backup identity or enough SSS shares (see Threat model below).
 - Not gbrain itself — gbrain is the second-brain product (`~/.gbrain`, on PGLite
   or Postgres) that produces the plaintext. cypher-brain only ever touches it
   long enough to encrypt.
@@ -67,7 +67,8 @@ format stays byte-compatible with it (CI asserts both directions, including
 scrypt passphrase wrapping):
 
 - **identity** (private key) — lives off your always-on machine; the *only* thing
-  that can decrypt. Lose it and the snapshots are unrecoverable.
+  that can decrypt. If you lose it, you need a backup identity or enough SSS
+  shares to recover access.
 - **recipient** (public key) — all the snapshotting machine needs.
 
 So the always-on box that runs gbrain (e.g. a Mac mini) holds **only the public
@@ -689,7 +690,7 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       "verify" exactly like any "keygen"-produced one, no special handling needed.
       Refuses to overwrite an existing --out path unless --force. Confirm the printed
       recipient matches what you expect, then verify it actually decrypts a real
-      snapshot (e.g. "verify --level drill") before relying on it.
+      snapshot (e.g. "verify --in <snapshot> --identity <path>") before relying on it.
 
   cypher-brain wallet create [--out <path>] [--force] [--chain arweave|ton]
       Generate a fresh signing credential. --chain arweave (default) generates an

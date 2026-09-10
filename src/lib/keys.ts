@@ -1,5 +1,5 @@
 // keygen + identity/recipient helpers.
-import { mkdir, open, rename, rm, chmod, readFile, type FileHandle } from 'node:fs/promises';
+import { mkdir, open, rename, rm, chmod, readFile, stat, type FileHandle } from 'node:fs/promises';
 import { constants as FS_CONST } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
@@ -344,9 +344,13 @@ export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
         );
       seen.add(resolve(p));
     }
-    if (!opts.force) {
-      for (const p of opts.sss.outPaths) {
-        if (await exists(p))
+    for (const p of opts.sss.outPaths) {
+      if (await exists(p)) {
+        if ((await stat(p)).isDirectory())
+          throw new Error(
+            `${p} is a directory. --sss-out-dir requires each share's full file path, e.g. ${resolve(p, 'share-1.txt')}.`,
+          );
+        if (!opts.force)
           throw new Error(
             `SSS share path already exists at ${p} (refusing to overwrite). Pass --force, or pick a different path.`,
           );
@@ -427,7 +431,10 @@ export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
       throw new Error(
         `identity and recipient were written successfully, but writing SSS shares failed partway ` +
           `(${written.length} of ${opts.sss.outPaths.length} written: ${written.join(', ') || '(none)'}) — ${errMsg(e)}. ` +
-          `Your identity is intact; retry the missing shares by hand, or rerun "keygen --force" with the same --sss.`,
+          `Your identity is intact. Share regeneration is all-or-nothing; missing shares cannot be recreated individually. ` +
+          `After fixing the output paths, rerun "keygen --force" with the same --sss policy and all --sss-out-dir paths ` +
+          `to generate a NEW identity and a complete NEW share set. Keep the current identity for existing snapshots, ` +
+          `and replace all distributed shares with the new set; do not mix shares from different runs.`,
       );
     }
     sssShares = written;
@@ -654,8 +661,13 @@ export async function keygen(o: CliOptions): Promise<void> {
       `Any ${threshold} of these ${shares} reconstruct the identity via ` +
         `"sss-combine --share <path> ... --out <path>" — no single share reveals anything about it.`,
     );
+    console.log(
+      `\n⚠  If you lose the identity file, any ${threshold} of these ${shares} shares still recover it — ` +
+        `losing the identity AND enough shares to fall below ${threshold} remaining means neither path works.`,
+    );
+  } else {
+    console.log('\n⚠  Back up the identity file now. If you lose it, the snapshots are unrecoverable.');
   }
-  console.log('\n⚠  Back up the identity file now. If you lose it, the snapshots are unrecoverable.');
 }
 
 // Share the CLI policy/count/collision checks with keygen. keygenAt() retains its
@@ -759,11 +771,11 @@ export async function sssCombineCommand(o: CliOptions): Promise<void> {
   );
   const { identity, recipient } = await combineShares(inputs);
   await writeKeyFile(out, identityFileText(identity, recipient), 0o600, !!o.force);
-  console.log(`reconstructed identity written to: ${out}`);
+  console.log(`reconstructed identity (PRIVATE, keep offline, NOT passphrase-protected) written to: ${out}`);
   console.log(`recipient = ${recipient}`);
   console.log(
     '\nVerify this matches the recipient you expect before relying on it, and confirm it decrypts a real ' +
-      'snapshot (e.g. "verify --level drill") before treating the original identity as recoverable.',
+      'snapshot (e.g. "verify --in <snapshot> --identity <path>") before treating the original identity as recoverable.',
   );
 }
 

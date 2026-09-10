@@ -461,7 +461,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       "verify" exactly like any "keygen"-produced one, no special handling needed.
       Refuses to overwrite an existing --out path unless --force. Confirm the printed
       recipient matches what you expect, then verify it actually decrypts a real
-      snapshot (e.g. "verify --level drill") before relying on it.
+      snapshot (e.g. "verify --in <snapshot> --identity <path>") before relying on it.
 
   cypher-brain wallet create [--out <path>] [--force] [--chain arweave|ton]
       Generate a fresh signing credential. --chain arweave (default) generates an

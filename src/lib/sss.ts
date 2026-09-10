@@ -123,6 +123,9 @@ export async function splitIdentity(identity: string, recipient: string, policy:
   return rawShares.map((raw, i) =>
     [
       SHARE_MAGIC,
+      '# Keep every line of this file unchanged, including lines starting with #; they contain required recovery data.',
+      '# Recover: cypher-brain sss-combine --share <share-1.txt> --share <share-2.txt> ... --out <identity.age>',
+      `# Supply at least ${policy.threshold} distinct shares from this split.`,
       `# threshold: ${policy.threshold}`,
       `# shares: ${policy.shares}`,
       `# label: ${i + 1} of ${policy.shares}`,
@@ -222,10 +225,11 @@ export async function combineShares(inputs: readonly ShareInput[]): Promise<{ id
   let key: Uint8Array;
   try {
     key = await sssCombine(parsed.map((p) => p.share.keyFragment));
-  } catch {
-    // Deliberately a FIXED message, not errMsg(e) — the underlying library's own
-    // errors here (e.g. "shares must contain unique values") never quote share
-    // content, but keeping this fixed removes any dependency on that staying true.
+  } catch (e) {
+    // Classify only the known structural duplicate error. Both messages stay fixed:
+    // never forward a library error that could contain secret share material.
+    if (e instanceof Error && e.message.includes('duplicate'))
+      throw new Error('the same share was supplied more than once — provide distinct shares from the same split');
     throw new Error('key reconstruction failed — one or more shares may be corrupt');
   }
   const blob = decodeStrictBase64(first.share.blob, 'blob', first.sourceLabel);
