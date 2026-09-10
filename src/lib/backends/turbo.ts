@@ -7,7 +7,15 @@
 import { stat, readFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { resolve } from 'node:path';
-import { AR_WALLET, AR_PAID_BY, AR_MAX_SPEND, SKIP_FUNDS_CHECK } from '../config.js';
+import {
+  AR_WALLET,
+  AR_PAID_BY,
+  AR_MAX_SPEND,
+  SKIP_FUNDS_CHECK,
+  AR_HTTP_TIMEOUT_MS,
+  TURBO_STATUS_URL,
+} from '../config.js';
+import { UsageError } from '../errors.js';
 import {
   warnIfLooseKeyPerms,
   fmtBytes,
@@ -32,6 +40,44 @@ import {
 import { remainingSpendBudget, chargeSpendTracker, spentSoFar, budgetExhaustedMessage } from '../spend-tracker.js';
 import { PushUncertainSpendError } from '../push-uncertain-spend.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
+
+export interface TurboUploadStatus {
+  found: boolean; // false only for Turbo's genuine "TX doesn't exist" 404
+  status?: string; // Turbo's raw upload-processing status, verbatim
+  raw?: unknown; // full parsed JSON response, verbatim
+}
+
+// One public, unauthenticated lookup of Turbo's own upload-processing report.
+// Unknown status strings are preserved; unavailable/malformed answers throw.
+export async function checkTurboUploadStatus(dataItemId: string): Promise<TurboUploadStatus> {
+  // Do not infer the backend from the id. Encode it as one path segment, even for
+  // another backend's locator; only unusable input is refused before the lookup.
+  if (typeof dataItemId !== 'string' || !dataItemId.trim() || /\s/.test(dataItemId) || /^\.{1,2}$/.test(dataItemId)) {
+    throw new UsageError('--locator <data-item-id> must be a non-empty identifier without whitespace or dot segments');
+  }
+  try {
+    const res = await fetch(`${TURBO_STATUS_URL.replace(/\/+$/, '')}/${encodeURIComponent(dataItemId)}/status`, {
+      signal: AbortSignal.timeout(AR_HTTP_TIMEOUT_MS),
+    });
+    if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
+    const raw: unknown = await res.json();
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new Error(`malformed response (HTTP ${res.status}): expected a JSON object`);
+    }
+    if (res.status === 404) {
+      // A proxy/router 404 is not evidence about this item. Require the service's
+      // missing-item error, checking the shape rather than assuming it exists.
+      if ('error' in raw && raw.error === "TX doesn't exist") return { found: false };
+      throw new Error('unexpected HTTP 404 response: missing Turbo "TX doesn\'t exist" error');
+    }
+    if (!('status' in raw) || typeof raw.status !== 'string' || !raw.status.trim()) {
+      throw new Error('malformed response: expected a non-empty status string');
+    }
+    return { found: true, status: raw.status, raw };
+  } catch (e) {
+    throw new Error(`Turbo upload status lookup failed; status unknown: ${errMsg(e)}`);
+  }
+}
 
 export function turboBackend(): StorageBackend {
   return {

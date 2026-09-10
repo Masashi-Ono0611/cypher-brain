@@ -304,8 +304,10 @@ configure both.
 ### There is no delete
 
 cypher-brain has no `forget`, `prune` or `delete` command, and will not grow one
-(#301). Once a snapshot is pushed to `arweave`/`turbo` it is parked permanently, and
-destroying your identity is not an escape hatch either: the backup recipient this
+(#301). Treat snapshots sent to `arweave`/`turbo` as permanent once stored. A
+successful Turbo push establishes upload-service acceptance; `push-status` exposes
+Turbo's own subsequent report, without independently checking Arweave L1 finality.
+Destroying your identity is not an escape hatch either: the backup recipient this
 project tells you to keep — and the printable recovery kit, if it carries one — still
 decrypts everything. **Recoverability was chosen over erasability, deliberately.** A
 per-snapshot key would buy [cryptographic erase](https://csrc.nist.gov/pubs/sp/800/88/r2/final)
@@ -526,6 +528,7 @@ cypher-brain wallet address                # prints the address — fund THIS on
                                             # see docs/arweave-upload-runbook.md), then push:
 TX=$(CYPHER_BRAIN_AR_WALLET=~/.cypher-brain/wallet.json \
   cypher-brain push --in brain-2026-06-27.age --backend turbo --yes)  # prints the locator (tx id)
+cypher-brain push-status --locator "$TX"  # Turbo's own report; not independent L1 confirmation
 cypher-brain pull --locator "$TX" --backend turbo --out got.age \
   --wait 1200    # fetch it back, anywhere (a fresh upload takes minutes to hit gateways)
 
@@ -1337,6 +1340,21 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       LATER --skip-unchanged run) requires --save-locator, so passing --digest without
       it is refused up front rather than silently doing nothing (#723).
 
+  cypher-brain push-status --locator <data-item-id> [--json]
+      Look up Turbo's own self-reported upload-processing status, on demand.
+      Use the same data-item id printed by push --backend turbo. No wallet or SDK
+      required. The locator alone cannot identify its backend: any usable locator
+      is tried against Turbo, including one that was never a Turbo upload.
+      Prints the raw status with a caveat: this is NOT independent Arweave-network
+      confirmation. Even "CONFIRMED" is Turbo's report; its exact meaning is not
+      fully documented. No containing L1 transaction or confirmation count is checked.
+      --json prints {found, status, raw}, preserving Turbo's full parsed JSON body;
+      a genuine "TX doesn't exist" 404 prints {found:false} (optional fields omitted).
+      Exit 0 means the lookup succeeded, including not found; lookup failures
+      (network/timeout, HTTP errors, malformed responses) exit 1 with status unknown.
+      Missing/invalid --locator exits 2. No automatic reconciliation, background
+      polling, per-push check, or persistent status file; this command looks up once.
+
   cypher-brain estimate --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--json] [--out <path.json>] [--remote <name>:<path>] [--force]
       Read-only preview: print what pushing --in to --backend would cost WITHOUT
       uploading anything. turbo/arweave show the native unit (winc/winston) plus
@@ -1622,6 +1640,7 @@ Env: CYPHER_BRAIN_HOME (default ~/.cypher-brain; an existing ~/.cipher-brain is 
 Storage: CYPHER_BRAIN_RECEIPT_LEDGER (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl — every arweave/turbo/ton-provider push that actually spent and finished recording it writes a RECEIPT here, #232; see 'ledger' above, and 'doctor's receipt-ledger-readability check, #456. A push whose outcome is UNCERTAIN (CB-E027), or that was killed after confirming a ton-provider spend but before the receipt reached disk, may have spent without one yet — see the pending-spends sidecar below for the ton-provider case. A '<ledger-name>.pending-spends.jsonl' sidecar is kept beside it (default $CYPHER_BRAIN_HOME/receipt-ledger.jsonl.pending-spends.jsonl): a ton-provider deploy records its contract address, provider and amount there BEFORE broadcasting and settles it once the receipt is on disk, so a spend confirmed by a run that then died is recovered by the next push instead of vanishing from the ledger — #808; see 'doctor's pending-spend-intents check).
          CYPHER_BRAIN_AUDIT_LOG (default $CYPHER_BRAIN_HOME/audit-log.jsonl — hash-chained record of every push/restore/verify run, #226; see 'audit' above, and 'doctor's audit-chain-integrity check, #456).
          CYPHER_BRAIN_FILE_DIR (file);
+         CYPHER_BRAIN_TURBO_STATUS_URL (push-status endpoint base; default https://upload.ardrive.io/v1/tx; queried as <base>/<data-item-id>/status with CYPHER_BRAIN_AR_HTTP_TIMEOUT in ms, default 60000);
          CYPHER_BRAIN_AR_{HOST,PORT,PROTOCOL,WALLET,GATEWAY,GATEWAYS,HTTP_TIMEOUT,USD_RATE_URL,TURBO_RATES_URL,BALANCE_URL,L1_MAX} (arweave; CYPHER_BRAIN_AR_WALLET is a path to a JWK key file — 'cypher-brain wallet create' generates one, 'wallet address' shows what to fund; when unset, push/estimate's payer resolution and 'wallet address'/'balance' all fall back to $CYPHER_BRAIN_HOME/wallet.json (the default 'wallet create' path, #472) — only required when the wallet lives somewhere else; the 'arweave' npm package is needed only to PUSH or for the rare L1 chunk fallback — a gateway pull needs none; the approximate-USD lines price each backend in its own truthful unit: the raw arweave L1 backend at AR SPOT (CYPHER_BRAIN_AR_USD_RATE_URL — the spend is real AR at market value), the turbo backend and 'wallet balance' at Turbo's own credit rate, fees included (CYPHER_BRAIN_AR_TURBO_RATES_URL — a turbo upload spends credits, and credits sell at Turbo's price, not AR spot; pricing them at spot understated a real push's cost by ~35%), falling back to labeled AR spot only when that price sheet is unavailable or unusable; a dead rate endpoint just omits the USD line, it never blocks a push; CYPHER_BRAIN_AR_BALANCE_URL overrides the payment-service account endpoint 'wallet balance' queries as '<url>?address=<addr>'; CYPHER_BRAIN_AR_L1_MAX overrides the raw-arweave-L1 backend's max single-tx size in bytes (default 10485760 ≈ 10 MiB — push/estimate refuse a larger raw-L1 tx and suggest --backend turbo instead, unless this is raised); 'schedule install' bakes the value in effect at install time into the generated nightly runner, same as the other AR_* settings);
          turbo: CYPHER_BRAIN_AR_WALLET (JWK signer) + optional CYPHER_BRAIN_AR_PAID_BY (an address sharing Turbo Credits to that signer); needs '@ardrive/turbo-sdk' to PUSH (a pull reuses the arweave gateway read, no SDK). Funding/credit-share details: docs/arweave-upload-runbook.md.
          rclone: CYPHER_BRAIN_RCLONE_BIN (path to the rclone binary; default 'rclone' on PATH) — the remote itself is whatever --remote <name>:<path> names in your own 'rclone config'.
@@ -1858,6 +1877,13 @@ node dist/mcp.mjs        # bundled build (npm run build), or: bin/cypher-brain-m
 | `keygen` | **writes a keypair** (no spend) | generate a fresh age identity/recipient keypair at `<CYPHER_BRAIN_HOME>/{identity.age,recipient.txt}` — first-run setup for a shell-less agent. `pq: true` generates a post-quantum HYBRID keypair (ML-KEM-768 + X25519) instead of plain X25519. Refuses if one already exists unless `force: true`, which backs the old identity up to `identity.age.bak-<timestamp>-<random>` (returned as `backup_path`) before replacing it — old snapshots stay decryptable with that backup. **No Shamir (M-of-N) share support** — `--sss`/`sss-split` remain CLI-only, since shares are meant for separate physical locations that an MCP-sandboxed write cannot meaningfully reach |
 | `wallet_create` | **writes a wallet** (no spend) | generate a fresh Arweave JWK wallet (default `<CYPHER_BRAIN_HOME>/wallet.json`, `out` overrides). Refuses if one already exists at the target path unless `force: true` (destructive — discards spend authority over any funds already sent to it). **Arweave only** (issue #439 — resolved by documenting the CLI-bootstrap-then-restart path below rather than adding a `chain` parameter) — this cannot create a TON wallet; see `snapshot_now` above for the CLI-bootstrap-then-restart steps `backend: "ton-provider"` needs instead |
 | `wallet_address` | read-only | derive and show the Arweave address for a JWK wallet file (the address to fund before pushing to `arweave`/`turbo`). **Arweave only** — same #439 scope as `wallet_create` above; a TON wallet's address is printed once by `cypher-brain wallet create --chain ton` at creation time |
+
+`cypher-brain push-status --locator <data-item-id> [--json]` is also CLI-only.
+It performs a manual lookup of Turbo's own upload-processing report; even
+`CONFIRMED` is not independent Arweave L1 finality. It does not resolve/check the
+containing L1 transaction, poll in the background, or persist lifecycle state.
+See [on-demand Turbo upload status](MANAGEMENT.md#on-demand-turbo-upload-status)
+for outcomes and limitations.
 
 **`cypher-brain ledger`, `cypher-brain audit`, and `cypher-brain wallet balance` are CLI-only** (#477):
 no MCP tool exposes any of the three, unlike every other CLI/MCP gap in this server, which IS
