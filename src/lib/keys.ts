@@ -815,3 +815,24 @@ export async function resolvePinnedRecipients(val: string): Promise<Set<string>>
   }
   return keys;
 }
+
+// The require-list accepts multiple recipient files as well as the pin's inline
+// pubkeys. Resolve each item with the existing pin parser, and fail closed on ANY
+// empty item so a typo cannot silently drop one required recovery key.
+export async function resolveRequiredRecipients(val: string): Promise<Set<string>> {
+  if (val === '')
+    throw new Error(
+      'CYPHER_BRAIN_REQUIRE_RECIPIENT is set but empty — refusing to snapshot (no required recovery recipients)',
+    );
+  const required = new Set<string>();
+  for (const item of val.split(',')) {
+    const entry = item.trim();
+    if (entry && (await exists(entry)) && !(await stat(entry)).isFile())
+      throw new Error(`CYPHER_BRAIN_REQUIRE_RECIPIENT entry "${entry}" is not a regular file — refusing to snapshot`);
+    const keys = entry ? await resolvePinnedRecipients(entry) : new Set<string>();
+    if (keys.size === 0)
+      throw new Error(`CYPHER_BRAIN_REQUIRE_RECIPIENT entry "${entry}" lists no age1… pubkeys — refusing to snapshot`);
+    for (const key of keys) required.add(key);
+  }
+  return required;
+}

@@ -60,6 +60,7 @@ import {
   TON_PROVIDER_MAX_SPEND_MONTHLY_ERROR,
   NON_CONTENT_ADDRESSED_BACKENDS,
   PIN_RECIPIENTS,
+  REQUIRE_SIGNATURE,
   MCP_SOURCE_ROOTS,
   MCP_SOURCE_ROOTS_ERROR,
 } from './lib/config.js';
@@ -2389,7 +2390,7 @@ async function handleVerifyRestore(args: ToolArgs): Promise<CallToolResult> {
       // #319: passed through rather than reinterpreted. verify() already turns an ABSENT
       // signature from a [SKIP] into a FAIL under this flag (#214), so the MCP surface gets
       // the CLI's exact semantics instead of a second implementation of them.
-      require_signature: requireSignature === true,
+      require_signature: requireSignature ?? REQUIRE_SIGNATURE,
       dirs: [],
       tables: [],
       recipients: [],
@@ -2665,7 +2666,7 @@ async function handleRestoreNow(args: ToolArgs): Promise<CallToolResult> {
       // Passing the flag through therefore puts the refusal ahead of the consequential
       // action, which is what a gate has to do. The `signature` field added in #312 reports
       // the same situation but only after the restore has run: detection, not a gate.
-      require_signature: requireSignature === true,
+      require_signature: requireSignature ?? REQUIRE_SIGNATURE,
       yes: true, // already gated above by confirm_write; restore()'s own --pg guard needs this to proceed
       dirs: [],
       tables: [],

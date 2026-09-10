@@ -49,6 +49,10 @@ import {
   AR_WALLET,
   TON_WALLET,
   PIN_RECIPIENTS,
+  REQUIRE_RECIPIENT,
+  REQUIRE_PQ_RECIPIENTS,
+  REQUIRE_SIGNATURE,
+  SIGN_RECIPIENT,
   MCP_SOURCE_ROOTS,
   MCP_SOURCE_ROOTS_ERROR,
   CONFIG_FILE_PATH,
@@ -58,7 +62,8 @@ import {
   RECEIPT_LEDGER,
 } from './config.js';
 import { exists, errMsg } from './util.js';
-import { recipientEntries, resolvePinnedRecipients } from './keys.js';
+import { parsePubkeyFile } from './minisign.js';
+import { recipientEntries, resolvePinnedRecipients, resolveRequiredRecipients } from './keys.js';
 import { WALLET_DEFAULT_PATH, TON_WALLET_DEFAULT_PATH } from './wallet.js';
 import { scheduleStatusReport, ScheduleNotInstalledError } from './schedule.js';
 import { buildInfo, buildAgeDays, BUILD_STALE_DAYS } from './buildinfo.js';
@@ -362,6 +367,102 @@ async function checkIdentityRecipientPairing(): Promise<DoctorCheck> {
 // something snapshots, possibly unattended at 03:30. Catching it here, ahead of time,
 // is the whole point of a doctor command: the same misconfiguration, found before it
 // breaks a run instead of during one.
+// Like the pin check, inspect the default recipient file: call-specific recipient
+// overrides can fix drift, but an invalid policy value must be repaired by the operator.
+async function checkRequiredRecipients(): Promise<DoctorCheck[]> {
+  const id = 'require-recipient-config';
+  if (REQUIRE_RECIPIENT === undefined)
+    return [{ id, status: 'skip', message: 'CYPHER_BRAIN_REQUIRE_RECIPIENT is disabled (optional)' }];
+  let required: Set<string>;
+  try {
+    required = await resolveRequiredRecipients(REQUIRE_RECIPIENT);
+  } catch (e) {
+    return [{ id, status: 'fail', message: errMsg(e), remediation: 'fix CYPHER_BRAIN_REQUIRE_RECIPIENT or unset it' }];
+  }
+  if (REQUIRE_PQ_RECIPIENTS && [...required].some((key) => !key.startsWith('age1pq1')))
+    return [
+      {
+        id,
+        status: 'fail',
+        message:
+          'CYPHER_BRAIN_REQUIRE_RECIPIENT includes a classical key but CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS=1 forbids it',
+        remediation: 'use PQ-hybrid recovery recipients or disable the PQ policy',
+      },
+    ];
+  if (PIN_RECIPIENTS !== undefined) {
+    const allowed = await resolvePinnedRecipients(PIN_RECIPIENTS);
+    if ([...required].some((key) => !allowed.has(key)))
+      return [
+        {
+          id,
+          status: 'fail',
+          message: 'CYPHER_BRAIN_REQUIRE_RECIPIENT requires keys excluded by CYPHER_BRAIN_PIN_RECIPIENTS',
+          remediation: 'include every required recovery key in the recipient pin',
+        },
+      ];
+  }
+  const primary = new Set(await safeRecipientEntries(RECIPIENT));
+  const missing = [...required].filter((key) => !primary.has(key));
+  return [
+    {
+      id,
+      status: missing.length ? 'warn' : 'pass',
+      message: missing.length
+        ? `CYPHER_BRAIN_REQUIRE_RECIPIENT: ${missing.length} required recipient(s) missing from ${RECIPIENT} — default snapshot will refuse`
+        : 'CYPHER_BRAIN_REQUIRE_RECIPIENT: every required recovery recipient is configured',
+      ...(missing.length
+        ? { remediation: 'add the required public keys to recipient.txt or pass them with --recipient' }
+        : {}),
+    },
+  ];
+}
+
+async function checkRequiredPqRecipients(): Promise<DoctorCheck> {
+  const id = 'require-pq-recipients';
+  if (!REQUIRE_PQ_RECIPIENTS)
+    return { id, status: 'skip', message: 'CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS is disabled (optional)' };
+  const primary = await safeRecipientEntries(RECIPIENT);
+  const satisfied = primary.length > 0 && primary.every((key) => key.startsWith('age1pq1'));
+  return {
+    id,
+    status: satisfied ? 'pass' : 'warn',
+    message: satisfied
+      ? 'CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS: every configured recipient is PQ-hybrid'
+      : 'CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS=1 but the default recipients are absent or not all PQ-hybrid — default snapshot will refuse',
+    ...(!satisfied
+      ? { remediation: 'configure public recipients generated with keygen --pq, or pass them with --recipient' }
+      : {}),
+  };
+}
+
+async function checkRequiredSignature(): Promise<DoctorCheck> {
+  const id = 'require-signature';
+  if (!REQUIRE_SIGNATURE)
+    return { id, status: 'skip', message: 'CYPHER_BRAIN_REQUIRE_SIGNATURE is disabled (optional)' };
+  const st = await statOrNotFound(SIGN_RECIPIENT);
+  if (!st)
+    return {
+      id,
+      status: 'warn',
+      message: `CYPHER_BRAIN_REQUIRE_SIGNATURE=1 but no signing public key exists at ${SIGN_RECIPIENT}`,
+      remediation: 'install the trusted sign-recipient.pub or pass --sign-recipient when restoring/verifying',
+    };
+  if (!st.isFile())
+    return {
+      id,
+      status: 'fail',
+      message: `signing public key ${SIGN_RECIPIENT} is not a regular file`,
+      remediation: 'configure a trusted minisign public-key file',
+    };
+  parsePubkeyFile(await readFile(SIGN_RECIPIENT, 'utf8'));
+  return {
+    id,
+    status: 'pass',
+    message:
+      'CYPHER_BRAIN_REQUIRE_SIGNATURE: a signing public key is configured (each backup still needs a valid signature)',
+  };
+}
+
 async function checkPinRecipients(): Promise<DoctorCheck[]> {
   const configId = 'pin-recipients-config';
   if (PIN_RECIPIENTS === undefined) {
@@ -1273,6 +1374,9 @@ const CHECK_DEFS: ReadonlyArray<{
   },
   { id: 'identity-recipient-pairing', run: () => checkIdentityRecipientPairing() },
   { id: 'pin-recipients-config', run: () => checkPinRecipients() },
+  { id: 'require-recipient-config', run: () => checkRequiredRecipients() },
+  { id: 'require-pq-recipients', run: () => checkRequiredPqRecipients() },
+  { id: 'require-signature', run: () => checkRequiredSignature() },
   { id: 'mcp-snapshot-policy', run: () => checkMcpSnapshotPolicy() },
   { id: 'offline-backup-different-disk', run: () => checkOfflineBackupDisk() },
   { id: 'schedule-last-run', run: () => checkSchedule() },

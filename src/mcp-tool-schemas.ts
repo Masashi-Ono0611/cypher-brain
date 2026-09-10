@@ -278,7 +278,8 @@ export const VERIFY_RESTORE_TOOL: Tool = {
       require_signature: {
         type: 'boolean',
         description:
-          'REQUIRED true to turn an ABSENT .minisig from a [SKIP] check into a FAIL verdict ' +
+          'True turns an absent/unverifiable signature from a [SKIP] check into a FAIL verdict. ' +
+          'Omitted defaults to CYPHER_BRAIN_REQUIRE_SIGNATURE=1; explicit true/false always wins. ' +
           "(#214's --require-signature). Deleting a sidecar — rather than forging one — is the downgrade this " +
           'closes; an INVALID signature already fails without it.',
       },
@@ -358,7 +359,8 @@ export const RESTORE_NOW_TOOL: Tool = {
       require_signature: {
         type: 'boolean',
         description:
-          'REQUIRED true to refuse an artifact whose .minisig is ABSENT, rather than warning and continuing ' +
+          'True refuses an absent/unverifiable signature before restoring. ' +
+          'Omitted defaults to CYPHER_BRAIN_REQUIRE_SIGNATURE=1; explicit true/false always wins. ' +
           "(#214's --require-signature). Deleting a sidecar — rather than forging one — is the downgrade this " +
           'closes; an INVALID signature is always refused regardless. Checked before anything is decrypted or ' +
           'written, so it gates pg_restore rather than reporting on it afterwards.',

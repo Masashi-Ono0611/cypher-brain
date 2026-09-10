@@ -29,6 +29,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   IDENTITY,
+  REQUIRE_SIGNATURE,
   CONFIG_FILE_ERROR,
   AR_MAX_SPEND_ERROR,
   TON_PROVIDER_MAX_SPEND_ERROR,
@@ -75,6 +76,7 @@ const BOOL_FLAGS = new Set([
   'sign',
   'no_sign',
   'require_signature',
+  'no_require_signature',
   'inline_identity',
   'csv',
 ]); // flags that take no value
@@ -533,7 +535,9 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       pairing mismatch (including an unexpected EXTRA recipient in recipient.txt that the
       identity does not derive), an empty CYPHER_BRAIN_PIN_RECIPIENTS fail-closing every
       snapshot, any recipient.txt entry missing from that same allowlist (not just the
-      primary one), an offline backup keypair sharing a disk with the primary identity at
+      primary one), unsatisfiable CYPHER_BRAIN_REQUIRE_RECIPIENT / REQUIRE_PQ_RECIPIENTS
+      policies, a missing signing public key under CYPHER_BRAIN_REQUIRE_SIGNATURE=1,
+      an offline backup keypair sharing a disk with the primary identity at
       its default location, the last scheduled run's outcome, the audit log's hash-chain
       integrity, the receipt ledger's readability — #456 — and any ton-provider spend
       that was recorded before its deploy broadcast but never settled against the receipt
@@ -755,7 +759,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       No signing identity at all -> unchanged pre-#214 behavior (no *.minisig written).
 
   cypher-brain restore --in <file.age> --out-dir <dir> [--identity <file>] [--pg <conn>] [--yes] [--no-expand-components]
-                        [--sha256 <hex>] [--sign-recipient <file>] [--require-signature] [--verbose]
+                        [--sha256 <hex>] [--sign-recipient <file>] [--require-signature | --no-require-signature] [--verbose]
       Decrypt with the PRIVATE identity. Extraction never clobbers a file already
       present in --out-dir: an existing file is left untouched, the rest of the
       archive still extracts around it, and the collision itself is not an error.
@@ -811,9 +815,11 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       $CYPHER_BRAIN_HOME/sign-recipient.pub; --sign-recipient picks a different one),
       an INVALID signature refuses to restore outright (nothing is decrypted or written).
       An absent signature (unsigned/legacy artifact) or an absent signing public key on
-      this box only warn and proceed — this never breaks a pre-#214 backup. --require-
+      this box warn and proceed unless CYPHER_BRAIN_REQUIRE_SIGNATURE=1. --require-
       signature turns that warn into a refusal too: an attacker who simply DELETES the
       .minisig sidecar (rather than forging one) no longer silently succeeds either.
+      --no-require-signature explicitly permits an unsigned legacy backup even when
+      the env default is on; either explicit signature flag always wins over that default.
       By default (#436), the console output is a short summary: which components were
       auto-expanded and where they landed under expanded/ (see --no-expand-components
       above), not the full manifest.json backing it. --verbose additionally prints that
@@ -823,7 +829,7 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       machine. Leave it off unless you actually need those fields (e.g. debugging a
       manifest itself).
 
-  cypher-brain verify --in <file.age> [--identity <file>] [--sha256 <hex>] [--sign-recipient <file>] [--require-signature] [--json]
+  cypher-brain verify --in <file.age> [--identity <file>] [--sha256 <hex>] [--sign-recipient <file>] [--require-signature | --no-require-signature] [--json]
                        [--level quick|remote|drill] [--verbose]
       Assert it is real age ciphertext, a wrong key cannot open it, AND (when the
       private identity is on this box) that YOUR key decrypts it into a well-formed
@@ -840,7 +846,9 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       decrypting); no signature or no configured public key just [SKIP]s this check
       by default. --require-signature upgrades that [SKIP] to a hard FAIL too — use it
       once you have run "keygen --sign" and expect every artifact you verify to carry
-      a valid signature; without it, an unsigned/legacy artifact still reaches PASS.
+      a valid signature. CYPHER_BRAIN_REQUIRE_SIGNATURE=1 enables this by default;
+      --no-require-signature explicitly allows an unsigned/legacy artifact to reach PASS.
+      Either explicit signature flag always wins over the env default.
       VERDICT: PASS (exit 0) / FAIL (exit 1) / PARTIAL (exit 2 — decryptability not
       proven, e.g. public-key-only box).
       --level (issue #209) picks how deep the check goes, restic/kopia-style — each
@@ -1293,6 +1301,10 @@ Env: CYPHER_BRAIN_HOME (default ~/.cypher-brain; an existing ~/.cipher-brain is 
      even under --no-load; override to sandbox a --no-load preview run).
      CYPHER_BRAIN_PASSPHRASE (non-interactive passphrase for a wrapped identity — automation/CI; otherwise prompted on the TTY).
      CYPHER_BRAIN_PIN_RECIPIENTS (snapshot: allowlist of age1… pubkeys, inline or a file — refuse to encrypt to any other recipient).
+     CYPHER_BRAIN_REQUIRE_RECIPIENT (snapshot: required age1… keys, inline or comma-separated recipient files; 0/unset disables, empty refuses).
+     CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS (1 requires EVERY snapshot recipient to be PQ-hybrid, age1pq1…; 0/unset disables).
+     CYPHER_BRAIN_REQUIRE_SIGNATURE (1 defaults restore/verify to --require-signature; 0/unset disables).
+       Explicit --require-signature / --no-require-signature always overrides the signature env default.
      CYPHER_BRAIN_MCP_SOURCE_ROOTS (MCP server only — issue #800: JSON array of absolute directory
      roots a snapshot_now call's 'dirs' must resolve inside, after following symlinks; a pinned
      'pg'-only call needs no roots. Unset/empty/malformed refuses every 'dirs' call. The CLI 'snapshot'
@@ -1757,6 +1769,7 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     'sha256',
     'sign_recipient',
     'require_signature',
+    'no_require_signature',
     'verbose',
   ],
   // --locator/--backend/--from-locator-file/--sig-locator are --level remote's fetch
@@ -1767,6 +1780,7 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     'sha256',
     'sign_recipient',
     'require_signature',
+    'no_require_signature',
     'json',
     'level',
     'verbose',
@@ -2017,6 +2031,13 @@ async function main(): Promise<void> {
     const o = parseArgs(rest, cmd);
     assertFlagsDeclared(cmd);
     assertFlagsRelevant(cmd, o);
+    if (cmd === 'restore' || cmd === 'verify') {
+      // --no-require-signature mirrors --no-sign: boolean flags are presence-only,
+      // so this explicit negative is how an operator overrides the env default.
+      if (o.require_signature && o.no_require_signature)
+        throw new UsageError('--require-signature and --no-require-signature are mutually exclusive');
+      o.require_signature = o.no_require_signature ? false : (o.require_signature ?? REQUIRE_SIGNATURE);
+    }
     return dispatchCommand(cmd, o);
   });
 }

@@ -103,7 +103,19 @@ Add `--require-signature` to `restore`/`verify` once you have run `keygen --sign
 expect every artifact to carry a valid signature, to turn a missing/unverifiable
 signature into a hard failure too — that is the recipe that actually closes the full
 gap. See the CLI reference's `keygen`/`snapshot`/`restore`/`verify` entries below for
-the flags.
+the flags. Set `CYPHER_BRAIN_REQUIRE_SIGNATURE=1` to make this the CLI/MCP default.
+An explicit `--no-require-signature` (MCP `require_signature: false`) permits a
+known-unsigned historical backup; explicit flags always win over the env default.
+There is no historical-exception registry. Invalid signatures still fail.
+
+`CYPHER_BRAIN_REQUIRE_RECIPIENT` independently requires every key resolved from
+comma-separated recipient files (or inline keys) to appear among the snapshot's
+effective recipients, catching a dropped recovery recipient. Unset/`0` disables it;
+an explicitly empty value fails closed. `CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS=1`
+requires every snapshot recipient to be PQ-hybrid (`age1pq1…`), rejecting classical
+or mixed sets. Both refuse before plaintext staging and work alongside the pin.
+The boolean policies enable only for literal `1`; `0`/unset disables them. See
+MANAGEMENT.md's "Opt-in recovery policies" for configuration and doctor checks.
 
 The same "anyone holding a recipient's public key can forge ciphertext" point applies
 one layer down, to the tar payload age decrypts to: `restore` inspects every tar entry
@@ -753,7 +765,9 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       pairing mismatch (including an unexpected EXTRA recipient in recipient.txt that the
       identity does not derive), an empty CYPHER_BRAIN_PIN_RECIPIENTS fail-closing every
       snapshot, any recipient.txt entry missing from that same allowlist (not just the
-      primary one), an offline backup keypair sharing a disk with the primary identity at
+      primary one), unsatisfiable CYPHER_BRAIN_REQUIRE_RECIPIENT / REQUIRE_PQ_RECIPIENTS
+      policies, a missing signing public key under CYPHER_BRAIN_REQUIRE_SIGNATURE=1,
+      an offline backup keypair sharing a disk with the primary identity at
       its default location, the last scheduled run's outcome, the audit log's hash-chain
       integrity, the receipt ledger's readability — #456 — and any ton-provider spend
       that was recorded before its deploy broadcast but never settled against the receipt
@@ -975,7 +989,7 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       No signing identity at all -> unchanged pre-#214 behavior (no *.minisig written).
 
   cypher-brain restore --in <file.age> --out-dir <dir> [--identity <file>] [--pg <conn>] [--yes] [--no-expand-components]
-                        [--sha256 <hex>] [--sign-recipient <file>] [--require-signature] [--verbose]
+                        [--sha256 <hex>] [--sign-recipient <file>] [--require-signature | --no-require-signature] [--verbose]
       Decrypt with the PRIVATE identity. Extraction never clobbers a file already
       present in --out-dir: an existing file is left untouched, the rest of the
       archive still extracts around it, and the collision itself is not an error.
@@ -1031,9 +1045,11 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       $CYPHER_BRAIN_HOME/sign-recipient.pub; --sign-recipient picks a different one),
       an INVALID signature refuses to restore outright (nothing is decrypted or written).
       An absent signature (unsigned/legacy artifact) or an absent signing public key on
-      this box only warn and proceed — this never breaks a pre-#214 backup. --require-
+      this box warn and proceed unless CYPHER_BRAIN_REQUIRE_SIGNATURE=1. --require-
       signature turns that warn into a refusal too: an attacker who simply DELETES the
       .minisig sidecar (rather than forging one) no longer silently succeeds either.
+      --no-require-signature explicitly permits an unsigned legacy backup even when
+      the env default is on; either explicit signature flag always wins over that default.
       By default (#436), the console output is a short summary: which components were
       auto-expanded and where they landed under expanded/ (see --no-expand-components
       above), not the full manifest.json backing it. --verbose additionally prints that
@@ -1043,7 +1059,7 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       machine. Leave it off unless you actually need those fields (e.g. debugging a
       manifest itself).
 
-  cypher-brain verify --in <file.age> [--identity <file>] [--sha256 <hex>] [--sign-recipient <file>] [--require-signature] [--json]
+  cypher-brain verify --in <file.age> [--identity <file>] [--sha256 <hex>] [--sign-recipient <file>] [--require-signature | --no-require-signature] [--json]
                        [--level quick|remote|drill] [--verbose]
       Assert it is real age ciphertext, a wrong key cannot open it, AND (when the
       private identity is on this box) that YOUR key decrypts it into a well-formed
@@ -1060,7 +1076,9 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       decrypting); no signature or no configured public key just [SKIP]s this check
       by default. --require-signature upgrades that [SKIP] to a hard FAIL too — use it
       once you have run "keygen --sign" and expect every artifact you verify to carry
-      a valid signature; without it, an unsigned/legacy artifact still reaches PASS.
+      a valid signature. CYPHER_BRAIN_REQUIRE_SIGNATURE=1 enables this by default;
+      --no-require-signature explicitly allows an unsigned/legacy artifact to reach PASS.
+      Either explicit signature flag always wins over the env default.
       VERDICT: PASS (exit 0) / FAIL (exit 1) / PARTIAL (exit 2 — decryptability not
       proven, e.g. public-key-only box).
       --level (issue #209) picks how deep the check goes, restic/kopia-style — each
@@ -1513,6 +1531,10 @@ Env: CYPHER_BRAIN_HOME (default ~/.cypher-brain; an existing ~/.cipher-brain is 
      even under --no-load; override to sandbox a --no-load preview run).
      CYPHER_BRAIN_PASSPHRASE (non-interactive passphrase for a wrapped identity — automation/CI; otherwise prompted on the TTY).
      CYPHER_BRAIN_PIN_RECIPIENTS (snapshot: allowlist of age1… pubkeys, inline or a file — refuse to encrypt to any other recipient).
+     CYPHER_BRAIN_REQUIRE_RECIPIENT (snapshot: required age1… keys, inline or comma-separated recipient files; 0/unset disables, empty refuses).
+     CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS (1 requires EVERY snapshot recipient to be PQ-hybrid, age1pq1…; 0/unset disables).
+     CYPHER_BRAIN_REQUIRE_SIGNATURE (1 defaults restore/verify to --require-signature; 0/unset disables).
+       Explicit --require-signature / --no-require-signature always overrides the signature env default.
      CYPHER_BRAIN_MCP_SOURCE_ROOTS (MCP server only — issue #800: JSON array of absolute directory
      roots a snapshot_now call's 'dirs' must resolve inside, after following symlinks; a pinned
      'pg'-only call needs no roots. Unset/empty/malformed refuses every 'dirs' call. The CLI 'snapshot'
@@ -1749,8 +1771,8 @@ node dist/mcp.mjs        # bundled build (npm run build), or: bin/cypher-brain-m
 |---|---|---|
 | `snapshot_now` | **can spend** (paid backend) | snapshot + optional push. `recipients` is REQUIRED with NO default (#478) — **unlike** the CLI `snapshot`, which defaults to `<CYPHER_BRAIN_HOME>/recipient.txt` when `--recipient` is omitted, this tool refuses a call with none rather than silently reaching for that file; pass the home recipient explicitly to get the same effect. `arweave`/`turbo`/`ton-provider` require `confirm_paid: true` (the `--yes` guard; the `CYPHER_BRAIN_YES` env escape hatch is not honored over MCP) — and the refusal describes **that** backend rather than assuming Arweave's permanence, since ton-provider's durability depends on a provider continuing to renew and serve the contract (#796). `locator_file` (the `push --save-locator` destination) must resolve, after following symlinks, to a path inside `CYPHER_BRAIN_HOME` — where MANAGEMENT.md's own cadence already puts it — and, if something is already there, to an existing save-locator file: `--save-locator` *replaces* that path outright, so an unscoped one would be an arbitrary-file-overwrite primitive on a tool the free `file` backend reaches with no consent gate at all (#789). `scan_secrets: "warn"\|"deny"\|"off"` runs the same gitleaks gate as the CLI `--scan-secrets` (#307) — and defaults the same way (#301): `warn` when there is at least one `dirs` entry and gitleaks is resolvable, nothing otherwise. An explicit mode other than `off` requires at least one `dirs` entry (it does not scan a `pg` dump); the result reports the mode that actually ran (`null` when none did), and a call asking for a scan on a machine without gitleaks fails rather than silently skipping it. `idempotency_key` makes a RETRY safe (#220, Stripe's idempotency-key pattern): a repeat call with the SAME key and the same `dirs`/`pg`/`recipients`/`out`/`backend`/`scan_secrets` returns the FIRST call's result — no new snapshot, no new spend — instead of re-executing (`idempotent_replay: true` in the result marks a replay); the same key with DIFFERENT values in any of those fields is refused (`ERR_IDEMPOTENCY_KEY_REUSED`) rather than silently answered with the wrong result. Cached results are kept in `<CYPHER_BRAIN_HOME>/idempotency-log.jsonl` and expire after `CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS` (default 24h). A replay reports the outcome the same way the first call did: a recorded FAILURE (a partial success, or the uncertain spend below) replays with `isError: true` and its recorded fields, never as a clean success (#810). One outcome never expires — a paid push whose result is UNCERTAIN (an `arweave` POST or a `ton-provider` broadcast that may or may not have been accepted) records a permanent tombstone `{code: "ERR_PUSH_OUTCOME_UNCERTAIN", spend_outcome: "uncertain", backend, check_kind, check_identifier, message}` with no `pushed`/`locator`, and every later call with that key replays it as an error and does no paid work: the money may already be gone, and expiring the record would only postpone the retry that spends again (#818 — verify `check_identifier` on-chain, then use a NEW key). If the result record cannot be WRITTEN after a possible spend, the key's claim is retained rather than released, so the retry is refused instead of re-executing (#809); the warning names the lock file to remove. See MANAGEMENT.md's "MCP idempotency keys" section. **Fail-closed policy (#800), enforced before *anything* else this tool does — before the idempotency lookup/replay, the output file, the secret scan, the snapshot and the upload, so a refused call leaves no artifact, no stored object and no idempotency record:** the server refuses every `snapshot_now` call unless `CYPHER_BRAIN_PIN_RECIPIENTS` resolves to at least one `age1…` key, and refuses any call naming `dirs` unless every entry resolves (after following symlinks) to one of the absolute roots in `CYPHER_BRAIN_MCP_SOURCE_ROOTS` — exact match or separator-bounded containment, so a `/roots/a` root does not cover `/roots/ab`. Unset/empty/malformed roots refuse every `dirs` call; a pinned `pg`-only call needs no roots. A replay is refused too if the current policy would deny the original call. Both are OPERATOR environment settings a caller cannot supply, so the refusal (`ERR_POLICY_DENIED`, `cb_code` `CB-E025`) is not something to retry with different arguments. The CLI `snapshot` is unaffected — see Threat model above. `backend: "ton-provider"` only appears in the enum when a local TON wallet is already configured — **and, unlike arweave/turbo, no MCP tool on this server can create that wallet** (issue #439): an operator must run `cypher-brain wallet create --chain ton` from a shell, set `CYPHER_BRAIN_TON_WALLET` in this server's own environment, and restart it before `"ton-provider"` shows up here at all |
 | `last_snapshot_status` | read-only | latest locator/backend/sha256/timestamp/age from a save-locator file and/or `index.tsv`. `locator_file`/`index_file` must resolve (after following symlinks) to a regular file inside `CYPHER_BRAIN_HOME`, where the documented cadence already keeps them — pointing this tool at an arbitrary path is refused, and a file that does not parse is described rather than quoted back, so the tool cannot be used to read local files it has no business reading (#787) |
-| `verify_restore` | read-only | pull by locator (or a local file) + verify; honest `PASS`/`FAIL`/`PARTIAL` verdict mirroring the CLI exit codes. `require_signature: true` turns an ABSENT `.minisig` from a `[SKIP]` into a `FAIL` — the CLI's `--require-signature` (#319). When it pulls, `pulled.log` carries everything the fetch said — retries, the `sha256 OK` confirmation, transfer progress — and a `signature` object appears when the artifact's `.minisig` was recorded but could not be fetched, which `verify` alone reports as "unsigned (legacy) artifact" (#312) |
-| `restore_now` | **writes files, can clobber a DB** (no spend) | pull by locator (or a local file / `locator_file`, same dual-mode input as `verify_restore`) + decrypt + extract into `out_dir` — the actual restore `verify_restore` stops short of. Requires `confirm_write: true` before any work happens; when `pg` is given, `pg_restore --clean --if-exists` also DROPS and replaces objects in that database, the same `--yes` consent the CLI's `restore --pg` requires. `require_signature: true` refuses an artifact whose `.minisig` is absent — checked **before** the identity is loaded or `pg_restore --clean` can drop anything, so it gates the write rather than reporting on it (#319). `out_dir` may sit outside `CYPHER_BRAIN_HOME` — that is the normal recovery case, and it only warns (#559) — but it may **not** itself be a symlink: that is refused, because the path the result reports and the path the plaintext lands in would then differ (#792). Ancestor symlinks are followed and reported as `out_dir_resolved` when they change the destination |
+| `verify_restore` | read-only | pull by locator (or a local file) + verify; honest `PASS`/`FAIL`/`PARTIAL` verdict mirroring the CLI exit codes. `require_signature` defaults to `CYPHER_BRAIN_REQUIRE_SIGNATURE=1` when omitted; explicit `false` permits a known-unsigned backup. `require_signature: true` turns an ABSENT `.minisig` from a `[SKIP]` into a `FAIL` — the CLI's `--require-signature` (#319). When it pulls, `pulled.log` carries everything the fetch said — retries, the `sha256 OK` confirmation, transfer progress — and a `signature` object appears when the artifact's `.minisig` was recorded but could not be fetched, which `verify` alone reports as "unsigned (legacy) artifact" (#312) |
+| `restore_now` | **writes files, can clobber a DB** (no spend) | pull by locator (or a local file / `locator_file`, same dual-mode input as `verify_restore`) + decrypt + extract into `out_dir` — the actual restore `verify_restore` stops short of. Requires `confirm_write: true` before any work happens; when `pg` is given, `pg_restore --clean --if-exists` also DROPS and replaces objects in that database, the same `--yes` consent the CLI's `restore --pg` requires. `require_signature` defaults to `CYPHER_BRAIN_REQUIRE_SIGNATURE=1` when omitted; explicit `false` overrides that default. `require_signature: true` refuses an artifact whose `.minisig` is absent — checked **before** the identity is loaded or `pg_restore --clean` can drop anything, so it gates the write rather than reporting on it (#319). `out_dir` may sit outside `CYPHER_BRAIN_HOME` — that is the normal recovery case, and it only warns (#559) — but it may **not** itself be a symlink: that is refused, because the path the result reports and the path the plaintext lands in would then differ (#792). Ancestor symlinks are followed and reported as `out_dir_resolved` when they change the destination |
 | `estimate_cost` | read-only | upload cost for a size: turbo (winc, via the optional `@ardrive/turbo-sdk`), arweave (winston, gateway `/price`), ton-provider (nanoTON, a real priced query against the live mytonprovider.org registry — only listed when a local TON wallet is configured; no MCP tool can create one, see `snapshot_now` above), file (free). All seven fields are always present, `null` where they do not apply (#268) — never test for a key to decide whether a value exists. For turbo/arweave, `usd_estimate` carries an approximate USD figure when a USD/AR rate is fetchable — a direct HTTP call to Turbo's public rate endpoint (#170), so it works with or without `@ardrive/turbo-sdk` installed — and is `null` on any rate failure. Same computation as `cypher-brain estimate` (`src/lib/estimate.ts`) |
 | `schedule_install` | **writes a real system file, can commit to ongoing spend** (no spend by itself) | register the nightly snapshot+push (a launchd plist or crontab entry), the MCP equivalent of `cypher-brain schedule install` (issue #174 follow-up). `arweave`/`turbo` require `max_spend` (a positive integer cap on every unattended run); always requires `confirm_install: true` before any write happens. `backend: "ton-provider"` (only listed when a local TON wallet is configured; no MCP tool can create one, see `snapshot_now` above) is also paid and unattended-capable, but its spend cap is a separate, env-only mechanism (`CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND`, in nanoTON) — this tool's own `max_spend` argument does not apply to it. `no_load: true` writes the artifacts without registering the trigger. `scan_secrets: "warn"\|"deny"\|"off"` bakes the gitleaks gate into the generated nightly (#307). Install resolves the **effective** mode even when none is given and bakes that in (#301) — `warn` when there is a `dirs` entry and gitleaks is resolvable, `off` otherwise — so the nightly never re-derives a default from whatever is on `PATH` at 03:30. An explicit mode other than `off` needs at least one `dirs` entry, and fails rather than installing when gitleaks cannot be resolved |
 | `schedule_status` | read-only | the same report as `cypher-brain schedule status`: configured time/backend, which config file supplied settings, trigger registration state, last run log + its final rc line, next scheduled run. **Structured fields**, not the printed lines — `cypher-brain schedule status --json`, this tool and the resource below all return one object built by a single function, so they cannot disagree |
