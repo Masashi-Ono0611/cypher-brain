@@ -54,6 +54,10 @@ import {
   IDEMPOTENCY_TTL_ERROR,
   AR_MAX_SPEND_ERROR,
   TON_PROVIDER_MAX_SPEND_ERROR,
+  AR_MAX_SPEND_DAILY_ERROR,
+  AR_MAX_SPEND_MONTHLY_ERROR,
+  TON_PROVIDER_MAX_SPEND_DAILY_ERROR,
+  TON_PROVIDER_MAX_SPEND_MONTHLY_ERROR,
   NON_CONTENT_ADDRESSED_BACKENDS,
   PIN_RECIPIENTS,
   MCP_SOURCE_ROOTS,
@@ -3243,6 +3247,10 @@ async function main(): Promise<void> {
   // cleanly). config.ts now records the failure instead of throwing it.
   if (AR_MAX_SPEND_ERROR) throw AR_MAX_SPEND_ERROR;
   if (TON_PROVIDER_MAX_SPEND_ERROR) throw TON_PROVIDER_MAX_SPEND_ERROR;
+  if (AR_MAX_SPEND_DAILY_ERROR) throw AR_MAX_SPEND_DAILY_ERROR;
+  if (AR_MAX_SPEND_MONTHLY_ERROR) throw AR_MAX_SPEND_MONTHLY_ERROR;
+  if (TON_PROVIDER_MAX_SPEND_DAILY_ERROR) throw TON_PROVIDER_MAX_SPEND_DAILY_ERROR;
+  if (TON_PROVIDER_MAX_SPEND_MONTHLY_ERROR) throw TON_PROVIDER_MAX_SPEND_MONTHLY_ERROR;
   // Module-load warnings (a deprecated env var, a loose-permissioned config file)
   // already printed to the server's stderr live; drain them here so they are not
   // misattributed to whichever tool call happens to run first — but PRESERVED, not

@@ -318,6 +318,62 @@ printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$LOC" "$SHA" \
   >> "$HOME/.cypher-brain/schedule/index.tsv"
 ```
 
+### Daily and monthly spend admission (one machine)
+
+Set `CYPHER_BRAIN_MAX_SPEND_DAILY` and/or `CYPHER_BRAIN_MAX_SPEND_MONTHLY`
+for the shared arweave/turbo unit family (winston/winc, the same native integer
+units as `CYPHER_BRAIN_MAX_SPEND`). Set
+`CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY` and/or
+`CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY` separately for nanoTON.
+Each is a non-negative integer; **0/unset disables that cap**. Both enabled
+caps must pass. Windows are the current **UTC calendar day and month**, not
+rolling 24-hour/30-day periods. These totals use receipt costs: Turbo's recorded
+preflight price, Arweave's signed reward, and TON's deploy amount (not wallet gas).
+
+These caps are **additive** to the existing per-push limits and consent gate.
+Keep the matching `CYPHER_BRAIN_MAX_SPEND` or
+`CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND` positive: the authoritative price is
+computed inside the backend, so admission reserves the **remaining per-push cap**
+as an upper bound before each upload, including the signature sidecar. This can
+refuse an upload whose eventual price would fit. After a priced receipt is durable
+and the upload outcome is known, the reservation is settled and only the receipt
+cost counts. A signed push can upload its ciphertext and then have its sidecar
+refused; its ciphertext remains paid for. Scheduled runners capture these settings
+and `CYPHER_BRAIN_RECEIPT_LEDGER` at installation; reinstall existing schedules
+to include them.
+
+**Single-machine only:** every participating CLI/MCP/scheduled caller must use the
+same enabled caps and local `CYPHER_BRAIN_RECEIPT_LEDGER` path (default
+`$CYPHER_BRAIN_HOME/receipt-ledger.jsonl`). Separate ledgers, hard-link aliases,
+cloud-synced copies, and multiple machines do not share a budget authority. Keep
+this file and its `<ledger>.spend-budget.jsonl` sidecar together; removing or
+redirecting them discards the local spending history. This is an operator-side
+admission guard, not protection against an actor who can change local config or logs.
+
+Admission sums matching receipts in each window **plus all open reservations**.
+An uncertain outcome, crash, or failed receipt write keeps its reservation charged
+across calendar boundaries until a human resolves it. Some failures after the
+backend charges its in-memory tracker but before submission also conservatively
+remain open. Malformed logs or unpriced receipts in an enabled window cause a
+refusal rather than an understated total.
+
+For recovery, stop all CLI/MCP/scheduled writers and retain a copy of both logs.
+Inspect the last JSON line for each `reservation_id` (last line wins), using the
+backend, timestamp and warning/error output to verify what happened. If funds
+moved, first record/verify the matching priced receipt in the ledger; then append
+a copy of the reservation with `state: "settled"` and a fresh ISO `updated_at`.
+If you have verified that no funds moved, append `state: "abandoned"` instead.
+Keep all other fields, including the id and original timestamp. Never free an
+uncertain reservation merely because its process exited. A receipt recorded just
+before a crash may temporarily count alongside its open reservation; verify that
+receipt before settling the reservation, without adding it again.
+
+The short admission critical section uses `<ledger>.spend-budget.jsonl.lock`.
+A competing caller waits up to five seconds; a crash inside that section leaves
+the lock for manual recovery. With **all writers stopped**, remove only this lock
+and restart. Removing a stale lock does **not** resolve any reservation or prove
+that its upload spent nothing.
+
 `schedule install --index-file <path>` overrides where the generated runner appends this
 line, if `$CYPHER_BRAIN_HOME/schedule/index.tsv` (shown above) isn't where you want it.
 

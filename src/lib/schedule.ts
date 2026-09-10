@@ -125,6 +125,12 @@ const NEEDS_UNATTENDED_CONSENT = new Set(['arweave', 'turbo', 'ton-provider']);
 // already bake unconditionally or separately (see the comment above envLines' loop
 // in runnerBody for the full exclusion list).
 const ENV_CAPTURE_VARS: readonly EnvName[] = [
+  // #907: preserve cumulative caps and their authority in the runner's bare environment.
+  'CYPHER_BRAIN_MAX_SPEND_DAILY',
+  'CYPHER_BRAIN_MAX_SPEND_MONTHLY',
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY',
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY',
+  'CYPHER_BRAIN_RECEIPT_LEDGER',
   'CYPHER_BRAIN_FILE_DIR',
   'CYPHER_BRAIN_PG_BIN',
   // #307: resolved to an ABSOLUTE path by install when --scan-secrets is used, so the
@@ -171,6 +177,7 @@ const ENV_CAPTURE_VARS: readonly EnvName[] = [
 // the runner from a DIFFERENT, unrelated cwd — so bake the ABSOLUTE path in, same
 // treatment already given to --vault/--zip/--recipient(file) below.
 const PATH_ENV_VARS = new Set([
+  'CYPHER_BRAIN_RECEIPT_LEDGER',
   'CYPHER_BRAIN_FILE_DIR', // config.ts: "file backend object store"
   'CYPHER_BRAIN_PG_BIN', // config.ts: "dir holding pg_dump/pg_restore"
   'CYPHER_BRAIN_AR_WALLET', // config.ts: "path to a JWK key file"

@@ -16,8 +16,9 @@ import { recordAudit } from './audit.js';
 import { warn } from './warn.js';
 import { UsageError } from './errors.js';
 import { acquirePushLock, saveLocatorLockKey } from './push-lock.js';
-import type { CliOptions, ReceiptEvent } from './types.js';
+import type { CliOptions, ReceiptEvent, PutOpts } from './types.js';
 import type { SpendTracker } from './spend-tracker.js';
+import { reserveSpendBudget, resolveSpendBudget, SPEND_BUDGET_LOG } from './spend-budget.js';
 import {
   PushPartialSuccessError,
   PushSignatureUploadError,
@@ -374,7 +375,7 @@ async function pushCoreLocked(
   // clear the ordinary --yes/CYPHER_BRAIN_YES gate below too, same as an unplanned push
   // — this is a stricter guarantee bolted on top, not a replacement for that gate, and
   // NOT a replacement for CYPHER_BRAIN_MAX_SPEND either: that cap, enforced INSIDE
-  // backend.put() below, remains the sole hard authority on actual spend (#105) — this
+  // backend.put() below, remains the hard per-push authority on actual spend (#105) — this
   // block only narrows what price/identity/destination was reviewed before getting
   // there (plan.ts's header comment documents this trust/TOCTOU boundary in full).
   // Runs its own fresh estimateCost() query rather than sharing the paid-backend-only
@@ -523,12 +524,7 @@ async function pushCoreLocked(
   // captured object resets inside a closure), so `o.backend` alone reads back as
   // `string | undefined` there even though it is provably a `string` by this point.
   const backendName = o.backend;
-  // Same TS narrowing-reset reasoning as `backendName` above: `if (!o.in) throw` at the
-  // top of this function does not carry through into the `onReceipt: (event) => ...`
-  // closure below (a NEW closure boundary), so `o.in` alone reads back as
-  // `string | undefined` there even though it is provably a `string` by this point.
-  const inPath = o.in;
-  const persistReceipt = async (uploadedPath: string, event: ReceiptEvent): Promise<void> => {
+  const persistReceipt = async (uploadedPath: string, event: ReceiptEvent): Promise<boolean> => {
     try {
       const [artifactSha256, payerAddress] = await Promise.all([sha256(uploadedPath), payerAddressFor(backendName, o)]);
       const { size: sizeBytes } = await stat(uploadedPath);
@@ -543,10 +539,21 @@ async function pushCoreLocked(
         unit: event.cost?.unit ?? null,
         raw: event.raw,
       });
+      // Only a priced, durably appended receipt can replace a budget reservation.
+      // ton-provider.ts's onReceipt calls always write the CURRENT casing 'nanoTON'
+      // (#751), so 'nanoton' below is accepted only for the same backward-READ-
+      // compatibility reason receipt.ts's pricedReceipt() (spend-budget.ts) accepts it
+      // — never written by this codebase today, but kept in agreement with that
+      // reader so a legacy-cased receipt can still settle a reservation instead of
+      // leaving it open forever (Codex review).
+      const expectedUnits =
+        backendName === 'arweave' ? ['winston'] : backendName === 'turbo' ? ['winc'] : ['nanoTON', 'nanoton'];
+      return !!event.cost && /^\d+$/.test(event.cost.amount) && expectedUnits.includes(event.cost.unit ?? '');
     } catch (e) {
       warn(
         `${backendName}: could not persist the upload receipt (${errMsg(e)}) — the underlying spend already happened (locator ${event.locator} is real); cumulative-cost ledger will be missing this entry`,
       );
+      return false;
     }
   };
 
@@ -567,6 +574,50 @@ async function pushCoreLocked(
   // strictly sequential (the sidecar's only starts once this one has resolved), which is
   // what the tracker's non-atomic check-then-charge contract requires.
   const spendTracker: SpendTracker = { spent: 0n };
+  // Cumulative admission covers BOTH uploads, across calls/processes, independently
+  // of SpendTracker. Keep reservations until put()'s outcome is classified: an
+  // uncertain outcome must remain charged even if a callback supplied a receipt.
+  const budgetedPut = async (path: string, opts: PutOpts): Promise<string> => {
+    const spentBefore = spendTracker.spent;
+    const reservation = await reserveSpendBudget(backendName, spentBefore);
+    let receiptSeen = false;
+    let receiptDurable = false;
+    const retain = () => {
+      if (reservation)
+        warn(
+          `spend-budget reservation ${reservation.reservation_id} remains open in ${SPEND_BUDGET_LOG}; ` +
+            'the spend is not safely resolved and still counts against daily/monthly caps',
+        );
+    };
+    try {
+      const result = await backend.put(path, {
+        ...opts,
+        onReceipt: async (event) => {
+          receiptSeen = true;
+          receiptDurable = await persistReceipt(path, event);
+        },
+      });
+      if (receiptDurable) await resolveSpendBudget(reservation, 'settled');
+      else if (!receiptSeen && backendName === 'ton-provider' && spendTracker.spent === spentBefore) {
+        // The already-active TON path can complete without moving any new funds.
+        await resolveSpendBudget(reservation, 'abandoned');
+      } else retain();
+      return result;
+    } catch (e) {
+      if (e instanceof PushUncertainSpendError) retain();
+      else if (receiptDurable) await resolveSpendBudget(reservation, 'settled');
+      else if (!receiptSeen && !(e instanceof PushPartialSuccessError) && spendTracker.spent === spentBefore) {
+        await resolveSpendBudget(reservation, 'abandoned');
+      } else {
+        // Trackers are charged before submission, so even some preflight failures
+        // conservatively stay open. A plain error after that point is not proof of
+        // no spend (e.g. a failed confirmed-intent write before onReceipt).
+        retain();
+      }
+      throw e;
+    }
+  };
+
   // #226/TOCTOU fix (multi-model review round 2 — Codex review): read the digest as
   // late as this function can make it — immediately before backend.put() below, the
   // actual point where `o.in`'s bytes are read for upload — rather than any earlier
@@ -589,12 +640,11 @@ async function pushCoreLocked(
   // fails to hash here is not a NEW failure mode, since backend.put() immediately below
   // would fail the exact same read moments later anyway.
   if (digestBox) digestBox.value = await sha256(o.in).catch(() => null);
-  const locator = await backend.put(o.in, {
+  const locator = await budgetedPut(o.in, {
     yes,
     remote: o.remote,
     force: o.force,
     spendTracker,
-    onReceipt: (event) => persistReceipt(inPath, event),
   });
   console.error(`pushed ${o.in} -> ${displayLocator(o.backend, locator)}`);
   // Authenticity sidecar (#214): if snapshot() wrote a "<in>.minisig" next to the
@@ -622,7 +672,7 @@ async function pushCoreLocked(
       // fire, same as a network blip or auth failure always could.
       // selftest-push-partial-failure.sh already exercises that partial-success
       // shape end-to-end.
-      justUploaded = await backend.put(sigPath, {
+      justUploaded = await budgetedPut(sigPath, {
         yes,
         remote: o.remote ? `${o.remote}.minisig` : undefined,
         force: o.force,
@@ -630,7 +680,6 @@ async function pushCoreLocked(
         // this is what lets the backend see the ciphertext upload's already-committed
         // spend and enforce its cap against the combined total.
         spendTracker,
-        onReceipt: (event) => persistReceipt(sigPath, event),
       });
     } catch (e) {
       // issue #654 (Codex review): a signed ton-provider push's SIDECAR deploy can hit

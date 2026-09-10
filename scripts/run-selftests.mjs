@@ -134,6 +134,7 @@ const PARALLEL = [
   // be affected by, any other test running concurrently in this pool.
   npmTest('selftest:init-keygen-force-race'),
   npmTest('selftest:init-turbo-uncertain-spend'),
+  npmTest('selftest:spend-budget'),
   npmTest('selftest:restore-security'),
   // ~7s measured in the pool. Parallel-safe under this list's own bar (a positive
   // finding, not the absence of a reason to suspect it): everything it creates lives

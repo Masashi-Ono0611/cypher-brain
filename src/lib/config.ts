@@ -58,6 +58,8 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_TON_TONVIEWER_URL',
   'CYPHER_BRAIN_TON_PROVIDER_OWNER',
   'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND',
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY',
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY',
   'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_BIN',
   'CYPHER_BRAIN_TON_PROVIDER_MYTONPROVIDER_URL',
   'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS', // test-only override (scripts/selftest-ton-provider.sh) — a real push waits on the 10-minute default
@@ -68,6 +70,8 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_TON_WALLET', // PR2: local TON wallet mnemonic file — when set, ton-provider auto-signs (no Tonkeeper deeplink) and derives `owner` from this wallet
   'CYPHER_BRAIN_YES',
   'CYPHER_BRAIN_MAX_SPEND',
+  'CYPHER_BRAIN_MAX_SPEND_DAILY',
+  'CYPHER_BRAIN_MAX_SPEND_MONTHLY',
   'CYPHER_BRAIN_SKIP_FUNDS_CHECK', // #342: one-run bypass of the turbo pre-upload funds check (stale balance reads)
   'CYPHER_BRAIN_PIPE_TIMEOUT',
   'CYPHER_BRAIN_PULL_RETRY_MS',
@@ -768,6 +772,20 @@ const TON_PROVIDER_MAX_SPEND_LOAD = parseMaxSpendBigInt(
 export const TON_PROVIDER_MAX_SPEND = TON_PROVIDER_MAX_SPEND_LOAD.value;
 /** Why CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND was refused, if it was (#715) — mirrors CONFIG_FILE_ERROR above. */
 export const TON_PROVIDER_MAX_SPEND_ERROR: Error | null = TON_PROVIDER_MAX_SPEND_LOAD.error;
+// Cumulative admission caps (#907): independent UTC calendar windows; 0/unset disables each cap.
+const TON_PROVIDER_MAX_SPEND_DAILY_LOAD = parseMaxSpendBigInt(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY'),
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY',
+);
+export const TON_PROVIDER_MAX_SPEND_DAILY = TON_PROVIDER_MAX_SPEND_DAILY_LOAD.value;
+export const TON_PROVIDER_MAX_SPEND_DAILY_ERROR: Error | null = TON_PROVIDER_MAX_SPEND_DAILY_LOAD.error;
+const TON_PROVIDER_MAX_SPEND_MONTHLY_LOAD = parseMaxSpendBigInt(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY'),
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY',
+);
+export const TON_PROVIDER_MAX_SPEND_MONTHLY = TON_PROVIDER_MAX_SPEND_MONTHLY_LOAD.value;
+export const TON_PROVIDER_MAX_SPEND_MONTHLY_ERROR: Error | null = TON_PROVIDER_MAX_SPEND_MONTHLY_LOAD.error;
+
 // Path to a locally-built scripts/go/storage-v1-client binary (`go build` in that dir) —
 // the ONLY step that needs it: notifying a provider over ADNL/RLDP has no mature
 // TypeScript implementation (checked; even thekiba/tonutils's storage package is
@@ -918,6 +936,20 @@ const MAX_SPEND_LOAD = parseMaxSpendBigInt(readEnv('CYPHER_BRAIN_MAX_SPEND'), 'C
 export const AR_MAX_SPEND = MAX_SPEND_LOAD.value;
 /** Why CYPHER_BRAIN_MAX_SPEND was refused, if it was (#715) — mirrors CONFIG_FILE_ERROR above. */
 export const AR_MAX_SPEND_ERROR: Error | null = MAX_SPEND_LOAD.error;
+// Cumulative admission caps (#907): independent UTC calendar windows; 0/unset disables each cap.
+const MAX_SPEND_DAILY_LOAD = parseMaxSpendBigInt(
+  readEnv('CYPHER_BRAIN_MAX_SPEND_DAILY'),
+  'CYPHER_BRAIN_MAX_SPEND_DAILY',
+);
+export const AR_MAX_SPEND_DAILY = MAX_SPEND_DAILY_LOAD.value;
+export const AR_MAX_SPEND_DAILY_ERROR: Error | null = MAX_SPEND_DAILY_LOAD.error;
+const MAX_SPEND_MONTHLY_LOAD = parseMaxSpendBigInt(
+  readEnv('CYPHER_BRAIN_MAX_SPEND_MONTHLY'),
+  'CYPHER_BRAIN_MAX_SPEND_MONTHLY',
+);
+export const AR_MAX_SPEND_MONTHLY = MAX_SPEND_MONTHLY_LOAD.value;
+export const AR_MAX_SPEND_MONTHLY_ERROR: Error | null = MAX_SPEND_MONTHLY_LOAD.error;
+
 // Escape hatch for the turbo pre-upload funds check (#342). The check refuses an upload
 // whose cost exceeds even the upper bound of reachable credit — a spend the payment
 // service would reject anyway — but the balance read can lag a top-up made seconds
