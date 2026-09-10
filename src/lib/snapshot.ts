@@ -619,15 +619,27 @@ export async function snapshot(o: CliOptions): Promise<void> {
     const required = await resolveRequiredRecipients(REQUIRE_RECIPIENT);
     for (const key of required) {
       if (!effectiveKeys.has(key))
+        // #902 dogfooding: name the concrete repair, not just the rule — an operator
+        // hitting this refusal needs to know THIS invocation is missing an extra
+        // --recipient, not just that "the recovery recipient could not decrypt".
         throw new Error(
-          `recipient "${key}" required by CYPHER_BRAIN_REQUIRE_RECIPIENT is missing — refusing to snapshot (the recovery recipient could not decrypt your brain)`,
+          `recipient "${key}" required by CYPHER_BRAIN_REQUIRE_RECIPIENT is missing — refusing to snapshot ` +
+            '(the recovery recipient could not decrypt your brain) — add it with an extra ' +
+            `--recipient ${key}`,
         );
     }
   }
   // PQ-hybrid age recipients use the age1pq1 prefix (keygen --pq), not age1 alone.
-  if (REQUIRE_PQ_RECIPIENTS && recipientList.some((key) => !key.startsWith('age1pq1')))
+  // #902 dogfooding: name the OFFENDING recipient(s), not just the rule — a mixed
+  // classical/PQ --recipient list otherwise leaves the operator to find which one by
+  // re-deriving every recipient's key by hand. The policy check short-circuits first
+  // (Codex review) so a disabled policy never pays for scanning every recipient.
+  const nonPqRecipients = REQUIRE_PQ_RECIPIENTS ? recipientList.filter((key) => !key.startsWith('age1pq1')) : [];
+  if (nonPqRecipients.length > 0)
     throw new Error(
-      'CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS=1 requires EVERY recipient to be PQ-hybrid (age1pq1…) — refusing to snapshot',
+      'CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS=1 requires EVERY recipient to be PQ-hybrid (age1pq1…) — refusing to ' +
+        `snapshot — non-PQ recipient(s): ${nonPqRecipients.join(', ')} — regenerate with 'keygen --pq' or drop ` +
+        'them from --recipient',
     );
 
   if (effectiveKeys.size === 1) {
