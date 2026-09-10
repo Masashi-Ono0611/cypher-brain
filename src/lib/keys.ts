@@ -15,8 +15,9 @@ import {
 } from './config.js';
 import { generateKeypair, identityFileText, askNewPassphrase, wrapIdentity } from './crypt.js';
 import { keygenSignAt } from './minisign.js';
-import { exists, syncDirectoryChain } from './util.js';
+import { exists, syncDirectoryChain, errMsg } from './util.js';
 import { installStageSignalGuard, addActiveKeyScratchFile, removeActiveKeyScratchFile } from './signal-guard.js';
+import { parseSssPolicy, splitIdentity, combineShares, type SssPolicy } from './sss.js';
 import type { CliOptions } from './types.js';
 
 // Core of keygen(), parameterized over WHERE to write (home dir + identity/recipient
@@ -34,6 +35,13 @@ export interface KeygenAtOpts {
   passphrase?: boolean;
   force?: boolean;
   pq?: boolean; // post-quantum HYBRID keypair (ML-KEM-768 + X25519, #205) instead of plain X25519
+  // #207: when set, ALSO split the identity into `sss.policy.shares` Shamir shares
+  // and write them to `sss.outPaths` (one path per share, resolved by the caller —
+  // keygen() below — BEFORE calling keygenAt(), so this function's own atomic
+  // identity.age/recipient.txt writes are untouched by that resolution). Additive:
+  // identity.age is written exactly as it always was; the shares are an extra
+  // disaster-recovery artifact, not a replacement for it.
+  sss?: { policy: SssPolicy; outPaths: string[] };
 }
 
 export interface KeygenAtResult {
@@ -43,6 +51,9 @@ export interface KeygenAtResult {
   // backupIdentityFile() (below) wrote the OLD identity's exact bytes to before
   // either write in keygenAt() touched anything (#786).
   backupPath?: string;
+  // Paths the SSS shares were written to, in the same order as opts.sss.outPaths,
+  // only present when --sss was requested and every share wrote successfully.
+  sssShares?: string[];
 }
 
 // Elide a long recipient string for terminal display (issue #424): a --pq hybrid
@@ -303,6 +314,24 @@ export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
       `recipient already exists at ${opts.recipientPath} (refusing to overwrite — a silently re-keyed recipient.txt would re-key every FUTURE snapshot). Pass --force only if you are certain.`,
     );
   }
+  // #207: SSS output paths are checked here too, BEFORE anything is generated —
+  // same "check everything, then write" ordering as identity/recipient above, and
+  // the same no-clobber posture (an existing file at a chosen share path almost
+  // certainly means the wrong path was picked, not that overwriting it is intended).
+  if (opts.sss) {
+    if (opts.sss.outPaths.length !== opts.sss.policy.shares)
+      throw new Error(
+        `--sss ${opts.sss.policy.threshold}-of-${opts.sss.policy.shares} needs exactly ${opts.sss.policy.shares} --sss-out-dir paths, got ${opts.sss.outPaths.length}`,
+      );
+    if (!opts.force) {
+      for (const p of opts.sss.outPaths) {
+        if (await exists(p))
+          throw new Error(
+            `SSS share path already exists at ${p} (refusing to overwrite). Pass --force, or pick a different path.`,
+          );
+      }
+    }
+  }
   // The key is generated in-process (typage) and — on the passphrase path — wrapped
   // in memory too (#36): unlike the old external `age -p` flow there is no unwrapped
   // temp file on disk, so nothing can linger even on Ctrl-C at the prompt.
@@ -315,6 +344,14 @@ export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
     payload = await wrapIdentity(text, await askNewPassphrase()); // scrypt, same format `age -p` writes
     wrapped = true;
   }
+  // #207: split from the PLAIN identity (never the passphrase-wrapped payload — a
+  // reconstruction should not ALSO require the passphrase, which would make the
+  // shares only as strong as "memorized passphrase" all over again, the exact
+  // single point of failure SSS exists to route around). Computed here, before any
+  // write happens, following this function's existing "prepare everything fully,
+  // THEN write" ordering (generateKeypair/wrapIdentity above, backupIdentityFile
+  // below) — a failure in splitIdentity() itself still leaves nothing written.
+  const sssShareTexts = opts.sss ? await splitIdentity(identity, recipient, opts.sss.policy) : undefined;
   // Both the new identity and the new recipient are fully prepared by this point —
   // only from here on is an existing file (--force) ever touched, and even then via
   // write-new-then-rename, never delete-then-write (#122; see writeKeyFile above).
@@ -350,7 +387,31 @@ export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
   // remaining safety net for the case both writes succeed.
   await writeKeyFile(opts.recipientPath, `${recipient}\n`, 0o644, !!opts.force);
   await writeKeyFile(opts.identityPath, payload, 0o600, !!opts.force);
-  return { recipient, wrapped, backupPath };
+  // #207: shares are written LAST and are additive — identity.age/recipient.txt
+  // above are already durably in place by this point regardless of what happens
+  // here, so a share-write failure never means "the identity was lost," only that
+  // the disaster-recovery share set is incomplete. Reports exactly which paths
+  // succeeded before the one that failed, rather than a blanket failure that would
+  // leave the operator unsure whether ANY shares made it to disk.
+  let sssShares: string[] | undefined;
+  if (opts.sss && sssShareTexts) {
+    const written: string[] = [];
+    try {
+      for (let i = 0; i < opts.sss.outPaths.length; i++) {
+        const p = opts.sss.outPaths[i];
+        await writeKeyFile(p, sssShareTexts[i], 0o600, !!opts.force);
+        written.push(p);
+      }
+    } catch (e) {
+      throw new Error(
+        `identity and recipient were written successfully, but writing SSS shares failed partway ` +
+          `(${written.length} of ${opts.sss.outPaths.length} written: ${written.join(', ') || '(none)'}) — ${errMsg(e)}. ` +
+          `Your identity is intact; retry the missing shares by hand, or rerun "keygen --force" with the same --sss.`,
+      );
+    }
+    sssShares = written;
+  }
+  return { recipient, wrapped, backupPath, sssShares };
 }
 
 // Passphrase-wrap an ALREADY-EXISTING identity file in place (#110): unlike `keygen
@@ -497,6 +558,13 @@ export async function keygen(o: CliOptions): Promise<void> {
       throw new Error(
         '--pq has no effect with --sign (the signing keypair is always Ed25519). Run "keygen --sign" on its own.',
       );
+    // --sss splits an AGE identity's key material — meaningless for a minisign
+    // signing keypair, which this branch never even generates the material for.
+    // Same "fail loud instead of silently no-op-ing" discipline as --pq above.
+    if (o.sss)
+      throw new Error(
+        '--sss has no effect with --sign (there is no age identity here to split). Run "keygen --sss <m>-of-<n>" on its own.',
+      );
     return keygenSign(o);
   }
   if (o.wrap_in_place) {
@@ -510,15 +578,35 @@ export async function keygen(o: CliOptions): Promise<void> {
       throw new Error(
         '--pq has no effect with --wrap-in-place (which only passphrase-wraps the EXISTING identity — it does not generate a new keypair). Run a fresh "keygen --pq --force" to rotate to a post-quantum keypair (this makes prior snapshots unrecoverable unless also encrypted to another key).',
       );
+    // --wrap-in-place never generates a new keypair (it only re-wraps the existing
+    // identity's TEXT), so there is no fresh key material here for --sss to split.
+    if (o.sss)
+      throw new Error(
+        '--sss has no effect with --wrap-in-place (which only passphrase-wraps the EXISTING identity — it does not generate new key material to split). Run "keygen --sss <m>-of-<n> --force" to rotate and split a fresh identity instead.',
+      );
     return wrapInPlace(IDENTITY);
   }
-  const { recipient, wrapped } = await keygenAt({
+  // #207: no default M-of-N anywhere (mirrors CYPHER_BRAIN_PIN_RECIPIENTS/
+  // CYPHER_BRAIN_MCP_SOURCE_ROOTS) — parsed/validated here, before keygenAt() does
+  // anything, so a bad --sss value fails before touching disk at all.
+  let sssRequest: { policy: SssPolicy; outPaths: string[] } | undefined;
+  if (o.sss !== undefined) {
+    const policy = parseSssPolicy(o.sss);
+    const outPaths = o.sss_out_dir ?? [];
+    if (outPaths.length !== policy.shares)
+      throw new Error(
+        `--sss ${policy.threshold}-of-${policy.shares} needs exactly ${policy.shares} --sss-out-dir <path> flags (one per share), got ${outPaths.length}`,
+      );
+    sssRequest = { policy, outPaths };
+  }
+  const { recipient, wrapped, sssShares } = await keygenAt({
     home: HOME,
     identityPath: IDENTITY,
     recipientPath: RECIPIENT,
     passphrase: o.passphrase,
     force: o.force,
     pq: o.pq,
+    sss: sssRequest,
   });
   // Both labels are the same width (33 chars), so a single space after each
   // colon is what actually lines the two paths up (issue #263). (#786: keygenAt()
@@ -536,7 +624,40 @@ export async function keygen(o: CliOptions): Promise<void> {
     console.log(
       '(post-quantum HYBRID keypair: ML-KEM-768 + X25519 — the recipient/ciphertext are much bigger than plain X25519, see README Threat model)',
     );
+  if (sssShares && sssRequest) {
+    const { threshold, shares } = sssRequest.policy;
+    console.log(`\nSSS shares written (${threshold}-of-${shares}, keep each at a SEPARATE physical location):`);
+    for (const p of sssShares) console.log(`  ${p}`);
+    console.log(
+      `Any ${threshold} of these ${shares} reconstruct the identity via ` +
+        `"sss-combine --share <path> ... --out <path>" — no single share reveals anything about it.`,
+    );
+  }
   console.log('\n⚠  Back up the identity file now. If you lose it, the snapshots are unrecoverable.');
+}
+
+// #207: reconstructs an identity from >= threshold SSS shares (see sss.ts's
+// combineShares() for the integrity checks this relies on) and writes it as a
+// completely normal identity file via the SAME writeKeyFile() path keygen() uses —
+// so the result is usable with "restore --identity"/"verify" unchanged, no special
+// handling needed anywhere else.
+export async function sssCombineCommand(o: CliOptions): Promise<void> {
+  if (!o.sss_shares || o.sss_shares.length < 2)
+    throw new Error(`sss-combine needs at least 2 "--share <path>" flags, got ${o.sss_shares?.length ?? 0}`);
+  if (!o.out) throw new Error('sss-combine requires --out <path> (where to write the reconstructed identity)');
+  if ((await exists(o.out)) && !o.force)
+    throw new Error(`${o.out} already exists (refusing to overwrite). Pass --force, or pick a different path.`);
+  const inputs = await Promise.all(
+    o.sss_shares.map(async (path) => ({ text: await readFile(path, 'utf8'), sourceLabel: path })),
+  );
+  const { identity, recipient } = await combineShares(inputs);
+  await writeKeyFile(o.out, identityFileText(identity, recipient), 0o600, !!o.force);
+  console.log(`reconstructed identity written to: ${o.out}`);
+  console.log(`recipient = ${recipient}`);
+  console.log(
+    '\nVerify this matches the recipient you expect before relying on it, and confirm it decrypts a real ' +
+      'snapshot (e.g. "verify --level drill") before treating the original identity as recoverable.',
+  );
 }
 
 // Return EVERY recipient entry a value feeds to the encrypter: an existing path is

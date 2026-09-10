@@ -15,18 +15,22 @@
 // minimal counterexample.
 //
 // Scope, stated narrowly on purpose (same discipline as selftest-error-codes.mjs's own
-// header): this file property-tests FIVE specific, already-identified invariants — the
+// header): this file property-tests a fixed set of already-identified invariants — the
 // two manifest-field guards in src/lib/restore.ts (#198's vulnerability class), the
 // expanded/ directory-name uniqueness invariant those guards' numeric-index prefix and
-// sourceDigest() together provide (#181/#423), and the age encrypt/decrypt roundtrip in
-// src/lib/crypt.ts. It does not attempt to fuzz the whole CLI surface, and it is not a
-// substitute for scripts/selftest-cctv-age.mjs (which checks typage's CONFORMANCE to the
-// age spec using upstream's own vectors — a different question from "does OUR code's
-// usage of typage roundtrip correctly").
+// sourceDigest() together provide (#181/#423), the age encrypt/decrypt roundtrip in
+// src/lib/crypt.ts, and five properties covering src/lib/sss.ts's Shamir split/combine
+// (#207): the roundtrip itself, corruption detection, insufficient-share refusal,
+// mixed-split refusal, and the core "reconstruction succeeds but the header lies about
+// the recipient" integrity check. It does not attempt to fuzz the whole CLI surface,
+// and it is not a substitute for scripts/selftest-cctv-age.mjs (which checks typage's
+// CONFORMANCE to the age spec using upstream's own vectors — a different question from
+// "does OUR code's usage of typage roundtrip correctly").
 import fc from 'fast-check';
 import { join, resolve, sep } from 'node:path';
 import { isSafeComponentName, shortSourceLabel, sourceDigest, SHORT_LABEL_MAX } from '../src/lib/restore.ts';
 import { generateKeypair, newEncrypter, newDecrypter } from '../src/lib/crypt.ts';
+import { splitIdentity, combineShares } from '../src/lib/sss.ts';
 
 let failed = 0;
 const check = (name, cond, detail) => {
@@ -359,6 +363,184 @@ await property(
       }
     },
   ),
+);
+
+// ---- sss.ts: splitIdentity / combineShares roundtrip + corruption detection (#207) ----
+//
+// Complements scripts/selftest-sss.sh's example-based, real-CLI, real-filesystem
+// coverage the same way the crypt.ts property above complements selftest-pq.sh: in-
+// process, no disk I/O, across randomized M-of-N policy AND randomized SUBSET (any
+// threshold-sized set of the N shares, not just "the first M") AND both plain/PQ
+// identity kinds.
+await property(
+  'SSS roundtrip: any m-of-n policy, ANY threshold-sized subset of shares reconstructs the identity byte-identically',
+  fc.asyncProperty(
+    fc.boolean(), // pq or plain X25519
+    fc.integer({ min: 2, max: 8 }).chain((n) => fc.tuple(fc.constant(n), fc.integer({ min: 2, max: n }))),
+    fc.gen(),
+    async (pq, [shares, threshold], gen) => {
+      const { identity, recipient } = await generateKeypair({ pq });
+      const shareTexts = await splitIdentity(identity, recipient, { threshold, shares });
+      // Pick a random THRESHOLD-sized subset of the N shares' indices, order shuffled —
+      // combineShares() must not care which subset, or their order.
+      const indices = [...Array(shares).keys()];
+      for (let i = indices.length - 1; i > 0; i--) {
+        const j = gen(fc.integer, { min: 0, max: i });
+        [indices[i], indices[j]] = [indices[j], indices[i]];
+      }
+      const chosen = indices.slice(0, threshold);
+      const inputs = chosen.map((i) => ({ text: shareTexts[i], sourceLabel: `share-${i}` }));
+      const result = await combineShares(inputs);
+      return result.identity === identity && result.recipient === recipient;
+    },
+  ),
+  { numRuns: 100 },
+);
+
+// A single corrupted byte in exactly one of the THRESHOLD shares used must never be
+// silently absorbed into a successful, byte-identical reconstruction — this is the
+// exact gap the underlying shamir-secret-sharing library's own README documents
+// ("this library does not verify the result of share reconstruction") and combineShares()
+// exists to close. Mathematically guaranteed, not merely likely: Lagrange
+// interpolation over GF(2^8) with exactly `threshold` sample points uniquely
+// determines each reconstructed byte as a NONZERO-coefficient linear combination of
+// the sample y-values, so changing one y-value (a corrupted body byte, excluding the
+// share's own trailing x-coordinate byte) changes the byte reconstructed at that
+// position — combineShares() must therefore either throw, or return a DIFFERENT
+// identity than the clean reconstruction would have.
+await property(
+  'SSS corruption: flipping one byte of one of exactly `threshold` shares never reconstructs the original identity — it throws, or differs',
+  fc.asyncProperty(
+    fc.boolean(),
+    fc.integer({ min: 2, max: 8 }).chain((n) => fc.tuple(fc.constant(n), fc.integer({ min: 2, max: n }))),
+    fc.gen(),
+    async (pq, [shares, threshold], gen) => {
+      const { identity, recipient } = await generateKeypair({ pq });
+      const shareTexts = await splitIdentity(identity, recipient, { threshold, shares });
+      const indices = [...Array(shares).keys()];
+      for (let i = indices.length - 1; i > 0; i--) {
+        const j = gen(fc.integer, { min: 0, max: i });
+        [indices[i], indices[j]] = [indices[j], indices[i]];
+      }
+      const chosen = indices.slice(0, threshold);
+      const inputs = chosen.map((i) => ({ text: shareTexts[i], sourceLabel: `share-${i}` }));
+      // Corrupt one base64 character of the FIRST chosen share's body line (never the
+      // header) — decoded base64 length is >= 33 bytes for any real identity, so a
+      // char at a fixed offset near the start is always within the body's IDENTITY
+      // portion, never the trailing appended x-coordinate byte at the very end.
+      const lines = inputs[0].text.split('\n');
+      const bodyIdx = lines.findIndex((l) => l.length > 0 && !l.startsWith('#'));
+      const body = lines[bodyIdx];
+      const pos = 4; // fixed, well within any real share body's length
+      const c = body[pos];
+      lines[bodyIdx] = body.slice(0, pos) + (c === 'A' ? 'B' : 'A') + body.slice(pos + 1);
+      inputs[0] = { ...inputs[0], text: lines.join('\n') };
+      try {
+        const result = await combineShares(inputs);
+        return result.identity !== identity;
+      } catch {
+        return true; // refused outright is the other acceptable outcome
+      }
+    },
+  ),
+  { numRuns: 100 },
+);
+
+// Fewer than the split's own declared threshold — even from a genuinely valid split —
+// must always be refused, never "reconstruct with whatever Lagrange happens to
+// produce from an under-determined polynomial." Random subset size in [1, threshold-1].
+await property(
+  'SSS insufficient shares: fewer than the declared threshold (from a valid split) is always refused',
+  fc.asyncProperty(
+    fc.boolean(),
+    fc.integer({ min: 2, max: 8 }).chain((n) => fc.tuple(fc.constant(n), fc.integer({ min: 2, max: n }))),
+    fc.gen(),
+    async (pq, [shares, threshold], gen) => {
+      const { identity, recipient } = await generateKeypair({ pq });
+      const shareTexts = await splitIdentity(identity, recipient, { threshold, shares });
+      const tooFew = gen(fc.integer, { min: 1, max: threshold - 1 });
+      const inputs = shareTexts.slice(0, tooFew).map((text, i) => ({ text, sourceLabel: `share-${i}` }));
+      if (inputs.length < 2) {
+        // combineShares() itself requires >= 2 inputs regardless of threshold — a
+        // 1-share call must be refused for THAT reason even when threshold happens
+        // to be small enough that 1 would otherwise be "insufficient" either way.
+        try {
+          await combineShares(inputs);
+          return false;
+        } catch {
+          return true;
+        }
+      }
+      try {
+        await combineShares(inputs);
+        return false; // must not have succeeded with too few shares
+      } catch (e) {
+        return e instanceof Error && /need \d+ shares/.test(e.message);
+      }
+    },
+  ),
+  { numRuns: 100 },
+);
+
+// Shares whose headers disagree (drawn from two INDEPENDENT splits — different
+// recipients, and generally different threshold/shares too) must be refused by the
+// header cross-check, before ever reaching combine()'s crypto. This is the property-
+// level counterpart to scripts/selftest-sss.sh's mixed-split example.
+await property(
+  'SSS mixed splits: shares from two independent keygen --sss runs are always refused',
+  fc.asyncProperty(
+    fc.integer({ min: 2, max: 8 }).chain((n) => fc.tuple(fc.constant(n), fc.integer({ min: 2, max: n }))),
+    fc.integer({ min: 2, max: 8 }).chain((n) => fc.tuple(fc.constant(n), fc.integer({ min: 2, max: n }))),
+    async ([sharesA, thresholdA], [sharesB, thresholdB]) => {
+      const a = await generateKeypair({ pq: false });
+      const b = await generateKeypair({ pq: false });
+      const textsA = await splitIdentity(a.identity, a.recipient, { threshold: thresholdA, shares: sharesA });
+      const textsB = await splitIdentity(b.identity, b.recipient, { threshold: thresholdB, shares: sharesB });
+      const inputs = [
+        { text: textsA[0], sourceLabel: 'a' },
+        { text: textsB[0], sourceLabel: 'b' },
+      ];
+      try {
+        await combineShares(inputs);
+        return false; // two shares from unrelated splits must never combine "successfully"
+      } catch (e) {
+        return e instanceof Error && /different split/.test(e.message);
+      }
+    },
+  ),
+  { numRuns: 50 },
+);
+
+// The core integrity check itself (recipient re-derived from the reconstruction must
+// match the recipient recorded on the shares): forges the `# recipient:` header on
+// every share of a REAL, otherwise-valid split to a DIFFERENT (but real) recipient —
+// so the header cross-check between shares (they all now agree with EACH OTHER, just
+// not with reality) does not fire, and reconstruction proceeds to the genuine
+// identity/recipient pair, which then must disagree with the forged header. This is
+// the one scenario that actually exercises "combine math succeeds, but the claimed
+// recipient is a lie" — the exact case #207's design doc calls out the underlying
+// shamir-secret-sharing library as NOT protecting against on its own.
+await property(
+  'SSS forged recipient header: a header lying about the recipient is refused even when reconstruction itself succeeds',
+  fc.asyncProperty(
+    fc.integer({ min: 2, max: 8 }).chain((n) => fc.tuple(fc.constant(n), fc.integer({ min: 2, max: n }))),
+    async ([shares, threshold]) => {
+      const real = await generateKeypair({ pq: false });
+      const decoy = await generateKeypair({ pq: false });
+      const shareTexts = await splitIdentity(real.identity, real.recipient, { threshold, shares });
+      const forged = shareTexts.slice(0, threshold).map((text, i) => ({
+        text: text.replace(/^# recipient: .*$/m, `# recipient: ${decoy.recipient}`),
+        sourceLabel: `forged-${i}`,
+      }));
+      try {
+        await combineShares(forged);
+        return false; // must never succeed with a header that lies about the recipient
+      } catch (e) {
+        return e instanceof Error && /integrity check/.test(e.message);
+      }
+    },
+  ),
+  { numRuns: 50 },
 );
 
 if (failed > 0) {

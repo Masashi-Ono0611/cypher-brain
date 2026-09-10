@@ -153,6 +153,30 @@ combines normally with the existing multi-recipient mechanism (a hybrid primary 
 an X25519 backup, or vice versa — either identity restores) and with
 `CYPHER_BRAIN_PIN_RECIPIENTS`.
 
+A separate risk is losing the identity outright — the flip side of "the key is
+only mine": nobody else can decrypt, but nobody else can help you recover it
+either. `keygen --sss <m>-of-<n>` (#207) addresses this with [Shamir's Secret
+Sharing](https://en.wikipedia.org/wiki/Shamir%27s_Secret_Sharing), via
+[`shamir-secret-sharing`](https://github.com/privy-io/shamir-secret-sharing)
+(independently audited by [Cure53](https://cure53.de/audit-report_privy-sss-library.pdf)
+and [Zellic](https://github.com/Zellic/publications/blob/master/Privy_Shamir_Secret_Sharing_-_Zellic_Audit_Report.pdf),
+zero runtime dependencies): it **additionally** splits the identity's key
+material into `<n>` share files, any `<m>` of which reconstruct it via
+`sss-combine` — the normal `identity.age` this command already writes is
+unaffected. No single share reveals anything about the identity, so keeping
+each at a separate physical location means no single lost or compromised
+location causes total lockout, while the identity stays recoverable even if
+some locations are lost, as long as `<m>` remain. This is a different
+resilience profile than the multi-recipient backup key above (which holds an
+entire independent keypair at one location) — the two compose, since one
+splits a single key and the other holds multiple keys. Works identically with
+`--pq`: an identity is split as opaque bytes, so a hybrid keypair needs no
+special handling. Because the underlying library does not itself verify a
+reconstruction (a corrupt or mismatched share can silently produce wrong
+bytes), `sss-combine` re-derives the recipient from the reconstructed identity
+and refuses outright if it does not match the recipient recorded (in
+plaintext — recipients are public) on every share.
+
 A different risk lives in the plaintext sources themselves, not the crypto:
 `snapshot --scan-secrets warn|deny|off` runs [gitleaks](https://github.com/gitleaks/gitleaks)
 over each `--dir`/`--profile` source's staged plaintext *before* it is
@@ -576,7 +600,7 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       --force, or drive the commands below by hand, to redo it) and requires a TTY
       on stdin (it is interactive, not automatable).
 
-  cypher-brain keygen [--passphrase] [--force] [--pq] | keygen --wrap-in-place | keygen --sign
+  cypher-brain keygen [--passphrase] [--force] [--pq] [--sss <m>-of-<n> --sss-out-dir <path> ...] | keygen --wrap-in-place | keygen --sign
       Create your age keypair: identity (PRIVATE) + recipient (PUBLIC).
       --passphrase wraps the identity at rest with a scrypt passphrase (prompted on the
       TTY); restore/verify then prompt for it. Identity = /home/user/.cypher-brain/identity.age
@@ -609,6 +633,33 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       they do to the age identity above, INCLUDING the --force backup (sign-identity.key
       backed up to "sign-identity.key.bak-<timestamp>-<random>", #786); --wrap-in-place
       does not (age-only).
+      --sss <m>-of-<n> (#207) ADDITIONALLY splits the identity's key material into <n>
+      Shamir shares, any <m> of which reconstruct it — a disaster-recovery mechanism
+      alongside (never instead of) the normal identity.age this command already writes.
+      No single share reveals anything about the identity, so no single lost or
+      compromised location causes total lockout, and it is still recoverable even if
+      some locations are lost, as long as <m> remain. Requires exactly <n>
+      "--sss-out-dir <path>" flags (one per share; there is no default policy or output
+      location — both must always be explicit). Splits the PLAIN identity, never a
+      --passphrase-wrapped payload, so reconstruction never also needs the passphrase.
+      Works identically with --pq (an identity is split as opaque bytes; #205's hybrid
+      keypairs need no special handling) and composes with --recipient/multi-recipient
+      backup keys (#99) — that mechanism holds independent keypairs, this one splits a
+      single keypair, so a setup can use both. Reconstruct with "sss-combine" below.
+
+  cypher-brain sss-combine --share <path> --share <path> ... --out <path> [--force]
+      Reconstructs an age identity from >= threshold Shamir shares written by
+      "keygen --sss" (#207). Refuses (never writes a wrong-but-plausible identity) if:
+      fewer than 2 --share paths are given, the shares disagree on recipient/threshold
+      (mixing shares from different "keygen --sss" runs), fewer shares are given than
+      the split's own threshold, or the reconstructed identity's derived recipient does
+      not match the recipient recorded on the shares — this last check is what closes
+      the underlying Shamir library's own documented gap (it does not verify
+      reconstruction on its own). --out is a normal identity file, usable with
+      "restore --identity"/"verify" exactly like any "keygen"-produced one, no special
+      handling needed. Refuses to overwrite an existing --out path unless --force.
+      Confirm the printed recipient matches what you expect, then verify it actually
+      decrypts a real snapshot (e.g. "verify --level drill") before relying on it.
 
   cypher-brain wallet create [--out <path>] [--force] [--chain arweave|ton]
       Generate a fresh signing credential. --chain arweave (default) generates an

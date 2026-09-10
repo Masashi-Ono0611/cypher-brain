@@ -123,6 +123,7 @@ const PARALLEL = [
   npmTest('selftest:interop'),
   npmTest('selftest:cypherbrainignore'),
   npmTest('selftest:pq'),
+  npmTest('selftest:sss'),
   npmTest('selftest:keygen-force'),
   npmTest('selftest:keyfile-fsync-cleanup'),
   // Parallel-safe by the same findings as mcp-uncertain-spend below: each scenario
