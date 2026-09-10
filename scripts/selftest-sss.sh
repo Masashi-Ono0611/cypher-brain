@@ -131,4 +131,79 @@ diff -q "$TMP/pq-orig-tail.txt" "$TMP/pq-recovered-tail.txt" >/dev/null \
   && echo "[PASS] PQ hybrid identity reconstructs byte-identically via SSS" \
   || { echo "[FAIL] PQ hybrid reconstruction differs from the original"; exit 1; }
 
+echo "== sss-split (#890): adds shares to an ALREADY-EXISTING identity without touching it =="
+HOME_E="$TMP/home-e"
+SHARES_E="$TMP/shares-e"
+mkdir -p "$SHARES_E"
+cb "$HOME_E" keygen >/dev/null # plain keygen, no --sss at all
+IDENTITY_SHA_BEFORE="$(sha "$HOME_E/identity.age")"
+RECIPIENT_BEFORE="$(cat "$HOME_E/recipient.txt")"
+mkdir -p "$TMP/src-e"
+echo "cypher-brain sss-split selftest payload" >"$TMP/src-e/note.txt"
+cb "$HOME_E" snapshot --dir "$TMP/src-e" --out "$TMP/snap-e.age" >/dev/null
+cb "$HOME_E" sss-split --sss 2-of-3 \
+  --sss-out-dir "$SHARES_E/1.txt" --sss-out-dir "$SHARES_E/2.txt" --sss-out-dir "$SHARES_E/3.txt" >/dev/null
+[ "$(sha "$HOME_E/identity.age")" = "$IDENTITY_SHA_BEFORE" ] \
+  && echo "[PASS] sss-split left identity.age byte-for-byte unchanged" \
+  || { echo "[FAIL] identity.age was modified by sss-split"; exit 1; }
+[ "$(cat "$HOME_E/recipient.txt")" = "$RECIPIENT_BEFORE" ] \
+  && echo "[PASS] sss-split left recipient.txt unchanged" \
+  || { echo "[FAIL] recipient.txt was modified by sss-split"; exit 1; }
+cb "$HOME_E" sss-combine --share "$SHARES_E/1.txt" --share "$SHARES_E/3.txt" --out "$TMP/recovered-e.age" >/dev/null
+tail -n +2 "$HOME_E/identity.age" >"$TMP/e-orig-tail.txt"
+tail -n +2 "$TMP/recovered-e.age" >"$TMP/e-recovered-tail.txt"
+diff -q "$TMP/e-orig-tail.txt" "$TMP/e-recovered-tail.txt" >/dev/null \
+  && echo "[PASS] sss-split shares reconstruct the pre-existing identity byte-for-byte" \
+  || { echo "[FAIL] sss-split reconstruction differs from the pre-existing identity"; exit 1; }
+cb "$HOME_E" restore --in "$TMP/snap-e.age" --identity "$TMP/recovered-e.age" --out-dir "$TMP/restored-e" --yes >/dev/null
+FOUND_NOTE_E="$(find "$TMP/restored-e" -name note.txt -print -quit)"
+[ -n "$FOUND_NOTE_E" ] && grep -q "cypher-brain sss-split selftest payload" "$FOUND_NOTE_E" \
+  && echo "[PASS] restore using sss-split's reconstructed identity recovers a snapshot made BEFORE sss-split ran" \
+  || { echo "[FAIL] restore via sss-split-reconstructed identity did not recover the pre-existing snapshot"; exit 1; }
+
+echo "== sss-split on a PASSPHRASE-protected identity: prompts via env var, shares reconstruct the PLAIN identity =="
+HOME_F="$TMP/home-f"
+SHARES_F="$TMP/shares-f"
+mkdir -p "$SHARES_F"
+CYPHER_BRAIN_PASSPHRASE=selftest-pass-f cb "$HOME_F" keygen --passphrase >/dev/null
+IDENTITY_SHA_BEFORE_F="$(sha "$HOME_F/identity.age")"
+CYPHER_BRAIN_PASSPHRASE=selftest-pass-f cb "$HOME_F" sss-split --sss 2-of-2 \
+  --sss-out-dir "$SHARES_F/a.txt" --sss-out-dir "$SHARES_F/b.txt" >/dev/null
+[ "$(sha "$HOME_F/identity.age")" = "$IDENTITY_SHA_BEFORE_F" ] \
+  && echo "[PASS] sss-split left the PASSPHRASE-WRAPPED identity.age byte-for-byte unchanged too" \
+  || { echo "[FAIL] the passphrase-wrapped identity.age was modified by sss-split"; exit 1; }
+cb "$HOME_F" sss-combine --share "$SHARES_F/a.txt" --share "$SHARES_F/b.txt" --out "$TMP/recovered-f.age" >/dev/null
+# No CYPHER_BRAIN_PASSPHRASE set for this restore -- succeeds only if the recovered
+# identity is genuinely unwrapped plaintext, not still passphrase-protected.
+mkdir -p "$TMP/src-f"
+echo "sss-split passphrase selftest payload" >"$TMP/src-f/note.txt"
+cb "$HOME_F" snapshot --dir "$TMP/src-f" --out "$TMP/snap-f.age" >/dev/null
+env -u CYPHER_BRAIN_PASSPHRASE node "${BIN_DEV_ARGS[@]}" "$BIN" restore \
+  --in "$TMP/snap-f.age" --identity "$TMP/recovered-f.age" --out-dir "$TMP/restored-f" --yes >/dev/null
+FOUND_NOTE_F="$(find "$TMP/restored-f" -name note.txt -print -quit)"
+[ -n "$FOUND_NOTE_F" ] && grep -q "sss-split passphrase selftest payload" "$FOUND_NOTE_F" \
+  && echo "[PASS] sss-split on a passphrase-protected identity reconstructs a usable PLAIN identity (no passphrase needed to restore)" \
+  || { echo "[FAIL] restore via the passphrase-originated sss-split reconstruction failed"; exit 1; }
+
+echo "== sss-split refuses share paths colliding with identity/recipient, and pre-existing share paths =="
+if cb "$HOME_E" sss-split --sss 2-of-2 \
+  --sss-out-dir "$HOME_E/identity.age" --sss-out-dir "$SHARES_E/new.txt" >"$TMP/split-collide.out" 2>&1; then
+  echo "[FAIL] sss-split accepted a share path colliding with identity.age"; cat "$TMP/split-collide.out"; exit 1
+fi
+if cb "$HOME_E" sss-split --sss 2-of-3 \
+  --sss-out-dir "$SHARES_E/1.txt" --sss-out-dir "$SHARES_E/2.txt" --sss-out-dir "$SHARES_E/3.txt" \
+  >"$TMP/split-exists.out" 2>&1; then
+  echo "[FAIL] sss-split accepted already-existing share paths"; cat "$TMP/split-exists.out"; exit 1
+fi
+echo "[PASS] sss-split refuses identity-path collisions and pre-existing share paths"
+
+echo "== sss-split refuses a missing identity with an actionable error, not a raw ENOENT =="
+if cb "$TMP/home-missing" sss-split --sss 2-of-2 --identity "$TMP/no-such-identity.age" \
+  --sss-out-dir "$TMP/no-such-1.txt" --sss-out-dir "$TMP/no-such-2.txt" >"$TMP/split-missing.out" 2>&1; then
+  echo "[FAIL] sss-split accepted a nonexistent --identity path"; cat "$TMP/split-missing.out"; exit 1
+fi
+grep -q "no identity at" "$TMP/split-missing.out" \
+  && echo "[PASS] missing --identity path refused with an actionable message" \
+  || { echo "[FAIL] missing --identity path did not get the actionable message"; cat "$TMP/split-missing.out"; exit 1; }
+
 echo "SSS SELFTEST: PASS"

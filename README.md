@@ -164,7 +164,10 @@ zero runtime dependencies): it **additionally** generates a fresh random
 wrapping key, AES-256-GCM-encrypts the identity with it, splits that key
 material into `<n>` share files, any `<m>` of which reconstruct it via
 `sss-combine` — the normal `identity.age` this command already writes is
-unaffected. No single share reveals anything about the identity, so keeping
+unaffected. For an existing key, `sss-split --sss <m>-of-<n> --sss-out-dir <path> ...
+[--identity <path>]` adds compatible shares without changing `identity.age` or
+`recipient.txt`, prompting for the identity's passphrase if protected.
+No single share reveals anything about the identity, so keeping
 each at a separate physical location means no single lost or compromised
 location causes total lockout, while the identity stays recoverable even if
 some locations are lost, as long as `<m>` remain. This is a different
@@ -658,11 +661,23 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       mechanism holds independent keypairs, this one splits a single keypair, so a
       setup can use both. Reconstruct with "sss-combine" below.
 
+  cypher-brain sss-split --sss <m>-of-<n> --sss-out-dir <path> ... [--identity <path>]
+      Adds Shamir recovery shares to an EXISTING age identity (#890), without
+      changing identity.age or recipient.txt. Defaults to the same identity as
+      restore; --identity selects another file containing exactly one age identity.
+      Prompts for its passphrase if protected (or uses CYPHER_BRAIN_PASSPHRASE),
+      then splits the plain identity in memory using the same format as keygen --sss.
+      Requires an explicit policy and exactly <n> --sss-out-dir FILE paths, each
+      distinct from the others and from the identity/recipient paths. Parent
+      directories must exist. Never overwrites an existing share path.
+      Keep shares at separate physical locations. Recover with sss-combine;
+      reconstruction does not require the original passphrase.
+
   cypher-brain sss-combine --share <path> --share <path> ... --out <path> [--force]
       Reconstructs an age identity from >= threshold Shamir shares written by
-      "keygen --sss" (#207). Refuses (never writes a wrong-but-plausible identity) if:
+      "keygen --sss" or "sss-split". Refuses (never writes a wrong-but-plausible identity) if:
       fewer than 2 --share paths are given, the shares disagree on recipient/blob/
-      threshold (mixing shares from different "keygen --sss" runs), fewer shares are
+      threshold (mixing shares from different split runs), fewer shares are
       given than the split's own threshold, the reconstructed key fails to
       AES-GCM-authenticate the encrypted identity (a real cryptographic check, not a
       heuristic — this is what closes the underlying Shamir library's own documented

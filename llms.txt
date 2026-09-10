@@ -55,7 +55,11 @@ stderr is load-bearing, not decoration. If you run cypher-brain on a human's beh
 - **identity** (private key) — the only thing that can decrypt. Lives off the
   always-on machine; lose it and the snapshots are unrecoverable. `keygen --pq`
   generates a post-quantum HYBRID identity (ML-KEM-768 + X25519) instead of
-  plain X25519 — see README.md's Threat model.
+  plain X25519 — see README.md's Threat model. `sss-split --sss <m>-of-<n>
+  --sss-out-dir <path> ... [--identity <path>]` adds recovery shares to an existing
+  identity without changing either key file (exactly *N* distinct, unused file
+  paths required); `sss-combine --share <path> ... --out <path>` recovers from *M*
+  shares without the original passphrase. These are CLI-only commands.
 - **recipient** (public key) — all the snapshotting machine needs. Safe to keep
   on the box that runs gbrain.
 - **backend** — pluggable `push`/`pull` storage behind one interface: `file`

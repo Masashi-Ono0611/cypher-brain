@@ -3,6 +3,7 @@ import { mkdir, open, rename, rm, chmod, readFile, type FileHandle } from 'node:
 import { constants as FS_CONST } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
+import { identityToRecipient } from 'age-encryption';
 import {
   HOME,
   IDENTITY,
@@ -13,7 +14,7 @@ import {
   AGE_MAGIC,
   AGE_ARMOR_HEADER,
 } from './config.js';
-import { generateKeypair, identityFileText, askNewPassphrase, wrapIdentity } from './crypt.js';
+import { generateKeypair, identityFileText, askNewPassphrase, wrapIdentity, loadIdentities } from './crypt.js';
 import { keygenSignAt } from './minisign.js';
 import { exists, syncDirectoryChain, errMsg } from './util.js';
 import { installStageSignalGuard, addActiveKeyScratchFile, removeActiveKeyScratchFile } from './signal-guard.js';
@@ -619,41 +620,7 @@ export async function keygen(o: CliOptions): Promise<void> {
   // #207: no default M-of-N anywhere (mirrors CYPHER_BRAIN_PIN_RECIPIENTS/
   // CYPHER_BRAIN_MCP_SOURCE_ROOTS) — parsed/validated here, before keygenAt() does
   // anything, so a bad --sss value fails before touching disk at all.
-  let sssRequest: { policy: SssPolicy; outPaths: string[] } | undefined;
-  if (o.sss !== undefined) {
-    const policy = parseSssPolicy(o.sss);
-    const outPaths = o.sss_out_dir ?? [];
-    if (outPaths.length !== policy.shares)
-      throw new Error(
-        `--sss ${policy.threshold}-of-${policy.shares} needs exactly ${policy.shares} --sss-out-dir <path> flags (one per share), got ${outPaths.length}`,
-      );
-    // #207 (Critical, multi-model review finding): collisions are checked here, in
-    // ADDITION to keygenAt()'s own per-path exists()/--force no-clobber check below —
-    // that check alone cannot catch an out-path that IS about to be created but
-    // collides with ANOTHER path in the SAME request (two --sss-out-dir values equal
-    // to each other, or one equal to IDENTITY/RECIPIENT): with --force, writeKeyFile()
-    // happily overwrites whatever is there, so two shares aliased to the same path
-    // would silently leave only the LAST one written (destroying the other share of
-    // the set while reporting success), and a share aliased to the identity/recipient
-    // path would silently clobber the just-written identity/recipient with share
-    // data. Deduplicated after path.resolve() (lexical only — normalizes "./x" vs "x"
-    // vs an absolute path; it does NOT touch the filesystem or follow symlinks, so it
-    // adds no TOCTOU window) rather than plain string equality, so differently-spelled
-    // paths naming the same file are still caught. Deliberately not resolving
-    // symlinks (no realpath): a caller who WANTS a symlinked path is still protected
-    // by keygenAt()'s existing writeKeyFile() call, and following symlinks here would
-    // add a real TOCTOU window (resolve now, symlink swapped before the actual write)
-    // without closing anything this check exists to close.
-    const seen = new Set<string>([resolve(IDENTITY), resolve(RECIPIENT)]);
-    for (const p of outPaths) {
-      if (seen.has(resolve(p)))
-        throw new Error(
-          `--sss-out-dir paths must be distinct from each other and from the identity/recipient paths — ${p} is used more than once`,
-        );
-      seen.add(resolve(p));
-    }
-    sssRequest = { policy, outPaths };
-  }
+  const sssRequest = o.sss === undefined ? undefined : parseSssRequest(o.sss, o.sss_out_dir ?? [], IDENTITY, RECIPIENT);
   const { recipient, wrapped, sssShares } = await keygenAt({
     home: HOME,
     identityPath: IDENTITY,
@@ -689,6 +656,82 @@ export async function keygen(o: CliOptions): Promise<void> {
     );
   }
   console.log('\n⚠  Back up the identity file now. If you lose it, the snapshots are unrecoverable.');
+}
+
+// Share the CLI policy/count/collision checks with keygen. keygenAt() retains its
+// own checks against its caller-provided paths before any key material is written.
+function parseSssRequest(
+  spec: string,
+  outPaths: string[],
+  identityPath: string,
+  recipientPath: string,
+): { policy: SssPolicy; outPaths: string[] } {
+  const policy = parseSssPolicy(spec);
+  if (outPaths.length !== policy.shares)
+    throw new Error(
+      `--sss ${policy.threshold}-of-${policy.shares} needs exactly ${policy.shares} --sss-out-dir <path> flags (one per share), got ${outPaths.length}`,
+    );
+  // Lexical normalization catches aliases like "./identity.age" and "identity.age".
+  // The exclusive-create write still protects existing files, including symlinks.
+  const seen = new Set<string>([resolve(identityPath), resolve(recipientPath)]);
+  for (const p of outPaths) {
+    if (seen.has(resolve(p)))
+      throw new Error(
+        `--sss-out-dir paths must be distinct from each other and from the identity/recipient paths — ${p} is used more than once`,
+      );
+    seen.add(resolve(p));
+  }
+  return { policy, outPaths };
+}
+
+// Add recovery shares to an existing identity without rewriting either key file.
+// loadIdentities() unwraps passphrase protection in memory, just as restore does.
+export async function sssSplitCommand(o: CliOptions): Promise<void> {
+  if (o.sss === undefined) throw new Error('sss-split requires --sss <m>-of-<n> (no default policy)');
+  const identityPath = o.identity || IDENTITY;
+  // Same "actionable message before touching anything else" posture as restore's own
+  // missing-identity check — without this, loadIdentities() below would surface a raw
+  // Node ENOENT instead.
+  if (!(await exists(identityPath)))
+    throw new Error(`no identity at ${identityPath} — cannot split shares without the private key`);
+  const { policy, outPaths } = parseSssRequest(o.sss, o.sss_out_dir ?? [], identityPath, RECIPIENT);
+  for (const p of outPaths) {
+    if (await exists(p))
+      throw new Error(`SSS share path already exists at ${p} (refusing to overwrite). Pick a different path.`);
+  }
+  const identities = await loadIdentities(identityPath);
+  // The existing share format describes one identity and one recipient. Never
+  // silently back up only the first key from a multi-identity file.
+  if (identities.length !== 1) throw new Error('sss-split requires a file containing exactly one age identity');
+  const identity = identities[0];
+  let recipient: string;
+  try {
+    recipient = await identityToRecipient(identity);
+  } catch {
+    // Library parser errors can include the secret input verbatim.
+    throw new Error('sss-split requires a valid age identity');
+  }
+  const texts = await splitIdentity(identity, recipient, policy);
+  const written: string[] = [];
+  try {
+    for (let i = 0; i < outPaths.length; i++) {
+      await writeKeyFile(outPaths[i], texts[i], 0o600, false);
+      written.push(outPaths[i]);
+    }
+  } catch (e) {
+    throw new Error(
+      `Writing SSS shares failed partway (${written.length} of ${outPaths.length} written: ${written.join(', ') || '(none)'}) — ${errMsg(e)}. ` +
+        'Your identity is unchanged; rerun sss-split with a complete set of fresh output paths. Do not mix shares from separate runs.',
+    );
+  }
+  console.log(
+    `SSS shares written (${policy.threshold}-of-${policy.shares}, keep each at a SEPARATE physical location):`,
+  );
+  for (const p of written) console.log(`  ${p}`);
+  console.log(
+    `Any ${policy.threshold} of these ${policy.shares} reconstruct the identity via ` +
+      '"sss-combine --share <path> ... --out <path>" without the original passphrase. Identity and recipient files are unchanged.',
+  );
 }
 
 // #207: reconstructs an identity from >= threshold SSS shares (see sss.ts's
