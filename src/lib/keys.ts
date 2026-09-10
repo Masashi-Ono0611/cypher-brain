@@ -323,6 +323,22 @@ export async function keygenAt(opts: KeygenAtOpts): Promise<KeygenAtResult> {
       throw new Error(
         `--sss ${opts.sss.policy.threshold}-of-${opts.sss.policy.shares} needs exactly ${opts.sss.policy.shares} --sss-out-dir paths, got ${opts.sss.outPaths.length}`,
       );
+    // Collision/dedup check (multi-model review finding, Critical): re-checked HERE
+    // against opts.identityPath/opts.recipientPath (not the caller's global
+    // constants) so this holds for ANY caller of keygenAt(), not just today's one
+    // (keys.ts's keygen(), which already checks this against the SAME two paths
+    // before calling in — see that call site's own comment for the full blast-radius
+    // explanation). Two share paths aliased to each other, or to the identity/
+    // recipient path, would otherwise let --force silently overwrite one share (or
+    // the just-written identity itself) with another, while still reporting success.
+    const seen = new Set<string>([opts.identityPath, opts.recipientPath]);
+    for (const p of opts.sss.outPaths) {
+      if (seen.has(p))
+        throw new Error(
+          `--sss-out-dir paths must be distinct from each other and from the identity/recipient paths — ${p} is used more than once`,
+        );
+      seen.add(p);
+    }
     if (!opts.force) {
       for (const p of opts.sss.outPaths) {
         if (await exists(p))
@@ -561,7 +577,11 @@ export async function keygen(o: CliOptions): Promise<void> {
     // --sss splits an AGE identity's key material — meaningless for a minisign
     // signing keypair, which this branch never even generates the material for.
     // Same "fail loud instead of silently no-op-ing" discipline as --pq above.
-    if (o.sss)
+    // `!== undefined`, not truthy (multi-model review finding): --sss "" is a real,
+    // distinct CLI invocation (not "flag absent") and must still be refused here —
+    // a bare `if (o.sss)` would silently let it through as if --sss had never been
+    // passed at all.
+    if (o.sss !== undefined)
       throw new Error(
         '--sss has no effect with --sign (there is no age identity here to split). Run "keygen --sss <m>-of-<n>" on its own.',
       );
@@ -580,12 +600,18 @@ export async function keygen(o: CliOptions): Promise<void> {
       );
     // --wrap-in-place never generates a new keypair (it only re-wraps the existing
     // identity's TEXT), so there is no fresh key material here for --sss to split.
-    if (o.sss)
+    // `!== undefined`, not truthy — same reasoning as the --sign guard above.
+    if (o.sss !== undefined)
       throw new Error(
         '--sss has no effect with --wrap-in-place (which only passphrase-wraps the EXISTING identity — it does not generate new key material to split). Run "keygen --sss <m>-of-<n> --force" to rotate and split a fresh identity instead.',
       );
     return wrapInPlace(IDENTITY);
   }
+  // #207: --sss-out-dir without --sss used to be silently accepted and ignored — the
+  // exact "flag accepted, never honored" bug class (#253/#277/#307) this codebase
+  // refuses everywhere else (multi-model review finding).
+  if (o.sss === undefined && o.sss_out_dir)
+    throw new Error('--sss-out-dir has no effect without --sss <m>-of-<n> — pass both together, or neither.');
   // #207: no default M-of-N anywhere (mirrors CYPHER_BRAIN_PIN_RECIPIENTS/
   // CYPHER_BRAIN_MCP_SOURCE_ROOTS) — parsed/validated here, before keygenAt() does
   // anything, so a bad --sss value fails before touching disk at all.
@@ -597,6 +623,28 @@ export async function keygen(o: CliOptions): Promise<void> {
       throw new Error(
         `--sss ${policy.threshold}-of-${policy.shares} needs exactly ${policy.shares} --sss-out-dir <path> flags (one per share), got ${outPaths.length}`,
       );
+    // #207 (Critical, multi-model review finding): collisions are checked here, in
+    // ADDITION to keygenAt()'s own per-path exists()/--force no-clobber check below —
+    // that check alone cannot catch an out-path that IS about to be created but
+    // collides with ANOTHER path in the SAME request (two --sss-out-dir values equal
+    // to each other, or one equal to IDENTITY/RECIPIENT): with --force, writeKeyFile()
+    // happily overwrites whatever is there, so two shares aliased to the same path
+    // would silently leave only the LAST one written (destroying the other share of
+    // the set while reporting success), and a share aliased to the identity/recipient
+    // path would silently clobber the just-written identity/recipient with share
+    // data. Deduplicated by realpath-independent string equality — deliberately not
+    // resolving symlinks here, since a caller who WANTS a symlinked path is still
+    // protected by keygenAt()'s existing writeKeyFile() call, and resolving here would
+    // only add a TOCTOU window (resolve now, symlink swapped before the actual write)
+    // without closing anything this check exists to close.
+    const seen = new Set<string>([IDENTITY, RECIPIENT]);
+    for (const p of outPaths) {
+      if (seen.has(p))
+        throw new Error(
+          `--sss-out-dir paths must be distinct from each other and from the identity/recipient paths — ${p} is used more than once`,
+        );
+      seen.add(p);
+    }
     sssRequest = { policy, outPaths };
   }
   const { recipient, wrapped, sssShares } = await keygenAt({
@@ -645,6 +693,13 @@ export async function sssCombineCommand(o: CliOptions): Promise<void> {
   if (!o.sss_shares || o.sss_shares.length < 2)
     throw new Error(`sss-combine needs at least 2 "--share <path>" flags, got ${o.sss_shares?.length ?? 0}`);
   if (!o.out) throw new Error('sss-combine requires --out <path> (where to write the reconstructed identity)');
+  // Same collision reasoning as keygen --sss's own out-path check: with --force,
+  // writing --out on top of one of the --share inputs would silently destroy that
+  // physical share backup (the read already happened by the time of the write below,
+  // so the reconstruction itself would still succeed — this guards the share FILE,
+  // not correctness).
+  if (o.sss_shares.includes(o.out))
+    throw new Error(`--out must be distinct from every --share path — ${o.out} is used as both`);
   if ((await exists(o.out)) && !o.force)
     throw new Error(`${o.out} already exists (refusing to overwrite). Pass --force, or pick a different path.`);
   const inputs = await Promise.all(

@@ -19,10 +19,11 @@
 // two manifest-field guards in src/lib/restore.ts (#198's vulnerability class), the
 // expanded/ directory-name uniqueness invariant those guards' numeric-index prefix and
 // sourceDigest() together provide (#181/#423), the age encrypt/decrypt roundtrip in
-// src/lib/crypt.ts, and five properties covering src/lib/sss.ts's Shamir split/combine
+// src/lib/crypt.ts, and six properties covering src/lib/sss.ts's Shamir split/combine
 // (#207): the roundtrip itself, corruption detection, insufficient-share refusal,
-// mixed-split refusal, and the core "reconstruction succeeds but the header lies about
-// the recipient" integrity check. It does not attempt to fuzz the whole CLI surface,
+// mixed-split refusal, the core "reconstruction succeeds but the header lies about
+// the recipient" integrity check, and parseSssPolicy()'s M-of-N bounds. It does not
+// attempt to fuzz the whole CLI surface,
 // and it is not a substitute for scripts/selftest-cctv-age.mjs (which checks typage's
 // CONFORMANCE to the age spec using upstream's own vectors — a different question from
 // "does OUR code's usage of typage roundtrip correctly").
@@ -30,7 +31,7 @@ import fc from 'fast-check';
 import { join, resolve, sep } from 'node:path';
 import { isSafeComponentName, shortSourceLabel, sourceDigest, SHORT_LABEL_MAX } from '../src/lib/restore.ts';
 import { generateKeypair, newEncrypter, newDecrypter } from '../src/lib/crypt.ts';
-import { splitIdentity, combineShares } from '../src/lib/sss.ts';
+import { splitIdentity, combineShares, parseSssPolicy } from '../src/lib/sss.ts';
 
 let failed = 0;
 const check = (name, cond, detail) => {
@@ -398,18 +399,22 @@ await property(
 );
 
 // A single corrupted byte in exactly one of the THRESHOLD shares used must never be
-// silently absorbed into a successful, byte-identical reconstruction — this is the
-// exact gap the underlying shamir-secret-sharing library's own README documents
-// ("this library does not verify the result of share reconstruction") and combineShares()
-// exists to close. Mathematically guaranteed, not merely likely: Lagrange
-// interpolation over GF(2^8) with exactly `threshold` sample points uniquely
-// determines each reconstructed byte as a NONZERO-coefficient linear combination of
-// the sample y-values, so changing one y-value (a corrupted body byte, excluding the
-// share's own trailing x-coordinate byte) changes the byte reconstructed at that
-// position — combineShares() must therefore either throw, or return a DIFFERENT
-// identity than the clean reconstruction would have.
+// silently absorbed into a successful reconstruction of anything OTHER than the exact
+// original identity — this is the exact gap the underlying shamir-secret-sharing
+// library's own README documents ("this library does not verify the result of share
+// reconstruction") and combineShares() exists to close, via AES-GCM authentication
+// (sss.ts's design note). Provable, not merely likely: corrupting one byte of the
+// underlying 32-byte key fragment (Lagrange interpolation over GF(2^8) with exactly
+// `threshold` sample points uniquely determines each reconstructed key byte as a
+// NONZERO-coefficient linear combination of the sample y-values, so a changed y-value
+// always changes the reconstructed key) yields a DIFFERENT key with overwhelming
+// probability, and AES-GCM's authentication tag rejects decryption under any key
+// other than the exact one the ciphertext was sealed with (2^-128 forgery
+// probability) — so combineShares() must throw. The only OTHER acceptable outcome is
+// succeeding with the identity EXACTLY unchanged (impossible here, since the key
+// really did change) — never a "succeeds with different, wrong data" outcome.
 await property(
-  'SSS corruption: flipping one byte of one of exactly `threshold` shares never reconstructs the original identity — it throws, or differs',
+  'SSS corruption: flipping one byte of one of exactly `threshold` shares is always refused (GCM authentication) — never reconstructs successfully with different data',
   fc.asyncProperty(
     fc.boolean(),
     fc.integer({ min: 2, max: 8 }).chain((n) => fc.tuple(fc.constant(n), fc.integer({ min: 2, max: n }))),
@@ -425,9 +430,11 @@ await property(
       const chosen = indices.slice(0, threshold);
       const inputs = chosen.map((i) => ({ text: shareTexts[i], sourceLabel: `share-${i}` }));
       // Corrupt one base64 character of the FIRST chosen share's body line (never the
-      // header) — decoded base64 length is >= 33 bytes for any real identity, so a
-      // char at a fixed offset near the start is always within the body's IDENTITY
-      // portion, never the trailing appended x-coordinate byte at the very end.
+      // header) — decoded fragment length is 33 bytes (32-byte key + 1 trailing
+      // x-coordinate byte) for ANY identity now (the split secret is the fixed-size
+      // wrapping key, not the variable-length identity — see sss.ts's design note),
+      // so a char at a fixed offset near the start is always within the key portion,
+      // never the trailing x-coordinate byte.
       const lines = inputs[0].text.split('\n');
       const bodyIdx = lines.findIndex((l) => l.length > 0 && !l.startsWith('#'));
       const body = lines[bodyIdx];
@@ -435,9 +442,17 @@ await property(
       const c = body[pos];
       lines[bodyIdx] = body.slice(0, pos) + (c === 'A' ? 'B' : 'A') + body.slice(pos + 1);
       inputs[0] = { ...inputs[0], text: lines.join('\n') };
+      // Multi-model review finding: the prior "throws, OR returns a DIFFERENT
+      // identity" assertion left a loophole a reviewer could read as accepting
+      // "succeeds with wrong data" as a passing outcome. AES-GCM authentication
+      // (sss.ts's design) makes the STRONGER claim provable instead: a successful
+      // return is only possible if decryption authenticated correctly, which is only
+      // possible for the exact original key/ciphertext pair — so a non-throwing
+      // result must be byte-identical to the original, full stop. No "or differs"
+      // escape hatch.
       try {
         const result = await combineShares(inputs);
-        return result.identity !== identity;
+        return result.identity === identity;
       } catch {
         return true; // refused outright is the other acceptable outcome
       }
@@ -541,6 +556,26 @@ await property(
     },
   ),
   { numRuns: 50 },
+);
+
+// parseSssPolicy()'s bounds (2 <= m <= n <= 255, shared with parseShare()'s own check
+// on a share FILE's claimed threshold/shares via validateSssBounds()) — random pairs
+// spanning well below 2 and well above 255 on both sides, so every boundary
+// (>= vs >, <= vs <, the m > n cross-check) actually gets exercised in both
+// directions, not just accidentally covered by whatever a handful of hand-picked
+// examples happened to hit.
+await property(
+  'parseSssPolicy: accepts exactly 2 <= m <= n <= 255, rejects everything else',
+  fc.property(fc.integer({ min: 0, max: 999 }), fc.integer({ min: 0, max: 999 }), (m, n) => {
+    const inBounds = m >= 2 && m <= 255 && n >= 2 && n <= 255 && m <= n;
+    try {
+      const policy = parseSssPolicy(`${m}-of-${n}`);
+      return inBounds && policy.threshold === m && policy.shares === n;
+    } catch {
+      return !inBounds;
+    }
+  }),
+  { numRuns: 300 },
 );
 
 if (failed > 0) {
