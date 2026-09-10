@@ -8,6 +8,8 @@ import ignore, { type Ignore } from 'ignore';
 import {
   RECIPIENT,
   PIN_RECIPIENTS,
+  REQUIRE_RECIPIENT,
+  REQUIRE_PQ_RECIPIENTS,
   PIPE_TIMEOUT_MS,
   SIGN_IDENTITY,
   pgTool,
@@ -19,7 +21,7 @@ import { exists, fmtBytes, requirePath, rmrf, sha256, errMsg, redactPgConn } fro
 import { warn } from './warn.js';
 import { UsageError } from './errors.js';
 import { findPgDataDirs, pgDataDirCopyWarning, pgDataDirTruncatedWarning } from './gbrain.js';
-import { recipientEntries, resolvePinnedRecipients } from './keys.js';
+import { recipientEntries, resolvePinnedRecipients, resolveRequiredRecipients } from './keys.js';
 import { loadSignIdentity, signDetached } from './minisign.js';
 import {
   assertExportRequiresO2bProfile,
@@ -612,6 +614,22 @@ export async function snapshot(o: CliOptions): Promise<void> {
   // one — so dedupe across all entries. Warn loudly (stderr → unattended logs) on exactly one.
   const effectiveKeys = new Set<string>();
   for (const entries of entriesByRec.values()) for (const e of entries) effectiveKeys.add(e);
+  // Both policies run alongside the pin, before any plaintext stage is created.
+  if (REQUIRE_RECIPIENT !== undefined) {
+    const required = await resolveRequiredRecipients(REQUIRE_RECIPIENT);
+    for (const key of required) {
+      if (!effectiveKeys.has(key))
+        throw new Error(
+          `recipient "${key}" required by CYPHER_BRAIN_REQUIRE_RECIPIENT is missing — refusing to snapshot (the recovery recipient could not decrypt your brain)`,
+        );
+    }
+  }
+  // PQ-hybrid age recipients use the age1pq1 prefix (keygen --pq), not age1 alone.
+  if (REQUIRE_PQ_RECIPIENTS && recipientList.some((key) => !key.startsWith('age1pq1')))
+    throw new Error(
+      'CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS=1 requires EVERY recipient to be PQ-hybrid (age1pq1…) — refusing to snapshot',
+    );
+
   if (effectiveKeys.size === 1) {
     warn(
       'snapshot encrypted to a SINGLE recipient key — if you lose that identity the brain is UNRECOVERABLE. Add a second --recipient (an offline backup public key) for key recovery; see MANAGEMENT.md.',

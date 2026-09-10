@@ -25,6 +25,9 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_AGE_KEYGEN', // deprecated no-op (#64)
   'CYPHER_BRAIN_PG_BIN',
   'CYPHER_BRAIN_PIN_RECIPIENTS',
+  'CYPHER_BRAIN_REQUIRE_RECIPIENT',
+  'CYPHER_BRAIN_REQUIRE_SIGNATURE',
+  'CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS',
   'CYPHER_BRAIN_PASSPHRASE',
   'CYPHER_BRAIN_INIT_ALLOW_NONINTERACTIVE',
   'CYPHER_BRAIN_SCHEDULE_DIR',
@@ -548,6 +551,13 @@ export const AGE_ARMOR_HEADER = '-----BEGIN AGE ENCRYPTED FILE-----';
 // Kept as `string | undefined` so the two cases stay distinguishable at the call site,
 // which must fail closed on the explicit-empty-string case.
 export const PIN_RECIPIENTS: string | undefined = readEnv('CYPHER_BRAIN_PIN_RECIPIENTS');
+
+// Recovery policies are independent opt-ins. Preserve an empty require-list so it
+// fails closed; only unset or the literal 0 disables it.
+const requiredRecipient = readEnv('CYPHER_BRAIN_REQUIRE_RECIPIENT');
+export const REQUIRE_RECIPIENT = requiredRecipient === '0' ? undefined : requiredRecipient;
+export const REQUIRE_SIGNATURE = readEnv('CYPHER_BRAIN_REQUIRE_SIGNATURE') === '1';
+export const REQUIRE_PQ_RECIPIENTS = readEnv('CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS') === '1';
 
 // #800: the roots an MCP `snapshot_now` call's `dirs` entries must resolve under — the
 // operator-side half of a fail-closed policy the MCP server enforces and the CLI does

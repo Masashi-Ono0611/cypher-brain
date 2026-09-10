@@ -122,6 +122,7 @@ const PARALLEL = [
   npmTest('selftest:rclone'),
   npmTest('selftest:interop'),
   npmTest('selftest:cypherbrainignore'),
+  npmTest('selftest:recovery-policy'),
   npmTest('selftest:pq'),
   npmTest('selftest:sss'),
   npmTest('selftest:keygen-force'),

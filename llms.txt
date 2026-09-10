@@ -113,7 +113,18 @@ MANAGEMENT.md for configuration and recovery. No new MCP tool is needed.
   restores exactly as before, which also means an attacker can strip a
   `*.minisig` sidecar instead of forging one and it looks like a legitimate
   unsigned backup. Pass `--require-signature` to `restore`/`verify` to close
-  that half too, once every artifact you expect to check is actually signed.
+  that half too, or set `CYPHER_BRAIN_REQUIRE_SIGNATURE=1` as the CLI/MCP default.
+  Explicit CLI `--require-signature` / `--no-require-signature` or MCP
+  `require_signature: true/false` always wins over the default; absent MCP input uses
+  the server setting. The negative override handles known-unsigned historical backups;
+  there is no historical-exception registry. Invalid signatures always fail.
+- Optional snapshot policies: `CYPHER_BRAIN_REQUIRE_RECIPIENT` requires every key
+  resolved from comma-separated recipient files (or inline keys) to be present;
+  unset/0 disables it, but an empty value fails closed. Unlike the pin allowlist,
+  this catches an omitted backup recipient. `CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS=1`
+  requires every effective recipient to start with `age1pq1`. Both refuse before
+  plaintext staging, for CLI and MCP snapshots. Both boolean policies enable only
+  for literal 1. `doctor` checks policy configuration and default recipient/key drift.
 
 ## Everyday commands
 

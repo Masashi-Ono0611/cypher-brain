@@ -385,6 +385,40 @@ and a box that can rewrite `recipient.txt` could re-key *future* snapshots — s
 recipient you did not pin. A full snapshot is ~850 MB today (pg_dump ~630 MB +
 `~/.gbrain` ~220 MB); incremental snapshots are a future optimization.
 
+### Opt-in recovery policies
+
+Three independent environment settings apply to CLI and MCP recovery operations:
+
+- `CYPHER_BRAIN_REQUIRE_RECIPIENT`: comma-separated recipient file paths (or inline
+  age public keys). Every resolved key must be among the snapshot's effective
+  recipients. Unlike `CYPHER_BRAIN_PIN_RECIPIENTS`, which limits who may decrypt,
+  this catches an omitted backup recipient. Both checks run before plaintext staging.
+  Unset or `0` disables this requirement; an explicitly empty value, an empty file,
+  or an entry resolving to no keys refuses the snapshot.
+- `CYPHER_BRAIN_REQUIRE_PQ_RECIPIENTS=1`: every effective snapshot recipient must be
+  PQ-hybrid (`age1pq1…`, from `keygen --pq`). A mixture of classical and PQ keys
+  refuses before staging, even if the keys satisfy the pin and required list.
+- `CYPHER_BRAIN_REQUIRE_SIGNATURE=1`: defaults `restore` and `verify` to requiring a
+  verifiable signature. Snapshot already signs by default when a signing identity is
+  available; this closes the recovery-side downgrade when a signature is absent.
+  An explicit flag always wins over the env default: use `--no-require-signature`
+  for a known-unsigned historical backup, or `--require-signature` to require one
+  when the env default is off. Passing both flags is an error. MCP `restore_now`
+  and `verify_restore` use their optional `require_signature` boolean: omitted uses
+  the server default, and explicit `true` or `false` overrides it. Invalid signatures
+  remain hard failures even with the negative override.
+
+The two boolean settings enable only for literal `1`; `0` and unset disable them.
+There is no historical-exception registry. Recipient policies govern new snapshots;
+existing backups use the explicit signature override above when needed. `doctor`
+reports malformed policies, contradictions between recipient policies, default
+recipient drift, and a missing or malformed signing public key. It cannot promise
+that a particular stored backup has a signature. Put policies in the environment of
+both the CLI and MCP server (or their `config.env`); restart an existing MCP
+server after changing its environment. For scheduled jobs, export these settings
+in the runner's environment: `schedule install` does not capture these new variables
+and its generated runner disables `config.env` loading.
+
 Prove restorability where the identity lives, on a cadence: a `verify` on the
 public-key-only snapshotting box reports **PARTIAL** (exit 2) because it cannot run
 the decrypt proof, so periodically pull a recent snapshot to a machine that holds the
