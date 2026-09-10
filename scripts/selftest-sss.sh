@@ -31,7 +31,7 @@ mkdir -p "$SHARES_A"
 
 echo "== keygen --sss 2-of-3: identity.age/recipient.txt written normally, PLUS 3 shares =="
 cb "$HOME_A" keygen --sss 2-of-3 \
-  --sss-out-dir "$SHARES_A/1.txt" --sss-out-dir "$SHARES_A/2.txt" --sss-out-dir "$SHARES_A/3.txt" >/dev/null
+  --sss-out-dir "$SHARES_A/1.txt" --sss-out-dir "$SHARES_A/2.txt" --sss-out-dir "$SHARES_A/3.txt" >"$TMP/keygen-a.out" 2>&1
 test -f "$HOME_A/identity.age" || { echo "[FAIL] identity.age not written"; exit 1; }
 test -f "$HOME_A/recipient.txt" || { echo "[FAIL] recipient.txt not written"; exit 1; }
 for i in 1 2 3; do
@@ -43,7 +43,7 @@ echo "[PASS] identity.age + recipient.txt + 3 share files all present"
 RECIPIENT_A="$(cat "$HOME_A/recipient.txt")"
 
 echo "== sss-combine with exactly threshold (2 of 3) shares reconstructs byte-identically =="
-cb "$HOME_A" sss-combine --share "$SHARES_A/1.txt" --share "$SHARES_A/3.txt" --out "$TMP/recovered-a.age" >/dev/null
+cb "$HOME_A" sss-combine --share "$SHARES_A/1.txt" --share "$SHARES_A/3.txt" --out "$TMP/recovered-a.age" >"$TMP/combine-a.out" 2>&1
 # The only expected difference is identityFileText()'s own "# created: <now>" comment
 # line — strip it before comparing, rather than asserting whole-file equality.
 tail -n +2 "$HOME_A/identity.age" >"$TMP/orig-tail.txt"
@@ -205,5 +205,133 @@ fi
 grep -q "no identity at" "$TMP/split-missing.out" \
   && echo "[PASS] missing --identity path refused with an actionable message" \
   || { echo "[FAIL] missing --identity path did not get the actionable message"; cat "$TMP/split-missing.out"; exit 1; }
+
+echo "== #888: directory share targets give a file-path example before writing, even with --force =="
+for mode in normal force; do
+  HOME_DIR="$TMP/home-dir-$mode"
+  mkdir -p "$TMP/share-dir-$mode"
+  force_args=()
+  if [ "$mode" = force ]; then force_args=(--force); fi
+  if cb "$HOME_DIR" keygen "${force_args[@]}" --sss 2-of-2 \
+    --sss-out-dir "$TMP/share-dir-$mode" --sss-out-dir "$TMP/unused-$mode.txt" >"$TMP/directory.out" 2>&1; then
+    echo "[FAIL] #888 directory target accepted ($mode)"; exit 1
+  fi
+  grep -Fq "$TMP/share-dir-$mode is a directory. --sss-out-dir requires each share's full file path" "$TMP/directory.out" \
+    && grep -Fq "$TMP/share-dir-$mode/share-1.txt" "$TMP/directory.out" \
+    || { echo "[FAIL] #888 missing actionable directory error ($mode)"; cat "$TMP/directory.out"; exit 1; }
+  test ! -e "$HOME_DIR/identity.age" && test ! -e "$HOME_DIR/recipient.txt" && test ! -e "$TMP/unused-$mode.txt" \
+    || { echo "[FAIL] #888 preflight wrote key/share files ($mode)"; exit 1; }
+done
+echo "[PASS] #888 directory targets refused before writing with a concrete file-path example"
+
+echo "== #889: partial failure explains all-or-nothing regeneration and identity rotation =="
+HOME_PARTIAL="$TMP/home-partial"
+echo "not a directory" >"$TMP/blocked-parent"
+# A regular file as the second share's parent fails deterministically during writing,
+# after the first share is durable, without relying on permissions or a timing race.
+if cb "$HOME_PARTIAL" keygen --sss 2-of-3 \
+  --sss-out-dir "$TMP/partial-1.txt" --sss-out-dir "$TMP/blocked-parent/2.txt" \
+  --sss-out-dir "$TMP/partial-3.txt" >"$TMP/partial.out" 2>&1; then
+  echo "[FAIL] #889 partial write unexpectedly succeeded"; exit 1
+fi
+test -f "$HOME_PARTIAL/identity.age" && test -f "$HOME_PARTIAL/recipient.txt" \
+  && test -f "$TMP/partial-1.txt" && test ! -e "$TMP/partial-3.txt" \
+  || { echo "[FAIL] #889 fixture did not reach partial share failure"; exit 1; }
+for phrase in '1 of 3 written' 'all-or-nothing' 'missing shares cannot be recreated individually' \
+  'NEW identity' 'complete NEW share set' 'Keep the current identity for existing snapshots' \
+  'replace all distributed shares'; do
+  grep -Fq "$phrase" "$TMP/partial.out" \
+    || { echo "[FAIL] #889 missing recovery guidance: $phrase"; cat "$TMP/partial.out"; exit 1; }
+done
+if grep -Fq 'retry the missing shares by hand' "$TMP/partial.out"; then
+  echo "[FAIL] #889 impossible manual retry still suggested"; exit 1
+fi
+echo "[PASS] #889 partial failure preserves the identity and explains full regeneration"
+
+echo "== #891: successful SSS keygen explains threshold recovery; plain keygen keeps its backup warning =="
+grep -Fq 'If you lose the identity file, any 2 of these 3 shares still recover it' "$TMP/keygen-a.out" \
+  && grep -Fq 'enough shares to fall below 2 remaining means neither path works' "$TMP/keygen-a.out" \
+  || { echo "[FAIL] #891 missing threshold-aware recovery warning"; cat "$TMP/keygen-a.out"; exit 1; }
+if grep -Fq 'If you lose it, the snapshots are unrecoverable' "$TMP/keygen-a.out"; then
+  echo "[FAIL] #891 SSS success still claims identity loss alone prevents recovery"; exit 1
+fi
+cb "$TMP/home-plain-warning" keygen >"$TMP/plain-warning.out" 2>&1
+grep -Fq 'Back up the identity file now. If you lose it, the snapshots are unrecoverable.' "$TMP/plain-warning.out" \
+  || { echo "[FAIL] #891 plain keygen lost its backup warning"; exit 1; }
+echo "[PASS] #891 SSS and plain keygen give appropriate recovery guidance"
+
+echo "== #892: duplicate share contents, including a copy at another path, are not called corrupt =="
+cp "$SHARES_A/1.txt" "$TMP/duplicate-copy.txt"
+for duplicate in "$SHARES_A/1.txt" "$TMP/duplicate-copy.txt"; do
+  if cb "$HOME_A" sss-combine --share "$SHARES_A/1.txt" --share "$duplicate" \
+    --out "$TMP/bad-duplicate.age" >"$TMP/duplicate.out" 2>&1; then
+    echo "[FAIL] #892 duplicate share accepted"; exit 1
+  fi
+  grep -Fq 'the same share was supplied more than once' "$TMP/duplicate.out" \
+    || { echo "[FAIL] #892 missing duplicate-specific error"; cat "$TMP/duplicate.out"; exit 1; }
+  if grep -qi 'corrupt' "$TMP/duplicate.out"; then
+    echo "[FAIL] #892 duplicate share still called corrupt"; exit 1
+  fi
+  # Only structural information belongs in the error; never the secret body line.
+  if grep -Fq "$(grep -v '^#' "$SHARES_A/1.txt" | sed '/^$/d')" "$TMP/duplicate.out"; then
+    echo "[FAIL] #892 duplicate error leaked share data"; exit 1
+  fi
+  test ! -e "$TMP/bad-duplicate.age" || { echo "[FAIL] #892 duplicate wrote an identity"; exit 1; }
+done
+echo "[PASS] #892 repeated and copied shares get a fixed, non-secret duplicate error"
+
+echo "== #893: recovery guidance and help give a working local-snapshot verification command =="
+cb "$HOME_A" --help >"$TMP/help.out" 2>&1
+for output in "$TMP/combine-a.out" "$TMP/help.out"; do
+  grep -Fq 'snapshot (e.g. "verify --in <snapshot> --identity <path>")' "$output" \
+    || { echo "[FAIL] #893 missing working verification example"; exit 1; }
+  if grep -Fq 'snapshot (e.g. "verify --level drill")' "$output"; then
+    echo "[FAIL] #893 incomplete drill example remains"; exit 1
+  fi
+done
+cb "$HOME_A" verify --in "$TMP/snap.age" --identity "$TMP/recovered-a.age" >"$TMP/verify.out" 2>&1
+grep -Fq 'VERDICT: PASS' "$TMP/verify.out" \
+  || { echo "[FAIL] #893 advertised verification did not pass"; cat "$TMP/verify.out"; exit 1; }
+echo "[PASS] #893 advertised command verifies a real snapshot with the recovered identity"
+
+echo "== #894: share comments explain preservation and recovery, retaining old-format compatibility =="
+for i in 1 2 3; do
+  grep -Fq '# Keep every line of this file unchanged, including lines starting with #; they contain required recovery data.' "$SHARES_A/$i.txt" \
+    && grep -Fq '# Recover: cypher-brain sss-combine --share' "$SHARES_A/$i.txt" \
+    && grep -Fq '# Supply at least 2 distinct shares from this split.' "$SHARES_A/$i.txt" \
+    || { echo "[FAIL] #894 missing preservation/recovery comments"; exit 1; }
+  [ "$(grep -vc '^#\|^$' "$SHARES_A/$i.txt")" = 1 ] \
+    || { echo "[FAIL] #894 share no longer has exactly one data line"; exit 1; }
+  # Strip only the new explanatory comments to reproduce the original format.
+  sed '/^# Keep every line /d; /^# Recover: /d; /^# Supply at least /d' "$SHARES_A/$i.txt" >"$TMP/legacy-$i.txt"
+done
+cb "$HOME_A" sss-combine --share "$TMP/legacy-1.txt" --share "$TMP/legacy-2.txt" --out "$TMP/recovered-legacy.age" >/dev/null
+tail -n +2 "$TMP/recovered-legacy.age" >"$TMP/legacy-tail.txt"
+diff -q "$TMP/orig-tail.txt" "$TMP/legacy-tail.txt" >/dev/null \
+  || { echo "[FAIL] #894 old-format shares no longer reconstruct the same identity"; exit 1; }
+echo "[PASS] #894 preservation/recovery instructions are comments; old-format shares still reconstruct"
+
+echo "== #895: passphrase-protected key recovery announces that its output is plaintext =="
+HOME_WRAPPED="$TMP/home-wrapped"
+CYPHER_BRAIN_PASSPHRASE='sss-selftest-passphrase' cb "$HOME_WRAPPED" keygen --passphrase --sss 2-of-2 \
+  --sss-out-dir "$TMP/wrapped-1.txt" --sss-out-dir "$TMP/wrapped-2.txt" >/dev/null
+# Confirm the fixture really started with a passphrase-protected identity.
+head -n 2 "$HOME_WRAPPED/identity.age" | grep -q '^-> scrypt ' \
+  || { echo "[FAIL] #895 original identity was not passphrase-protected"; exit 1; }
+CYPHER_BRAIN_PASSPHRASE='' cb "$HOME_WRAPPED" sss-combine --share "$TMP/wrapped-1.txt" \
+  --share "$TMP/wrapped-2.txt" --out "$TMP/recovered-wrapped.age" >"$TMP/combine-wrapped.out" 2>&1
+for output in "$TMP/combine-a.out" "$TMP/combine-wrapped.out"; do
+  grep -Fq '(PRIVATE, keep offline, NOT passphrase-protected) written to:' "$output" \
+    || { echo "[FAIL] #895 recovered identity lacks plaintext notice"; exit 1; }
+done
+grep -Fq "written to: $TMP/recovered-wrapped.age" "$TMP/combine-wrapped.out" \
+  && grep -q '^AGE-SECRET-KEY-1' "$TMP/recovered-wrapped.age" \
+  || { echo "[FAIL] #895 output path/identity does not match plaintext notice"; exit 1; }
+cb "$HOME_WRAPPED" snapshot --dir "$TMP/src" --out "$TMP/wrapped-snap.age" >/dev/null
+CYPHER_BRAIN_PASSPHRASE='' cb "$HOME_WRAPPED" verify --in "$TMP/wrapped-snap.age" \
+  --identity "$TMP/recovered-wrapped.age" >"$TMP/verify-wrapped.out" 2>&1
+grep -Fq 'VERDICT: PASS' "$TMP/verify-wrapped.out" \
+  || { echo "[FAIL] #895 recovered identity could not verify without the passphrase"; exit 1; }
+echo "[PASS] #895 recovery announces plaintext output and verifies without the original passphrase"
 
 echo "SSS SELFTEST: PASS"
