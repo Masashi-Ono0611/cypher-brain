@@ -28,7 +28,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { IDENTITY, CONFIG_FILE_ERROR, AR_MAX_SPEND_ERROR, TON_PROVIDER_MAX_SPEND_ERROR } from './lib/config.js';
-import { keygen, sssCombineCommand } from './lib/keys.js';
+import { keygen, sssSplitCommand, sssCombineCommand } from './lib/keys.js';
 import { snapshot } from './lib/snapshot.js';
 import { restore, verify } from './lib/restore.js';
 import { push, pull } from './lib/pushpull.js';
@@ -433,11 +433,23 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       mechanism holds independent keypairs, this one splits a single keypair, so a
       setup can use both. Reconstruct with "sss-combine" below.
 
+  cypher-brain sss-split --sss <m>-of-<n> --sss-out-dir <path> ... [--identity <path>]
+      Adds Shamir recovery shares to an EXISTING age identity (#890), without
+      changing identity.age or recipient.txt. Defaults to the same identity as
+      restore; --identity selects another file containing exactly one age identity.
+      Prompts for its passphrase if protected (or uses CYPHER_BRAIN_PASSPHRASE),
+      then splits the plain identity in memory using the same format as keygen --sss.
+      Requires an explicit policy and exactly <n> --sss-out-dir FILE paths, each
+      distinct from the others and from the identity/recipient paths. Parent
+      directories must exist. Never overwrites an existing share path.
+      Keep shares at separate physical locations. Recover with sss-combine;
+      reconstruction does not require the original passphrase.
+
   cypher-brain sss-combine --share <path> --share <path> ... --out <path> [--force]
       Reconstructs an age identity from >= threshold Shamir shares written by
-      "keygen --sss" (#207). Refuses (never writes a wrong-but-plausible identity) if:
+      "keygen --sss" or "sss-split". Refuses (never writes a wrong-but-plausible identity) if:
       fewer than 2 --share paths are given, the shares disagree on recipient/blob/
-      threshold (mixing shares from different "keygen --sss" runs), fewer shares are
+      threshold (mixing shares from different split runs), fewer shares are
       given than the split's own threshold, the reconstructed key fails to
       AES-GCM-authenticate the encrypted identity (a real cryptographic check, not a
       heuristic — this is what closes the underlying Shamir library's own documented
@@ -1474,6 +1486,7 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   ],
   // sssCombineCommand() reads all three of its COMMAND_FLAGS entries (sss_shares, out,
   // force) — nothing to declare irrelevant.
+  'sss-split': [],
   'sss-combine': [],
   // estimate.ts reads o.backend but never o.yes: pricing spends nothing, so there is no
   // consent to give.
@@ -1702,6 +1715,7 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     'sss',
     'sss_out_dir',
   ],
+  'sss-split': ['sss', 'sss_out_dir', 'identity'],
   'sss-combine': ['share', 'out', 'force'],
   snapshot: [
     'out',
@@ -2019,6 +2033,8 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
     }
     case 'keygen':
       return keygen(o);
+    case 'sss-split':
+      return sssSplitCommand(o);
     case 'sss-combine':
       return sssCombineCommand(o);
     case 'snapshot':
