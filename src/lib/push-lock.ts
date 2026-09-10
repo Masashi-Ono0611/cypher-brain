@@ -73,7 +73,7 @@ import { sleep } from './util.js';
 import { warn } from './warn.js';
 
 /** What a lock is keyed by — the wording of every message below branches on it. */
-export type PushLockKind = 'save-locator' | 'rclone-remote';
+export type PushLockKind = 'save-locator' | 'rclone-remote' | 'witness-catalog';
 
 /**
  * Thrown when the lock is still held by a LIVE process after the bounded wait — the one
@@ -402,10 +402,12 @@ async function directPublish(lockPath: string, body: string): Promise<boolean> {
 }
 
 function subjectFor(kind: PushLockKind, key: string): string {
+  if (kind === 'witness-catalog') return `witness catalog ${key}`;
   return kind === 'save-locator' ? `locator file ${key}` : `rclone remote ${key}`;
 }
 
 function riskFor(kind: PushLockKind): string {
+  if (kind === 'witness-catalog') return 'publishing competing witness entries for the same sequence';
   return kind === 'save-locator'
     ? 'paying twice for the same content and recording only one of the two locators'
     : 'silently overwriting the object the other push is uploading';

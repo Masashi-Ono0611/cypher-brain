@@ -195,6 +195,15 @@ async function isMinisig(part: string): Promise<boolean> {
 const SHAPE_CHECK: Record<FetchShape, (part: string) => Promise<boolean>> = {
   age: isAgeCiphertext,
   minisig: isMinisig,
+  // A framing gate only; witness.ts validates canonical fields and signatures.
+  witness: async (part) => {
+    if ((await stat(part)).size > 16384) return false;
+    try {
+      return JSON.parse(await readFile(part, 'utf8'))?.cypher_brain_witness_version === 1;
+    } catch {
+      return false;
+    }
+  },
 };
 
 // Stream an Arweave gateway GET to `part`; resolve true iff it produced a non-empty

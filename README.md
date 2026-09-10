@@ -73,8 +73,8 @@ scrypt passphrase wrapping):
 
 So the always-on box that runs gbrain (e.g. a Mac mini) holds **only the public
 key**. It can produce snapshots forever but can never read them back: the
-**snapshots it writes, and anything the storage backend ever sees, are ciphertext
-only** — that is the property this design guarantees.
+**snapshot contents shipped to storage are ciphertext**. Detached signatures and
+opt-in witness catalog metadata are public; neither includes snapshot plaintext.
 
 Three honest caveats, since this is a security tool. (1) That box also *runs* gbrain,
 so the live plaintext (`~/.gbrain`, plus a Postgres server if that is the engine in
@@ -323,6 +323,69 @@ step that does. A command that *sounds* like deletion while the ciphertext stays
 would be worse than not having one. The position itself is
 [Perkeep's](https://perkeep.org/doc/principles) — a permanent store is allowed to say it
 does not delete, as long as it says so before you push rather than after you leak.
+
+### Independent witness catalog (opt-in, Arweave only)
+
+`push --witness` publishes one small, individually signed, hash-linked JSON entry
+per successful push, plus its detached minisign signature. It reuses the signing
+identity from `keygen --sign` (`--sign-identity` can override its path). Missing
+signing keys refuse before upload. Both additional uploads use the same backend,
+receipts, per-run cap and daily/monthly caps as the snapshot. This supports Arweave
+via `--backend arweave` or `turbo`; there is no multi-backend witness option.
+`file` is accepted for offline tests only and provides no independent evidence.
+A `--skip-unchanged` skip publishes nothing; it warns when `--witness` was requested.
+The JSON exposes the snapshot locator, optional signature locator, ciphertext digest,
+backend, timestamp, sequence and signing key id publicly; it contains no plaintext.
+
+This adds evidence outside the source machine: a compromised or lost machine
+cannot erase already-published Arweave entries by rewriting/truncating local
+history. It complements the local `audit` chain, whose complete rewrite remains
+undetectable by `audit` alone. Keep a trusted signing public key and witness anchors
+off-box. A compromised signing key can append plausible-looking entries; signatures
+preserve **evidence of what was signed**, not proof of the operator's intent.
+
+```sh
+cypher-brain push --in snapshot.age --backend turbo --yes --witness --save-locator latest.tsv
+cypher-brain recovery-kit --from-locator-file latest.tsv --out recovery-kit.txt
+cypher-brain witness verify --locator <entry-id> --sig-locator <signature-id> --pubkey saved-sign-recipient.pub
+# Explicit bounded history check, down to genesis:
+cypher-brain witness verify --locator <entry-id> --pubkey saved-sign-recipient.pub --to-sequence 0
+```
+
+Verification returns three distinct outcomes:
+
+- `confirmed`: the explicitly requested bounded segment (or a library caller's
+  pinned anchor) verified without gaps. This **does not prove it is globally latest**;
+  JSON always reports `latest_known: false` in this version.
+- `conflicting`: two different, validly signed entries claim the same sequence under
+  the same trusted key. This is a fork/rewrite alarm, never resolved by choosing a
+  higher sequence. Inspect both locators before trusting the history.
+- `freshness-unknown`: discovery is unavailable, or locators/signatures needed for
+  the requested walk are missing/unavailable. Even a consistent chain to genesis
+  returns this by default when no bounded range was requested. It never silently
+  becomes `confirmed`. A bad signature or hash link instead raises an explicit error.
+
+The append-only `$CYPHER_BRAIN_HOME/witness-catalog.local.jsonl` is an **untrusted
+convenience cache**, folded by sequence while retaining competing candidates.
+It supplies previous hashes when building entries and locator mappings when walking
+backward: `prev_entry_hash` is a content hash, **not an Arweave locator**. Verification
+fetches and authenticates the real entries; cache contents are not evidence. There
+is no independent enumeration/discovery service in this version. With only an old
+known-good locator and no hint file, an operator cannot discover newer entries or
+resolve the older chain; even the starting detached signature needs its own locator.
+Regenerated recovery kits include the latest locally known entry **and signature**
+locators plus sequence only when witness is in use. Refresh and store that kit and
+a copy of the locator mapping offline. An old kit remains an old anchor.
+
+`doctor` warns about locally detectable coverage/sequence gaps after witness has
+been used, including a newer snapshot push with no matching witness. It never
+fails solely for this optional feature and does not claim remote verification.
+Two same-home pushes serialize catalog publication. Separate machines/homes are
+not coordinated. A crash, lost upload response, or hint-write failure after entry
+publication can leave an unrecorded entry; blindly retrying may create a competing
+sequence. Preserve printed locators and receipts and inspect the published evidence
+before retrying. Key rotation needs the old trusted public key for older entries;
+this verifier accepts one trusted key per invocation, not a rotation trust chain.
 
 ## Install
 
@@ -849,6 +912,16 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       line missing it (or with a mismatched value) is rejected as unreadable, same as
       malformed JSON — not silently defaulted or dropped from the count.
 
+  cypher-brain witness verify --locator <entry-locator> [--sig-locator <signature-locator>] [--pubkey <path>] [--to-sequence <n>] [--backend <arweave|turbo|file>] [--json]
+      Verify signed, hash-linked witness entries using the trusted minisign public key
+      (default sign-recipient.pub). Local hints resolve predecessor/signature locators;
+      --sig-locator lets an offline recovery kit supply the starting detached signature.
+      Prints confirmed / conflicting / freshness-unknown. With --to-sequence, confirmed
+      means ONLY the requested bounded segment verified; it never proves global freshness.
+      Without that bounded request, unavailable discovery yields freshness-unknown even
+      for a consistent chain. Conflicts and unknown freshness exit 1; invalid signatures
+      or hash links are errors. Arweave-only; file is for offline tests, not independent evidence.
+
   cypher-brain audit [--json]
       Read-only hash-chain verification (#226): every "push"/"restore"/"verify" run
       (success OR failure) appends an entry to $CYPHER_BRAIN_HOME/audit-log.jsonl (or
@@ -1126,7 +1199,13 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       has to fall back to scraping stderr; "code" is the CB-E0xx identifier when the failure
       matches a known one (MANAGEMENT.md#error-codes), null otherwise.
 
-  cypher-brain push --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--remote <name>:<path>] [--yes] [--plan <path.json>] [--save-locator <path>] [--skip-unchanged] [--digest <hex>] [--force]
+  cypher-brain push --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--remote <name>:<path>] [--yes] [--plan <path.json>] [--save-locator <path>] [--skip-unchanged] [--digest <hex>] [--force] [--witness] [--sign-identity <path>]
+      --witness opts into TWO additional Arweave uploads: a public signed catalog entry
+      and its detached signature, sharing the same per-run/daily/monthly spend caps.
+      Requires the existing sign-identity.key (or --sign-identity); supports arweave/turbo,
+      with file for offline tests only. A skipped unchanged push publishes no witness.
+      Records locators/digest/time/key id publicly; no plaintext contents are included.
+      Regenerate recovery-kit afterward to keep an offline witness anchor current.
       Upload ciphertext to storage. Prints ONLY the locator to stdout
       (file: store path; arweave: tx id; turbo: ANS-104 data item id; rclone: the
       --remote value itself; ton: "ton:v1:<bag-id>"; ton-provider: "ton-provider:v1:<bag-id>").
@@ -1769,7 +1848,7 @@ node dist/mcp.mjs        # bundled build (npm run build), or: bin/cypher-brain-m
 
 | Tool | Money | What it does |
 |---|---|---|
-| `snapshot_now` | **can spend** (paid backend) | snapshot + optional push. `recipients` is REQUIRED with NO default (#478) — **unlike** the CLI `snapshot`, which defaults to `<CYPHER_BRAIN_HOME>/recipient.txt` when `--recipient` is omitted, this tool refuses a call with none rather than silently reaching for that file; pass the home recipient explicitly to get the same effect. `arweave`/`turbo`/`ton-provider` require `confirm_paid: true` (the `--yes` guard; the `CYPHER_BRAIN_YES` env escape hatch is not honored over MCP) — and the refusal describes **that** backend rather than assuming Arweave's permanence, since ton-provider's durability depends on a provider continuing to renew and serve the contract (#796). `locator_file` (the `push --save-locator` destination) must resolve, after following symlinks, to a path inside `CYPHER_BRAIN_HOME` — where MANAGEMENT.md's own cadence already puts it — and, if something is already there, to an existing save-locator file: `--save-locator` *replaces* that path outright, so an unscoped one would be an arbitrary-file-overwrite primitive on a tool the free `file` backend reaches with no consent gate at all (#789). `scan_secrets: "warn"\|"deny"\|"off"` runs the same gitleaks gate as the CLI `--scan-secrets` (#307) — and defaults the same way (#301): `warn` when there is at least one `dirs` entry and gitleaks is resolvable, nothing otherwise. An explicit mode other than `off` requires at least one `dirs` entry (it does not scan a `pg` dump); the result reports the mode that actually ran (`null` when none did), and a call asking for a scan on a machine without gitleaks fails rather than silently skipping it. `idempotency_key` makes a RETRY safe (#220, Stripe's idempotency-key pattern): a repeat call with the SAME key and the same `dirs`/`pg`/`recipients`/`out`/`backend`/`scan_secrets` returns the FIRST call's result — no new snapshot, no new spend — instead of re-executing (`idempotent_replay: true` in the result marks a replay); the same key with DIFFERENT values in any of those fields is refused (`ERR_IDEMPOTENCY_KEY_REUSED`) rather than silently answered with the wrong result. Cached results are kept in `<CYPHER_BRAIN_HOME>/idempotency-log.jsonl` and expire after `CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS` (default 24h). A replay reports the outcome the same way the first call did: a recorded FAILURE (a partial success, or the uncertain spend below) replays with `isError: true` and its recorded fields, never as a clean success (#810). One outcome never expires — a paid push whose result is UNCERTAIN (an `arweave` POST or a `ton-provider` broadcast that may or may not have been accepted) records a permanent tombstone `{code: "ERR_PUSH_OUTCOME_UNCERTAIN", spend_outcome: "uncertain", backend, check_kind, check_identifier, message}` with no `pushed`/`locator`, and every later call with that key replays it as an error and does no paid work: the money may already be gone, and expiring the record would only postpone the retry that spends again (#818 — verify `check_identifier` on-chain, then use a NEW key). If the result record cannot be WRITTEN after a possible spend, the key's claim is retained rather than released, so the retry is refused instead of re-executing (#809); the warning names the lock file to remove. See MANAGEMENT.md's "MCP idempotency keys" section. **Fail-closed policy (#800), enforced before *anything* else this tool does — before the idempotency lookup/replay, the output file, the secret scan, the snapshot and the upload, so a refused call leaves no artifact, no stored object and no idempotency record:** the server refuses every `snapshot_now` call unless `CYPHER_BRAIN_PIN_RECIPIENTS` resolves to at least one `age1…` key, and refuses any call naming `dirs` unless every entry resolves (after following symlinks) to one of the absolute roots in `CYPHER_BRAIN_MCP_SOURCE_ROOTS` — exact match or separator-bounded containment, so a `/roots/a` root does not cover `/roots/ab`. Unset/empty/malformed roots refuse every `dirs` call; a pinned `pg`-only call needs no roots. A replay is refused too if the current policy would deny the original call. Both are OPERATOR environment settings a caller cannot supply, so the refusal (`ERR_POLICY_DENIED`, `cb_code` `CB-E025`) is not something to retry with different arguments. The CLI `snapshot` is unaffected — see Threat model above. `backend: "ton-provider"` only appears in the enum when a local TON wallet is already configured — **and, unlike arweave/turbo, no MCP tool on this server can create that wallet** (issue #439): an operator must run `cypher-brain wallet create --chain ton` from a shell, set `CYPHER_BRAIN_TON_WALLET` in this server's own environment, and restart it before `"ton-provider"` shows up here at all |
+| `snapshot_now` | **can spend** (paid backend) | snapshot + optional push. `recipients` is REQUIRED with NO default (#478) — **unlike** the CLI `snapshot`, which defaults to `<CYPHER_BRAIN_HOME>/recipient.txt` when `--recipient` is omitted, this tool refuses a call with none rather than silently reaching for that file; pass the home recipient explicitly to get the same effect. `arweave`/`turbo`/`ton-provider` require `confirm_paid: true` (the `--yes` guard; the `CYPHER_BRAIN_YES` env escape hatch is not honored over MCP) — and the refusal describes **that** backend rather than assuming Arweave's permanence, since ton-provider's durability depends on a provider continuing to renew and serve the contract (#796). `locator_file` (the `push --save-locator` destination) must resolve, after following symlinks, to a path inside `CYPHER_BRAIN_HOME` — where MANAGEMENT.md's own cadence already puts it — and, if something is already there, to an existing save-locator file: `--save-locator` *replaces* that path outright, so an unscoped one would be an arbitrary-file-overwrite primitive on a tool the free `file` backend reaches with no consent gate at all (#789). `scan_secrets: "warn"\|"deny"\|"off"` runs the same gitleaks gate as the CLI `--scan-secrets` (#307) — and defaults the same way (#301): `warn` when there is at least one `dirs` entry and gitleaks is resolvable, nothing otherwise. An explicit mode other than `off` requires at least one `dirs` entry (it does not scan a `pg` dump); the result reports the mode that actually ran (`null` when none did), and a call asking for a scan on a machine without gitleaks fails rather than silently skipping it. `idempotency_key` makes a RETRY safe (#220, Stripe's idempotency-key pattern): a repeat call with the SAME key and the same `dirs`/`pg`/`recipients`/`out`/`backend`/`scan_secrets`/`witness` returns the FIRST call's result — no new snapshot, no new spend — instead of re-executing (`idempotent_replay: true` in the result marks a replay); the same key with DIFFERENT values in any of those fields is refused (`ERR_IDEMPOTENCY_KEY_REUSED`) rather than silently answered with the wrong result. Cached results are kept in `<CYPHER_BRAIN_HOME>/idempotency-log.jsonl` and expire after `CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS` (default 24h). A replay reports the outcome the same way the first call did: a recorded FAILURE (a partial success, or the uncertain spend below) replays with `isError: true` and its recorded fields, never as a clean success (#810). One outcome never expires — a paid push whose result is UNCERTAIN (an `arweave` POST or a `ton-provider` broadcast that may or may not have been accepted) records a permanent tombstone `{code: "ERR_PUSH_OUTCOME_UNCERTAIN", spend_outcome: "uncertain", backend, check_kind, check_identifier, message}` with no `pushed`/`locator`, and every later call with that key replays it as an error and does no paid work: the money may already be gone, and expiring the record would only postpone the retry that spends again (#818 — verify `check_identifier` on-chain, then use a NEW key). If the result record cannot be WRITTEN after a possible spend, the key's claim is retained rather than released, so the retry is refused instead of re-executing (#809); the warning names the lock file to remove. See MANAGEMENT.md's "MCP idempotency keys" section. **Fail-closed policy (#800), enforced before *anything* else this tool does — before the idempotency lookup/replay, the output file, the secret scan, the snapshot and the upload, so a refused call leaves no artifact, no stored object and no idempotency record:** the server refuses every `snapshot_now` call unless `CYPHER_BRAIN_PIN_RECIPIENTS` resolves to at least one `age1…` key, and refuses any call naming `dirs` unless every entry resolves (after following symlinks) to one of the absolute roots in `CYPHER_BRAIN_MCP_SOURCE_ROOTS` — exact match or separator-bounded containment, so a `/roots/a` root does not cover `/roots/ab`. Unset/empty/malformed roots refuse every `dirs` call; a pinned `pg`-only call needs no roots. A replay is refused too if the current policy would deny the original call. Both are OPERATOR environment settings a caller cannot supply, so the refusal (`ERR_POLICY_DENIED`, `cb_code` `CB-E025`) is not something to retry with different arguments. The CLI `snapshot` is unaffected — see Threat model above. `backend: "ton-provider"` only appears in the enum when a local TON wallet is already configured — **and, unlike arweave/turbo, no MCP tool on this server can create that wallet** (issue #439): an operator must run `cypher-brain wallet create --chain ton` from a shell, set `CYPHER_BRAIN_TON_WALLET` in this server's own environment, and restart it before `"ton-provider"` shows up here at all |
 | `last_snapshot_status` | read-only | latest locator/backend/sha256/timestamp/age from a save-locator file and/or `index.tsv`. `locator_file`/`index_file` must resolve (after following symlinks) to a regular file inside `CYPHER_BRAIN_HOME`, where the documented cadence already keeps them — pointing this tool at an arbitrary path is refused, and a file that does not parse is described rather than quoted back, so the tool cannot be used to read local files it has no business reading (#787) |
 | `verify_restore` | read-only | pull by locator (or a local file) + verify; honest `PASS`/`FAIL`/`PARTIAL` verdict mirroring the CLI exit codes. `require_signature` defaults to `CYPHER_BRAIN_REQUIRE_SIGNATURE=1` when omitted; explicit `false` permits a known-unsigned backup. `require_signature: true` turns an ABSENT `.minisig` from a `[SKIP]` into a `FAIL` — the CLI's `--require-signature` (#319). When it pulls, `pulled.log` carries everything the fetch said — retries, the `sha256 OK` confirmation, transfer progress — and a `signature` object appears when the artifact's `.minisig` was recorded but could not be fetched, which `verify` alone reports as "unsigned (legacy) artifact" (#312) |
 | `restore_now` | **writes files, can clobber a DB** (no spend) | pull by locator (or a local file / `locator_file`, same dual-mode input as `verify_restore`) + decrypt + extract into `out_dir` — the actual restore `verify_restore` stops short of. Requires `confirm_write: true` before any work happens; when `pg` is given, `pg_restore --clean --if-exists` also DROPS and replaces objects in that database, the same `--yes` consent the CLI's `restore --pg` requires. `require_signature` defaults to `CYPHER_BRAIN_REQUIRE_SIGNATURE=1` when omitted; explicit `false` overrides that default. `require_signature: true` refuses an artifact whose `.minisig` is absent — checked **before** the identity is loaded or `pg_restore --clean` can drop anything, so it gates the write rather than reporting on it (#319). `out_dir` may sit outside `CYPHER_BRAIN_HOME` — that is the normal recovery case, and it only warns (#559) — but it may **not** itself be a symlink: that is refused, because the path the result reports and the path the plaintext lands in would then differ (#792). Ancestor symlinks are followed and reported as `out_dir_resolved` when they change the destination |

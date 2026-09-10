@@ -8,6 +8,15 @@ import { AGE_MAGIC, CIPHER_YES, readEnv, WAIT_RETRY_BACKENDS } from './config.js
 import { exists, requireFile, sleep, sha256, readHead, errMsg, RetryableError } from './util.js';
 import { backendFor } from './backends/index.js';
 import { estimateCost, formatEstimate } from './estimate.js';
+import {
+  buildWitnessEntry,
+  publishWitnessEntry,
+  loadWitnessIdentity,
+  latestWitnessHint,
+  WITNESS_HINT_FILE,
+  type WitnessPublicationProgress,
+} from './witness.js';
+import { PushWitnessUploadError } from './push-partial-success.js';
 import { signatureKeyIdHex } from './minisign.js';
 import { tonWalletConfigured, payerAddressFor } from './wallet.js';
 import { readPlanFile, validatePlan } from './plan.js';
@@ -339,6 +348,21 @@ async function pushCore(
   o: CliOptions,
   digestBox?: { value: string | null },
 ): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
+  if (!o.witness) return pushCoreWithLocatorLock(o, digestBox);
+  // One catalog per home, even across different --save-locator destinations.
+  // Hold through publication + hint append, so ordinary concurrent pushes do not fork.
+  const release = await acquirePushLock('witness-catalog', WITNESS_HINT_FILE);
+  try {
+    return await pushCoreWithLocatorLock(o, digestBox);
+  } finally {
+    await release();
+  }
+}
+
+async function pushCoreWithLocatorLock(
+  o: CliOptions,
+  digestBox?: { value: string | null },
+): Promise<{ success: boolean; locator: string | null; sigLocator: string | null }> {
   if (!o.save_locator) return pushCoreLocked(o, digestBox);
   const release = await acquirePushLock('save-locator', await saveLocatorLockKey(o.save_locator));
   try {
@@ -357,6 +381,9 @@ async function pushCoreLocked(
   if (!o.backend) throw new UsageError('--backend <file|arweave|turbo|rclone|ton> required'); // no silent default
   assertRemoteRequiresRcloneBackend(o); // #655 — see the function's own doc comment (supersedes #658's warn-only version, since a hard refusal here makes that warn path unreachable)
   assertDigestRequiresSaveLocator(o); // #723 — see the function's own doc comment
+  if (o.sign_identity && !o.witness) throw new UsageError('push --sign-identity requires --witness');
+  const witnessIdentity = await loadWitnessIdentity(o); // refuse BEFORE any paid upload
+  if (witnessIdentity) await latestWitnessHint();
   await requireFile(o.in); // #267: one shared check/wording across every command
   // storage must only ever see ciphertext — refuse to push a non-age artifact
   // (e.g. an accidental plaintext path), which would be the last gate before a
@@ -366,6 +393,8 @@ async function pushCoreLocked(
   }
   const skipResult = await resolveSkipUnchanged(o);
   if (skipResult.skip) {
+    if (o.witness)
+      warn('--witness: unchanged push skipped; no new witness entry was published (use --force to publish)');
     return { success: false, locator: skipResult.locator, sigLocator: skipResult.sigLocator };
   }
   // --plan <path.json> (#231): re-validate a plan written by "estimate --out" against
@@ -479,6 +508,11 @@ async function pushCoreLocked(
         );
       }
     }
+  }
+  if (o.witness) {
+    console.error(
+      '--witness: TWO additional uploads (public catalog JSON + detached signature) share the spend caps for this push. A later refusal leaves the primary upload already paid for.',
+    );
   }
   const yes = !!o.yes || CIPHER_YES;
   // arweave and turbo are paid, permanent stores — require an explicit opt-in so
@@ -639,7 +673,9 @@ async function pushCoreLocked(
   // further. Best-effort, same fallback recordAudit() itself used to apply: an --in that
   // fails to hash here is not a NEW failure mode, since backend.put() immediately below
   // would fail the exact same read moments later anyway.
-  if (digestBox) digestBox.value = await sha256(o.in).catch(() => null);
+  const snapshotDigest = await sha256(o.in).catch(() => null);
+  if (digestBox) digestBox.value = snapshotDigest;
+  if (o.witness && !snapshotDigest) throw new Error('--witness: could not hash the snapshot before upload');
   const locator = await budgetedPut(o.in, {
     yes,
     remote: o.remote,
@@ -804,6 +840,40 @@ async function pushCoreLocked(
       console.error(`locator saved -> ${o.save_locator}`);
     } catch (e) {
       throw new PushLocatorWriteError(locator, sigLocator, e);
+    }
+  }
+  if (witnessIdentity && snapshotDigest) {
+    const progress: WitnessPublicationProgress = {};
+    try {
+      const entry = await buildWitnessEntry({
+        backend: backendName,
+        locator,
+        sig_locator: sigLocator ?? null,
+        snapshot_sha256: snapshotDigest,
+        signing_key_fingerprint: witnessIdentity.keyId.toString('hex'),
+      });
+      // The SAME budgetedPut wrapper and tracker cover all four possible uploads:
+      // ciphertext, its signature, witness JSON, witness signature. No bypass of #907.
+      await publishWitnessEntry(
+        entry,
+        witnessIdentity,
+        { put: budgetedPut },
+        { yes, spendTracker },
+        WITNESS_HINT_FILE,
+        progress,
+      );
+    } catch (e) {
+      if (e instanceof PushUncertainSpendError)
+        throw new PushUncertainSpendError({
+          backend: e.backend,
+          checkKind: e.checkKind,
+          checkIdentifier: e.checkIdentifier,
+          detail: `Witness publication: ${e.detail}. Confirmed witness entry: ${progress.entryLocator ?? 'none'}; confirmed witness signature: ${progress.sigLocator ?? 'none'}`,
+          verifyHint: e.verifyHint,
+          confirmedCiphertextLocator: locator,
+          cause: e,
+        });
+      throw new PushWitnessUploadError(locator, sigLocator, e, progress.entryLocator, progress.sigLocator);
     }
   }
   console.log(locator); // stdout = locator ONLY, so a script can capture it

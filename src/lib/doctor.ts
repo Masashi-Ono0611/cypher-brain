@@ -68,6 +68,7 @@ import { WALLET_DEFAULT_PATH, TON_WALLET_DEFAULT_PATH } from './wallet.js';
 import { scheduleStatusReport, ScheduleNotInstalledError } from './schedule.js';
 import { buildInfo, buildAgeDays, BUILD_STALE_DAYS } from './buildinfo.js';
 import { readAuditLog, verifyAuditChain } from './audit.js';
+import { readWitnessHints, WITNESS_HINT_FILE } from './witness.js';
 import { readReceipts } from './receipt.js';
 import { readSpendIntents, isUnsettled, PENDING_SPENDS_LOG, type SpendIntentRecord } from './pending-spend.js';
 import { detectGbrainEngine, resolveGbrainConfigPath } from './gbrain.js';
@@ -847,6 +848,65 @@ function describeIntent(i: SpendIntentRecord): string {
 //     is the #822 uncertain-spend case exactly: only an operator looking at the contract
 //     address on an explorer can say whether the funds moved.
 //
+// Advisory LOCAL coverage check, not verification of independent evidence.
+export async function checkWitnessCoverage(): Promise<DoctorCheck> {
+  const id = 'witness-coverage';
+  try {
+    const { hints, bySequence, skippedLines } = await readWitnessHints();
+    const problem = (message: string): DoctorCheck => ({
+      id,
+      status: 'warn',
+      message,
+      remediation:
+        'Inspect witness-catalog.local.jsonl and run witness verify with an off-box anchor; refresh the recovery kit after a witnessed push.',
+    });
+    if (skippedLines) return problem(`${skippedLines} unreadable witness hint line(s) may hide a coverage gap`);
+    if (!hints.length)
+      return (await exists(WITNESS_HINT_FILE))
+        ? problem('Witness hint file exists but has no entries; coverage is unknown')
+        : { id, status: 'skip', message: 'Witness catalog has not been used' };
+    let expected = 0;
+    for (const sequence of [...bySequence.keys()].sort((a, b) => a - b)) {
+      if (sequence !== expected) return problem(`Witness sequence gap: expected ${expected}, found ${sequence}`);
+      if (new Set(bySequence.get(sequence)?.map((h) => h.entry_hash)).size > 1)
+        return problem(`Competing witness hints at sequence ${sequence}; verify the signed entries`);
+      expected++;
+    }
+    const latest = hints[hints.length - 1];
+    const { entries, skippedLines: auditSkipped } = await readAuditLog();
+    const pushed = entries.filter((e) => e.command === 'push' && e.locator).at(-1);
+    if (auditSkipped) return problem('Unreadable push history prevents checking witness coverage');
+    if (
+      pushed &&
+      (pushed.locator !== latest.snapshot_locator ||
+        pushed.backend !== latest.backend ||
+        (pushed.artifact_sha256 && pushed.artifact_sha256 !== latest.snapshot_sha256))
+    )
+      return problem(
+        `Latest pushed snapshot ${pushed.locator} has no matching witness entry (latest witness sequence ${latest.sequence})`,
+      );
+    const { receipts, skippedLines: receiptSkipped } = await readReceipts();
+    if (receiptSkipped) return problem('Unreadable receipts prevent checking witness coverage');
+    const receipt = receipts.at(-1);
+    if (receipt && (!latest.updated_at || Date.parse(receipt.timestamp) > Date.parse(latest.updated_at)))
+      return problem(
+        `Receipt ${receipt.locator} is newer than witness sequence ${latest.sequence}; witness coverage may be incomplete`,
+      );
+    return {
+      id,
+      status: 'pass',
+      message: `Local witness coverage is current at sequence ${latest.sequence} (independent verification requires witness verify)`,
+    };
+  } catch (e) {
+    return {
+      id,
+      status: 'warn',
+      message: `Cannot check witness coverage: ${errMsg(e)}`,
+      remediation: `Inspect ${WITNESS_HINT_FILE}`,
+    };
+  }
+}
+
 // WARN, never FAIL: nothing here is insecure or broken, and both states resolve — one by
 // pushing the same artifact again, one by looking. A FAIL would also flip `verify`-style
 // exit codes for what is, at worst, an incomplete cost record.
@@ -1382,6 +1442,7 @@ const CHECK_DEFS: ReadonlyArray<{
   { id: 'schedule-last-run', run: () => checkSchedule() },
   { id: 'audit-chain-integrity', run: () => checkAuditChain() },
   { id: 'receipt-ledger-readability', run: () => checkReceiptLedger() },
+  { id: 'witness-coverage', run: () => checkWitnessCoverage() },
   { id: 'pending-spend-intents', run: () => checkPendingSpends() },
   { id: 'gbrain-engine-detection', run: () => checkGbrainEngine() },
   { id: 'identity-backup-accumulation', run: () => checkIdentityBackups() },

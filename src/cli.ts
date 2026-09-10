@@ -48,6 +48,7 @@ import { wallet } from './lib/wallet.js';
 import { estimate } from './lib/estimate.js';
 import { doctor } from './lib/doctor.js';
 import { ledger } from './lib/ledger.js';
+import { witnessVerify } from './lib/witness.js';
 import { audit } from './lib/audit.js';
 import { withSpan } from './lib/otel.js';
 import { init } from './lib/wizard.js';
@@ -61,6 +62,7 @@ import { printFounderNote, printWisdomQuote } from './lib/wisdom.js';
 import type { CliOptions } from './lib/types.js';
 
 const BOOL_FLAGS = new Set([
+  'witness',
   'force',
   'passphrase',
   'wrap_in_place',
@@ -87,6 +89,8 @@ const BOOL_FLAGS = new Set([
 // listed here: they're repeatable array flags handled by their own branches
 // below, before this set is ever consulted.
 const VALUE_FLAGS = new Set([
+  'pubkey',
+  'to_sequence',
   'out',
   'out_dir',
   'profile',
@@ -158,7 +162,7 @@ const KNOWN_FLAG_NAMES: string[] = [
 // inferred from FLAG_IRRELEVANT, which is about specific --flag names, a different
 // axis) so parseArgs() knows, for a KNOWN command, how many bare (non "--") tokens
 // its own o._ slot is allowed to hold — see the positional-argument check below.
-const POSITIONAL_COMMANDS = new Set(['schedule', 'wallet']);
+const POSITIONAL_COMMANDS = new Set(['schedule', 'wallet', 'witness']);
 
 // The four repeatable array flags parseArgs()'s loop below consumes a following value
 // for in their own branches (before VALUE_FLAGS/BOOL_FLAGS is ever consulted) — pulled
@@ -619,6 +623,16 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       line missing it (or with a mismatched value) is rejected as unreadable, same as
       malformed JSON — not silently defaulted or dropped from the count.
 
+  cypher-brain witness verify --locator <entry-locator> [--sig-locator <signature-locator>] [--pubkey <path>] [--to-sequence <n>] [--backend <arweave|turbo|file>] [--json]
+      Verify signed, hash-linked witness entries using the trusted minisign public key
+      (default sign-recipient.pub). Local hints resolve predecessor/signature locators;
+      --sig-locator lets an offline recovery kit supply the starting detached signature.
+      Prints confirmed / conflicting / freshness-unknown. With --to-sequence, confirmed
+      means ONLY the requested bounded segment verified; it never proves global freshness.
+      Without that bounded request, unavailable discovery yields freshness-unknown even
+      for a consistent chain. Conflicts and unknown freshness exit 1; invalid signatures
+      or hash links are errors. Arweave-only; file is for offline tests, not independent evidence.
+
   cypher-brain audit [--json]
       Read-only hash-chain verification (#226): every "push"/"restore"/"verify" run
       (success OR failure) appends an entry to $CYPHER_BRAIN_HOME/audit-log.jsonl (or
@@ -896,7 +910,13 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       has to fall back to scraping stderr; "code" is the CB-E0xx identifier when the failure
       matches a known one (MANAGEMENT.md#error-codes), null otherwise.
 
-  cypher-brain push --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--remote <name>:<path>] [--yes] [--plan <path.json>] [--save-locator <path>] [--skip-unchanged] [--digest <hex>] [--force]
+  cypher-brain push --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--remote <name>:<path>] [--yes] [--plan <path.json>] [--save-locator <path>] [--skip-unchanged] [--digest <hex>] [--force] [--witness] [--sign-identity <path>]
+      --witness opts into TWO additional Arweave uploads: a public signed catalog entry
+      and its detached signature, sharing the same per-run/daily/monthly spend caps.
+      Requires the existing sign-identity.key (or --sign-identity); supports arweave/turbo,
+      with file for offline tests only. A skipped unchanged push publishes no witness.
+      Records locators/digest/time/key id publicly; no plaintext contents are included.
+      Regenerate recovery-kit afterward to keep an offline witness anchor current.
       Upload ciphertext to storage. Prints ONLY the locator to stdout
       (file: store path; arweave: tx id; turbo: ANS-104 data item id; rclone: the
       --remote value itself; ton: "ton:v1:<bag-id>"; ton-provider: "ton-provider:v1:<bag-id>").
@@ -1482,6 +1502,7 @@ interface FlagIrrelevance {
 }
 
 const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
+  witness: [],
   // restore's destination is --out-dir; src/lib/restore.ts's restore() never reads o.out.
   // The single highest-traffic instance, since --out means the output on snapshot, pull and
   // wallet create — restore is the one command that spells it differently.
@@ -1790,7 +1811,21 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     'sig_locator',
     'pg',
   ],
-  push: ['in', 'backend', 'remote', 'yes', 'plan', 'save_locator', 'skip_unchanged', 'digest', 'force', 'wallet'],
+  witness: ['locator', 'sig_locator', 'pubkey', 'backend', 'to_sequence', 'json'],
+  push: [
+    'witness',
+    'sign_identity',
+    'in',
+    'backend',
+    'remote',
+    'yes',
+    'plan',
+    'save_locator',
+    'skip_unchanged',
+    'digest',
+    'force',
+    'wallet',
+  ],
   pull: ['out', 'locator', 'backend', 'remote', 'from_locator_file', 'wait', 'sha256', 'sig_locator', 'force'],
   estimate: ['in', 'backend', 'json', 'out', 'remote', 'force', 'wallet'],
   'publish-latest': ['domain', 'from_locator_file', 'yes', 'wait'],
@@ -2122,6 +2157,8 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
       return doctor(o);
     case 'ledger':
       return ledger(o);
+    case 'witness':
+      return witnessVerify(o);
     case 'audit':
       return audit(o);
     // mascot on stderr (decoration only, EPIPE-safe — see printMascot in

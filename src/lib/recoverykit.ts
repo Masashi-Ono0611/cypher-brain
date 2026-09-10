@@ -41,6 +41,7 @@ import { installStageSignalGuard, setActiveRecoveryKitVerifyDir } from './signal
 import type { CliOptions } from './types.js';
 import { errMsg, exists, redactPgConn } from './util.js';
 import { warn } from './warn.js';
+import { latestWitnessHint, type WitnessHint } from './witness.js';
 import { UsageError } from './errors.js';
 
 export interface BackupKey {
@@ -72,6 +73,7 @@ export interface SigningKey {
 }
 
 export interface KitInputs {
+  witness?: Pick<WitnessHint, 'entry_locator' | 'sequence' | 'sig_locator'>;
   primaryIdentityPath: string;
   /** Non-null only for the standalone command's --inline-identity (wrapped+armored, enforced by the caller). init never inlines the primary. */
   primaryInline: { text: string } | null;
@@ -245,6 +247,22 @@ export function buildRecoveryKit(k: KitInputs): string {
     lines.push('None was generated during init. Snapshots restore exactly as before (age confidentiality +');
     lines.push('tamper detection), just without the extra authenticity check. Add one later at any time:');
     lines.push('cypher-brain keygen --sign');
+    lines.push('');
+  }
+  if (k.witness) {
+    lines.push('--- WITNESS CATALOG ANCHOR (latest locally known; keep this off-box) ---');
+    lines.push(`Sequence: ${k.witness.sequence}`);
+    lines.push(`Entry locator: ${k.witness.entry_locator}`);
+    lines.push(`Signature locator: ${k.witness.sig_locator}`);
+    lines.push(
+      'cypher-brain witness verify --locator ' +
+        k.witness.entry_locator +
+        ' --sig-locator ' +
+        k.witness.sig_locator +
+        ' --pubkey <saved-signing-public-key>',
+    );
+    lines.push('This anchor does not discover newer entries. Preserve the local locator mapping off-box');
+    lines.push('too if you need to walk older entries; the mapping itself is not trusted proof.');
     lines.push('');
   }
   lines.push('--- LATEST SAVE-LOCATOR (back this up off-box, next to the backup identity) ---');
@@ -691,6 +709,7 @@ export async function recoveryKit(o: CliOptions): Promise<void> {
     pg: 'unknown',
     generatedAt: new Date().toISOString(),
     keyVerification,
+    witness: await latestWitnessHint(),
   });
 
   if (o.out) {

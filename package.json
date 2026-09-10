@@ -66,6 +66,7 @@
     "selftest:recovery-kit": "bash scripts/selftest-recovery-kit.sh",
     "selftest:restore-security": "bash scripts/selftest-restore-security.sh",
     "selftest:restore-toctou": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-restore-toctou.mjs",
+    "selftest:witness": "node scripts/selftest-witness.mjs",
     "selftest:recovery-policy": "node scripts/selftest-recovery-policy.mjs",
     "selftest:pq": "bash scripts/selftest-pq.sh",
     "selftest:sss": "bash scripts/selftest-sss.sh",

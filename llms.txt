@@ -62,6 +62,26 @@ receipt ledger; open/uncertain reservations keep counting until resolved. See
 MANAGEMENT.md for configuration and recovery. No new MCP tool is needed.
 
 
+## Independent witness catalog
+
+`push --witness` (MCP `snapshot_now` with `witness: true`) opts into two additional
+public Arweave uploads: one hash-linked catalog entry and its minisign signature.
+Requires the existing sign-identity.key; CLI push accepts --sign-identity. Uses
+arweave/turbo and the same per-run/daily/monthly caps; file is for offline tests only.
+No general multi-backend witness framework. The opt-in is part of MCP idempotency.
+`witness verify --locator <entry> [--sig-locator <signature>] [--pubkey <path>]`
+returns confirmed / conflicting / freshness-unknown. Default latest-entry checks
+cannot confirm freshness: there is no independent discovery. --to-sequence <n>
+requests a bounded segment; confirmed then means that segment only, never globally
+latest (latest_known is false). Invalid signatures/hash links raise errors.
+Local witness-catalog.local.jsonl is an untrusted convenience cache supplying
+predecessor/signature locators, not evidence. An old locator without this mapping
+cannot recover the chain or discover newer entries. Recovery kits optionally print
+latest known entry/signature locators and sequence: regenerate and keep them and
+the trusted public key off-box. Doctor warns about local coverage gaps. Arweave
+preserves published evidence against local history rewrites, but a compromised
+signing key can append plausible entries; signatures cannot prove operator intent.
+
 ## Key concepts
 
 - **identity** (private key) — the only thing that can decrypt. Lives off the

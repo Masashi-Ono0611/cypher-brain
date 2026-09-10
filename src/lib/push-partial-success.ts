@@ -155,3 +155,25 @@ export class PushFundingConfirmedButIncompleteError extends PushPartialSuccessEr
     this.name = 'PushFundingConfirmedButIncompleteError';
   }
 }
+
+// Primary storage is already confirmed; retrying the whole push can pay twice.
+export class PushWitnessUploadError extends PushPartialSuccessError {
+  readonly witnessEntryLocator?: string;
+  readonly witnessSigLocator?: string;
+  constructor(
+    locator: string,
+    sigLocator: string | undefined,
+    cause: unknown,
+    witnessEntryLocator?: string,
+    witnessSigLocator?: string,
+  ) {
+    super(
+      `ciphertext upload succeeded (locator: ${locator}) but witness publication failed: ${cause instanceof Error ? cause.message : String(cause)}. Confirmed witness entry: ${witnessEntryLocator ?? 'none'}; confirmed witness signature: ${witnessSigLocator ?? 'none'}. Do not blindly re-push; inspect these locators and the receipt ledger first.`,
+      locator,
+      sigLocator,
+    );
+    this.name = 'PushWitnessUploadError';
+    this.witnessEntryLocator = witnessEntryLocator;
+    this.witnessSigLocator = witnessSigLocator;
+  }
+}

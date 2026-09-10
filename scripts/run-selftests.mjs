@@ -123,6 +123,7 @@ const PARALLEL = [
   npmTest('selftest:interop'),
   npmTest('selftest:cypherbrainignore'),
   npmTest('selftest:recovery-policy'),
+  npmTest('selftest:witness'),
   npmTest('selftest:pq'),
   npmTest('selftest:sss'),
   npmTest('selftest:keygen-force'),
