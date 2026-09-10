@@ -166,8 +166,12 @@ HOME_F="$TMP/home-f"
 SHARES_F="$TMP/shares-f"
 mkdir -p "$SHARES_F"
 CYPHER_BRAIN_PASSPHRASE=selftest-pass-f cb "$HOME_F" keygen --passphrase >/dev/null
+IDENTITY_SHA_BEFORE_F="$(sha "$HOME_F/identity.age")"
 CYPHER_BRAIN_PASSPHRASE=selftest-pass-f cb "$HOME_F" sss-split --sss 2-of-2 \
   --sss-out-dir "$SHARES_F/a.txt" --sss-out-dir "$SHARES_F/b.txt" >/dev/null
+[ "$(sha "$HOME_F/identity.age")" = "$IDENTITY_SHA_BEFORE_F" ] \
+  && echo "[PASS] sss-split left the PASSPHRASE-WRAPPED identity.age byte-for-byte unchanged too" \
+  || { echo "[FAIL] the passphrase-wrapped identity.age was modified by sss-split"; exit 1; }
 cb "$HOME_F" sss-combine --share "$SHARES_F/a.txt" --share "$SHARES_F/b.txt" --out "$TMP/recovered-f.age" >/dev/null
 # No CYPHER_BRAIN_PASSPHRASE set for this restore -- succeeds only if the recovered
 # identity is genuinely unwrapped plaintext, not still passphrase-protected.
