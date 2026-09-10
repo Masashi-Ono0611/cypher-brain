@@ -58,7 +58,7 @@ export class PushUncertainSpendError extends Error {
   /** Optional backend-specific pointer to where the identifier can be looked up. */
   readonly verifyHint: string | undefined;
   /**
-   * Set ONLY when this error escaped from the ".minisig" sidecar's own upload, after the
+   * Set ONLY when this error escaped from an additional sidecar or witness upload, after the
    * CIPHERTEXT's upload had already succeeded (multi-model review, Critical): that locator
    * is confirmed and must not be lost, or the "verify, then use a new key" recovery
    * re-uploads — and on a paid backend re-pays for — bytes that are already stored. It is
@@ -75,7 +75,7 @@ export class PushUncertainSpendError extends Error {
     detail: string;
     /** Optional backend-specific pointer to where the identifier can be looked up. */
     verifyHint?: string;
-    /** See confirmedCiphertextLocator above — set only by the sidecar re-throw in pushpull.ts. */
+    /** See confirmedCiphertextLocator above — set only after primary upload success in pushpull.ts. */
     confirmedCiphertextLocator?: string;
     cause?: unknown;
   }) {
@@ -98,7 +98,7 @@ export class PushUncertainSpendError extends Error {
         `${opts.checkIdentifier}${opts.verifyHint ? ` (${opts.verifyHint})` : ''} BEFORE re-running push or ` +
         'retrying with a new idempotency key: if the first attempt did land, a retry pays for a second one.' +
         (opts.confirmedCiphertextLocator
-          ? ` Only the ".minisig" signature sidecar's own upload is in doubt — the CIPHERTEXT already uploaded ` +
+          ? ` The additional upload described above is in doubt — the CIPHERTEXT already uploaded ` +
             `successfully (locator: ${opts.confirmedCiphertextLocator}). Record that locator: re-pushing the ` +
             'artifact would pay for storing those bytes a second time.'
           : ''),

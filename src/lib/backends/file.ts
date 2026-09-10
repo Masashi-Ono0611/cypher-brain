@@ -11,13 +11,14 @@ import type { StorageBackend, PutOpts } from '../types.js';
 
 // locators produced by put() always have this shape (basename of `<sha256><ext>`).
 // ".age" is the ciphertext extension every --in push() itself accepts; ".minisig" is
-// the ONLY other extension push() ever hands this backend — the detached authenticity
-// sidecar (#214), uploaded alongside the ciphertext it signs (see push() in
+// another extension push() hands this backend — the detached authenticity
+// sidecar (#214). Witness catalogs additionally use .json (#903). The signature is
+// uploaded alongside the ciphertext it signs (see push() in
 // pushpull.ts). A tight allowlist, not an open regex: same "narrow validated shape"
 // defense-in-depth this file already applied to age ciphertext (an untrusted locator,
 // e.g. from a tampered --save-locator file, must never resolve outside FILE_DIR OR to
 // an unexpected extension).
-const LOCATOR_SHAPE_RE = /^[0-9a-f]{64}\.(age|minisig)$/;
+const LOCATOR_SHAPE_RE = /^[0-9a-f]{64}\.(age|minisig|json)$/;
 
 export function fileBackend(): StorageBackend {
   return {

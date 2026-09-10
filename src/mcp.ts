@@ -66,7 +66,9 @@ import {
 } from './lib/config.js';
 import { restoreRunbook } from './lib/runbook.js';
 import { drainWarnings, warn } from './lib/warn.js';
+import { loadWitnessIdentity } from './lib/witness.js';
 import { snapshot } from './lib/snapshot.js';
+import { PushWitnessUploadError } from './lib/push-partial-success.js';
 import { restore, verify } from './lib/restore.js';
 import { withSpan } from './lib/otel.js';
 import {
@@ -1580,6 +1582,7 @@ function snapshotNowFingerprint(args: ToolArgs): string {
     out: args.out,
     backend: args.backend,
     scan_secrets: args.scan_secrets,
+    ...(args.witness === true ? { witness: true } : {}),
   };
   return createHash('sha256').update(JSON.stringify(relevant)).digest('hex');
 }
@@ -1594,6 +1597,7 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
     locator_file: locatorFile,
     confirm_paid: confirmPaid,
     scan_secrets: scanSecrets,
+    witness,
     idempotency_key: idempotencyKeyRaw,
   } = args;
   if (!isStrArray(recipients) || recipients.length === 0)
@@ -1603,6 +1607,8 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
     );
   if (!isStr(out)) throw new ToolError('ERR_INVALID_INPUT', 'out (string path for the .age ciphertext) is required');
   if (!isStrArray(dirs)) throw new ToolError('ERR_INVALID_INPUT', 'dirs must be an array of strings');
+  if (witness !== undefined && typeof witness !== 'boolean')
+    throw new ToolError('ERR_INVALID_INPUT', 'witness must be boolean');
   if (backend !== undefined) requireBackend(backend, 'backend');
   if (pg !== undefined && !isStr(pg)) throw new ToolError('ERR_INVALID_INPUT', 'pg must be a string connection URI');
   if (locatorFile !== undefined && !isStr(locatorFile))
@@ -1871,6 +1877,7 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
     // the residual properly needs descriptor-bound reads (openat/RESOLVE_BENEATH), which
     // Node does not expose and which live in snapshot.ts, not here.
     await assertSnapshotPolicy(dirs, recipients);
+    await loadWitnessIdentity({ witness: witness === true, backend, dirs: [], tables: [], recipients: [] });
     const snapOpts: CliOptions = { out, pg, dirs, tables: [], recipients, scan_secrets: scanSecrets };
     let snap: CaptureResult<void>;
     try {
@@ -1915,6 +1922,7 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
       const pushOpts: CliOptions = {
         in: out,
         backend,
+        witness: witness === true,
         yes: confirmPaid === true,
         save_locator: savedLocatorFile, // #789: the resolved, home-contained path, never the caller's raw one
 
@@ -2021,7 +2029,13 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
               ? { funding_confirmed: true, provider_download_confirmed: false, partial_stage: e.stage }
               : e.name === 'PushSignatureUploadError'
                 ? { signature_upload_failed: true }
-                : { locator_file_write_failed: true };
+                : e instanceof PushWitnessUploadError
+                  ? {
+                      witness_upload_failed: true,
+                      witness_entry_locator: e.witnessEntryLocator ?? null,
+                      witness_sig_locator: e.witnessSigLocator ?? null,
+                    }
+                  : { locator_file_write_failed: true };
           const partialResult: Record<string, unknown> = {
             ...result,
             pushed: true,

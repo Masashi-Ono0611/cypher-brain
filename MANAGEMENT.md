@@ -726,6 +726,26 @@ no opt-out for the pin — the pin is what stops a caller choosing who can decry
 single broad root (e.g. the home directory the brain lives under) is a legitimate
 configuration if that is genuinely the boundary you mean.
 
+## Witness recovery anchors
+
+For Arweave pushes, `push --witness` opts into a public signed catalog entry and a
+separate signature upload. It requires the existing signing identity and shares all
+push spend caps. MCP `snapshot_now` exposes the same opt-in as `witness: true`,
+using the operator's default signing identity; `confirm_paid` still gates paid
+backends. `witness` participates in the idempotency fingerprint.
+
+Regenerate `recovery-kit` after witnessed pushes: its optional witness block carries
+the latest known entry locator, sequence and detached signature locator. Keep that
+kit and the signing public key offline. Preserve `witness-catalog.local.jsonl` off-box
+too for predecessor locator resolution, while treating it only as an untrusted cache.
+`witness verify --locator <id> --sig-locator <signature-id> --pubkey <public-key>`
+reports `freshness-unknown` without independent latest-entry discovery; add
+`--to-sequence 0` for an explicit genesis-to-supplied-head segment check. A segment's
+`confirmed` result does not establish global freshness. `conflicting` names a signed
+fork and must be investigated. Missing discovery or mapping never implies success.
+See README's independent witness section for the lost-cache/old-anchor limitation,
+partial publication recovery, and signing-key compromise boundary.
+
 ## MCP idempotency keys
 
 The MCP `snapshot_now` tool takes an optional `idempotency_key` (issue #220, Stripe's

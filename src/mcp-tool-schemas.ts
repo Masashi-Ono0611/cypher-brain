@@ -88,12 +88,12 @@ export const SNAPSHOT_NOW_TOOL: Tool = {
     'arweave/turbo/ton-provider REQUIRES confirm_paid=true (the MCP equivalent of the CLI --yes ' +
     'guard; the CYPHER_BRAIN_YES env escape hatch is NOT honored here, so nothing can be spent ' +
     'without an explicit confirm_paid in the call). Snapshotting itself needs only the PUBLIC ' +
-    'recipient key(s); storage only ever sees ciphertext. Pass idempotency_key to make a RETRY ' +
+    'recipient key(s); snapshot contents are ciphertext, witness metadata is public. Pass idempotency_key to make a RETRY ' +
     'safe (issue #220, the Stripe idempotency-key pattern): a repeat call with the SAME key ' +
     "returns the FIRST call's result (no new snapshot, no new spend) instead of re-executing — " +
     "the fix for an agent's own retry logic (a network blip after the upload already succeeded, " +
     "say) double-spending on arweave/turbo. The key is scoped to THIS call's dirs/pg/recipients/" +
-    'out/backend/scan_secrets: reusing it for a call that differs in any of those is refused ' +
+    'out/backend/scan_secrets/witness: reusing it for a call that differs in any of those is refused ' +
     'rather than silently answered with the wrong result. Cached results expire after ' +
     'CYPHER_BRAIN_IDEMPOTENCY_TTL_SECONDS (default 24h) — a repeat past that is a fresh call, ' +
     'with ONE exception that never expires: a paid push whose outcome is UNCERTAIN (the payment ' +
@@ -149,6 +149,11 @@ export const SNAPSHOT_NOW_TOOL: Tool = {
         type: 'string',
         description:
           'Path for push --save-locator: writes "<locator>\\t<backend>\\t<sha256>[\\t<content_digest>[\\t<recipients_fingerprint>[\\t<sig_locator>[\\t<sign_key_id>]]]]" (the durable recovery pointer; back it up off-box). Must resolve, after following symlinks, to a path inside CYPHER_BRAIN_HOME — where the documented cadence already keeps it — and, if a file is already there, to an existing save-locator file: this path is REPLACED outright, so it is scoped the same way wallet_create\'s out is rather than left able to clobber any writable file (#789).',
+      },
+      witness: {
+        type: 'boolean',
+        description:
+          'Opt in to TWO additional public witness uploads on Arweave (backend arweave/turbo; file for offline tests). Requires the operator-configured sign-identity.key. Shares all push spend caps; no latest-entry discovery guarantee.',
       },
       confirm_paid: {
         type: 'boolean',

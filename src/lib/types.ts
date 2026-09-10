@@ -34,6 +34,7 @@ export interface CliOptions {
   sss_shares?: string[]; // repeatable sss-combine --share <path>: >= threshold share files to reconstruct from (#207)
 
   // boolean flags (BOOL_FLAGS in cli.ts) — absent when not passed
+  witness?: boolean;
   force?: boolean;
   passphrase?: boolean;
   wrap_in_place?: boolean;
@@ -55,6 +56,8 @@ export interface CliOptions {
   skip_signature_check?: boolean; // INTERNAL ONLY, never a CLI/MCP flag (not in cli.ts's BOOL_FLAGS/VALUE_FLAGS): verify --level drill sets this on the restoreImpl() call it makes from src/lib/restore.ts, after its own runFileChecks() already ran (and printed) this exact signature check against this exact fetched artifact — restoreImpl skips re-running (and re-printing) it rather than reporting the same check twice (#530)
 
   // value flags — always a string when passed (argv is untyped text)
+  pubkey?: string;
+  to_sequence?: string;
   out?: string;
   out_dir?: string;
   profile?: string;
@@ -95,12 +98,13 @@ export interface CliOptions {
 
 /**
  * What a get() is fetching. `age` is the ciphertext; `minisig` is the detached authenticity
- * signature push parks beside it (#214). They are different file formats, and a backend
+ * signature push parks beside it (#214); witness is public catalog JSON (#903).
+ * They are different file formats, and a backend
  * that validates the shape it received must be told which one to expect — hard-coding
  * "always age ciphertext" is what made a signed artifact's sidecar unfetchable from
  * arweave/turbo (#318).
  */
-export type FetchShape = 'age' | 'minisig';
+export type FetchShape = 'age' | 'minisig' | 'witness';
 
 // The event a paid backend hands to onReceipt (below) — issue #654 made this
 // locator-aware and async so pushpull.ts can persist the receipt SYNCHRONOUSLY inside
@@ -118,7 +122,7 @@ export interface ReceiptEvent {
 }
 
 // A StorageBackend is { put(file) -> locator, get(locator, outFile) }. Storage
-// only ever sees the *.age ciphertext. The locator is whatever the backend
+// sees ciphertext, detached signatures and opt-in public witness metadata. The locator is whatever the backend
 // assigns: a content hash for file (known before upload), or a tx id for
 // arweave (assigned AFTER upload) — the interface assumes neither.
 export interface PutOpts {

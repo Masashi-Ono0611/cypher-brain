@@ -61,6 +61,14 @@ let ACTIVE_RECOVERY_KIT_VERIFY_DIR: string | null = null;
 // That is the same "two unrelated resources must not share one slot" reasoning that gave
 // ACTIVE_RESTORE_SCRATCH_DIR its own field, applied WITHIN one resource kind.
 const ACTIVE_MCP_FETCH_DIRS = new Set<string>();
+// Witness publication/verification owns separate scratch directories, including overlapping calls.
+const ACTIVE_WITNESS_DIRS = new Set<string>();
+export function addActiveWitnessDir(dir: string): void {
+  ACTIVE_WITNESS_DIRS.add(dir);
+}
+export function removeActiveWitnessDir(dir: string): void {
+  ACTIVE_WITNESS_DIRS.delete(dir);
+}
 // scanForSecrets()'s gitleaks report temp dir while a scan is in flight — a Set for the
 // exact same reason ACTIVE_MCP_FETCH_DIRS above is one: mcp.ts's snapshot_now handler only
 // takes an idempotency lock when a caller-supplied idempotency_key is given, so two
@@ -539,6 +547,8 @@ export function installStageSignalGuard(): void {
       // itself, never a caller-owned path.
       for (const dir of ACTIVE_MCP_FETCH_DIRS) forceRmSync(dir);
       ACTIVE_MCP_FETCH_DIRS.clear();
+      for (const dir of ACTIVE_WITNESS_DIRS) forceRmSync(dir);
+      ACTIVE_WITNESS_DIRS.clear();
       // Every scan report dir currently in flight (see ACTIVE_SCAN_REPORT_DIRS above) — a
       // set, so concurrent snapshot_now scans are each erased rather than only whichever
       // registered last. Always safe to erase outright: each one is a directory
