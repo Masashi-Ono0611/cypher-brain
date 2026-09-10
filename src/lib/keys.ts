@@ -601,7 +601,7 @@ export async function keygen(o: CliOptions): Promise<void> {
     // instead (reviewer-flagged, #205).
     if (o.pq)
       throw new Error(
-        '--pq has no effect with --wrap-in-place (which only passphrase-wraps the EXISTING identity — it does not generate a new keypair). Run a fresh "keygen --pq --force" to rotate to a post-quantum keypair (this makes prior snapshots unrecoverable unless also encrypted to another key).',
+        '--pq has no effect with --wrap-in-place (which only passphrase-wraps the EXISTING identity — it does not generate a new keypair). Run a fresh "keygen --pq --force" to rotate to a post-quantum keypair (this generates a brand-new keypair; prior snapshots need the OLD identity, backed up by --force to a sibling .bak-<timestamp>-<random> file, not the new one).',
       );
     // --wrap-in-place never generates a new keypair (it only re-wraps the existing
     // identity's TEXT), so there is no fresh key material here for --sss to split.
