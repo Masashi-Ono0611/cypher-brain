@@ -583,22 +583,28 @@ export const KEYGEN_TOOL: Tool = {
     'cannot do (issue #174): snapshot_now/verify_restore need this keypair to already exist, and there ' +
     'was no MCP tool that could create one. Spends no money, but is destructive the same way a ' +
     'money-gated call is: it refuses if an identity/recipient already exists at ' +
-    '<CYPHER_BRAIN_HOME>/{identity.age,recipient.txt} UNLESS force=true, and force=true DISCARDS the old ' +
-    'keypair — every snapshot already encrypted to it becomes permanently unrecoverable. ' +
+    '<CYPHER_BRAIN_HOME>/{identity.age,recipient.txt} UNLESS force=true; force=true first backs up the ' +
+    'old identity to a sibling identity.age.bak-<timestamp>-<random> file (its path is returned as ' +
+    'backup_path) before generating the new keypair — snapshots already encrypted to the old identity ' +
+    'still decrypt with that backup, not with the new one. ' +
     'passphrase=true additionally wraps the new identity at rest; since MCP has no interactive TTY this ' +
     'REQUIRES CYPHER_BRAIN_PASSPHRASE to be set in the server environment (fails closed with a clear ' +
-    'error otherwise — never prompts blindly). NOTE (#690): this server serializes every captured tool ' +
-    'call through one internal queue, so this call can sit WAITING (not failing, not hung) behind an ' +
-    'unrelated in-flight snapshot_now/restore_now/verify_restore call that happens to still be running — ' +
-    'a slow response here does not by itself mean anything is wrong.',
+    'error otherwise — never prompts blindly). This tool has no way to add Shamir (M-of-N) recovery ' +
+    'shares — that is deliberately CLI-only for now (cypher-brain keygen --sss / sss-split), since ' +
+    'shares are meant to be distributed to separate PHYSICAL locations, which is outside what an ' +
+    'MCP-server-sandboxed write can meaningfully do. NOTE (#690): this server serializes every captured ' +
+    'tool call through one internal queue, so this call can sit WAITING (not failing, not hung) behind ' +
+    'an unrelated in-flight snapshot_now/restore_now/verify_restore call that happens to still be ' +
+    'running — a slow response here does not by itself mean anything is wrong.',
   inputSchema: {
     type: 'object',
     properties: {
       force: {
         type: 'boolean',
         description:
-          'Delete and overwrite an existing identity/recipient. DESTRUCTIVE — the old identity is ' +
-          'discarded, so every snapshot already encrypted to it becomes unrecoverable.',
+          'Delete and overwrite an existing identity/recipient. DESTRUCTIVE in the sense that it replaces ' +
+          'the active keypair — but the old identity is backed up first (path returned as backup_path), ' +
+          'not discarded; snapshots already encrypted to it still decrypt with that backup.',
       },
       passphrase: {
         type: 'boolean',
@@ -617,9 +623,10 @@ export const KEYGEN_TOOL: Tool = {
     additionalProperties: false,
   },
   annotations: {
-    // force=true discards the existing identity/recipient — every snapshot
-    // already encrypted to it becomes permanently unrecoverable — so this is
-    // destructive the same way keygen's description frames it. Each call
+    // force=true replaces the existing identity/recipient with a brand-new
+    // keypair (backing the old one up first, per the description above) — so
+    // this is destructive in the "replaces active credentials" sense, even
+    // though the old identity is recoverable from its backup. Each call
     // generates a fresh random keypair, so repeat calls are not idempotent.
     // Purely local key generation, no network calls.
     readOnlyHint: false,

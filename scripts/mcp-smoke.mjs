@@ -114,7 +114,7 @@ import {
   chmod,
   open,
 } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
@@ -807,6 +807,9 @@ async function runKeygenWalletTests(tmp) {
     const recipientPath2 = keygen1Sc.recipient_path;
     if (!existsSync(identityPath)) throw new Error(`keygen (fresh) did not write identity_path: ${identityPath}`);
     if (!existsSync(recipientPath2)) throw new Error(`keygen (fresh) did not write recipient_path: ${recipientPath2}`);
+    // Captured BEFORE keygen --force below overwrites identityPath, so 3c can confirm
+    // backup_path actually holds THIS (the old) identity's bytes, not just any file.
+    const originalIdentityBytes = readFileSync(identityPath, 'utf8');
 
     // 3b. keygen again, no force: must refuse (no-clobber) rather than silently re-key.
     send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'keygen', arguments: {} } });
@@ -833,6 +836,21 @@ async function runKeygenWalletTests(tmp) {
       throw new Error(`keygen (force) recipient unexpected: ${JSON.stringify(keygen3Sc?.recipient)}`);
     if (keygen3Sc.recipient === keygen1Sc.recipient)
       throw new Error('keygen (force) did not generate a new keypair (recipient unchanged)');
+    // keygen --force backs the OLD identity up rather than discarding it (#786) — the
+    // structured response must surface that path (backup_path) so a caller never has
+    // to scrape it out of the unstructured `log` lines. A fresh keygen with no prior
+    // identity (3a) has nothing to back up, so backup_path must be ABSENT there —
+    // asserting both sides is what would catch a mistakenly-unconditional field.
+    if (keygen1Sc?.backup_path !== undefined)
+      throw new Error(`keygen (fresh) unexpectedly reported backup_path: ${JSON.stringify(keygen1Sc.backup_path)}`);
+    if (typeof keygen3Sc?.backup_path !== 'string' || !existsSync(keygen3Sc.backup_path))
+      throw new Error(
+        `keygen (force) did not report an existing backup_path: ${JSON.stringify(keygen3Sc?.backup_path)}`,
+      );
+    // Existence alone would pass even if backup_path mistakenly pointed at the NEW
+    // identity (or some other file) instead of the old one — compare actual bytes.
+    if (readFileSync(keygen3Sc.backup_path, 'utf8') !== originalIdentityBytes)
+      throw new Error("keygen (force) backup_path does not contain the OLD identity's bytes");
 
     // 3d. wallet_create on a brand-new home: must succeed and actually write the JWK.
     send({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'wallet_create', arguments: {} } });

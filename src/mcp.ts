@@ -2941,8 +2941,11 @@ async function handleScheduleStatus(): Promise<CallToolResult> {
 // keygenAt() (src/lib/keys.ts) is the SAME generation logic `cypher-brain keygen`
 // calls (keygen() is a thin wrapper over it for the module's global HOME/IDENTITY/
 // RECIPIENT paths) — used directly here (rather than keygen()) because it RETURNS
-// { recipient, wrapped } instead of only printing them, so this handler returns
-// structured fields instead of re-parsing console.log lines.
+// { recipient, wrapped, backupPath, sssShares } instead of only printing them, so
+// this handler returns structured fields instead of re-parsing console.log lines.
+// This tool never passes an `sss` policy, so backupPath is the only optional field
+// keygenAt() can actually return here — sssShares stays undefined and is omitted;
+// see KEYGEN_TOOL's description for why SSS is deliberately CLI-only over MCP.
 async function handleKeygen(args: ToolArgs): Promise<CallToolResult> {
   const { force, passphrase, pq } = args;
   if (force !== undefined && !isBool(force)) throw new ToolError('ERR_INVALID_INPUT', 'force must be a boolean');
@@ -2958,6 +2961,7 @@ async function handleKeygen(args: ToolArgs): Promise<CallToolResult> {
     recipient: res.value.recipient,
     passphrase_wrapped: res.value.wrapped,
     post_quantum: !!pq,
+    ...(res.value.backupPath ? { backup_path: res.value.backupPath } : {}),
     log: [...res.out, ...res.err],
     ...(res.warnings.length ? { warnings: res.warnings } : {}),
   });
