@@ -621,10 +621,11 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       snapshot). Combines normally with --recipient (a hybrid primary + an X25519
       backup, or vice versa, both work — pick whichever identity "restore" is called with).
       --wrap-in-place passphrase-protects the EXISTING identity WITHOUT generating a new
-      keypair (unlike --force, which always creates a brand-new one and makes every prior
-      snapshot unrecoverable) — use this if you skipped the passphrase step during "init"
-      or a bare keygen and want to add one later. Refuses if the identity is already
-      wrapped, or if none exists yet.
+      keypair (unlike --force, which always creates a brand-new one; prior snapshots
+      need the OLD identity, backed up by --force as described below, not the new one).
+      Use this if you skipped the passphrase step during "init" or a bare keygen and
+      want to add one later. Refuses if the identity is already wrapped, or if none
+      exists yet.
       --force replacing an EXISTING identity first backs up its old bytes to a sibling
       "identity.age.bak-<timestamp>-<random>" file (mode 0600, printed as "old identity
       backed up to: ...") — the safety net for forgetting to copy it aside yourself before
