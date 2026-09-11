@@ -2070,6 +2070,29 @@ function assertFlagsRelevant(cmd: string | undefined, o: CliOptions): void {
   );
 }
 
+/**
+ * #929: the "unknown command" refusal — dispatchCommand()'s `default` arm below AND
+ * main()'s own "an unrecognized command name combined with --help" check just below
+ * both need the byte-identical message/suggestion (the same wording #269/#425 already
+ * shipped), so it lives here once rather than being re-derived at either throw site.
+ * `cmd` is `string | undefined` (rather than requiring the caller to have already
+ * narrowed it) purely to match dispatchCommand()'s own pre-existing `cmd ? ... :
+ * undefined` guard byte-for-byte — every real caller only ever reaches this with a
+ * defined string, per each call site's own comment.
+ */
+function unknownCommandError(cmd: string | undefined): UsageError {
+  const names = commandNames();
+  const suggestion = cmd ? nearestName(cmd, names) : undefined;
+  const lines = [`unknown command: ${cmd}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`];
+  // Guard the derived list: if a future HELP edit ever changed the section-header
+  // shape enough that nothing matches, "valid commands: " with nothing after it
+  // would be worse than not printing the line at all.
+  // cli-smoke also asserts the list matches the real command set on every run.
+  if (names.length > 0) lines.push(`valid commands: ${names.join(', ')}`);
+  lines.push(`run 'cypher-brain --help' for the full reference, or 'cypher-brain <command> --help' for one command`);
+  return new UsageError(lines.join('\n'));
+}
+
 async function main(): Promise<void> {
   // #286: the config file refused to load. config.ts records rather than throws (a
   // module-body throw escapes main().catch and prints a raw stack trace), so this is
@@ -2104,12 +2127,29 @@ async function main(): Promise<void> {
   // see isValueConsumingFlag()/valueConsumedIndices() above).
   const helpScanSkip = valueConsumedIndices(rest);
   if (rest.some((tok, i) => (tok === '--help' || tok === '-h') && !helpScanSkip.has(i))) {
+    // #929: a `cmd` that is NOT an actually-dispatchable command (a typo, or nonsense)
+    // used to fall through the `|| HELP` below and silently print the WHOLE ~26KB
+    // reference at exit 0 — the single worst reply to a typo, since it gives zero
+    // indication the command name isn't real (worse than the same typo WITHOUT
+    // --help, which already correctly refuses via dispatchCommand()'s own `default`
+    // arm below). `scopedHelp` is null for exactly that case (no HELP section matches
+    // `cmd`) — reuse the SAME "unknown command" refusal dispatchCommand() throws for
+    // the no-`--help` invocation (unknownCommandError() above), rather than silently
+    // succeeding. 'help'/'-h'/'--help' themselves have no HELP section of their own
+    // (they are aliases dispatchCommand()'s switch treats identically to a genuine
+    // --help request, not a mistyped command) so they are exempted rather than
+    // refused — `cypher-brain help --help` printing the full reference is not a typo.
+    const scopedHelp = cmd !== undefined ? helpForCommand(cmd) : null;
+    const isHelpAlias = cmd === 'help' || cmd === '-h' || cmd === '--help';
+    if (cmd !== undefined && scopedHelp === null && !isHelpAlias) {
+      throw unknownCommandError(cmd);
+    }
     // Deliberately outside tracing's scope (Codex review, #226 part 3): --help/-h never
     // reaches dispatchCommand() and has no side effects to observe, the same reason
     // the audit trail (#419, part 2 of this same issue) also only records
     // push/restore/verify — not every invocation of the binary.
     printMascot('neutral');
-    console.log((cmd !== undefined && helpForCommand(cmd)) || HELP);
+    console.log(scopedHelp || HELP);
     return;
   }
   // #226: each dispatched command becomes an OTel span when active (see otel.ts's withSpan() —
@@ -2277,26 +2317,14 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
     // #779: same UsageError treatment as the `case undefined:` arm above, for the
     // same reason — this used to be the OTHER hand-rolled exit-2 reply that never
     // reached main().catch()'s --json branch.
-    default: {
-      // Guard the derived list: if a future HELP edit ever changed the section-header
-      // shape enough that nothing matches, "valid commands: " with nothing after it
-      // would be worse than not printing the line at all.
-      // cli-smoke also asserts the list matches the real command set on every run.
-      const names = commandNames();
-      // #425: generalizes #253's own "would be nice-to-have" mention of a did-you-mean
-      // suggestion beyond restore's --out/--out-dir special case. `cmd` is only ever
-      // undefined via the earlier `case undefined:` arm (mapped to its own usage-error
-      // reply, #427), so it is always a real (if unrecognized) string here — the
-      // `cmd ? ... : undefined` guard exists for the type checker, not because this
-      // path can actually see undefined.
-      const suggestion = cmd ? nearestName(cmd, names) : undefined;
-      const lines = [`unknown command: ${cmd}${suggestion ? ` (${didYouMean(suggestion)})` : ''}`];
-      if (names.length > 0) lines.push(`valid commands: ${names.join(', ')}`);
-      lines.push(
-        `run 'cypher-brain --help' for the full reference, or 'cypher-brain <command> --help' for one command`,
-      );
-      throw new UsageError(lines.join('\n'));
-    }
+    default:
+      // #425/#929: `cmd` is only ever undefined via the earlier `case undefined:` arm
+      // (mapped to its own usage-error reply, #427), so it is always a real (if
+      // unrecognized) string here — unknownCommandError()'s own `cmd ? ... : undefined`
+      // guard exists for the type checker, not because this path can actually see
+      // undefined. Shared with main()'s "unrecognized command name combined with
+      // --help" check (#929) so the two never drift apart on wording/suggestion.
+      throw unknownCommandError(cmd);
   }
 }
 
