@@ -367,7 +367,17 @@ TYPO_HELP_RC=$?
   || { echo "[FAIL] 'recoverykit --help' wrote $(wc -c < "$TMP/typo-help.out") bytes to stdout, expected none"; exit 1; }
 grep -Fq 'error: unknown command: recoverykit (did you mean recovery-kit?)' "$TMP/typo-help.err" \
   || { echo "[FAIL] 'recoverykit --help' (typo for recovery-kit) did not get a did-you-mean suggestion"; cat "$TMP/typo-help.err"; exit 1; }
-echo "[PASS] dist <command> --help: scoped to that command, keeps the Env block; an unrecognized command + --help refuses like the no-help case (#929) instead of dumping the full reference"
+# Same refusal via the short "-h" spelling — the early scan treats --help/-h
+# identically (issue #171), so an unrecognized command must refuse for both.
+node "$DIST" recoverykit -h > "$TMP/typo-h.out" 2> "$TMP/typo-h.err"
+TYPO_H_RC=$?
+[ "$TYPO_H_RC" = "2" ] \
+  || { echo "[FAIL] 'recoverykit -h' (typo for recovery-kit) exited $TYPO_H_RC, expected 2"; cat "$TMP/typo-h.err"; exit 1; }
+[ ! -s "$TMP/typo-h.out" ] \
+  || { echo "[FAIL] 'recoverykit -h' wrote $(wc -c < "$TMP/typo-h.out") bytes to stdout, expected none"; exit 1; }
+grep -Fq 'error: unknown command: recoverykit (did you mean recovery-kit?)' "$TMP/typo-h.err" \
+  || { echo "[FAIL] 'recoverykit -h' (typo for recovery-kit) did not get a did-you-mean suggestion"; cat "$TMP/typo-h.err"; exit 1; }
+echo "[PASS] dist <command> --help: scoped to that command, keeps the Env block; an unrecognized command + --help/-h refuses like the no-help case (#929) instead of dumping the full reference"
 
 # (j) an unknown command (#269): everything on stderr, stdout EMPTY, exit 2, and a
 # short answer — the command list + where to read more — instead of ~26 KB of help.
