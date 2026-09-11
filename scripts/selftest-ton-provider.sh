@@ -1586,6 +1586,21 @@ RECEIPT_COUNT_AFTER_RESUME=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER
 [ "$RECEIPT_COUNT_AFTER_RESUME" = "$RECEIPT_COUNT_AFTER_NIGHT1" ] \
   || { echo "[FAIL] issue #950 REGRESSION: resuming the original contract wrote an extra receipt (double-counted a single spend)"; exit 1; }
 echo "[PASS] issue #950: the documented manual recovery step (re-push the retained original ciphertext) resumes the SAME contract, completes notify, and records no second spend"
+
+echo "-- a SUCCESSFUL resume clears the guard: a later push of the SAME still-unchanged content is not wrongly blocked forever (codex xhigh review, Warning) --"
+# Without resolution-tracking, the guard's own record from night 1 never gets cleared by
+# the successful recovery just above — a genuinely later push of the SAME unchanged
+# content would keep being refused for the full CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS
+# window even though nothing about night 1's contract is stuck anymore.
+cb snapshot --dir "$TMP/issue950-src" --out "$TMP/issue950-night3.age" # SAME source dir -> same content digest as night1/night2
+if ! NIGHT3_LOC=$(cb push --in "$TMP/issue950-night3.age" --backend ton-provider 2>"$TMP/issue950-night3.err"); then
+  echo "[FAIL] issue #950 REGRESSION: a later push of the SAME content stayed blocked even after night 1's contract was successfully resumed and resolved"; cat "$TMP/issue950-night3.err"; exit 1
+fi
+printf '%s' "$NIGHT3_LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' \
+  || { echo "[FAIL] issue #950: night 3's push did not return a locator: $NIGHT3_LOC"; exit 1; }
+[ "$NIGHT3_LOC" != "$NIGHT1_RESUME_LOC" ] \
+  || { echo "[FAIL] issue #950 setup: night 3 unexpectedly derived night 1's own contract — test is not actually exercising a fresh deploy"; exit 1; }
+echo "[PASS] issue #950: a successful resume resolves the guard record, so a later push of the same unchanged content is a normal fresh deploy again, not wrongly refused"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
 echo "== issue #654 (MCP-level): a snapshot_now notify timeout classifies as funding_confirmed, not a generic partial-success bucket =="
