@@ -330,6 +330,20 @@ caps must pass. Windows are the current **UTC calendar day and month**, not
 rolling 24-hour/30-day periods. These totals use receipt costs: Turbo's recorded
 preflight price, Arweave's signed reward, and TON's deploy amount (not wallet gas).
 
+**Only `arweave`/`turbo`/`ton-provider` are covered.** `file` and `rclone` have no
+real cost concept these caps can quantify, so a push to either backend skips this
+admission check entirely — no lock, no read, no write, no warning. Testing your
+budget config against a free `--backend file` push will *always* succeed
+regardless of how low `CYPHER_BRAIN_MAX_SPEND_DAILY`/`_MONTHLY` are set; that is
+not evidence the caps are working.
+
+If both a `_DAILY` and a `_MONTHLY` cap are enabled for the same pair
+(`CYPHER_BRAIN_MAX_SPEND_*` or `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_*`), the
+monthly value must be **>=** the daily value — a UTC month always contains a
+full UTC day, so a smaller monthly cap could never be the actual binding
+constraint and is refused outright rather than silently only ever enforcing the
+monthly figure.
+
 These caps are **additive** to the existing per-push limits and consent gate.
 Keep the matching `CYPHER_BRAIN_MAX_SPEND` or
 `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND` positive: the authoritative price is

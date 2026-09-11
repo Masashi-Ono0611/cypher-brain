@@ -963,6 +963,55 @@ const MAX_SPEND_MONTHLY_LOAD = parseMaxSpendBigInt(
 export const AR_MAX_SPEND_MONTHLY = MAX_SPEND_MONTHLY_LOAD.value;
 export const AR_MAX_SPEND_MONTHLY_ERROR: Error | null = MAX_SPEND_MONTHLY_LOAD.error;
 
+// #928: an enabled MONTHLY cap smaller than its enabled DAILY cap is not a stricter
+// setting, it is structurally nonsensical — a UTC month always contains at least one
+// full UTC day, so any single day's spend within it is already counted toward (and
+// bounded above by) the month's own running total. With MONTHLY < DAILY the daily
+// figure could NEVER be the actual binding constraint; only the monthly one ever
+// fires. That is virtually always a fat-fingered/transposed value, not intent, and
+// letting it through silently only ever enforces the smaller of the two caps the
+// operator asked for — the same "config typo silently changes what a check actually
+// proves" failure class parseMaxSpendBigInt's own callers already guard against, one
+// level up (across the pair, not within a single value). Matches this codebase's
+// existing convention for a genuinely nonsensical cross-field combination (see
+// sss.ts's threshold-cannot-exceed-shares check): a hard refusal, not a warning.
+// Skipped when either side already failed to parse (that failure is reported on its
+// own) or either cap is 0/disabled (0 vs. a positive value is "no cap on this side",
+// not an ordering claim to validate). RECORDED rather than thrown for the same
+// reason as every other check in this file: this runs in a module body, before
+// either entry point's own error formatting is available (see parseMaxSpendBigInt's
+// comment above CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND's load, further up).
+function checkSpendCapOrder(
+  daily: { value: bigint; error: Error | null },
+  monthly: { value: bigint; error: Error | null },
+  dailyName: string,
+  monthlyName: string,
+): Error | null {
+  if (daily.error || monthly.error) return null;
+  if (daily.value > 0n && monthly.value > 0n && monthly.value < daily.value) {
+    return new Error(
+      `${monthlyName}=${monthly.value} is smaller than ${dailyName}=${daily.value} — a UTC month always ` +
+        `contains at least one full UTC day, so the daily cap could never be the binding constraint; ` +
+        `set ${monthlyName} >= ${dailyName}, or disable (0/unset) whichever one you did not mean to set`,
+    );
+  }
+  return null;
+}
+/** Why the CYPHER_BRAIN_MAX_SPEND_DAILY/_MONTHLY pair was refused, if it was (#928) — mirrors AR_MAX_SPEND_ERROR above. */
+export const AR_MAX_SPEND_ORDER_ERROR: Error | null = checkSpendCapOrder(
+  MAX_SPEND_DAILY_LOAD,
+  MAX_SPEND_MONTHLY_LOAD,
+  'CYPHER_BRAIN_MAX_SPEND_DAILY',
+  'CYPHER_BRAIN_MAX_SPEND_MONTHLY',
+);
+/** Same check for the separate ton-provider pair (#928) — mirrors TON_PROVIDER_MAX_SPEND_ERROR above. */
+export const TON_PROVIDER_MAX_SPEND_ORDER_ERROR: Error | null = checkSpendCapOrder(
+  TON_PROVIDER_MAX_SPEND_DAILY_LOAD,
+  TON_PROVIDER_MAX_SPEND_MONTHLY_LOAD,
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY',
+  'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY',
+);
+
 // Escape hatch for the turbo pre-upload funds check (#342). The check refuses an upload
 // whose cost exceeds even the upper bound of reachable credit — a spend the payment
 // service would reject anyway — but the balance read can lag a top-up made seconds
