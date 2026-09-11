@@ -330,19 +330,25 @@ caps must pass. Windows are the current **UTC calendar day and month**, not
 rolling 24-hour/30-day periods. These totals use receipt costs: Turbo's recorded
 preflight price, Arweave's signed reward, and TON's deploy amount (not wallet gas).
 
-**Only `arweave`/`turbo`/`ton-provider` are covered.** `file` and `rclone` have no
-real cost concept these caps can quantify, so a push to either backend skips this
-admission check entirely — no lock, no read, no write, no warning. Testing your
-budget config against a free `--backend file` push will *always* succeed
-regardless of how low `CYPHER_BRAIN_MAX_SPEND_DAILY`/`_MONTHLY` are set; that is
-not evidence the caps are working.
+**Only `arweave`/`turbo`/`ton-provider` are covered by the admission check
+itself.** `file` and `rclone` have no real cost concept these caps can
+quantify, so a push to either backend skips admission entirely — no lock, no
+read, no write, no warning, no charge — for any **well-formed** pair of caps.
+Testing your budget config against a free `--backend file` push will *always*
+succeed regardless of how low `CYPHER_BRAIN_MAX_SPEND_DAILY`/`_MONTHLY` are
+set; that is not evidence the caps are working. (A **malformed** or
+internally-inconsistent value is a separate, backend-agnostic startup check —
+see next paragraph — and refuses every command, `file`/`rclone` pushes
+included, the same way an unparseable `CYPHER_BRAIN_MAX_SPEND_DAILY` already
+did before this admission check existed.)
 
 If both a `_DAILY` and a `_MONTHLY` cap are enabled for the same pair
 (`CYPHER_BRAIN_MAX_SPEND_*` or `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_*`), the
 monthly value must be **>=** the daily value — a UTC month always contains a
-full UTC day, so a smaller monthly cap could never be the actual binding
-constraint and is refused outright rather than silently only ever enforcing the
-monthly figure.
+full UTC day, so a smaller monthly cap would always be reached first and the
+**daily** cap could then never be the actual binding constraint. That
+combination is refused outright at startup, for every command, rather than
+silently only ever enforcing the monthly figure.
 
 These caps are **additive** to the existing per-push limits and consent gate.
 Keep the matching `CYPHER_BRAIN_MAX_SPEND` or
