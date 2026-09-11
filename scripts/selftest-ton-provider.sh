@@ -170,7 +170,20 @@ const SLOW_ADDR_DELAY_MS = 3000;
 const seenAddrs = new Set(); // issue #638: first-ever query for an address -> 'nonexist'; every query after that -> 'active' (see header comment above)
 
 createServer((req, res) => {
-  const slowAddr = slowAddrFlagPath && existsSync(slowAddrFlagPath) ? readFileSync(slowAddrFlagPath, 'utf8').trim() : null;
+  // issue #949 (Codex review): existsSync()+readFileSync() as two separate calls races
+  // against the test scripts that intentionally delete this exact flag file the moment
+  // they are done needing the delay (both selftest-ton-provider-mcp-confirmed-write.mjs
+  // and this script's own scenario-2 block do this). An ENOENT landing between the two
+  // calls used to throw uncaught inside this synchronous request handler -- Node has no
+  // built-in catch for that, so it would crash this whole mock server process and fail
+  // every OTHER in-flight test in this run, not just this one request. Read-and-catch
+  // instead of check-then-read closes the TOCTOU window entirely.
+  let slowAddr = null;
+  try {
+    slowAddr = slowAddrFlagPath ? readFileSync(slowAddrFlagPath, 'utf8').trim() : null;
+  } catch {
+    slowAddr = null; // absent (ENOENT) or otherwise unreadable -- same as "no flag set"
+  }
   if (slowAddr && req.url.includes(slowAddr)) {
     setTimeout(() => handle(req, res), SLOW_ADDR_DELAY_MS);
     return;

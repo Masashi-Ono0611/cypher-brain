@@ -238,12 +238,20 @@ async function main() {
     }
     // The original call's own message (sc1) embeds the same locator inline rather than as
     // a structured field (see the comment above) — cross-checked against it here so the
-    // replay is proven to describe the SAME spend, not merely A valid-looking one.
+    // replay is proven to describe the SAME spend, not merely A valid-looking one. A
+    // failed extraction must FAIL this test loudly (Codex review), not silently skip the
+    // same-spend assertion — a message-wording drift that broke this regex should be
+    // caught here, not pass unnoticed.
     const embeddedLocator = /locator: (ton-provider:v1:\S+)\)/.exec(sc1?.message ?? '')?.[1];
+    if (!embeddedLocator) {
+      throw new Error(
+        `could not extract the embedded locator from the original call's own message: ${JSON.stringify(sc1?.message)}`,
+      );
+    }
     if (typeof sc2?.locator !== 'string' || !sc2.locator.startsWith('ton-provider:v1:')) {
       throw new Error(`replayed result is missing a real ton-provider locator: ${JSON.stringify(sc2).slice(0, 500)}`);
     }
-    if (embeddedLocator && sc2.locator !== embeddedLocator) {
+    if (sc2.locator !== embeddedLocator) {
       throw new Error(
         `replayed locator does not match the original refusal's own embedded locator: first=${JSON.stringify(embeddedLocator)} replay=${JSON.stringify(sc2.locator)}`,
       );
