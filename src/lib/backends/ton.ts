@@ -441,9 +441,18 @@ export function tonBackend(): StorageBackend {
           throw new Error(`ton backend: transfer corrupted — local sha256 ${sha}, seeder-side ${remoteSha}`);
         }
         await sshRun(`mv -f -- '${p.staging}' '${p.bagDir}/${entry}'`);
-      } finally {
-        // A failed scp can leave a partial file too. Remove only this attempt's path.
-        await sshRun(`rm -f -- '${p.staging}'`).catch(() => undefined);
+      } catch (uploadErr) {
+        // A failed scp/hash-check can leave a partial file too. Remove only this
+        // attempt's own path (never a sibling attempt's). If the cleanup itself
+        // fails (e.g. SSH drops), surface it rather than leaving an orphaned
+        // per-attempt temp file on the seeder with no trace it was ever left behind.
+        await sshRun(`rm -f -- '${p.staging}'`).catch((cleanupErr) =>
+          warn(
+            `ton: could not remove failed upload's staging file ${p.staging} on ${TON_SSH_HOST} ` +
+              `(${errMsg(cleanupErr)}) — it may need manual cleanup`,
+          ),
+        );
+        throw uploadErr;
       }
 
       // /api/v1/create needs an ABSOLUTE path on the seeder; resolve the (possibly
@@ -492,8 +501,17 @@ export function tonBackend(): StorageBackend {
       // of this file is the "fully created" signal the idempotency check above trusts.
       try {
         await sshRun(`printf '%s' '${locator}' > '${p.inventoryTmp}' && mv -f -- '${p.inventoryTmp}' '${p.inventory}'`);
-      } finally {
-        await sshRun(`rm -f -- '${p.inventoryTmp}'`).catch(() => undefined);
+      } catch (invErr) {
+        // Same reasoning as the staging cleanup above: remove only this attempt's own
+        // temp file, and surface a cleanup failure rather than silently leaving an
+        // orphaned per-attempt file behind.
+        await sshRun(`rm -f -- '${p.inventoryTmp}'`).catch((cleanupErr) =>
+          warn(
+            `ton: could not remove failed inventory temp file ${p.inventoryTmp} on ${TON_SSH_HOST} ` +
+              `(${errMsg(cleanupErr)}) — it may need manual cleanup`,
+          ),
+        );
+        throw invErr;
       }
       console.error(`ton: bag ${bagId} created and seeding on ${TON_SSH_HOST}`);
       return locator;
