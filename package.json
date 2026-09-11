@@ -148,7 +148,7 @@
     "@stryker-mutator/core": "^9.6.1",
     "@types/node": "^26.1.0",
     "arlocal": "^1.1.66",
-    "arweave": "^1.15.7",
+    "arweave": "^2.0.1",
     "cctv-age": "0.2.0",
     "fast-check": "^4.9.0",
     "typescript": "^7.0.2"
