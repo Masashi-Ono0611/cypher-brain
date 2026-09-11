@@ -6,7 +6,7 @@
 // The test is also run unchanged with the production cap comparison bypassed to
 // prove both the fixture-cap refusals and the actual concurrent race detect it.
 import assert from 'node:assert/strict';
-import { fork } from 'node:child_process';
+import { fork, spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -65,6 +65,15 @@ if (!scenario) {
     'missing-upper-bound',
     'invalid-cap',
     'ton-no-spend',
+    // #928: MONTHLY < DAILY must be refused — checked directly against config.ts's
+    // own exports (see the 'order-' branch below), not through push(), since this
+    // check gates cli.ts's main() dispatch rather than spend-budget.ts's admission.
+    // Named so the scenario itself ends in '-refused' or '-ok' (matched below).
+    'order-ar-refused',
+    'order-ar-ok',
+    'order-ar-daily-zero-skipped-ok',
+    'order-ton-refused',
+    'order-ton-ok',
   ];
   try {
     for (const name of scenarios) {
@@ -96,6 +105,79 @@ if (!scenario) {
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
+
+  // #928: a malformed CYPHER_BRAIN_MAX_SPEND_DAILY must NOT block --help/--version
+  // themselves (cli.ts's isHelpOrVersionRequest gate) — while a REAL command with
+  // the same malformed value must still be refused, so this is a gate, not a
+  // blanket skip of the validation. Drives the real CLI entry point
+  // (bin/cypher-brain.mjs against source, the same dev-mode invocation
+  // scripts/check-help-docs.mjs uses) rather than importing spend-budget.ts
+  // directly, since the bug lives in cli.ts's main(), before dispatch.
+  {
+    const BIN = join(ROOT, 'bin', 'cypher-brain.mjs');
+    const helpScratch = await mkdtemp(join(tmpdir(), 'cb-spend-budget-help-'));
+    try {
+      const home = join(helpScratch, 'home');
+      await mkdir(home);
+      const baseEnv = {
+        ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(CYPHER|CIPHER)_BRAIN_/.test(key))),
+        CYPHER_BRAIN_HOME: home,
+        CYPHER_BRAIN_NO_CONFIG_FILE: '1',
+        CYPHER_BRAIN_MAX_SPEND_DAILY: 'abc', // malformed — must not parse as an integer
+      };
+      const runCli = (args) => spawnSync('node', [...FLAGS, BIN, ...args], { env: baseEnv, encoding: 'utf8' });
+      const check = (name, ok, detail) => {
+        if (ok) {
+          passed++;
+          console.log(`[PASS] ${name}`);
+        } else {
+          failed++;
+          console.log(`[FAIL] ${name}${detail ? `\n${detail}` : ''}`);
+        }
+      };
+      const bareHelp = runCli(['--help']);
+      check(
+        'order-help-not-blocked (bare --help)',
+        bareHelp.status === 0 && bareHelp.stdout.includes('cypher-brain — encrypt a gbrain snapshot'),
+        `status=${bareHelp.status}\nstdout=${bareHelp.stdout}\nstderr=${bareHelp.stderr}`,
+      );
+      const shortHelp = runCli(['-h']);
+      check(
+        'order-help-not-blocked (bare -h)',
+        shortHelp.status === 0 && shortHelp.stdout.includes('cypher-brain — encrypt a gbrain snapshot'),
+        `status=${shortHelp.status}\nstdout=${shortHelp.stdout}\nstderr=${shortHelp.stderr}`,
+      );
+      const subHelp = runCli(['push', '--help']);
+      check(
+        'order-help-not-blocked (push --help)',
+        subHelp.status === 0 && subHelp.stdout.includes('cypher-brain push'),
+        `status=${subHelp.status}\nstdout=${subHelp.stdout}\nstderr=${subHelp.stderr}`,
+      );
+      const version = runCli(['--version']);
+      check(
+        'order-help-not-blocked (--version)',
+        version.status === 0 && /^\d+\.\d+\.\d+/.test(version.stdout.trim()),
+        `status=${version.status}\nstdout=${version.stdout}\nstderr=${version.stderr}`,
+      );
+      const shortVersion = runCli(['-V']);
+      check(
+        'order-help-not-blocked (-V)',
+        shortVersion.status === 0 && /^\d+\.\d+\.\d+/.test(shortVersion.stdout.trim()),
+        `status=${shortVersion.status}\nstdout=${shortVersion.stdout}\nstderr=${shortVersion.stderr}`,
+      );
+      // Sanity: the SAME malformed value must still refuse a real command — this is
+      // a gate on help/version specifically, not a blanket skip of the validation.
+      const realCmd = runCli(['doctor']);
+      check(
+        'order-help-not-blocked (doctor still refused)',
+        realCmd.status !== 0 && /CYPHER_BRAIN_MAX_SPEND_DAILY must be an integer/.test(realCmd.stderr),
+        `status=${realCmd.status}\nstdout=${realCmd.stdout}\nstderr=${realCmd.stderr}`,
+      );
+    } finally {
+      await rm(helpScratch, { recursive: true, force: true });
+    }
+  }
+
   console.log(`SPEND BUDGET SELFTEST: ${passed} passed, ${failed} failed`);
   process.exitCode = failed ? 1 : 0;
 } else {
@@ -113,9 +195,34 @@ if (!scenario) {
   }
   if (scenario === 'missing-upper-bound') process.env.CYPHER_BRAIN_MAX_SPEND = '0';
   if (scenario === 'invalid-cap') process.env.CYPHER_BRAIN_MAX_SPEND_DAILY = '-1';
+  // #928: the parent sets CYPHER_BRAIN_MAX_SPEND_DAILY=100 / _MONTHLY=1000 and
+  // CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY=100 (no TON _MONTHLY) for every
+  // scenario; override MONTHLY (and DAILY, where the scenario needs it disabled)
+  // per order- scenario so each exercises one specific point on the ordering check.
+  if (scenario === 'order-ar-refused') process.env.CYPHER_BRAIN_MAX_SPEND_MONTHLY = '50'; // < DAILY=100
+  if (scenario === 'order-ar-ok') process.env.CYPHER_BRAIN_MAX_SPEND_MONTHLY = '100'; // == DAILY=100, boundary must pass
+  if (scenario === 'order-ar-daily-zero-skipped-ok') {
+    process.env.CYPHER_BRAIN_MAX_SPEND_DAILY = '0'; // disabled side — not an ordering claim
+    process.env.CYPHER_BRAIN_MAX_SPEND_MONTHLY = '1';
+  }
+  if (scenario === 'order-ton-refused') process.env.CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY = '50'; // < DAILY=100
+  if (scenario === 'order-ton-ok') process.env.CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY = '200'; // > DAILY=100
 
   const budget = await import('../src/lib/spend-budget.ts');
-  if (scenario === 'race-worker' || scenario === 'crash-worker') {
+  if (scenario.startsWith('order-')) {
+    // Checked directly against config.ts's own exports rather than through push():
+    // this ordering check gates cli.ts's main() dispatch (see cli.ts's
+    // isHelpOrVersionRequest gate), it is not part of spend-budget.ts's admission
+    // logic at all, so no backend/push mocking is needed here.
+    const config = await import('../src/lib/config.ts');
+    const err = scenario.includes('-ton') ? config.TON_PROVIDER_MAX_SPEND_ORDER_ERROR : config.AR_MAX_SPEND_ORDER_ERROR;
+    if (scenario.endsWith('-refused')) {
+      assert.ok(err, `${scenario}: expected an order error, got null`);
+      assert.match(err.message, /is smaller than/);
+    } else {
+      assert.equal(err, null, `${scenario}: expected no order error, got: ${err?.message}`);
+    }
+  } else if (scenario === 'race-worker' || scenario === 'crash-worker') {
     if (scenario === 'race-worker') {
       const go = new Promise((resolve) => process.once('message', resolve));
       process.send({ ready: true });
