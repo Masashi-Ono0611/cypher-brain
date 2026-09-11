@@ -4,6 +4,7 @@
 # through PATH-shimmed `ssh`/`scp` (so the REAL backend code runs its REAL remote
 # command lines), and both tonutils-storage daemons are scripts/mock-tonutils.mjs
 # (so the REAL HTTP client, ephemeral-daemon startup dance and poll loops all run).
+# Pass --transfers-only to run the filesystem regressions without loopback sockets.
 # What this cannot prove is TON Storage itself — that is scripts/ton-dogfood.mjs,
 # operator-run against the real network.
 #
@@ -18,6 +19,170 @@ source "$ROOT/scripts/dev-node-flags.sh"
 # cb/sha/start_ton_seeder: shared across scripts/selftest-*.sh, see
 # scripts/selftest-lib.sh (#570, #572).
 source "$ROOT/scripts/selftest-lib.sh"
+
+# Transfer regressions need only command shims, so they can also run in sandboxes
+# that forbid loopback listeners. The full daemon/P2P suite follows below.
+transfer_regressions() (
+set -euo pipefail
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+export CYPHER_BRAIN_HOME="$TMP/keys"
+SEEDER_HOME="$TMP/seeder-home"
+SHIM="$TMP/bin"
+mkdir -p "$SHIM" "$SEEDER_HOME"
+export TON_TEST_SEEDER_HOME="$SEEDER_HOME"
+export CYPHER_BRAIN_TON_SSH_HOST=mock-seeder
+export CYPHER_BRAIN_TON_REMOTE_DIR=cypher-brain-ton
+export CYPHER_BRAIN_TON_REMOTE_API=127.0.0.1:1
+export CYPHER_BRAIN_TON_BIN="$TMP/no-daemon"
+export CYPHER_BRAIN_TON_NO_FALLBACK=0
+export PATH="$SHIM:$PATH"
+LOC="ton:v1:$(printf '%064d' 0)"
+export TON_TEST_BAG_ID="${LOC##*:}"
+# Same command-boundary shims as start_ton_seeder(), with a canned curl response:
+# this block tests filesystem transfer orchestration, not HTTP or the daemon.
+cat >"$SHIM/ssh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+while [ "$1" != -- ]; do shift; done
+shift 2
+cd "$TON_TEST_SEEDER_HOME"
+exec bash -c "$*"
+SH
+cat >"$SHIM/scp" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+while [ "$1" != -- ]; do shift; done
+shift
+resolve() {
+  case "$1" in
+    *:/*) printf '%s' "${1#*:}";;
+    *:*) printf '%s/%s' "$TON_TEST_SEEDER_HOME" "${1#*:}";;
+    *) printf '%s' "$1";;
+  esac
+}
+cp "$(resolve "$1")" "$(resolve "$2")"
+SH
+cat >"$SHIM/curl" <<'SH'
+#!/usr/bin/env bash
+printf '{"bag_id":"%s","completed":true,"active":true}' "$TON_TEST_BAG_ID"
+SH
+chmod +x "$SHIM/ssh" "$SHIM/scp" "$SHIM/curl"
+printf 'age-encryption.org/v1\ntransfer regression fixture\n' > "$TMP/snap.age"
+ORIG=$(sha "$TMP/snap.age")
+echo "== concurrent same-ciphertext pushes keep separate staging and inventory temps =="
+# Gate both pushes AFTER hashing their uploads, and again AFTER writing their
+# inventory temps. These barriers force each old shared-temp race without timing bets.
+cp "$SHIM/ssh" "$SHIM/ssh-original"
+export TON_RACE_HOME="$SEEDER_HOME" TON_RACE_BARRIER="$TMP/ton-race"
+mkdir -p "$TON_RACE_BARRIER"
+cat >"$SHIM/ssh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${TON_RACE_ENABLED:-}" != 1 ]; then exec "$(dirname "$0")/ssh-original" "$@"; fi
+while [ "$1" != -- ]; do shift; done
+shift 2
+cd "$TON_RACE_HOME"
+barrier() {
+  touch "$TON_RACE_BARRIER/$1.$$"
+  for _ in $(seq 1 200); do
+    local count
+    count=$(find "$TON_RACE_BARRIER" -name "$1.*" | wc -l | tr -d ' ')
+    if [ "$count" = 2 ]; then return; fi
+    sleep 0.05
+  done
+  echo "[FAIL] timed out at $1 barrier" >&2; exit 1
+}
+cmd="$*"
+case "$cmd" in
+  'if command -v sha256sum'*) bash -c "$cmd"; barrier hashed ;;
+  "printf '%s'"*)
+    bash -c "${cmd%% && mv*}"
+    barrier inventory
+    bash -c "mv${cmd#* && mv}"
+    ;;
+  *) exec bash -c "$cmd" ;;
+esac
+SH
+chmod +x "$SHIM/ssh"
+# A separate remote base avoids the already-seeded fast path; separate locator
+# files prove pushpull's optional save-locator lock does not serialize these calls.
+TON_RACE_ENABLED=1 CYPHER_BRAIN_TON_REMOTE_DIR=concurrent cb push --in "$TMP/snap.age" --backend ton --save-locator "$TMP/race-a.tsv" >"$TMP/race-a.out" 2>"$TMP/race-a.err" &
+RACE_A=$!
+TON_RACE_ENABLED=1 CYPHER_BRAIN_TON_REMOTE_DIR=concurrent cb push --in "$TMP/snap.age" --backend ton --save-locator "$TMP/race-b.tsv" >"$TMP/race-b.out" 2>"$TMP/race-b.err" &
+RACE_B=$!
+RACE_A_RC=0; wait "$RACE_A" || RACE_A_RC=$?
+RACE_B_RC=0; wait "$RACE_B" || RACE_B_RC=$?
+if [ "$RACE_A_RC" != 0 ] || [ "$RACE_B_RC" != 0 ]; then
+  echo "[FAIL] concurrent identical pushes failed: $RACE_A_RC / $RACE_B_RC"
+  cat "$TMP/race-a.err" "$TMP/race-b.err"; exit 1
+fi
+cmp "$TMP/race-a.out" "$TMP/race-b.out"
+[ "$(sha "$SEEDER_HOME/concurrent/bags/$ORIG/snapshot.age")" = "$ORIG" ] || { echo "[FAIL] concurrent push bytes differ"; exit 1; }
+[ "$(cat "$SEEDER_HOME/concurrent/inventory/$ORIG.locator")" = "$(cat "$TMP/race-a.out")" ] || { echo "[FAIL] concurrent inventory locator differs"; exit 1; }
+[ -z "$(find "$SEEDER_HOME/concurrent/staging" "$SEEDER_HOME/concurrent/inventory" -name '*.part' -o -name '*.tmp')" ] || { echo "[FAIL] concurrent push left temporary files"; exit 1; }
+echo "[PASS] both identical pushes succeed across both forced race windows"
+mv "$SHIM/ssh-original" "$SHIM/ssh"
+
+mkdir -p "$SEEDER_HOME/cypher-brain-ton/bags/$ORIG" "$SEEDER_HOME/cypher-brain-ton/inventory"
+cp "$TMP/snap.age" "$SEEDER_HOME/cypher-brain-ton/bags/$ORIG/snapshot.age"
+printf '%s' "$LOC" > "$SEEDER_HOME/cypher-brain-ton/inventory/$ORIG.locator"
+echo "== fallback creates missing output parents and isolates temporary downloads =="
+cb pull --backend ton --locator "$LOC" --out "$TMP/missing/parents/fallback.age" 2>"$TMP/nested.err" \
+  || { echo "[FAIL] fallback to a new output directory failed"; cat "$TMP/nested.err"; exit 1; }
+[ "$(sha "$TMP/missing/parents/fallback.age")" = "$ORIG" ] || { echo "[FAIL] nested fallback bytes differ"; exit 1; }
+# The former predictable temp path could overwrite a pre-existing sibling (or
+# follow its symlink). Call the backend directly to pin that name exactly.
+printf 'must survive' > "$TMP/fallback-victim"
+ln -s "$TMP/fallback-victim" "$TMP/direct.age.ton-fallback.part"
+node "${BIN_DEV_ARGS[@]}" --input-type=module - "$ROOT" "$LOC" "$TMP/direct.age" <<'JS'
+const { tonBackend } = await import(`${process.argv[2]}/src/lib/backends/ton.ts`);
+await tonBackend().get(process.argv[3], process.argv[4]);
+JS
+[ "$(cat "$TMP/fallback-victim")" = 'must survive' ] || { echo "[FAIL] fallback overwrote a pre-existing temp-path symlink target"; exit 1; }
+[ "$(sha "$TMP/direct.age")" = "$ORIG" ] || { echo "[FAIL] direct fallback bytes differ"; exit 1; }
+echo "[PASS] fallback works under new parents and leaves unrelated siblings intact"
+
+echo "== failed scp transfers remove their partial upload/download =="
+cp "$SHIM/scp" "$SHIM/scp-original"
+export TON_FAILED_SCP_PATH="$TMP/failed-scp-path"
+cat >"$SHIM/scp" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+while [ "$1" != -- ]; do shift; done
+shift
+dest="$2"
+case "$dest" in *:*) dest="$TON_TEST_SEEDER_HOME/${dest#*:}";; esac
+printf '%s' "$dest" > "$TON_FAILED_SCP_PATH"
+printf 'partial transfer' > "$dest"
+echo 'injected scp transfer failure' >&2
+exit 23
+SH
+chmod +x "$SHIM/scp"
+if CYPHER_BRAIN_TON_REMOTE_DIR=failed-upload cb push --in "$TMP/snap.age" --backend ton >"$TMP/failed-upload.out" 2>"$TMP/failed-upload.err"; then
+  echo "[FAIL] failed upload scp was reported as success"; exit 1
+fi
+grep -q 'injected scp transfer failure' "$TMP/failed-upload.err" || { cat "$TMP/failed-upload.err"; exit 1; }
+[ -s "$TON_FAILED_SCP_PATH" ] || { echo "[FAIL] upload failure injection was not reached"; exit 1; }
+[ ! -e "$(cat "$TON_FAILED_SCP_PATH")" ] || { echo "[FAIL] failed scp left its partial upload"; exit 1; }
+[ ! -e "$SEEDER_HOME/failed-upload/inventory/$ORIG.locator" ] || { echo "[FAIL] failed upload published inventory"; exit 1; }
+rm "$TON_FAILED_SCP_PATH"
+echo "[PASS] failed upload reports the transfer error and cleans its staging file"
+if cb pull --backend ton --locator "$LOC" --out "$TMP/failed-fallback.age" 2>"$TMP/failed-fallback.err"; then
+  echo "[FAIL] failed scp was reported as success"; exit 1
+fi
+grep -q 'injected scp transfer failure' "$TMP/failed-fallback.err" || { cat "$TMP/failed-fallback.err"; exit 1; }
+[ -s "$TON_FAILED_SCP_PATH" ] || { echo "[FAIL] scp failure injection was not reached"; exit 1; }
+[ ! -e "$(cat "$TON_FAILED_SCP_PATH")" ] || { echo "[FAIL] failed scp left its partial download"; exit 1; }
+[ ! -e "$TMP/failed-fallback.age" ] || { echo "[FAIL] failed fallback published output"; exit 1; }
+mv "$SHIM/scp-original" "$SHIM/scp"
+echo "[PASS] failed fallback reports the transfer error and cleans its partial file"
+)
+transfer_regressions
+if [ "${1:-}" = --transfers-only ]; then
+  echo "== ton transfer regressions: ALL PASS (daemon suite not requested) =="
+  exit 0
+fi
 
 TMP="$(mktemp -d)"
 SEEDER_PID=""

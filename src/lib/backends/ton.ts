@@ -22,6 +22,7 @@
 // verifies every piece against it — but the SSH fallback path does not, which is
 // why `ton` sits in NON_CONTENT_ADDRESSED_BACKENDS (config.ts): a pull without a
 // --sha256 pin cannot tell which path served it.
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { mkdir, copyFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -192,7 +193,7 @@ const requireHost = (): void => {
 
 // Remote layout under CYPHER_BRAIN_TON_REMOTE_DIR (relative paths land in the SSH
 // user's home, which is where a bare `ssh host cmd` runs):
-//   staging/<sha>.part        upload in flight (unique name; atomically moved away)
+//   staging/<sha>.<uuid>.part upload in flight (per-push name; atomically moved away)
 //   bags/<sha>/snapshot<ext>  the bag's content dir (what /api/v1/create is pointed at)
 //   inventory/<sha>.locator   sha->locator record, written LAST — its existence means
 //                             "this bag was fully created and seeding was confirmed",
@@ -203,15 +204,20 @@ interface RemotePaths {
   staging: string;
   bagDir: string;
   inventory: string;
+  inventoryTmp: string;
 }
 
 function remotePathsFor(sha: string): RemotePaths {
   const base = assertRemoteSafe(TON_REMOTE_DIR, 'CYPHER_BRAIN_TON_REMOTE_DIR', REMOTE_PATH_RE);
+  // Separate writers, including on different machines, must never move or remove
+  // each other's in-flight upload or inventory record. Durable paths stay keyed by sha.
+  const attempt = randomUUID();
   return {
     base,
-    staging: `${base}/staging/${sha}.part`,
+    staging: `${base}/staging/${sha}.${attempt}.part`,
     bagDir: `${base}/bags/${sha}`,
     inventory: `${base}/inventory/${sha}.locator`,
+    inventoryTmp: `${base}/inventory/${sha}.${attempt}.tmp`,
   };
 }
 
@@ -368,14 +374,22 @@ async function seederFetch(bagId: string, expect: FetchShape, out: string): Prom
   assertRemoteSafe(sha, 'inventory sha', /^[0-9a-f]{64}$/);
   const ext = expect === 'minisig' ? '.minisig' : '.age';
   const remoteFile = `${base}/bags/${sha}/snapshot${ext}`;
-  const tmpLocal = `${resolve(out)}.ton-fallback.part`;
-  await scpFromSeeder(remoteFile, tmpLocal);
+  installStageSignalGuard();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'cypher-brain-ton-fallback-'));
+  addActiveTonTmpDir(tmpRoot);
+  const tmpLocal = join(tmpRoot, 'snapshot.part');
   try {
+    await scpFromSeeder(remoteFile, tmpLocal);
     await assertShape(tmpLocal, expect);
     await mkdir(dirname(resolve(out)), { recursive: true });
     await copyFile(tmpLocal, out);
   } finally {
-    await rmrf(tmpLocal).catch(() => undefined);
+    try {
+      await rmrf(tmpRoot);
+      removeActiveTonTmpDir(tmpRoot);
+    } catch {
+      /* keep registered for signal cleanup, as in p2pFetch() */
+    }
   }
 }
 
@@ -409,27 +423,37 @@ export function tonBackend(): StorageBackend {
       }
 
       await sshRun(`mkdir -p -- '${p.base}/staging' '${p.bagDir}' '${p.base}/inventory'`);
-      await scpToSeeder(file, p.staging);
-      // Integrity of the transfer, checked before anything durable happens: scp already
-      // checksums per-packet, but "the file scp wrote is the file we hashed locally" is
-      // cheap to prove and ends any doubt a partial/interrupted earlier upload left.
-      // sha256sum on Linux seeders, shasum -a 256 on macOS ones — same output shape.
-      const remoteSha = (
-        await sshRun(
-          `if command -v sha256sum >/dev/null 2>&1; then sha256sum -- '${p.staging}'; else shasum -a 256 -- '${p.staging}'; fi`,
-          PIPE_TIMEOUT_MS,
+      try {
+        await scpToSeeder(file, p.staging);
+        // Integrity of the transfer, checked before anything durable happens: scp already
+        // checksums per-packet, but "the file scp wrote is the file we hashed locally" is
+        // cheap to prove and ends any doubt a partial/interrupted earlier upload left.
+        // sha256sum on Linux seeders, shasum -a 256 on macOS ones — same output shape.
+        const remoteSha = (
+          await sshRun(
+            `if command -v sha256sum >/dev/null 2>&1; then sha256sum -- '${p.staging}'; else shasum -a 256 -- '${p.staging}'; fi`,
+            PIPE_TIMEOUT_MS,
+          )
         )
-      )
-        .trim()
-        .split(/\s+/)[0];
-      if (remoteSha !== sha) {
-        // Remove the bad staging copy before failing (review W4) — a deterministic
-        // name means the next attempt overwrites it anyway, but a known-corrupt file
-        // has no business surviving on the seeder.
-        await sshRun(`rm -f -- '${p.staging}'`).catch(() => undefined);
-        throw new Error(`ton backend: transfer corrupted — local sha256 ${sha}, seeder-side ${remoteSha}`);
+          .trim()
+          .split(/\s+/)[0];
+        if (remoteSha !== sha) {
+          throw new Error(`ton backend: transfer corrupted — local sha256 ${sha}, seeder-side ${remoteSha}`);
+        }
+        await sshRun(`mv -f -- '${p.staging}' '${p.bagDir}/${entry}'`);
+      } catch (uploadErr) {
+        // A failed scp/hash-check can leave a partial file too. Remove only this
+        // attempt's own path (never a sibling attempt's). If the cleanup itself
+        // fails (e.g. SSH drops), surface it rather than leaving an orphaned
+        // per-attempt temp file on the seeder with no trace it was ever left behind.
+        await sshRun(`rm -f -- '${p.staging}'`).catch((cleanupErr) =>
+          warn(
+            `ton: could not remove failed upload's staging file ${p.staging} on ${TON_SSH_HOST} ` +
+              `(${errMsg(cleanupErr)}) — it may need manual cleanup`,
+          ),
+        );
+        throw uploadErr;
       }
-      await sshRun(`mv -f -- '${p.staging}' '${p.bagDir}/${entry}'`);
 
       // /api/v1/create needs an ABSOLUTE path on the seeder; resolve the (possibly
       // home-relative) bag dir there rather than guessing at $HOME from here.
@@ -475,7 +499,20 @@ export function tonBackend(): StorageBackend {
       const locator = tonLocator(bagId);
       // Written last, atomically (tmp + mv): see the RemotePaths comment — existence
       // of this file is the "fully created" signal the idempotency check above trusts.
-      await sshRun(`printf '%s' '${locator}' > '${p.inventory}.tmp' && mv -f -- '${p.inventory}.tmp' '${p.inventory}'`);
+      try {
+        await sshRun(`printf '%s' '${locator}' > '${p.inventoryTmp}' && mv -f -- '${p.inventoryTmp}' '${p.inventory}'`);
+      } catch (invErr) {
+        // Same reasoning as the staging cleanup above: remove only this attempt's own
+        // temp file, and surface a cleanup failure rather than silently leaving an
+        // orphaned per-attempt file behind.
+        await sshRun(`rm -f -- '${p.inventoryTmp}'`).catch((cleanupErr) =>
+          warn(
+            `ton: could not remove failed inventory temp file ${p.inventoryTmp} on ${TON_SSH_HOST} ` +
+              `(${errMsg(cleanupErr)}) — it may need manual cleanup`,
+          ),
+        );
+        throw invErr;
+      }
       console.error(`ton: bag ${bagId} created and seeding on ${TON_SSH_HOST}`);
       return locator;
     },
