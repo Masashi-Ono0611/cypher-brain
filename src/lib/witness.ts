@@ -301,11 +301,27 @@ export async function verifyWitnessChain(
     // tx/data-item ids assigned by the network from the signed transaction/data-item
     // structure (see pushpull.ts's own "arweave/turbo (locator != content hash)"
     // --sha256 comment), so this can't be closed by recomputing a hash from the locator
-    // string itself. It IS closed by noticing that two DIFFERENT locators legitimately
-    // resolving to byte-identical (hash-identical) entry content is not an expected
-    // outcome of normal operation — nothing in this codebase's publish path ever
-    // re-uploads the exact same already-built entry object (each timestamp is fresh) —
-    // so it is treated as evidence of substitution, not coincidence.
+    // string itself. This DOES close it for the issue's actual repro and every ordinary
+    // case: `verifyWitnessChain` fetches every locator any local hint names (the loop
+    // below), so whenever the genuinely-published entry's OWN hint is among them — which
+    // it always is unless something has already removed it — a replay is caught the
+    // moment BOTH its real locator and the locator it was replayed for get queried in
+    // the same run, because two DIFFERENT locators legitimately resolving to byte-
+    // identical (hash-identical) entry content is not an expected outcome of normal
+    // operation (nothing in this codebase's publish path re-uploads the exact same
+    // already-built entry object; each timestamp is fresh).
+    // Residual risk (documented, not silently accepted as closed): this is a same-run,
+    // cross-locator comparison, not a durable, globally-authoritative one. If the local
+    // hint file's own entry for the genuinely-published locator is itself missing —
+    // e.g. an attacker with local write access pruned it, or it was simply never
+    // recorded here — that locator is never queried in this run, `hashLocators` never
+    // learns its hash, and a lone replayed locator is authenticated with nothing to
+    // compare it against. No purely local, single-run check (this one included) can
+    // close that gap; it is the same limitation this file's header comment already
+    // names for the hint file generally ("the append-only local hint file is ONLY a
+    // convenience cache, never proof... keep recovery anchors... off-box") — the
+    // existing mitigation is an independent, off-box copy of the hint/recovery-kit
+    // data (recoverykit.ts), not something addressable inside fetchEntry() itself.
     // Deliberately NOT keyed off any local hint-file field (entry_hash, sequence, ...):
     // the hint file is an untrusted convenience cache an attacker with local write
     // access could rewrite freely (see this file's header comment), so trusting one of

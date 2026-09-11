@@ -30,3 +30,19 @@ authenticated for each locator actually asked of the backend.
 Added a regression test (`fork-replay-substitution` in
 `scripts/selftest-witness.mjs`) that reproduces the original vulnerability with a
 mocked replaying backend and confirms it red/green against the fix.
+
+**Residual risk (not closed by this fix, documented rather than silently
+shipped as complete):** this is a same-run, cross-locator comparison — it
+catches a replay only when the genuinely-published entry's own locator is
+*also* queried during that same `witness verify` run (which the existing
+discovery loop always does whenever the local hint file records that locator,
+i.e. in every ordinary case, including the issue's own repro). If the local
+hint file's entry for the genuine locator has itself been removed — e.g. by
+an attacker who already has local write access — that locator is never
+queried, and a lone replayed locator has nothing to be compared against. No
+purely local, single-run check can close that gap; it is the same limitation
+this codebase already documents for the hint file in general (`witness.ts`'s
+own header: "the append-only local hint file is ONLY a convenience cache,
+never proof... keep recovery anchors... off-box"). The existing mitigation is
+keeping an independent, off-box copy of the hint/recovery-kit data
+(`recoverykit.ts`), not something addressable inside a single verify call.
