@@ -235,3 +235,84 @@ export async function resolveSpendBudget(
     );
   }
 }
+
+export interface SpendUsage {
+  /** Which admission-control family this reflects — 'ar' covers BOTH arweave and turbo (they share one cap); 'ton-provider' is separate. */
+  family: UnitFamily;
+  /** Receipted (settled) spend within the current UTC calendar day, in the family's native unit (winc/winston are pegged 1:1; nanoTON for ton-provider). */
+  daySpent: bigint;
+  /** Receipted spend within the current UTC calendar month. */
+  monthSpent: bigint;
+  /** Sum of currently-OPEN (unresolved) reservations for this family — counts against BOTH windows, same as reserveSpendBudget()'s own admission check. */
+  openReservations: bigint;
+  /** True when a receipt or reservation line was unreadable, or a receipt could not be priced — daySpent/monthSpent/openReservations may UNDERCOUNT actual spend. */
+  degraded: boolean;
+}
+
+/**
+ * Read-only cumulative-spend usage snapshot for `backend`'s admission-control family
+ * (#925/#927): how much has been receipted today/this UTC calendar month, plus any
+ * still-open reservations — WITHOUT reserving or writing anything, unlike
+ * reserveSpendBudget() (which reserves the remaining per-push cap as a side effect).
+ * Mirrors the same fold/date-window logic reserveSpendBudget() uses above (same UTC
+ * day/month boundaries, same "open reservations count against both windows" rule) — kept
+ * as a SEPARATE, more lenient function rather than a shared internal helper the two call
+ * (see the "Deliberately more lenient" paragraph below), so a caller comparing its own
+ * result against a real push's admission check should still expect the SAME daySpent/
+ * monthSpent/openReservations numbers on well-formed data, but not identical behavior on
+ * malformed data (that function fails closed; this one degrades).
+ *
+ * Returns null when `backend` has no admission-control family at all (file/rclone/ton)
+ * OR when neither family's daily nor monthly cap is configured — mirroring
+ * reserveSpendBudget()'s own no-op posture for those two cases, so callers never have to
+ * re-derive that decision themselves.
+ *
+ * Deliberately more lenient than reserveSpendBudget() on bad data: that function fails
+ * CLOSED (an unreadable line, or a receipt it cannot price, aborts the whole admission
+ * check) because it is gating a REAL spend. This is a passive report with no gate to
+ * fail closed on, so it instead sets `degraded: true` and keeps folding whatever it CAN
+ * read — the same "warn, do not fail" posture doctor.ts's own receipt-ledger-readability
+ * check already takes for the identical class of problem (an unreadable ledger line).
+ */
+export async function getSpendUsage(backend: string): Promise<SpendUsage | null> {
+  const family = familyFor(backend);
+  if (family === null) return null;
+  const ton = family === 'ton-provider';
+  const daily = ton ? TON_PROVIDER_MAX_SPEND_DAILY : AR_MAX_SPEND_DAILY;
+  const monthly = ton ? TON_PROVIDER_MAX_SPEND_MONTHLY : AR_MAX_SPEND_MONTHLY;
+  if (daily === 0n && monthly === 0n) return null;
+  const { receipts, skippedLines: receiptsSkipped } = await readReceipts();
+  const log = await readBudgetReservations();
+  let degraded = receiptsSkipped > 0 || log.skippedLines > 0;
+  const now = new Date();
+  const dayStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const monthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+  const dayEnd = dayStart + 86_400_000;
+  const monthEnd = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+  let daySpent = 0n;
+  let monthSpent = 0n;
+  for (const receipt of receipts) {
+    if (familyFor(receipt.backend) !== family) continue;
+    const timestamp = Date.parse(receipt.timestamp);
+    if (!Number.isFinite(timestamp)) {
+      degraded = true;
+      continue;
+    }
+    const inDay = timestamp >= dayStart && timestamp < dayEnd;
+    const inMonth = timestamp >= monthStart && timestamp < monthEnd;
+    if (!(daily > 0n && inDay) && !(monthly > 0n && inMonth)) continue;
+    let cost: bigint;
+    try {
+      cost = pricedReceipt(receipt);
+    } catch {
+      degraded = true;
+      continue;
+    }
+    if (inDay) daySpent += cost;
+    if (inMonth) monthSpent += cost;
+  }
+  const openReservations = log.reservations
+    .filter((r) => r.state === 'open' && familyFor(r.backend) === family)
+    .reduce((sum, r) => sum + BigInt(r.amount), 0n);
+  return { family, daySpent, monthSpent, openReservations, degraded };
+}

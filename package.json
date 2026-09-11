@@ -105,6 +105,7 @@
     "selftest:init-keygen-force-race": "node --experimental-strip-types --experimental-test-module-mocks --import ./scripts/dev-cli-loader.mjs scripts/selftest-init-keygen-force-race.mjs",
     "selftest:push-status": "node scripts/selftest-push-status.mjs",
     "selftest:spend-budget": "node scripts/selftest-spend-budget.mjs",
+    "selftest:estimate-spend-cap": "node scripts/selftest-estimate-spend-cap.mjs",
     "selftest:init-turbo-uncertain-spend": "node --experimental-strip-types --experimental-test-module-mocks --import ./scripts/dev-cli-loader.mjs scripts/selftest-init-turbo-uncertain-spend.mjs",
     "selftest:properties": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-properties.mjs",
     "selftest:cctv-age": "node scripts/selftest-cctv-age.mjs",
