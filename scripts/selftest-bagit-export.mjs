@@ -488,6 +488,53 @@ try {
       })(),
     );
 
+    // Regression test for a multi-model review finding: normalizing BEFORE lowercasing
+    // (the original order this fix shipped with) left this specific pair undetected. A
+    // decomposed uppercase "J" (U+004A) + combining caron (U+030C) does not compose to
+    // anything under NFC while still uppercase (there is no precomposed uppercase
+    // "J WITH CARON"), so it must be lowercased FIRST — collapsing to the same
+    // decomposed "j" + combining caron as the precomposed lowercase "ǰ" (U+01F0) — and
+    // only THEN normalized to land on an identical key. See bagit.ts's own doc comment
+    // on findNormalizedNameCollisions() for the fix (toLowerCase().normalize('NFC')).
+    {
+      const precomposedLowerJCaron = '\u01f0.tar.gz'; // precomposed "j with caron", already lowercase
+      const decomposedUpperJCaron = 'J\u030c.tar.gz'; // "J" + combining caron, uppercase
+      assert.notStrictEqual(
+        precomposedLowerJCaron,
+        decomposedUpperJCaron,
+        'test fixture bug: these two forms must be byte-distinct to be a real test',
+      );
+      const groups = findNormalizedNameCollisions([precomposedLowerJCaron, decomposedUpperJCaron, 'unrelated.txt']);
+      check(
+        'findNormalizedNameCollisions: precomposed lowercase "ǰ" and decomposed uppercase "J+combining caron" are grouped together (order-of-operations regression)',
+        groups.length === 1 &&
+          groups[0].length === 2 &&
+          groups[0].includes(precomposedLowerJCaron) &&
+          groups[0].includes(decomposedUpperJCaron),
+        JSON.stringify(groups),
+      );
+    }
+
+    // Documented, deliberately accepted residual (multi-model review finding, see
+    // bagit.ts's own doc comment on findNormalizedNameCollisions()): a simple
+    // toLowerCase() case-fold does NOT catch Greek context-sensitive special-casing
+    // pairs like "Σ"/final-form "ς" — "Σ".toLowerCase() is always "σ", never "ς". This
+    // test documents that CURRENT, intentional behavior (full Unicode case-folding
+    // would need a CaseFolding.txt table this file's own header comment says it
+    // deliberately does not carry as a new dependency) so a future reader sees this
+    // gap as a recorded decision, not a silent regression waiting to be "discovered".
+    {
+      const groups = findNormalizedNameCollisions([
+        '\u03c3.tar.gz' /* \u03c3 (sigma) */,
+        '\u03c2.tar.gz' /* \u03c2 (final sigma) */,
+      ]);
+      check(
+        'findNormalizedNameCollisions: KNOWN LIMITATION (documented, not a bug) — Greek "σ" vs final-form "ς" is not detected as a case-fold collision',
+        groups.length === 0,
+        JSON.stringify(groups),
+      );
+    }
+
     // exportBagit() calls this exact function immediately after planTopLevel() (see
     // bagit.ts) and throws naming every colliding filename if it returns any groups --
     // covered directly by reading that call site plus the coverage above of the
@@ -530,6 +577,63 @@ try {
         firstLanded !== secondLanded && entries.length === 1,
         `first=${JSON.stringify(firstLanded)} second=${JSON.stringify(secondLanded)} entries=${JSON.stringify(entries)}`,
       );
+    }
+
+    // ---- 15d. real, adaptive integration test through exportBagit() itself —
+    //           regression test for a multi-model review finding: without this, the
+    //           ENTIRE #943 refusal block in exportBagit() could be deleted and every
+    //           test above would still pass (15a-c only test the standalone function
+    //           and a generic copy loop, never exportBagit() with a real collision).
+    //
+    //           This repo's CI matrix runs both macos-latest (APFS folds these names —
+    //           see this test's own header comment above) and ubuntu-latest (ext4 does
+    //           not). Rather than skip the integration path entirely on the
+    //           non-cooperating runner, this tries several candidate colliding pairs
+    //           and — for whichever ones this runner's filesystem actually lets exist
+    //           as two distinct real dirents — runs exportBagit() for real and asserts
+    //           it refuses, naming both files, with no --out-dir or leftover
+    //           .bagit-export-*.partial created. On a runner where every candidate
+    //           folds (as this fix's own local development machine's does), this is
+    //           reported as an explicit, visible SKIP (not a silent no-op or false
+    //           PASS) rather than a failing check — the deterministic 15a coverage
+    //           above still exercises the exact function exportBagit() calls. ----
+    {
+      const candidates = [
+        { label: 'ASCII case', a: 'Collide-A.tar.gz', b: 'collide-a.tar.gz' },
+        { label: 'NFC vs NFD', a: 'caf\u00e9-collide.tar.gz', b: 'cafe\u0301-collide.tar.gz' },
+        { label: 'precomposed/decomposed j-caron', a: '\u01f0collide.tar.gz', b: 'J\u030ccollide.tar.gz' },
+      ];
+      let ranAtLeastOneIntegrationCase = false;
+      for (const [candidateIndex, { label, a, b }] of candidates.entries()) {
+        const collideFrom = await makeRestoreDir(`collision-integration-${candidateIndex}`);
+        await writeFile(join(collideFrom, a), 'first colliding file bytes');
+        await writeFile(join(collideFrom, b), 'second colliding file bytes, deliberately different');
+        const entries = await readdir(collideFrom);
+        if (!(entries.includes(a) && entries.includes(b))) {
+          console.log(
+            `[SKIP] collision-integration (${label}): this filesystem folds "${a}" and "${b}" onto the same real dirent before bagit-export's own code runs — platform-dependent, not exercisable here (see 15a for deterministic coverage of the same check)`,
+          );
+          continue;
+        }
+        ranAtLeastOneIntegrationCase = true;
+        const collideOut = join(tmp, `collision-integration-${label.replace(/\s+/g, '-')}-out`);
+        await checkThrows(
+          `collision-integration (${label}): exportBagit() itself refuses a real on-disk collision, naming both files`,
+          () => exportBagit({ fromDir: collideFrom, outDir: collideOut }),
+          (e) => /collide/.test(e.message) && e.message.includes(a) && e.message.includes(b),
+        );
+        check(`collision-integration (${label}): no --out-dir was created at all`, !(await pathExists(collideOut)));
+        const siblings = await readdir(tmp);
+        check(
+          `collision-integration (${label}): no leftover .bagit-export-*.partial temp directory either`,
+          !siblings.some((n) => n.startsWith('.bagit-export-')),
+        );
+      }
+      if (!ranAtLeastOneIntegrationCase) {
+        console.log(
+          '[SKIP] collision-integration: every candidate pair folded to one real dirent on this filesystem — no real on-disk integration case could run here this time',
+        );
+      }
     }
   }
 

@@ -168,6 +168,27 @@ async function planTopLevel(fromDir: string): Promise<{ files: string[] }> {
 // three-or-more-way collisions are also caught and every real conflicting filename is
 // named, not just the first two found.
 //
+// Order matters (multi-model review finding): lowercasing BEFORE normalizing, not
+// after. A decomposed uppercase letter+combining-mark sequence (e.g. "J" U+004A +
+// combining caron U+030C) only becomes canonically equal to its precomposed lowercase
+// form (e.g. "ǰ" U+01F0) once case-folded first — normalize('NFC') on the uppercase
+// sequence alone does not compose it (there is no precomposed uppercase "J WITH CARON"
+// for NFC to fold onto), so normalizing before lowercasing left this pair undetected;
+// toLowerCase() first collapses both to the same decomposed "j" + combining caron,
+// which normalize('NFC') then correctly composes to one identical key.
+//
+// Known, deliberately accepted residual: this is a SIMPLE case-fold (toLowerCase()),
+// not the full Unicode default case-folding algorithm (which needs a CaseFolding.txt
+// mapping table this codebase does not carry — this file's own header comment states
+// bagit-export adds no new runtime dependency). Context-sensitive special-casing
+// pairs, e.g. Greek "Σ"/"σ"/final-form "ς", are NOT caught: "Σ".toLowerCase() is
+// always "σ", never "ς", so "ς.tar.gz" and "Σ.tar.gz" are not detected as colliding
+// here even though some case-insensitive filesystems' own folding may treat them as
+// equal. Given this tool's domain (restore output filenames — manifest.json,
+// *.tar.gz component archives, db.dump), this residual is treated the same as
+// pathsOverlap()'s own stated symlink residual above: accepted, not silently
+// unconsidered.
+//
 // Exported (only) so the selftest can exercise this deterministic string comparison
 // directly with synthetic name arrays — this repo's own CI matrix runs both
 // macos-latest (APFS folds ASCII case AND Unicode normalization for real on-disk
@@ -178,7 +199,7 @@ async function planTopLevel(fromDir: string): Promise<{ files: string[] }> {
 export function findNormalizedNameCollisions(fileNames: string[]): string[][] {
   const groups = new Map<string, string[]>();
   for (const name of fileNames) {
-    const key = name.normalize('NFC').toLowerCase();
+    const key = name.toLowerCase().normalize('NFC');
     const group = groups.get(key);
     if (group) group.push(name);
     else groups.set(key, [name]);
