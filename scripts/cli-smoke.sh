@@ -141,14 +141,31 @@ fi
 echo "[PASS] dist estimate --backend ton --json: same fix reaches the JSON path MCP estimate_cost returns (#481)"
 
 # (e) estimate --backend turbo — deterministic/offline either way, but the expected
-# note depends on whether the OPTIONAL @ardrive/turbo-sdk happens to be installed in
-# this environment (it is not a devDependency, only an optional peerDependency — see
-# package.json — so `bun install --frozen-lockfile` normally leaves it absent, but a
-# future lockfile change could add it): branch on its actual presence instead of
-# assuming absence, so this test can't silently start failing on a healthy install.
+# note depends on whether the OPTIONAL @ardrive/turbo-sdk actually resolves from where
+# $DIST runs (it is not a devDependency, only an optional dependency — see package.json
+# — so `bun install --frozen-lockfile` normally leaves it absent, but a future lockfile
+# change could add it): branch on its actual resolvability instead of assuming absence,
+# so this test can't silently start failing on a healthy install.
+#
+# This is checked via `require.resolve` run FROM $DIST's own directory — NOT via
+# `[ -d "$ROOT/node_modules/@ardrive/turbo-sdk" ]` (the form this line used before a
+# multi-model review of #915 flagged it): Node's module resolution for a bare specifier
+# walks UP the directory tree from the importing file, so it can find an ANCESTOR
+# directory's node_modules even when $ROOT's own node_modules lacks the package
+# entirely. That divergence is not hypothetical — it reproduces every time this script
+# runs inside a `.claude/worktrees/<name>` subdirectory that was never given its own
+# `npm`/`bun install` (this repo's own multi-agent worktree workflow creates exactly
+# that shape): $ROOT there has no node_modules of its own, so the OLD `-d` check
+# reported "absent" while the CLI's actual `import('@ardrive/turbo-sdk')` still resolved
+# through the ancestor real checkout's node_modules and returned a real quote —
+# a spurious FAIL entirely unrelated to whatever change was actually being tested.
+# `require.resolve` and dynamic `import()` share the identical node_modules directory-
+# walk algorithm for a bare specifier (they differ only in which exports-map condition
+# they pick, not which directories they search), so this predicts the real outcome
+# correctly regardless of directory nesting.
 node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend turbo > "$TMP/estimate-turbo.log" 2>&1 \
   || { echo "[FAIL] dist estimate --backend turbo exited non-zero"; cat "$TMP/estimate-turbo.log"; exit 1; }
-if [ -d "$ROOT/node_modules/@ardrive/turbo-sdk" ]; then
+if (cd "$(dirname "$DIST")" && node -e "require.resolve('@ardrive/turbo-sdk')") > /dev/null 2>&1; then
   grep -q "^backend: turbo$" "$TMP/estimate-turbo.log" \
     || { echo "[FAIL] estimate --backend turbo (sdk installed) did not report backend: turbo"; cat "$TMP/estimate-turbo.log"; exit 1; }
   echo "[PASS] dist estimate --backend turbo: SDK installed, ran without crashing"
