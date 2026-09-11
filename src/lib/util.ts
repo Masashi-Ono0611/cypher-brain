@@ -249,8 +249,29 @@ export function readHead(path: string, n: number): Promise<string> {
 // A caught value is `unknown` under strict TS (useUnknownInCatchVariables) — this codebase
 // catches a LOT of errors just to report `.message`, so centralize the narrowing here
 // instead of an `as Error` cast (or worse, `any`) at every call site.
+//
+// #920: Node's `fetch` throws a generic `TypeError: fetch failed` for a network/DNS
+// failure, whose actual reason (ECONNREFUSED, ENOTFOUND, a socket reset) rides in
+// `.cause`, not `.message` — dropping it flattened every such failure to the same
+// uninformative "fetch failed" text (e.g. push-status's checkTurboUploadStatus()).
+// Appended in the SAME shape scripts/arweave-roundtrip.mjs's own failure reporting
+// already used for this (`(cause: <code> — <message>)`), so the two don't drift.
+// Only appended when a cause is actually present: a plain `new Error(msg)` (the vast
+// majority of this codebase's throws) is completely unaffected, so every existing
+// caller that matches/asserts on exact `.message` text keeps seeing exactly that.
 export function errMsg(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
+  if (!(e instanceof Error)) return String(e);
+  const cause = e.cause;
+  if (cause === undefined) return e.message;
+  const code =
+    typeof cause === 'object' &&
+    cause !== null &&
+    'code' in cause &&
+    typeof (cause as { code: unknown }).code === 'string'
+      ? (cause as { code: string }).code
+      : null;
+  const causeMsg = cause instanceof Error ? cause.message : String(cause);
+  return `${e.message} (cause: ${code ? `${code} — ` : ''}${causeMsg})`;
 }
 
 export interface ReadJsonlLogResult<T> {
