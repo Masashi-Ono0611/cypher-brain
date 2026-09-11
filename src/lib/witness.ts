@@ -287,6 +287,51 @@ export async function verifyWitnessChain(
   try {
     type FetchedOk = { entry: WitnessEntry; hash: string; locator: string };
     const verified = new Map<string, FetchedOk>();
+    // #941: the entry LOCATOR under which each distinct, authenticated entry hash was
+    // FIRST observed in THIS verify run. A backend cannot forge a new valid signature,
+    // but a malicious or compromised one CAN answer a request for one locator by
+    // replaying a different, genuinely-signed entry's own bytes (e.g. an earlier entry
+    // E2's real locator+signature, served back in place of a competing fork F2's) — that
+    // replayed signature checks out fine (it genuinely IS E2's own valid signature over
+    // E2's own bytes), so authenticity alone cannot catch this: fetchEntry used to accept
+    // any validly-signed response regardless of whether it corresponded to the LOCATOR
+    // that was actually requested, letting a real fork get folded together with the
+    // honest entry it was replayed as (reported `confirmed` instead of `conflicting`).
+    // Arweave/Turbo locators are NOT content hashes of the uploaded bytes — they are
+    // tx/data-item ids assigned by the network from the signed transaction/data-item
+    // structure (see pushpull.ts's own "arweave/turbo (locator != content hash)"
+    // --sha256 comment), so this can't be closed by recomputing a hash from the locator
+    // string itself. This DOES close it for the issue's actual repro and every ordinary
+    // case: `verifyWitnessChain` fetches every locator any local hint names (the loop
+    // below), so whenever the genuinely-published entry's OWN hint is among them — which
+    // it always is unless something has already removed it — a replay is caught the
+    // moment BOTH its real locator and the locator it was replayed for get queried in
+    // the same run, because two DIFFERENT locators legitimately resolving to byte-
+    // identical (hash-identical) entry content is not an expected outcome of normal
+    // operation (nothing in this codebase's publish path re-uploads the exact same
+    // already-built entry object; each timestamp is fresh).
+    // Residual risk (documented, not silently accepted as closed): this is a same-run,
+    // cross-locator comparison, not a durable, globally-authoritative one. If the local
+    // hint file's own entry for the genuinely-published locator is itself missing —
+    // e.g. an attacker with local write access pruned it, or it was simply never
+    // recorded here — that locator is never queried in this run, `hashLocators` never
+    // learns its hash, and a lone replayed locator is authenticated with nothing to
+    // compare it against. No purely local, single-run check (this one included) can
+    // close that gap; it is the same limitation this file's header comment already
+    // names for the hint file generally ("the append-only local hint file is ONLY a
+    // convenience cache, never proof... keep recovery anchors... off-box") — the
+    // existing mitigation is an independent, off-box copy of the hint/recovery-kit
+    // data (recoverykit.ts), not something addressable inside fetchEntry() itself.
+    // Deliberately NOT keyed off any local hint-file field (entry_hash, sequence, ...):
+    // the hint file is an untrusted convenience cache an attacker with local write
+    // access could rewrite freely (see this file's header comment), so trusting one of
+    // ITS fields as the "expected" hash here would both be circular and would let
+    // fabricated hint metadata manufacture a false failure on its own — exactly the
+    // property the fork-with-poisoned-hint/hint-forgery scenarios below already require
+    // OTHER fields (sequence, entry_hash) not to have. This map instead compares only
+    // what was independently fetched AND authenticated (valid signature, correct
+    // fingerprint) for each locator actually asked of the backend.
+    const hashLocators = new Map<string, string>();
     // Codex review: fetchEntry used to THROW on an invalid signature/fingerprint,
     // which aborted verifyWitnessChain entirely — before the fork-detection loop
     // below ever ran. That let ONE poisoned/malformed hint suppress a genuine
@@ -327,7 +372,22 @@ export async function verifyWitnessChain(
       const entry = parseEntry(bytes.toString('utf8'));
       if (entry.signing_key_fingerprint !== o.trustedFingerprint)
         return { invalid: 'entry signing fingerprint differs from trusted key' };
-      const value = { entry, hash: witnessEntryHash(entry), locator };
+      const hash = witnessEntryHash(entry);
+      // #941: authenticity (a valid signature by the trusted key) proves the bytes are
+      // GENUINELY signed; it does not prove they are the bytes THIS locator was actually
+      // supposed to resolve to. See the header comment on `hashLocators` above.
+      const priorLocator = hashLocators.get(hash);
+      if (priorLocator !== undefined && priorLocator !== locator) {
+        return {
+          invalid:
+            `entry hash ${hash} was returned by the backend for two different locators ` +
+            `(${priorLocator} and ${locator}) — a backend cannot forge a new signature, but it can ` +
+            `replay one genuinely-signed entry's bytes in place of another's; treated as a possible ` +
+            `fork-hiding substitution, not a coincidence`,
+        };
+      }
+      hashLocators.set(hash, locator);
+      const value = { entry, hash, locator };
       verified.set(cacheKey, value);
       checked++;
       return value;

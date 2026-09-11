@@ -33,6 +33,7 @@ import {
   PushSignatureUploadError,
   PushLocatorWriteError,
   PushFundingConfirmedButIncompleteError,
+  PushFundingConfirmedIntentWriteError,
   PushUploadConfirmedResponseLostError,
 } from './push-partial-success.js';
 import { PushUncertainSpendError } from './push-uncertain-spend.js';
@@ -44,6 +45,7 @@ export {
   PushSignatureUploadError,
   PushLocatorWriteError,
   PushFundingConfirmedButIncompleteError,
+  PushFundingConfirmedIntentWriteError,
   PushUploadConfirmedResponseLostError,
 } from './push-partial-success.js';
 export { PushUncertainSpendError } from './push-uncertain-spend.js';
@@ -732,6 +734,16 @@ async function pushCoreLocked(
       // subclass's convention) and the sidecar's confirmed locator as sigLocator.
       if (e instanceof PushFundingConfirmedButIncompleteError) {
         throw new PushFundingConfirmedButIncompleteError(locator, e, e.locator);
+      }
+      // issue #949: the sidecar deploy's own confirmed-intent-write can fail exactly the
+      // same way the ciphertext deploy's can (backends/ton-provider.ts throws this from
+      // the SAME code path for either put() call) — same reasoning as the sibling branch
+      // immediately above: unconditionally wrapping it as PushSignatureUploadError would
+      // discard the sidecar's own confirmed locator and misreport a confirmed on-chain
+      // spend as an ordinary signature-upload failure, and mcp.ts's own `instanceof
+      // PushFundingConfirmedIntentWriteError` classification would never fire.
+      if (e instanceof PushFundingConfirmedIntentWriteError) {
+        throw new PushFundingConfirmedIntentWriteError(locator, e, e.locator);
       }
       // #802: the arweave equivalent, and the same reasoning verbatim — the sidecar's own
       // L1 POST can lose its response after the transaction was accepted, so the sidecar

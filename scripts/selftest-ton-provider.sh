@@ -164,10 +164,34 @@ const lookupFailAddrFlagPath = process.argv[10]; // issue #640: if present, its 
 const contractLookupFailFlagPath = process.argv[11]; // issue #805: if present, GET /v2/blockchain/accounts/<addr> answers HTTP 500 for every NON-owner address (i.e. the derived StorageV1 contract) -- the "the already-funded check cannot answer" case, which must fail CLOSED. Address-agnostic (same shape as neverActiveFlagPath) because the contract address is derived inside put() and is not known to the test up front
 const broadcastFailFlagPath = process.argv[12]; // issue #664: if present, POST /v2/blockchain/message still RECORDS the BOC (the transfer lands) but answers HTTP 500 -- the "accepted, response lost" broadcast case
 const contractNeverExistsFlagPath = process.argv[13]; // issue #664: if present, every NON-owner address reports 'nonexist' forever, so the post-broadcast probe stays inconclusive
+const slowAddrFlagPath = process.argv[14]; // issue #949: if present, its CONTENTS name an address -- EVERY request whose URL contains that address substring (accounts/blockchain/seqno alike) is delayed SLOW_ADDR_DELAY_MS before answering normally. A synchronization aid, not a failure mode: it opens a wide, deterministic window between the pending-spend record write and the funding broadcast/confirmation for a test to mutate on-disk state (e.g. revoke write access to the pending-spend log) without racing a normally-instant mocked round trip.
+const SLOW_ADDR_DELAY_MS = 3000;
 
 const seenAddrs = new Set(); // issue #638: first-ever query for an address -> 'nonexist'; every query after that -> 'active' (see header comment above)
 
 createServer((req, res) => {
+  // issue #949 (Codex review): existsSync()+readFileSync() as two separate calls races
+  // against the test scripts that intentionally delete this exact flag file the moment
+  // they are done needing the delay (both selftest-ton-provider-mcp-confirmed-write.mjs
+  // and this script's own scenario-2 block do this). An ENOENT landing between the two
+  // calls used to throw uncaught inside this synchronous request handler -- Node has no
+  // built-in catch for that, so it would crash this whole mock server process and fail
+  // every OTHER in-flight test in this run, not just this one request. Read-and-catch
+  // instead of check-then-read closes the TOCTOU window entirely.
+  let slowAddr = null;
+  try {
+    slowAddr = slowAddrFlagPath ? readFileSync(slowAddrFlagPath, 'utf8').trim() : null;
+  } catch {
+    slowAddr = null; // absent (ENOENT) or otherwise unreadable -- same as "no flag set"
+  }
+  if (slowAddr && req.url.includes(slowAddr)) {
+    setTimeout(() => handle(req, res), SLOW_ADDR_DELAY_MS);
+    return;
+  }
+  handle(req, res);
+}).listen(port, '127.0.0.1');
+
+function handle(req, res) {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (url.pathname === '/v2/rates') {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -257,7 +281,7 @@ createServer((req, res) => {
   }
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ status, balance: lowBalance ? 1 : 5000000000 }));
-}).listen(port, '127.0.0.1');
+}
 MOCKEOF
 FROZEN_ADDR_FLAG="$TMP/frozen-addr-flag"
 SEQNO_FILE="$TMP/seqno-value"
@@ -268,8 +292,9 @@ LOOKUP_FAIL_ADDR_FLAG="$TMP/lookup-fail-addr-flag"
 CONTRACT_LOOKUP_FAIL_FLAG="$TMP/contract-lookup-fail-flag"
 BROADCAST_FAIL_FLAG="$TMP/broadcast-fail-flag"
 CONTRACT_NEVER_EXISTS_FLAG="$TMP/contract-never-exists-flag"
+SLOW_ADDR_FLAG="$TMP/slow-addr-flag"
 TONAPI_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" "$UNFUNDED_ADDR_FLAG" "$LOOKUP_FAIL_ADDR_FLAG" "$CONTRACT_LOOKUP_FAIL_FLAG" "$BROADCAST_FAIL_FLAG" "$CONTRACT_NEVER_EXISTS_FLAG" &
+node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" "$UNFUNDED_ADDR_FLAG" "$LOOKUP_FAIL_ADDR_FLAG" "$CONTRACT_LOOKUP_FAIL_FLAG" "$BROADCAST_FAIL_FLAG" "$CONTRACT_NEVER_EXISTS_FLAG" "$SLOW_ADDR_FLAG" &
 TONAPI_PID=$!
 export CYPHER_BRAIN_TON_TONAPI_URL="http://127.0.0.1:$TONAPI_PORT"
 
@@ -1701,6 +1726,30 @@ fi
 grep -q "TON balance" "$TMP/autosign-timeout.err" || { echo "[FAIL] the auto-sign timeout did not give auto-sign-appropriate guidance"; cat "$TMP/autosign-timeout.err"; exit 1; }
 echo "[PASS] auto-sign timeout gives auto-sign-appropriate guidance, not the Tonkeeper-deeplink instruction"
 
+echo "== issue #949: the SAME auto-sign timeout is reported as an UNCERTAIN spend (CB-E027), not a plain 'nothing happened' error =="
+# The broadcast in this run DID leave this process (tonapi accepted it with HTTP 200,
+# per the mock) -- only the CONFIRMATION poll timed out. Before #949's fix this surfaced
+# as a plain Error indistinguishable from "no funds moved", which let an MCP idempotency-
+# key retry release its claim and pay a second time for the same deploy. It must now be
+# PushUncertainSpendError (CB-E027), matching every other "the paid step ended
+# ambiguously" case this codebase already gives that code to (issue #818, arweave.ts).
+grep -q 'the outcome is UNCERTAIN' "$TMP/autosign-timeout.err" \
+  || { echo "[FAIL] issue #949: the auto-sign confirm-timeout after a successful broadcast did not report an UNCERTAIN spend"; cat "$TMP/autosign-timeout.err"; exit 1; }
+grep -q '\[CB-E027\]' "$TMP/autosign-timeout.err" \
+  || { echo "[FAIL] issue #949: the uncertain-spend report is missing its CB-E027 error code"; cat "$TMP/autosign-timeout.err"; exit 1; }
+grep -q 'Check TON contract' "$TMP/autosign-timeout.err" \
+  || { echo "[FAIL] issue #949: the uncertain-spend report did not name the TON contract check an operator/agent needs"; cat "$TMP/autosign-timeout.err"; exit 1; }
+echo "[PASS] issue #949: a confirm-timeout right after a successful auto-sign broadcast reports CB-E027 (uncertain spend), not a plain error"
+
+echo "== issue #949 (MCP-level): a confirm-timeout after a successful broadcast classifies as ERR_PUSH_OUTCOME_UNCERTAIN, not a plain error =="
+# NEVER_ACTIVE_FLAG is still set from the CLI-level test above -- reused here (its own
+# source payload, hence its own fresh bag/contract address, is distinct from every push
+# already made in this script run).
+MCP_UNCERTAIN_TEST_TMP="$TMP" \
+  MCP_UNCERTAIN_TEST_TON_WALLET="$TMP/ton-wallet.json" \
+  MCP_UNCERTAIN_TEST_RECIPIENT="$CYPHER_BRAIN_HOME/recipient.txt" \
+  node scripts/selftest-ton-provider-mcp-uncertain.mjs
+
 echo "== auto-sign: the same timeout wait prints periodic progress instead of staying silent for its whole duration (#480) =="
 PROGRESS_LINES=$(grep -c 'still waiting for contract' "$TMP/autosign-timeout.err")
 [ "$PROGRESS_LINES" -ge 1 ] || { echo "[FAIL] no progress line was printed during the deploy-confirm wait"; cat "$TMP/autosign-timeout.err"; exit 1; }
@@ -1718,6 +1767,124 @@ fi
 echo "[PASS] the Tonkeeper-deeplink path's timeout guidance is unchanged"
 rm -f "$NEVER_ACTIVE_FLAG"
 unset CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS
+
+# ========================================================================
+# issue #949 (scenario 2): the confirmed-state pending-spend record write ITSELF fails
+# (e.g. ENOSPC) right after waitForContractActive() has already confirmed the deploy
+# on-chain — before this fix, that surfaced as a plain Error indistinguishable from
+# "nothing was spent". Simulated here by chmod'ing the pending-spend log read-only
+# BETWEEN its 'pending' write (recordSpendIntent, before the broadcast) and its
+# 'confirmed' write (advanceSpendIntent, right after on-chain confirmation) — a real
+# EACCES on the same `open(path, 'a')` call ton-provider.ts's own advanceSpendIntent()
+# uses, not a simulated timeout/hang. The SLOW_ADDR_FLAG mock hook (added for #949)
+# opens a wide, deterministic window for this script to win that race instead of hoping
+# a normally-instant mocked round trip is slow enough to catch by polling alone.
+# ========================================================================
+echo "== issue #949 (scenario 2): a confirmed-state pending-spend write failure reports funding_confirmed, not a plain error =="
+I949_DIR="$TMP/issue949-ledger"
+mkdir -p "$I949_DIR"
+I949_LEDGER="$I949_DIR/receipt-ledger.jsonl"
+# Derived, not configured — same convention as the #808 test above.
+I949_PENDING="$I949_DIR/receipt-ledger.jsonl.pending-spends.jsonl"
+mkdir -p "$TMP/issue949-src"
+printf 'ton-provider issue #949 confirmed-intent-write-failure payload\n' > "$TMP/issue949-src/note.txt"
+cb snapshot --dir "$TMP/issue949-src" --out "$TMP/issue949.age"
+# The mock notify shim reads this file for how many bytes to claim as "downloaded" (see
+# selftest-ton-provider.sh's own mock-notify.mjs) — without restoring it to this push's
+# OWN real size, the run-2 recovery push below (which DOES reach notify) would retry
+# against a stale/undersized value from an earlier test and hang for the full
+# notify-retry window instead of completing quickly.
+I949_SIZE=$(stat -f%z "$TMP/issue949.age" 2>/dev/null || stat -c%s "$TMP/issue949.age")
+echo "$I949_SIZE" > "$TMP/notify-downloaded"
+: > "$BROADCAST_LOG"
+printf '%s' "$TON_WALLET_ADDR_RAW" > "$SLOW_ADDR_FLAG"
+CYPHER_BRAIN_RECEIPT_LEDGER="$I949_LEDGER" CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue949.age" --backend ton-provider >"$TMP/issue949-run1.out" 2>"$TMP/issue949-run1.err" &
+I949_PID=$!
+I949_GOT_PENDING=0
+for _ in $(seq 1 100); do
+  if [ -f "$I949_PENDING" ] && grep -q '"state":"pending"' "$I949_PENDING"; then
+    chmod 444 "$I949_PENDING"
+    rm -f "$SLOW_ADDR_FLAG" # no longer needed -- avoid compounding the mock's own delay on later queries
+    I949_GOT_PENDING=1
+    break
+  fi
+  kill -0 "$I949_PID" 2>/dev/null || break
+  sleep 0.1
+done
+rm -f "$SLOW_ADDR_FLAG" # in case the loop above exited via the kill -0 check, not the match
+[ "$I949_GOT_PENDING" = 1 ] \
+  || { echo "[FAIL] issue #949 setup: the pending-spend record never appeared before the push exited"; kill -9 "$I949_PID" 2>/dev/null || true; wait "$I949_PID" 2>/dev/null || true; cat "$TMP/issue949-run1.err"; exit 1; }
+# Bounded wait, same shape as the rest of this file's own with_timeout()-free background
+# waits: poll for exit, then force-kill if it somehow hangs instead of erroring.
+I949_DONE=0
+for _ in $(seq 1 200); do
+  kill -0 "$I949_PID" 2>/dev/null || { I949_DONE=1; break; }
+  sleep 0.1
+done
+if [ "$I949_DONE" != 1 ]; then
+  kill -9 "$I949_PID" 2>/dev/null || true
+  chmod 644 "$I949_PENDING" 2>/dev/null || true
+  echo "[FAIL] issue #949: the push hung instead of throwing once the pending-spend record became unwritable"; cat "$TMP/issue949-run1.err"; exit 1
+fi
+if wait "$I949_PID" 2>/dev/null; then I949_RC=0; else I949_RC=$?; fi
+chmod 644 "$I949_PENDING" # restore write access before anything else in this script touches $I949_DIR, and for cleanup
+[ "$I949_RC" = 0 ] && { echo "[FAIL] issue #949: push succeeded despite the confirmed-state pending-spend record being unwritable"; cat "$TMP/issue949-run1.err"; exit 1; }
+[ "$(grep -c '"boc"' "$BROADCAST_LOG" || true)" = "1" ] \
+  || { echo "[FAIL] issue #949 setup: expected exactly 1 broadcast before the confirmed-state write failed, got $(grep -c '"boc"' "$BROADCAST_LOG" || true)"; cat "$BROADCAST_LOG"; exit 1; }
+grep -q 'contract funding is CONFIRMED on-chain' "$TMP/issue949-run1.err" \
+  || { echo "[FAIL] issue #949: the report did not say funding is confirmed on-chain"; cat "$TMP/issue949-run1.err"; exit 1; }
+grep -q 'recording the confirmed-state pending-spend record failed' "$TMP/issue949-run1.err" \
+  || { echo "[FAIL] issue #949: the report did not name the confirmed-state pending-spend record as the failure point"; cat "$TMP/issue949-run1.err"; exit 1; }
+if grep -q 'notifying the storage provider failed' "$TMP/issue949-run1.err"; then
+  echo "[FAIL] issue #949 REGRESSION: misclassified as the #654 notify-stage sibling (PushFundingConfirmedButIncompleteError) instead of its own confirmed-intent-write stage"; cat "$TMP/issue949-run1.err"; exit 1
+fi
+grep -q '"state":"confirmed"' "$I949_PENDING" \
+  && { echo "[FAIL] issue #949: the intent was advanced to 'confirmed' despite the write that was supposed to do so having failed"; cat "$I949_PENDING"; exit 1; }
+grep -q '"state":"pending"' "$I949_PENDING" \
+  || { echo "[FAIL] issue #949: the pending-spend record disappeared instead of staying at 'pending' for issue #808's own recovery path"; cat "$I949_PENDING"; exit 1; }
+echo "[PASS] issue #949: a confirmed-state pending-spend write failure reports funding_confirmed via its own stage, and leaves the intent recoverable at 'pending'"
+
+echo "== issue #949: the next push recovers the spend #808-style instead of re-funding it =="
+I949_CONTRACT=$(node -e '
+const fs = require("fs");
+const lines = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+process.stdout.write(lines[lines.length - 1].contract_address);
+' "$I949_PENDING") || { echo "[FAIL] issue #949: could not read the pending intent's contract address"; cat "$I949_PENDING"; exit 1; }
+CYPHER_BRAIN_RECEIPT_LEDGER="$I949_LEDGER" CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue949.age" --backend ton-provider >/dev/null 2>"$TMP/issue949-run2.err" \
+  || { echo "[FAIL] issue #949: the recovery push failed"; cat "$TMP/issue949-run2.err"; exit 1; }
+grep -q 'already shows on-chain activity' "$TMP/issue949-run2.err" \
+  || { echo "[FAIL] issue #949: the recovery push did not take the already-active branch"; cat "$TMP/issue949-run2.err"; exit 1; }
+grep -q 'recording a receipt an earlier run confirmed but never wrote' "$TMP/issue949-run2.err" \
+  || { echo "[FAIL] issue #949 REGRESSION: the already-active branch skipped the earlier run's unrecorded spend instead of recording it"; cat "$TMP/issue949-run2.err"; exit 1; }
+[ "$(grep -c '"boc"' "$BROADCAST_LOG" || true)" = "1" ] \
+  || { echo "[FAIL] issue #949: the recovery push re-funded the already-active contract — DOUBLE SPEND"; cat "$BROADCAST_LOG"; exit 1; }
+[ "$(node -e '
+const fs = require("fs");
+let n = 0;
+for (const line of fs.readFileSync(process.argv[1], "utf8").split("\n")) {
+  if (!line.trim()) continue;
+  const r = JSON.parse(line);
+  if (r.backend === "ton-provider" && r.raw && r.raw.contract_address === process.argv[2]) n++;
+}
+process.stdout.write(String(n));
+' "$I949_LEDGER" "$I949_CONTRACT")" = "1" ] \
+  || { echo "[FAIL] issue #949: expected exactly one receipt for $I949_CONTRACT after recovery"; cat "$I949_LEDGER"; exit 1; }
+grep -q '"state":"settled"' "$I949_PENDING" \
+  || { echo "[FAIL] issue #949: the recovered intent was never marked settled"; cat "$I949_PENDING"; exit 1; }
+echo "[PASS] issue #949: the recovery push settles the earlier confirmed-but-unrecorded spend WITHOUT a second broadcast"
+
+echo "== issue #949 (MCP-level): a confirmed-state pending-spend write failure retains the idempotency claim instead of releasing it =="
+MCP_I949_LEDGER="$TMP/issue949-mcp-ledger/receipt-ledger.jsonl"
+mkdir -p "$(dirname "$MCP_I949_LEDGER")"
+MCP_CONFIRMED_WRITE_TEST_TMP="$TMP" \
+  MCP_CONFIRMED_WRITE_TEST_TON_WALLET="$TMP/ton-wallet.json" \
+  MCP_CONFIRMED_WRITE_TEST_LEDGER="$MCP_I949_LEDGER" \
+  MCP_CONFIRMED_WRITE_TEST_SLOW_ADDR_FLAG="$SLOW_ADDR_FLAG" \
+  MCP_CONFIRMED_WRITE_TEST_WALLET_ADDR_RAW="$TON_WALLET_ADDR_RAW" \
+  MCP_CONFIRMED_WRITE_TEST_RECIPIENT="$CYPHER_BRAIN_HOME/recipient.txt" \
+  node scripts/selftest-ton-provider-mcp-confirmed-write.mjs
 
 echo "== schedule install --backend ton-provider is eligible ONLY when a TON wallet is configured (#396 PR2) =="
 if CYPHER_BRAIN_TON_WALLET= cb schedule install --backend ton-provider --dir "$SRC" --no-load \

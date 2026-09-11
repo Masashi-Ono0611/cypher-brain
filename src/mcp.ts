@@ -78,6 +78,7 @@ import {
   redactUserinfo,
   PushPartialSuccessError,
   PushFundingConfirmedButIncompleteError,
+  PushFundingConfirmedIntentWriteError,
   PushUncertainSpendError,
   writeReplayedSavedLocator,
 } from './lib/pushpull.js';
@@ -2008,13 +2009,16 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
         // sidecar upload failing (PushSignatureUploadError, e.sigLocator undefined —
         // see its own doc comment in pushpull.ts), the LOCAL --save-locator
         // bookkeeping failing after everything durably uploaded (PushLocatorWriteError,
-        // e.sigLocator set when a signed push's sidecar landed first), and issue #654's
+        // e.sigLocator set when a signed push's sidecar landed first), issue #654's
         // PushFundingConfirmedButIncompleteError (a ton-provider deploy whose funding
-        // is confirmed on-chain but whose provider notify handshake did not complete).
-        // Either way, a retry carrying the same idempotency_key must be told the spend
-        // already happened, not sent to spend again for an AFTERMATH failure that has
-        // nothing to do with whether the paid upload/deploy itself landed — this is
-        // precisely the "partial success" scenario #220 exists to make retry-safe.
+        // is confirmed on-chain but whose provider notify handshake did not complete),
+        // and issue #949's PushFundingConfirmedIntentWriteError (funding confirmed
+        // on-chain, but recording that confirmation in the pending-spend record failed —
+        // notify never even started). Either way, a retry carrying the same
+        // idempotency_key must be told the spend already happened, not sent to spend
+        // again for an AFTERMATH failure that has nothing to do with whether the paid
+        // upload/deploy itself landed — this is precisely the "partial success" scenario
+        // #220 exists to make retry-safe.
         if (idempotencyKey && fingerprint && e instanceof PushPartialSuccessError) {
           // issue #654 (Codex design review): PushFundingConfirmedButIncompleteError
           // gets its OWN branch, not the `locator_file_write_failed` fallback the other
@@ -2024,8 +2028,14 @@ async function handleSnapshotNow(args: ToolArgs): Promise<CallToolResult> {
           // transfer is confirmed). `provider_download_confirmed: false` is explicit
           // (not merely absent) so a caller cannot mistake "field not present" for
           // "confirmed false" if this result shape is ever extended later.
+          //
+          // issue #949: PushFundingConfirmedIntentWriteError shares this exact shape
+          // (funding confirmed, provider not yet notified either way — the notify step
+          // never even started here) but its OWN `partial_stage` value
+          // ('confirmed_intent_write', vs. the sibling's 'provider_notify') tells a
+          // caller/agent which aftermath step actually failed.
           const stageFields: Record<string, unknown> =
-            e instanceof PushFundingConfirmedButIncompleteError
+            e instanceof PushFundingConfirmedButIncompleteError || e instanceof PushFundingConfirmedIntentWriteError
               ? { funding_confirmed: true, provider_download_confirmed: false, partial_stage: e.stage }
               : e.name === 'PushSignatureUploadError'
                 ? { signature_upload_failed: true }

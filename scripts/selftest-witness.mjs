@@ -14,6 +14,7 @@ const scenarios = [
   'signature',
   'fork',
   'fork-with-poisoned-hint',
+  'fork-replay-substitution',
   'gap',
   'freshness',
   'unavailable',
@@ -150,6 +151,7 @@ if (!process.env.CB_WITNESS_SCENARIO) {
       'signature',
       'fork',
       'fork-with-poisoned-hint',
+      'fork-replay-substitution',
       'gap',
       'freshness',
       'unavailable',
@@ -225,6 +227,50 @@ if (!process.env.CB_WITNESS_SCENARIO) {
       assert.equal(r.outcome, 'conflicting', 'a poisoned hint must not suppress detection of a genuine fork');
       assert.equal(r.conflicts.sequence, 2);
       assert.equal(r.conflicts.locators.length, 2);
+    } else if (scenario === 'fork-replay-substitution') {
+      // #941: the actual reported vulnerability — a malicious/compromised backend never
+      // forges a signature. It answers a request for a COMPETING fork's (F2) locator/
+      // signature by instead returning a genuinely-signed, genuinely-valid EARLIER
+      // entry's (E2) own bytes. Both entries are real and both signatures are real; only
+      // the substitution — serving E2's bytes for a request that named F2's locator — is
+      // malicious. Before the #941 fix, fetchEntry() authenticated whatever came back
+      // with no check that it corresponded to the LOCATOR that was actually requested,
+      // so the replayed E2 bytes were folded together with the honestly-fetched E2 entry
+      // (same hash -> deduped, not grouped as a second candidate at sequence 2) and
+      // verifyWitnessChain reported `confirmed` instead of surfacing the fork.
+      const fork = { ...entries[2], locator: 'different-snapshot-same-sequence' };
+      const forkHint = await w.publishWitnessEntry(fork, key, store);
+      // Sanity check on the HONEST backend first (same shape as the plain `fork`
+      // scenario above): isolates every assertion below to the REPLAYING backend's
+      // substitution, not to some unrelated mistake in this scenario's own setup.
+      const honest = await w.verifyWitnessChain(store, { ...options, locator });
+      assert.equal(honest.outcome, 'conflicting', 'sanity: an honest backend must still report the real fork');
+      // A backend that behaves honestly for every OTHER locator, but answers a request
+      // for the fork's own entry/signature locator by serving entry 2's genuine
+      // locator/signature bytes instead — exactly the issue's reported attack.
+      const replayingBackend = {
+        put: store.put,
+        get: (loc, out, expect) => {
+          if (loc === forkHint.entry_locator) return store.get(hints[2].entry_locator, out, expect);
+          if (loc === forkHint.sig_locator) return store.get(hints[2].sig_locator, out, expect);
+          return store.get(loc, out, expect);
+        },
+      };
+      const r = await w.verifyWitnessChain(replayingBackend, { ...options, locator });
+      assert.notEqual(
+        r.outcome,
+        'confirmed',
+        `a backend that replays entry 2's bytes for the fork's locator must never be confirmed (got: ${JSON.stringify(r)})`,
+      );
+      // The substitution is caught per-candidate inside fetchEntry() (see witness.ts's
+      // hashLocators comment), which forces the shared `incomplete` flag rather than
+      // surfacing its own specific message through the generic freshness-unknown path —
+      // same "an unverifiable candidate must never be silently dropped as if it had
+      // simply been absent" contract fork-with-poisoned-hint already relies on for a
+      // different invalid reason. `outcome` (asserted above) is the load-bearing check;
+      // this just confirms it took the expected refusal path, not some other one.
+      assert.equal(r.outcome, 'freshness-unknown');
+      assert.match(r.reason, /could not be checked/, r.reason);
     } else if (scenario === 'gap') {
       await writeFile(w.WITNESS_HINT_FILE, `${JSON.stringify(hints[2])}\n`);
       assert.equal((await w.verifyWitnessChain(store, { ...options, locator })).outcome, 'freshness-unknown');
