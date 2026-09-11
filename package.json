@@ -87,6 +87,7 @@
     "selftest:arweave-gateway-cap": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-arweave-gateway-cap.mjs",
     "selftest:onreceipt-guard": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-onreceipt-guard.mjs",
     "selftest:file-toctou": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-file-toctou.mjs",
+    "selftest:bagit-export": "node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs scripts/selftest-bagit-export.mjs",
     "selftest:usd-rate": "node scripts/selftest-usd-rate.mjs",
     "selftest:wallet-balance": "node scripts/selftest-wallet-balance.mjs",
     "selftest:sdk-advice": "node scripts/selftest-sdk-advice.mjs",

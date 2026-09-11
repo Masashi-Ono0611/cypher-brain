@@ -326,6 +326,31 @@ would be worse than not having one. The position itself is
 [Perkeep's](https://perkeep.org/doc/principles) — a permanent store is allowed to say it
 does not delete, as long as it says so before you push rather than after you leak.
 
+### Long-term interoperability (`bagit-export`, opt-in)
+
+`restore --out-dir` writes a flat, cypher-brain-specific layout (`manifest.json`,
+per-component archives, an optional `*.minisig` sidecar). That is sufficient for this
+tool's own restore flow — but if cypher-brain the tool ever stops being maintained, that
+custom layout is the only clue for how a third party, or a future tool that has never
+heard of cypher-brain, should interpret the decrypted payload sitting on Arweave for
+decades to come. `bagit-export --from-restored-dir <dir> --out-dir <path>` addresses
+exactly that: it packages an already-restored `--out-dir` as a standards-conformant
+[BagIt 1.0](https://www.rfc-editor.org/rfc/rfc8493) bag at a separate directory.
+
+This is a **fully offline, post-restore, non-destructive** step: `--from-restored-dir`
+is only ever read, `restore`'s output is untouched, and the bag is written to a new
+location. It buys "the payload becomes independently interpretable via any
+BagIt-aware tool" — a checksum manifest and tag manifest any standard tool can verify,
+without that tool ever needing to know cypher-brain exists.
+
+What it does **not** buy: BagIt is a structural-integrity format (is this bag intact
+and complete?), not a semantic one (what *is* this payload, and how do its parts relate
+to each other?). [RO-Crate](https://www.researchobject.org/ro-crate/) — a JSON-LD
+description of profile type, generating software/version and component relationships —
+would answer that second question, and is deliberately **not** included here; it is a
+separate, larger scope tracked by the still-open remainder of
+[#217](https://github.com/Masashi-Ono0611/cypher-brain/issues/217).
+
 ### Independent witness catalog (opt-in, Arweave only)
 
 `push --witness` publishes one small, individually signed, hash-linked JSON entry
@@ -1134,6 +1159,37 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       necessarily this one) and every component's original absolute SOURCE path on that
       machine. Leave it off unless you actually need those fields (e.g. debugging a
       manifest itself).
+
+  cypher-brain bagit-export --from-restored-dir <dir> --out-dir <path> [--force] [--json]
+      Fully offline, post-restore, non-destructive: package an already-restored
+      ("restore --out-dir <dir>") directory as a standards-conformant BagIt 1.0 bag
+      (RFC 8493) at --out-dir, a SEPARATE directory. --from-restored-dir itself is only
+      ever read, never modified — this only reads it and writes a second directory
+      elsewhere. No encryption, key material, storage backend or network is touched.
+      --from-restored-dir must directly contain a manifest.json (a cheap sanity check
+      that it plausibly IS a restore output, not an arbitrary directory) — its contents
+      are never parsed, so any payload format restore produced is accepted once that
+      check passes. Every other plain file directly under it (manifest.json, each
+      component's *.tar.gz, db.dump, a *.minisig sidecar) is copied byte-for-byte into
+      <out-dir>/data/. restore's own "expanded/" subdirectory, if present, is always
+      skipped (an informational message, not an error) — it is restore's own derived
+      view of components already present as their own *.tar.gz archives, and
+      re-including it would duplicate the payload for no interoperability benefit. Any
+      symlink, or any other unexpected entry shape, anywhere at the top level refuses
+      the whole export rather than silently skipping it.
+      Writes bagit.txt, bag-info.txt (Bagging-Date, Bag-Software-Agent, Payload-Oxum),
+      manifest-sha256.txt and tagmanifest-sha256.txt per RFC 8493 — every hash is
+      computed by re-reading the bytes actually written to <out-dir>, never by trusting
+      the source. Everything is staged in a temporary sibling directory first and
+      published with a single rename, so a failure partway through never leaves a
+      half-written directory at --out-dir. --out-dir must not already exist unless
+      --force is given, matching this codebase's usual no-clobber convention.
+      This closes the "is this bag intact and complete" question (structural
+      integrity) via a format any BagIt-aware tool can verify, even one that has never
+      heard of cypher-brain — it does NOT close the "what am I looking at" question
+      (a semantic description of the payload), which RO-Crate would answer and is
+      intentionally not implemented here; see #217 for that remaining piece.
+      --json prints {outDir, fileCount, octetCount, files}.
 
   cypher-brain verify --in <file.age> [--identity <file>] [--sha256 <hex>] [--sign-recipient <file>] [--require-signature | --no-require-signature] [--json]
                        [--level quick|remote|drill] [--verbose]

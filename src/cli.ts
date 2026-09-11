@@ -43,6 +43,7 @@ import { snapshot } from './lib/snapshot.js';
 import { restore, verify } from './lib/restore.js';
 import { push, pull } from './lib/pushpull.js';
 import { pushStatus } from './lib/push-status.js';
+import { bagitExportCommand } from './lib/bagit.js';
 import { publishLatest } from './lib/ton-dns.js';
 import { schedule } from './lib/schedule.js';
 import { wallet } from './lib/wallet.js';
@@ -128,6 +129,7 @@ const VALUE_FLAGS = new Set([
   'chain',
   'plan',
   'sss',
+  'from_restored_dir',
 ]);
 
 // Flags whose value can itself embed a credential (--pg's connection string carries a
@@ -844,6 +846,37 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       machine. Leave it off unless you actually need those fields (e.g. debugging a
       manifest itself).
 
+  cypher-brain bagit-export --from-restored-dir <dir> --out-dir <path> [--force] [--json]
+      Fully offline, post-restore, non-destructive: package an already-restored
+      ("restore --out-dir <dir>") directory as a standards-conformant BagIt 1.0 bag
+      (RFC 8493) at --out-dir, a SEPARATE directory. --from-restored-dir itself is only
+      ever read, never modified — this only reads it and writes a second directory
+      elsewhere. No encryption, key material, storage backend or network is touched.
+      --from-restored-dir must directly contain a manifest.json (a cheap sanity check
+      that it plausibly IS a restore output, not an arbitrary directory) — its contents
+      are never parsed, so any payload format restore produced is accepted once that
+      check passes. Every other plain file directly under it (manifest.json, each
+      component's *.tar.gz, db.dump, a *.minisig sidecar) is copied byte-for-byte into
+      <out-dir>/data/. restore's own "expanded/" subdirectory, if present, is always
+      skipped (an informational message, not an error) — it is restore's own derived
+      view of components already present as their own *.tar.gz archives, and
+      re-including it would duplicate the payload for no interoperability benefit. Any
+      symlink, or any other unexpected entry shape, anywhere at the top level refuses
+      the whole export rather than silently skipping it.
+      Writes bagit.txt, bag-info.txt (Bagging-Date, Bag-Software-Agent, Payload-Oxum),
+      manifest-sha256.txt and tagmanifest-sha256.txt per RFC 8493 — every hash is
+      computed by re-reading the bytes actually written to <out-dir>, never by trusting
+      the source. Everything is staged in a temporary sibling directory first and
+      published with a single rename, so a failure partway through never leaves a
+      half-written directory at --out-dir. --out-dir must not already exist unless
+      --force is given, matching this codebase's usual no-clobber convention.
+      This closes the "is this bag intact and complete" question (structural
+      integrity) via a format any BagIt-aware tool can verify, even one that has never
+      heard of cypher-brain — it does NOT close the "what am I looking at" question
+      (a semantic description of the payload), which RO-Crate would answer and is
+      intentionally not implemented here; see #217 for that remaining piece.
+      --json prints {outDir, fileCount, octetCount, files}.
+
   cypher-brain verify --in <file.age> [--identity <file>] [--sha256 <hex>] [--sign-recipient <file>] [--require-signature | --no-require-signature] [--json]
                        [--level quick|remote|drill] [--verbose]
       Assert it is real age ciphertext, a wrong key cannot open it, AND (when the
@@ -1533,6 +1566,9 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
     { flag: 'out', because: 'restore extracts into a directory', instead: '--out-dir' },
     { flag: 'json', because: 'restore has no JSON success output — only the failure path is JSON-shaped' },
   ],
+  // bagit.ts's bagitExportCommand() reads all four of its COMMAND_FLAGS entries below —
+  // nothing to declare irrelevant.
+  'bagit-export': [],
   // verify() reads neither: it inspects --in in place and writes nothing.
   verify: [
     { flag: 'out', because: 'verify writes nothing — it inspects --in in place' },
@@ -1811,6 +1847,7 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     'no_require_signature',
     'verbose',
   ],
+  'bagit-export': ['from_restored_dir', 'out_dir', 'force', 'json'],
   // --locator/--backend/--from-locator-file/--sig-locator are --level remote's fetch
   // inputs and --pg is the one --level drill refuses; all five are read by verifyImpl().
   verify: [
@@ -2134,6 +2171,8 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
       return restore(o);
     case 'verify':
       return verify(o);
+    case 'bagit-export':
+      return bagitExportCommand(o);
     case 'push': {
       // push() is shared with the MCP server (src/mcp.ts) and the init wizard
       // (wizard.ts), both of which capture its console.error output as

@@ -111,6 +111,15 @@ const ACTIVE_TON_TMP_DIRS = new Set<string>();
 // on restore()), so the long-lived MCP server can have more than one restore_now
 // (each running its own expandComponents() loop) in flight at once.
 const ACTIVE_EXPAND_SCRATCH_DIRS = new Set<string>();
+// bagit.ts's exportBagit(): the `.bagit-export-<pid>-<hex>.partial` sibling directory it
+// stages the whole bag (data/ copies + bagit.txt/bag-info.txt/manifest-sha256.txt/
+// tagmanifest-sha256.txt) into before a single rename() publishes it at --out-dir — same
+// "always ours, always safe to erase outright" reasoning as ACTIVE_TON_TMP_DIRS/
+// ACTIVE_EXPAND_SCRATCH_DIRS above (multi-model review finding: without this, a signal
+// mid-export left the partial staging directory under --out-dir's parent forever). A
+// Set, not a scalar slot, for the same MCP-concurrency-style reason those two are: two
+// bagit-export invocations in flight in the same process must each track their own.
+const ACTIVE_BAGIT_SCRATCH_DIRS = new Set<string>();
 // keys.ts's writeKeyFile() (--force branch): the sibling `<path>.<pid>.<hex>.tmp` file
 // it writes the new payload into BEFORE renaming over `path` holds a complete,
 // unencrypted secret (an age identity, a minisign signing key, or an Arweave JWK —
@@ -398,6 +407,16 @@ export const addActiveExpandScratchDir = (dir: string): void => {
 export const removeActiveExpandScratchDir = (dir: string): void => {
   ACTIVE_EXPAND_SCRATCH_DIRS.delete(dir);
 };
+// bagit.ts's exportBagit() calls these the same way every other add/remove-Set pair
+// above does: add() in the same tick mkdir() creates the staging directory (no other
+// await in between), delete() only after the publish rename() or the catch block's own
+// cleanup rm() has actually finished.
+export const addActiveBagitScratchDir = (dir: string): void => {
+  ACTIVE_BAGIT_SCRATCH_DIRS.add(dir);
+};
+export const removeActiveBagitScratchDir = (dir: string): void => {
+  ACTIVE_BAGIT_SCRATCH_DIRS.delete(dir);
+};
 // keys.ts's writeKeyFile() calls these differently from every add/remove-Set pair
 // above (a second Codex review pass of that fix, see its own header comment there for
 // the two reasons): add() runs BEFORE `open(tmp, 'wx', ...)` even starts (not after it
@@ -571,6 +590,13 @@ export function installStageSignalGuard(): void {
       // it was extracted from.
       for (const dir of ACTIVE_EXPAND_SCRATCH_DIRS) forceRmSync(dir);
       ACTIVE_EXPAND_SCRATCH_DIRS.clear();
+      // Every bagit-export staging directory currently in flight (see
+      // ACTIVE_BAGIT_SCRATCH_DIRS above) — forceRmSync for the same reason as every
+      // other set here: it can be mid-copyFile/mid-hash at the exact instant a signal
+      // lands, and --from-restored-dir itself (never registered, never touched by this
+      // cleanup) is always left alone.
+      for (const dir of ACTIVE_BAGIT_SCRATCH_DIRS) forceRmSync(dir);
+      ACTIVE_BAGIT_SCRATCH_DIRS.clear();
       // Every writeKeyFile() tmp file currently in flight (see ACTIVE_KEY_SCRATCH_FILES
       // above) — a set, so concurrent MCP keygen/wallet-create calls are each erased
       // rather than only whichever registered last. A plain rmSync (like ACTIVE_OUT_PART

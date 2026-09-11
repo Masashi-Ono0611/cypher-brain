@@ -180,6 +180,14 @@ const PARALLEL = [
   npmTest('selftest:progress'),
   npmTest('selftest:cctv-age'),
   npmTest('selftest:file-toctou'),
+  // Pure in-process unit test of src/lib/bagit.ts's exportBagit(), plus a handful of
+  // `dist/cli.mjs bagit-export` invocations for the CLI/--json/exit-code surface — same
+  // isolation shape as selftest:file-toctou right above: everything it creates lives
+  // under its own mkdtemp beneath the per-test TMPDIR (removed in a `finally`), no
+  // CYPHER_BRAIN_HOME, no port, no LaunchAgent write. bagit-export itself never touches
+  // encryption, a storage backend or the network, so this reads dist/cli.mjs (read-only)
+  // and nothing else outside its own scratch tree.
+  npmTest('selftest:bagit-export'),
   npmTest('selftest:error-codes'),
   npmTest('selftest:import-quietly'),
 ];
