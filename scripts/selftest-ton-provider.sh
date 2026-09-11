@@ -605,15 +605,32 @@ grep -q 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND must be set' "$TMP/no-cap.err" || {
 echo "[PASS] zero-spend-cap guard fired"
 
 echo "== positive control: spend cap below the computed cost refuses the deploy =="
-if CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND=1 cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/low-cap.err"; then
+# issue #951: got.age's own (default-owner) contract was already broadcast by the very
+# first "push --backend ton-provider" test above — tonapi's mock now reports it 'active'
+# on every subsequent query (see the mock's "seen" tracking header comment). Since #951
+# moved the #638 already-active check BEFORE provider selection/buildDeploy(), a push of
+# an already-active address now skips buildDeploy() (and therefore its own spend-cap
+# check) entirely — correctly, since no funds move on that branch — so reusing got.age
+# here would no longer exercise this check at all. Use a distinct, never-before-pushed
+# source instead, same pattern rates-ok.age/issue805.age/etc. already establish.
+mkdir -p "$TMP/low-cap-src"
+printf 'ton-provider #951 low-spend-cap payload (must derive a not-yet-active contract)\n' > "$TMP/low-cap-src/note.txt"
+cb snapshot --dir "$TMP/low-cap-src" --out "$TMP/low-cap.age"
+if CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND=1 cb push --in "$TMP/low-cap.age" --backend ton-provider 2>"$TMP/low-cap.err"; then
   echo "[FAIL] push under an impossibly low spend cap was accepted"; exit 1
 fi
 grep -q 'exceeds the' "$TMP/low-cap.err" || { echo "[FAIL] wrong low-cap message"; exit 1; }
 echo "[PASS] under-cap deploy guard fired"
 
 echo "== positive control: no live providers in the registry refuses the push =="
+# issue #951: same reasoning as the low-cap control just above — got.age is already
+# active, and an already-active push now skips provider selection entirely (the whole
+# point of #951), so this check needs its own never-before-pushed source too.
+mkdir -p "$TMP/no-providers-src"
+printf 'ton-provider #951 no-live-providers payload (must derive a not-yet-active contract)\n' > "$TMP/no-providers-src/note.txt"
+cb snapshot --dir "$TMP/no-providers-src" --out "$TMP/no-providers.age"
 touch "$TMP/empty-providers-flag"
-if cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/no-providers.err"; then
+if cb push --in "$TMP/no-providers.age" --backend ton-provider 2>"$TMP/no-providers.err"; then
   echo "[FAIL] push with zero live providers was accepted"; exit 1
 fi
 grep -q 'no live mytonprovider.org provider' "$TMP/no-providers.err" || { echo "[FAIL] wrong no-providers message"; exit 1; }
@@ -621,8 +638,13 @@ rm -f "$TMP/empty-providers-flag"
 echo "[PASS] no-live-providers guard fired"
 
 echo "== positive control: a provider whose rounded-up span exceeds its own max_span is refused =="
+# issue #951: same reasoning again — spanDaysFor() only ever runs during provider
+# selection, which an already-active got.age would now skip entirely.
+mkdir -p "$TMP/bad-span-src"
+printf 'ton-provider #951 bad-span payload (must derive a not-yet-active contract)\n' > "$TMP/bad-span-src/note.txt"
+cb snapshot --dir "$TMP/bad-span-src" --out "$TMP/bad-span.age"
 touch "$TMP/bad-span-flag"
-if cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/bad-span.err"; then
+if cb push --in "$TMP/bad-span.age" --backend ton-provider 2>"$TMP/bad-span.err"; then
   echo "[FAIL] push with an impossible provider span was accepted"; exit 1
 fi
 grep -q 'exceeds its own max_span' "$TMP/bad-span.err" || { echo "[FAIL] wrong bad-span message"; exit 1; }
@@ -692,15 +714,31 @@ echo "$SIZE" > "$TMP/notify-downloaded" # restore for any later runs
 echo "[PASS] the provider's stated reason is surfaced once, immediately, and not repeated while unchanged"
 
 echo "== positive control: an insufficient owner balance WARNS but does not abort the push (advisory funds check, #396 Phase B) =="
+# issue #951: got.age's own (default-owner) contract is already active by this point in
+# the script (the very first push test above), and the funds check is now gated on
+# `!alreadyActive` (there is no `deploy.amountNano` left to compare the balance against
+# once no provider is selected and no deploy is built — see the comment above that check
+# in ton-provider.ts) — so an already-active got.age would no longer reach this check at
+# all. Use a distinct, never-before-pushed source instead, same pattern as the other
+# #951-affected controls above.
+mkdir -p "$TMP/low-balance-src"
+printf 'ton-provider #951 low-balance payload (must derive a not-yet-active contract)\n' > "$TMP/low-balance-src/note.txt"
+cb snapshot --dir "$TMP/low-balance-src" --out "$TMP/low-balance.age"
 touch "$LOW_BALANCE_FLAG"
-cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/low-balance.err" >/dev/null \
+cb push --in "$TMP/low-balance.age" --backend ton-provider 2>"$TMP/low-balance.err" >/dev/null \
   || { echo "[FAIL] push aborted on a low-balance warning — the funds check must be advisory only, never a hard block"; cat "$TMP/low-balance.err"; exit 1; }
 grep -q 'balance.*looks lower than' "$TMP/low-balance.err" || { echo "[FAIL] the funds-check warning did not fire despite the mocked low owner balance"; cat "$TMP/low-balance.err"; exit 1; }
 grep -q 'CYPHER_BRAIN_SKIP_FUNDS_CHECK' "$TMP/low-balance.err" || { echo "[FAIL] the warning does not mention the skip flag"; cat "$TMP/low-balance.err"; exit 1; }
 echo "[PASS] a low owner balance prints a warning but still lets the push proceed (a human signs the real deploy either way)"
 
 echo "== positive control: CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences the same warning (shared flag with turbo's own funds check) =="
-CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/low-balance-skip.err" >/dev/null \
+# issue #951: its own fresh source too — otherwise this would trivially "pass" for the
+# wrong reason (already-active skipping the check entirely, not CYPHER_BRAIN_SKIP_FUNDS_CHECK
+# silencing it), which would stop actually testing what this control claims to test.
+mkdir -p "$TMP/low-balance-skip-src"
+printf 'ton-provider #951 low-balance-skip payload (must derive a not-yet-active contract)\n' > "$TMP/low-balance-skip-src/note.txt"
+cb snapshot --dir "$TMP/low-balance-skip-src" --out "$TMP/low-balance-skip.age"
+CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 cb push --in "$TMP/low-balance-skip.age" --backend ton-provider 2>"$TMP/low-balance-skip.err" >/dev/null \
   || { echo "[FAIL] push failed under CYPHER_BRAIN_SKIP_FUNDS_CHECK=1"; cat "$TMP/low-balance-skip.err"; exit 1; }
 if grep -q 'balance.*looks lower than' "$TMP/low-balance-skip.err"; then
   echo "[FAIL] CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 did not silence the funds-check warning"; cat "$TMP/low-balance-skip.err"; exit 1
@@ -802,10 +840,20 @@ echo "[PASS] auto-sign path: owner derived from the wallet, deploy broadcast (no
 # ========================================================================
 
 echo "== live-rates check: provider reports itself NOT available -> refuses before broadcast (#651) =="
+# issue #951: got.age's own (auto-sign-wallet, unset-owner) contract address was already
+# broadcast by the "auto-sign path" test above — tonapi's mock now reports it 'active' on
+# every subsequent query (see the mock's "seen" tracking header comment), and since #951
+# moved the #638 already-active check BEFORE provider selection, an already-active push
+# now skips checkProviderLiveTerms() entirely (correctly — no funds move on that branch),
+# so reusing got.age here would never even consult this flag. Use a distinct,
+# never-before-pushed source instead (same pattern rates-ok.age below already uses).
+mkdir -p "$TMP/rates-unavailable-src"
+printf 'ton-provider #651/#951 rates-unavailable payload (must derive a not-yet-active contract)\n' > "$TMP/rates-unavailable-src/note.txt"
+cb snapshot --dir "$TMP/rates-unavailable-src" --out "$TMP/rates-unavailable.age"
 touch "$TMP/rates-unavailable-flag"
 : > "$BROADCAST_LOG"
 if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/rates-unavailable.err"; then
+  cb push --in "$TMP/rates-unavailable.age" --backend ton-provider 2>"$TMP/rates-unavailable.err"; then
   echo "[FAIL] push succeeded despite the provider's live rates reporting itself unavailable"; exit 1
 fi
 grep -q 'reports itself as NOT available' "$TMP/rates-unavailable.err" || { echo "[FAIL] wrong rates-unavailable message"; cat "$TMP/rates-unavailable.err"; exit 1; }
@@ -814,10 +862,15 @@ rm -f "$TMP/rates-unavailable-flag"
 echo "[PASS] a provider reporting itself unavailable via live ADNL rates refuses the push before any funds move"
 
 echo "== live-rates check: provider's LIVE rate exceeds what the registry snapshot assumed -> refuses (#651) =="
+# issue #951: same reasoning as the rates-unavailable control just above — its own fresh
+# source, since got.age (and now rates-unavailable.age too) are already active.
+mkdir -p "$TMP/rates-high-rate-src"
+printf 'ton-provider #651/#951 rates-high-rate payload (must derive a not-yet-active contract)\n' > "$TMP/rates-high-rate-src/note.txt"
+cb snapshot --dir "$TMP/rates-high-rate-src" --out "$TMP/rates-high-rate.age"
 touch "$TMP/rates-high-rate-flag"
 : > "$BROADCAST_LOG"
 if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/rates-high-rate.err"; then
+  cb push --in "$TMP/rates-high-rate.age" --backend ton-provider 2>"$TMP/rates-high-rate.err"; then
   echo "[FAIL] push succeeded despite the provider's live rate exceeding the registry-derived rate"; exit 1
 fi
 grep -q 'LIVE rate' "$TMP/rates-high-rate.err" || { echo "[FAIL] wrong high-rate message"; cat "$TMP/rates-high-rate.err"; exit 1; }
@@ -826,10 +879,14 @@ rm -f "$TMP/rates-high-rate-flag"
 echo "[PASS] a live rate higher than the registry snapshot refuses the push before any funds move"
 
 echo "== live-rates check: provider's LIVE span range no longer covers the chosen span -> refuses (#651) =="
+# issue #951: same reasoning again — its own fresh source.
+mkdir -p "$TMP/rates-narrow-span-src"
+printf 'ton-provider #651/#951 rates-narrow-span payload (must derive a not-yet-active contract)\n' > "$TMP/rates-narrow-span-src/note.txt"
+cb snapshot --dir "$TMP/rates-narrow-span-src" --out "$TMP/rates-narrow-span.age"
 touch "$TMP/rates-narrow-span-flag"
 : > "$BROADCAST_LOG"
 if CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
-  cb push --in "$TMP/got.age" --backend ton-provider 2>"$TMP/rates-narrow-span.err"; then
+  cb push --in "$TMP/rates-narrow-span.age" --backend ton-provider 2>"$TMP/rates-narrow-span.err"; then
   echo "[FAIL] push succeeded despite the provider's live span range excluding the chosen span"; exit 1
 fi
 grep -q 'LIVE span range' "$TMP/rates-narrow-span.err" || { echo "[FAIL] wrong narrow-span message"; cat "$TMP/rates-narrow-span.err"; exit 1; }
@@ -1313,8 +1370,19 @@ CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= 
   cb push --in "$TMP/issue665.age" --backend ton-provider >/dev/null 2>"$TMP/issue665-retry.err" \
   || { echo "[FAIL] issue #665: the retry push failed"; cat "$TMP/issue665-retry.err"; rm -f "$ALT_PROVIDER_FLAG"; exit 1; }
 rm -f "$ALT_PROVIDER_FLAG"
-grep -q "selected provider $PROVIDER_PUBKEY_ALT" "$TMP/issue665-retry.err" \
-  || { echo "[FAIL] issue #665 setup: the retry did not actually select the DIFFERENT provider (the mock flip did not take)"; cat "$TMP/issue665-retry.err"; exit 1; }
+# issue #951: this test predates #951, when a retry against an already-active contract
+# STILL ran searchProviders()/selectProvider() (unconditionally, before the #638 check),
+# which is exactly what let it disagree with the deployed provider in the first place —
+# the scenario this whole test exists to prove is handled safely. #951 closes that
+# disagreement at its source: an already-active retry now skips provider selection
+# entirely, so it can never again pick $PROVIDER_PUBKEY_ALT here at all. Assert the
+# NEGATIVE instead — no "selected provider" line appears on this retry — which directly
+# demonstrates #951's own fix, and is a STRONGER guarantee than the original assertion
+# (disagreeing with the deployed provider is now structurally impossible, not merely
+# handled once it happens).
+if grep -q 'selected provider' "$TMP/issue665-retry.err"; then
+  echo "[FAIL] issue #951 REGRESSION: an already-active retry ran provider selection at all (expected none)"; cat "$TMP/issue665-retry.err"; exit 1
+fi
 grep -q 'already shows on-chain activity' "$TMP/issue665-retry.err" \
   || { echo "[FAIL] issue #665 setup: the retry did not take the already-active branch"; cat "$TMP/issue665-retry.err"; exit 1; }
 grep -qx -- "$PROVIDER_PUBKEY" "$TMP/notify-args.log" \
@@ -1399,6 +1467,125 @@ grep -q "this machine recorded none of them" "$TMP/issue665b-ambiguous.err" \
   || { echo "[FAIL] issue #665 (b): the ambiguous-dict refusal did not say why"; cat "$TMP/issue665b-ambiguous.err"; rm -f "$TMP/onchain-providers"; exit 1; }
 echo "[PASS] issue #665 (b): a multi-provider dict with nothing recorded locally refuses instead of falling back to this run's pick"
 rm -f "$TMP/onchain-providers" # back to "the on-chain read is unavailable" for every later test
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
+
+echo "== issue #951: resuming an already-active contract is NOT blocked by an unrelated NEW provider's pricing =="
+# The exact issue #951 scenario: after a contract is already funded (provider A), a
+# retry's own provider SELECTION would now rank a DIFFERENT provider (B) highest, and
+# B's LIVE ADNL rate does not match what the mytonprovider.org registry snapshot
+# assumed. Before the #951 fix, searchProviders()/selectProvider()/checkProviderLiveTerms()
+# ran UNCONDITIONALLY, before the #638 already-active check even existed in this
+# function's flow — so B's unrelated pricing mismatch threw before this retry ever
+# reached the "is this contract already active, resume it" check, blocking a
+# resumption that has nothing to do with B. The fix reorders the #638 check BEFORE
+# provider (re-)selection, so an already-active contract never selects (or price-checks)
+# a provider at all and resumes with whichever provider it was ACTUALLY deployed with.
+mkdir -p "$TMP/issue951-src"
+printf 'ton-provider issue #951 pricing-mismatch-does-not-block-resume payload\n' > "$TMP/issue951-src/note.txt"
+cb snapshot --dir "$TMP/issue951-src" --out "$TMP/issue951.age"
+I951_SIZE=$(stat -f%z "$TMP/issue951.age" 2>/dev/null || stat -c%s "$TMP/issue951.age")
+echo "$I951_SIZE" > "$TMP/notify-downloaded"
+: > "$TMP/notify-args.log"
+FIRST951_LOC=$(CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue951.age" --backend ton-provider 2>"$TMP/issue951-first.err") \
+  || { echo "[FAIL] issue #951 setup: the first (fresh) push failed"; cat "$TMP/issue951-first.err"; exit 1; }
+printf '%s' "$FIRST951_LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' \
+  || { echo "[FAIL] issue #951 setup: first push did not return a locator: $FIRST951_LOC"; exit 1; }
+grep -qx -- "$PROVIDER_PUBKEY" "$TMP/notify-args.log" \
+  || { echo "[FAIL] issue #951 setup: the fresh push did not notify the registry's default provider"; cat "$TMP/notify-args.log"; exit 1; }
+echo "[PASS] issue #951 setup: first push against a fresh contract succeeds via provider $PROVIDER_PUBKEY (baseline)"
+
+# -- RED/GREEN pair: the retry below, WITHOUT the #951 reorder, would select provider B
+# and throw on B's simulated live-rate mismatch before ever checking already-active. --
+touch "$ALT_PROVIDER_FLAG"      # a retry's own selectProvider() would now rank provider B (PROVIDER_PUBKEY_ALT) highest
+touch "$TMP/rates-high-rate-flag"   # and B's LIVE ADNL rate would exceed the registry-derived rate (an unrelated pricing mismatch)
+: > "$TMP/notify-args.log"
+SECOND951_LOC=$(CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue951.age" --backend ton-provider 2>"$TMP/issue951-retry.err") \
+  || { echo "[FAIL] issue #951 REGRESSION: resuming an already-active contract was blocked by an unrelated new provider's pricing mismatch"; cat "$TMP/issue951-retry.err"; rm -f "$ALT_PROVIDER_FLAG" "$TMP/rates-high-rate-flag"; exit 1; }
+rm -f "$ALT_PROVIDER_FLAG" "$TMP/rates-high-rate-flag"
+[ "$FIRST951_LOC" = "$SECOND951_LOC" ] \
+  || { echo "[FAIL] issue #951: the retry derived a DIFFERENT locator than the first push ($FIRST951_LOC vs $SECOND951_LOC)"; exit 1; }
+if grep -q 'LIVE rate' "$TMP/issue951-retry.err"; then
+  echo "[FAIL] issue #951 REGRESSION: the retry ran checkProviderLiveTerms() at all (the unrelated pricing check fired)"; cat "$TMP/issue951-retry.err"; exit 1
+fi
+if grep -q 'selected provider' "$TMP/issue951-retry.err"; then
+  echo "[FAIL] issue #951 REGRESSION: the retry ran provider selection at all (expected none)"; cat "$TMP/issue951-retry.err"; exit 1
+fi
+grep -q 'already shows on-chain activity' "$TMP/issue951-retry.err" \
+  || { echo "[FAIL] issue #951: the retry did not take the already-active branch"; cat "$TMP/issue951-retry.err"; exit 1; }
+grep -qx -- "$PROVIDER_PUBKEY" "$TMP/notify-args.log" \
+  || { echo "[FAIL] issue #951: the retry did not resume notify with the originally-deployed provider"; cat "$TMP/notify-args.log"; exit 1; }
+grep -qx -- "$PROVIDER_PUBKEY_ALT" "$TMP/notify-args.log" \
+  && { echo "[FAIL] issue #951 REGRESSION: the retry notified provider B despite never having been deployed with it"; cat "$TMP/notify-args.log"; exit 1; }
+echo "[PASS] issue #951: resuming an already-active contract succeeds despite an unrelated new provider's pricing mismatch (no provider selection, no live-rate check, resumes with $PROVIDER_PUBKEY)"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
+
+echo "== issue #950: a nightly run that misses the notify-wait window does not abandon the paid contract and re-pay for a new one =="
+# The exact issue #950 scenario: a nightly \`schedule install\` run re-encrypts the SAME
+# underlying source to a FRESH ciphertext every night (age's own ephemeral per-run file
+# key — see schedule.ts's own comment on this), so a contract whose notify never
+# confirmed a full download (a genuine timeout, not a bug) cannot be recognized as "the
+# same underlying data" by CONTRACT ADDRESS alone on a later run: the #638 already-active
+# check keys off the CIPHERTEXT's derived address, which differs every re-encrypt. Before
+# this fix, the next run would derive a brand-new address and pay to deploy an entirely
+# new contract, repeating every night the transfer genuinely needs more than the
+# notify-wait window, for the SAME unchanged source data.
+mkdir -p "$TMP/issue950-src"
+printf 'ton-provider issue #950 nightly-notify-timeout-does-not-repay payload\n' > "$TMP/issue950-src/note.txt"
+cb snapshot --dir "$TMP/issue950-src" --out "$TMP/issue950-night1.age"
+I950_SIZE=$(stat -f%z "$TMP/issue950-night1.age" 2>/dev/null || stat -c%s "$TMP/issue950-night1.age")
+RECEIPT_COUNT_BEFORE_950=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+
+echo "-- night 1: the deploy is confirmed on-chain (funds spent), but notify genuinely never confirms a full download within the wait window --"
+echo "1" > "$TMP/notify-downloaded" # far short of the real size -- notify's retry loop never sees "full"
+if CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS=2000 CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS=500 \
+  cb push --in "$TMP/issue950-night1.age" --backend ton-provider 2>"$TMP/issue950-night1.err"; then
+  echo "[FAIL] issue #950 setup: night 1's push should have failed once notify timed out"; cat "$TMP/issue950-night1.err"; exit 1
+fi
+grep -q 'contract funding is CONFIRMED on-chain' "$TMP/issue950-night1.err" \
+  || { echo "[FAIL] issue #950 setup: night 1 did not report confirmed-funding-notify-incomplete"; cat "$TMP/issue950-night1.err"; exit 1; }
+RECEIPT_COUNT_AFTER_NIGHT1=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+[ "$((RECEIPT_COUNT_AFTER_NIGHT1 - RECEIPT_COUNT_BEFORE_950))" = "1" ] \
+  || { echo "[FAIL] issue #950 setup: expected exactly ONE receipt from night 1's confirmed spend"; exit 1; }
+echo "[PASS] issue #950 setup: night 1 pays and confirms funding, but notify genuinely times out (the abandonment scenario)"
+
+echo "-- night 2: re-encrypting the SAME unchanged source (a fresh ciphertext, matching schedule.ts's own nightly re-encrypt) must NOT pay for a new contract --"
+cb snapshot --dir "$TMP/issue950-src" --out "$TMP/issue950-night2.age" # SAME source dir -> same content digest, DIFFERENT ciphertext/address (age's own ephemeral file key)
+[ "$(cat "$TMP/issue950-night1.age.digest")" = "$(cat "$TMP/issue950-night2.age.digest")" ] \
+  || { echo "[FAIL] issue #950 setup: night 1 and night 2 do not share the same plaintext content digest — test setup is not actually simulating unchanged data"; exit 1; }
+[ "$(sha "$TMP/issue950-night1.age")" != "$(sha "$TMP/issue950-night2.age")" ] \
+  || { echo "[FAIL] issue #950 setup: night 1 and night 2 produced byte-identical ciphertext — test setup did not actually re-encrypt"; exit 1; }
+if CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS=2000 CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS=500 \
+  cb push --in "$TMP/issue950-night2.age" --backend ton-provider 2>"$TMP/issue950-night2.err"; then
+  echo "[FAIL] issue #950 REGRESSION: night 2 paid to deploy a brand-new contract for the SAME unchanged source content"; cat "$TMP/issue950-night2.err"; exit 1
+fi
+grep -q 'already paid' "$TMP/issue950-night2.err" \
+  || { echo "[FAIL] issue #950: night 2's refusal did not name the prior paid contract"; cat "$TMP/issue950-night2.err"; exit 1; }
+grep -q 'issue #950' "$TMP/issue950-night2.err" \
+  || { echo "[FAIL] issue #950: night 2's refusal did not cite issue #950"; cat "$TMP/issue950-night2.err"; exit 1; }
+grep -qF "$TMP/issue950-night1.age" "$TMP/issue950-night2.err" \
+  || { echo "[FAIL] issue #950: night 2's refusal did not point back at night 1's original ciphertext for manual recovery"; cat "$TMP/issue950-night2.err"; exit 1; }
+RECEIPT_COUNT_AFTER_NIGHT2=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+[ "$RECEIPT_COUNT_AFTER_NIGHT2" = "$RECEIPT_COUNT_AFTER_NIGHT1" ] \
+  || { echo "[FAIL] issue #950 REGRESSION: night 2 wrote a NEW receipt — a second payment was actually made"; exit 1; }
+echo "[PASS] issue #950: re-encrypting the SAME unchanged source on a later run refuses to pay for a new contract, naming the prior paid one and the manual recovery step"
+
+echo "-- recovery: re-running push with night 1's ORIGINAL retained ciphertext resumes the SAME contract instead of paying again --"
+echo "$I950_SIZE" > "$TMP/notify-downloaded" # notify can now confirm a full download
+if ! NIGHT1_RESUME_LOC=$(cb push --in "$TMP/issue950-night1.age" --backend ton-provider 2>"$TMP/issue950-resume.err"); then
+  echo "[FAIL] issue #950: resuming with the ORIGINAL night-1 ciphertext (the documented manual recovery step) failed"; cat "$TMP/issue950-resume.err"; exit 1
+fi
+printf '%s' "$NIGHT1_RESUME_LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' \
+  || { echo "[FAIL] issue #950: the resume push did not return a locator: $NIGHT1_RESUME_LOC"; exit 1; }
+grep -q 'already shows on-chain activity' "$TMP/issue950-resume.err" \
+  || { echo "[FAIL] issue #950: resuming with the original file did not take the #638 already-active branch"; cat "$TMP/issue950-resume.err"; exit 1; }
+grep -q 'reports the full bag downloaded' "$TMP/issue950-resume.err" \
+  || { echo "[FAIL] issue #950: resuming with the original file did not complete notify"; cat "$TMP/issue950-resume.err"; exit 1; }
+RECEIPT_COUNT_AFTER_RESUME=$(grep -c '"backend":"ton-provider"' "$RECEIPT_LEDGER_PATH_TP" 2>/dev/null || echo 0)
+[ "$RECEIPT_COUNT_AFTER_RESUME" = "$RECEIPT_COUNT_AFTER_NIGHT1" ] \
+  || { echo "[FAIL] issue #950 REGRESSION: resuming the original contract wrote an extra receipt (double-counted a single spend)"; exit 1; }
+echo "[PASS] issue #950: the documented manual recovery step (re-push the retained original ciphertext) resumes the SAME contract, completes notify, and records no second spend"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
 echo "== issue #654 (MCP-level): a snapshot_now notify timeout classifies as funding_confirmed, not a generic partial-success bucket =="
