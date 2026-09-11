@@ -2220,6 +2220,75 @@ async function run(tmp) {
         `last_snapshot_status with a DIRECTORY as locator_file should be refused as not-a-regular-file: ${JSON.stringify(dirRes.result).slice(0, 400)}`,
       );
 
+    // Recovery's locator-file branch must enforce the same read boundary as status.
+    // Both errors must withhold decoy bytes, including a malformed file inside home.
+    const recoveryEscaped = join(home, 'recovery-escape.tsv');
+    await symlink(secretDecoy, recoveryEscaped);
+    const oversizedLocator = join(home, 'oversized-locator.tsv');
+    await writeFile(oversizedLocator, 'x'.repeat(1024 * 1024 + 1));
+    let recoveryId = 5100;
+    const recoveryErrors = [];
+    for (const tool of ['verify_restore', 'restore_now']) {
+      for (const [path, expected] of [
+        [secretDecoy, /must be inside CYPHER_BRAIN_HOME/],
+        [recoveryEscaped, /must be inside CYPHER_BRAIN_HOME/],
+        [inHomeGarbage, /must contain/],
+        [home, /not a regular file/],
+        [oversizedLocator, /byte limit/],
+      ]) {
+        const id = recoveryId++;
+        const outDir = join(tmp, `refused-recovery-${id}`);
+        send({
+          jsonrpc: '2.0',
+          id,
+          method: 'tools/call',
+          params: {
+            name: tool,
+            arguments: {
+              locator_file: path,
+              ...(tool === 'restore_now' ? { out_dir: outDir, confirm_write: true } : {}),
+            },
+          },
+        });
+        const frame = await waitFor(id);
+        const payload = frame.result?.structuredContent;
+        if (!frame.result?.isError || payload?.code !== 'ERR_INVALID_INPUT' || !expected.test(payload.message))
+          recoveryErrors.push(`${tool}: missing safe refusal for ${path}`);
+        const text = JSON.stringify(frame.result);
+        if (text.includes(secretDecoyLine) || text.includes(inHomeGarbageLine))
+          recoveryErrors.push(`${tool}: disclosed decoy file contents`);
+        if (existsSync(outDir)) recoveryErrors.push(`${tool}: created output for a rejected locator file`);
+      }
+    }
+    if (recoveryErrors.length) throw new Error(recoveryErrors.join('; '));
+
+    // A FIFO with no writer must be refused without blocking the capture mutex.
+    const recoveryFifo = join(home, 'recovery-fifo.tsv');
+    const fifoSetup = spawnSync('mkfifo', [recoveryFifo], { encoding: 'utf8' });
+    if (fifoSetup.status !== 0) throw new Error(`mkfifo failed: ${fifoSetup.stderr}`);
+    for (const tool of ['verify_restore', 'restore_now']) {
+      const id = recoveryId++;
+      send({
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: {
+          name: tool,
+          arguments: {
+            locator_file: recoveryFifo,
+            ...(tool === 'restore_now' ? { out_dir: join(tmp, 'fifo-restore'), confirm_write: true } : {}),
+          },
+        },
+      });
+      const frame = await waitFor(id);
+      if (
+        frame.result?.structuredContent?.code !== 'ERR_INVALID_INPUT' ||
+        !/not a regular file/.test(frame.result.structuredContent.message)
+      )
+        throw new Error(`${tool}: did not refuse a locator FIFO`);
+    }
+    process.stdout.write('MCP SMOKE (recovery locator boundary): PASS — no disclosure, oversized reads or FIFO hang\n');
+
     // 2c-iv. #789: snapshot_now's locator_file is push --save-locator's destination, and
     // push RENAMES a temp sibling over it — an atomic, unconditional replacement. Unscoped,
     // that is an arbitrary-file-overwrite primitive reachable through the FREE `file`
@@ -2387,7 +2456,7 @@ async function run(tmp) {
     // "unsigned (legacy) artifact" and a PASS — true of a pre-#214 backup, false here.
     // Point field 6 (sig_locator) of the save-locator file at something unfetchable and
     // assert the result says so; the ciphertext itself still verifies.
-    const sigProbeFile = join(tmp, 'sig-gap-locator.tsv');
+    const sigProbeFile = join(home, 'sig-gap-locator.tsv');
     const locFields = (await readFile(locatorFile, 'utf8')).trim().split('\t');
     while (locFields.length < 5) locFields.push('');
     locFields[5] = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef.age';
@@ -2572,7 +2641,7 @@ async function run(tmp) {
       method: 'tools/call',
       params: {
         name: 'restore_now',
-        arguments: { locator: snapSc.locator, backend: 'file', out_dir: viaAncestorOutDir, confirm_write: true },
+        arguments: { locator_file: locatorFile, out_dir: viaAncestorOutDir, confirm_write: true },
       },
     });
     const ancRes = await waitFor(5022);
@@ -2581,6 +2650,8 @@ async function run(tmp) {
       throw new Error(
         `restore_now through an ANCESTOR symlink must still work (#792 must not over-refuse): ${JSON.stringify(ancRes.result).slice(0, 500)}`,
       );
+    if (ancSc?.pulled?.sha256_pin !== snapSc.sha256)
+      throw new Error('restore_now(locator_file) lost the saved sha256 pin');
     if (ancSc?.out_dir !== viaAncestorOutDir)
       throw new Error(`restore_now should echo the caller's own out_dir: ${JSON.stringify(ancSc?.out_dir)}`);
     if (ancSc?.out_dir_resolved !== join(await realpath(ancestorLinkParent), 'restored-via-ancestor'))
@@ -2915,6 +2986,44 @@ async function run(tmp) {
       );
     }
 
+    // Execute the installed runner, not just its installer. Baking process.argv[1]
+    // here used to launch mcp.mjs for snapshot/push and create no backup at all.
+    const installedConfig = JSON.parse(await readFile(join(scheduleDir, 'schedule.json'), 'utf8'));
+    const nightly = spawnSync('bash', [installedConfig.runner], {
+      env: { ...process.env },
+      encoding: 'utf8',
+      input: '',
+      timeout: TIMEOUT_MS,
+    });
+    if (nightly.status !== 0 || nightly.error) {
+      const logs = await readdir(installedConfig.logs_dir);
+      const details = await Promise.all(logs.map((n) => readFile(join(installedConfig.logs_dir, n), 'utf8')));
+      throw new Error(`MCP-installed nightly failed (${nightly.status}): ${details.join('\n').slice(-2000)}`);
+    }
+    const nightlySnapshots = (await readdir(join(scheduleDir, 'snapshots'))).filter((n) => n.endsWith('.age'));
+    if (nightlySnapshots.length !== 1)
+      throw new Error(`MCP-installed nightly created ${nightlySnapshots.length} snapshots; expected one fresh backup`);
+    const nightlyLoc = (await readFile(installedConfig.save_locator, 'utf8')).trim().split('\t');
+    if (nightlyLoc[1] !== 'file' || !/^[a-f0-9]{64}$/.test(nightlyLoc[2] ?? ''))
+      throw new Error('MCP-installed nightly did not save a file-backend locator with a sha256 pin');
+    const nightlyVerify = spawnSync(
+      process.execPath,
+      [
+        SERVER_PATH.replace(/mcp\.mjs$/, 'cli.mjs'),
+        'verify',
+        '--level',
+        'remote',
+        '--from-locator-file',
+        installedConfig.save_locator,
+      ],
+      { env: { ...process.env }, encoding: 'utf8', timeout: TIMEOUT_MS },
+    );
+    if (nightlyVerify.status !== 0 || !/VERDICT: PASS/.test(nightlyVerify.stdout))
+      throw new Error(
+        `MCP-installed nightly backup is not recoverable: ${nightlyVerify.stderr || nightlyVerify.stdout}`,
+      );
+    process.stdout.write('MCP SMOKE (installed nightly): PASS — runner created a verifiable local backup\n');
+
     // 2l. schedule_status — thin wrapper over the SAME schedule() the CLI's `schedule
     // status` dispatches to; asserts against the schedule_install call just above,
     // the structured report (#285) — the same object the resource and the CLI --json serve
@@ -3015,6 +3124,10 @@ async function run(tmp) {
       env: {
         ...process.env,
         CYPHER_BRAIN_HOME: home,
+        CYPHER_BRAIN_PIN_RECIPIENTS: recipientPath,
+        CYPHER_BRAIN_MCP_SOURCE_ROOTS: JSON.stringify([tmp]),
+        CYPHER_BRAIN_SCHEDULE_DIR: join(tmp, 'dev-schedule'),
+        CYPHER_BRAIN_LAUNCHD_DIR: join(tmp, 'dev-launchagents'),
         NODE_OPTIONS: `--experimental-strip-types --import ${join(ROOT, 'scripts', 'dev-cli-loader.mjs')}`,
       },
     });
@@ -3042,6 +3155,39 @@ async function run(tmp) {
             `dist=${promptText.length}ch dev=${typeof devText === 'string' ? `${devText.length}ch` : JSON.stringify(devGet)}`,
         );
       }
+      dev.send({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: {
+          name: 'schedule_install',
+          arguments: {
+            backend: 'file',
+            dirs: [data],
+            recipients: [recipientPath],
+            no_load: true,
+            confirm_install: true,
+            scan_secrets: 'off',
+          },
+        },
+      });
+      const devInstall = await dev.waitFor(3);
+      if (devInstall.result?.isError)
+        throw new Error(`source MCP install failed: ${JSON.stringify(devInstall.result)}`);
+      const devConfig = JSON.parse(await readFile(join(tmp, 'dev-schedule', 'schedule.json'), 'utf8'));
+      const devRun = spawnSync('bash', [devConfig.runner], {
+        env: { ...process.env },
+        encoding: 'utf8',
+        input: '',
+        timeout: TIMEOUT_MS,
+      });
+      if (devRun.status !== 0 || devRun.error)
+        throw new Error(`source MCP-installed runner failed: ${devRun.error || devRun.status}`);
+      const devSnapshots = (await readdir(join(tmp, 'dev-schedule', 'snapshots'))).filter((n) => n.endsWith('.age'));
+      if (devSnapshots.length !== 1) throw new Error('source MCP-installed nightly created no fresh snapshot');
+      if (devConfig.cli !== join(ROOT, 'bin', 'cypher-brain.mjs'))
+        throw new Error(`source MCP installed the wrong CLI: ${devConfig.cli}`);
+      process.stdout.write('MCP SMOKE (source nightly): PASS — source MCP installed an executable CLI shim runner\n');
     } finally {
       await killAndWait(devChild);
     }

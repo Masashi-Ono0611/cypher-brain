@@ -777,6 +777,20 @@ man's switch for it the way there is for the automated `verify` levels above.
 
 ## MCP snapshot policy
 
+Policy denials identify the caller's recipient argument without quoting entries
+read from that file; a rejected file may contain private data rather than keys.
+
+For MCP `verify_restore` and `restore_now`, `locator_file` must resolve inside
+`CYPHER_BRAIN_HOME` and be a regular file no larger than 1 MiB. The server reads
+it once and pulls using a private copy, preserving its integrity pin and signature
+locator. For a recovery pointer stored elsewhere, supply its `locator`, `backend`,
+and `sha256` fields directly or copy the locator file into `CYPHER_BRAIN_HOME`.
+
+After upgrading, reinstall schedules previously created with MCP
+`schedule_install`: older runners may invoke the MCP executable instead of the
+CLI. Reinstalling writes the correct CLI path for bundled and source installations;
+`no_load: true` still writes artifacts without registering a trigger.
+
 > **Upgrading an existing MCP setup?** This is a breaking change, and the only one in
 > its release. `CYPHER_BRAIN_PIN_RECIPIENTS` is required for **every** `snapshot_now`
 > call; `CYPHER_BRAIN_MCP_SOURCE_ROOTS` is required only for a call that names `dirs`
