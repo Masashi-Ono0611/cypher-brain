@@ -405,6 +405,27 @@ try {
     const rForce = cli(['bagit-export', '--from-restored-dir', from, '--out-dir', out, '--force']);
     check('cli: re-running with --force succeeds', rForce.status === 0, rForce.output);
   }
+
+  // ---- 14. --out-dir already existing (no --force) refuses BEFORE planTopLevel() ever
+  //          walks --from-restored-dir — regression test for #923: the cheap, purely-local
+  //          "does --out-dir exist" check must run first, so a doomed invocation never
+  //          prints the "skipping ... expanded" informational message (which would
+  //          otherwise imply progress on a run that is about to abort anyway) ----
+  {
+    const from = await makeRestoreDir('preexisting-out-with-expanded', { expanded: true });
+    const out = join(tmp, 'preexisting-out-with-expanded-out');
+    await mkdir(out); // pre-create --out-dir so the existing-out-dir refusal fires
+    const cli = (args) => spawnSync(process.execPath, [dist, ...args], { encoding: 'utf8', timeout: 30000 });
+    const r = cli(['bagit-export', '--from-restored-dir', from, '--out-dir', out]);
+    check('existing-out-dir+expanded: exits non-zero', r.status !== 0, `${r.stdout}${r.stderr}`);
+    check('existing-out-dir+expanded: refuses with "already exists"', /already exists/.test(r.stderr ?? ''), r.stderr);
+    check(
+      'existing-out-dir+expanded: the "skipping expanded" message is NOT printed — the ' +
+        'out-dir-exists check ran before planTopLevel() ever walked fromDir',
+      !/skipping/.test(r.stderr ?? ''),
+      r.stderr,
+    );
+  }
 } finally {
   await rm(tmp, { recursive: true, force: true });
 }
