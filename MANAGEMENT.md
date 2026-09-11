@@ -338,17 +338,19 @@ Testing your budget config against a free `--backend file` push will *always*
 succeed regardless of how low `CYPHER_BRAIN_MAX_SPEND_DAILY`/`_MONTHLY` are
 set; that is not evidence the caps are working. (A **malformed** or
 internally-inconsistent value is a separate, backend-agnostic startup check —
-see next paragraph — and refuses every command, `file`/`rclone` pushes
-included, the same way an unparseable `CYPHER_BRAIN_MAX_SPEND_DAILY` already
-did before this admission check existed.)
+see next paragraph — and refuses every command other than a bare
+`--help`/`-h`/`--version`/`-V` request, `file`/`rclone` pushes included, the
+same way an unparseable `CYPHER_BRAIN_MAX_SPEND_DAILY` already did before
+this admission check existed.)
 
 If both a `_DAILY` and a `_MONTHLY` cap are enabled for the same pair
 (`CYPHER_BRAIN_MAX_SPEND_*` or `CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_*`), the
 monthly value must be **>=** the daily value — a UTC month always contains a
 full UTC day, so a smaller monthly cap would always be reached first and the
 **daily** cap could then never be the actual binding constraint. That
-combination is refused outright at startup, for every command, rather than
-silently only ever enforcing the monthly figure.
+combination is refused outright at startup, for every command other than a
+bare `--help`/`-h`/`--version`/`-V` request, rather than silently only ever
+enforcing the monthly figure.
 
 These caps are **additive** to the existing per-push limits and consent gate.
 Keep the matching `CYPHER_BRAIN_MAX_SPEND` or
