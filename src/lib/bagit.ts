@@ -239,12 +239,15 @@ export async function exportBagit(opts: BagitExportOptions): Promise<BagitExport
     );
   }
 
-  const { files: fileNames } = await planTopLevel(fromDir);
-
   // --force semantics: refuse an existing destination outright unless --force, matching
   // this codebase's existing no-clobber convention (e.g. sss-combine's own `--out already
   // exists` refusal in keys.ts). lstat (not stat/exists()) so a symlink already sitting at
   // outDir counts as "already exists" too, rather than silently following it.
+  // Deliberately checked BEFORE planTopLevel() below (#923): this is a cheap, purely local
+  // check on --out-dir alone — it does not need to look at --from-restored-dir at all — so
+  // a doomed invocation (existing --out-dir without --force) fails immediately, before
+  // planTopLevel() ever walks fromDir and potentially prints its "skipping ... expanded"
+  // notice, which would otherwise imply progress on a run that is about to abort anyway.
   const outExists = await lstat(outDir)
     .then(() => true)
     .catch((e: NodeJS.ErrnoException) => {
@@ -256,6 +259,8 @@ export async function exportBagit(opts: BagitExportOptions): Promise<BagitExport
       `--out-dir ${outDir} already exists (refusing to overwrite). Pass --force, or pick a different path.`,
     );
   }
+
+  const { files: fileNames } = await planTopLevel(fromDir);
 
   // Atomicity: everything is written into a temporary SIBLING directory first (same
   // parent as outDir, so the final publish below is a same-filesystem rename), mirroring

@@ -856,13 +856,19 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       that it plausibly IS a restore output, not an arbitrary directory) — its contents
       are never parsed, so any payload format restore produced is accepted once that
       check passes. Every other plain file directly under it (manifest.json, each
-      component's *.tar.gz, db.dump, a *.minisig sidecar) is copied byte-for-byte into
-      <out-dir>/data/. restore's own "expanded/" subdirectory, if present, is always
-      skipped (an informational message, not an error) — it is restore's own derived
-      view of components already present as their own *.tar.gz archives, and
-      re-including it would duplicate the payload for no interoperability benefit. Any
-      symlink, or any other unexpected entry shape, anywhere at the top level refuses
-      the whole export rather than silently skipping it.
+      component's *.tar.gz, db.dump) is copied byte-for-byte into <out-dir>/data/.
+      restore --out-dir does NOT place a *.minisig signature there on its own — "snapshot
+      --sign" writes it next to the SOURCE .age file, not into restore's output — so a
+      restore output never has one to copy by default. If you want the authenticity
+      signature preserved in the bag, copy "<in>.age.minisig" into --from-restored-dir
+      yourself before running bagit-export; once it is there, it is a plain file like
+      any other and gets copied in with the rest. restore's own "expanded/"
+      subdirectory, if present, is always skipped (an informational message, not an
+      error) — it is restore's own derived view of components already present as their
+      own *.tar.gz archives, and re-including it would duplicate the payload for no
+      interoperability benefit. Any symlink, or any other unexpected entry shape,
+      anywhere at the top level refuses the whole export rather than silently skipping
+      it.
       Writes bagit.txt, bag-info.txt (Bagging-Date, Bag-Software-Agent, Payload-Oxum),
       manifest-sha256.txt and tagmanifest-sha256.txt per RFC 8493 — every hash is
       computed by re-reading the bytes actually written to <out-dir>, never by trusting
@@ -870,6 +876,12 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       published with a single rename, so a failure partway through never leaves a
       half-written directory at --out-dir. --out-dir must not already exist unless
       --force is given, matching this codebase's usual no-clobber convention.
+      Verifying a bag: from inside the written bag directory, "shasum -a 256 -c
+      manifest-sha256.txt" and "shasum -a 256 -c tagmanifest-sha256.txt" confirm its own
+      internal integrity with standard tools alone, no cypher-brain required — both
+      should report OK for every line. A reference BagIt implementation (e.g. Python's
+      "bagit" package) can additionally do a fuller spec-conformance check, if you have
+      one installed; this tool does not depend on it.
       This closes the "is this bag intact and complete" question (structural
       integrity) via a format any BagIt-aware tool can verify, even one that has never
       heard of cypher-brain — it does NOT close the "what am I looking at" question

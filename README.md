@@ -329,19 +329,34 @@ does not delete, as long as it says so before you push rather than after you lea
 ### Long-term interoperability (`bagit-export`, opt-in)
 
 `restore --out-dir` writes a flat, cypher-brain-specific layout (`manifest.json`,
-per-component archives, an optional `*.minisig` sidecar). That is sufficient for this
-tool's own restore flow — but if cypher-brain the tool ever stops being maintained, that
-custom layout is the only clue for how a third party, or a future tool that has never
-heard of cypher-brain, should interpret the decrypted payload sitting on Arweave for
-decades to come. `bagit-export --from-restored-dir <dir> --out-dir <path>` addresses
-exactly that: it packages an already-restored `--out-dir` as a standards-conformant
-[BagIt 1.0](https://www.rfc-editor.org/rfc/rfc8493) bag at a separate directory.
+per-component archives, `db.dump` when a Postgres component was restored). That is
+sufficient for this tool's own restore flow — but if cypher-brain the tool ever stops
+being maintained, that custom layout is the only clue for how a third party, or a
+future tool that has never heard of cypher-brain, should interpret the decrypted
+payload sitting on Arweave for decades to come. `bagit-export --from-restored-dir <dir>
+--out-dir <path>` addresses exactly that: it packages an already-restored `--out-dir`
+as a standards-conformant [BagIt 1.0](https://www.rfc-editor.org/rfc/rfc8493) bag at a
+separate directory.
 
 This is a **fully offline, post-restore, non-destructive** step: `--from-restored-dir`
 is only ever read, `restore`'s output is untouched, and the bag is written to a new
 location. It buys "the payload becomes independently interpretable via any
 BagIt-aware tool" — a checksum manifest and tag manifest any standard tool can verify,
 without that tool ever needing to know cypher-brain exists.
+
+The authenticity signature is not part of that layout, and getting it into the bag is
+a manual step: `snapshot --sign` writes `*.minisig` next to the source `.age` file, not
+into `restore --out-dir` — `restore` never copies it there, so `bagit-export` never
+sees it either. If you want the signature preserved in the bag, copy `<in>.age.minisig`
+into `--from-restored-dir` yourself before running `bagit-export`; once it is there, it
+is a plain file like any other and is copied in with the rest.
+
+Verifying a bag: once written, a bag's own internal integrity can be checked with
+standard tools alone, no cypher-brain required — from inside the bag directory, run
+`shasum -a 256 -c manifest-sha256.txt` and `shasum -a 256 -c tagmanifest-sha256.txt`;
+both should report `OK` for every line. A reference [BagIt](https://pypi.org/project/bagit/)
+implementation (e.g. Python's `bagit` package) can additionally do a fuller
+spec-conformance check if you have one installed; this project does not depend on it.
 
 What it does **not** buy: BagIt is a structural-integrity format (is this bag intact
 and complete?), not a semantic one (what *is* this payload, and how do its parts relate
@@ -1170,13 +1185,19 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       that it plausibly IS a restore output, not an arbitrary directory) — its contents
       are never parsed, so any payload format restore produced is accepted once that
       check passes. Every other plain file directly under it (manifest.json, each
-      component's *.tar.gz, db.dump, a *.minisig sidecar) is copied byte-for-byte into
-      <out-dir>/data/. restore's own "expanded/" subdirectory, if present, is always
-      skipped (an informational message, not an error) — it is restore's own derived
-      view of components already present as their own *.tar.gz archives, and
-      re-including it would duplicate the payload for no interoperability benefit. Any
-      symlink, or any other unexpected entry shape, anywhere at the top level refuses
-      the whole export rather than silently skipping it.
+      component's *.tar.gz, db.dump) is copied byte-for-byte into <out-dir>/data/.
+      restore --out-dir does NOT place a *.minisig signature there on its own — "snapshot
+      --sign" writes it next to the SOURCE .age file, not into restore's output — so a
+      restore output never has one to copy by default. If you want the authenticity
+      signature preserved in the bag, copy "<in>.age.minisig" into --from-restored-dir
+      yourself before running bagit-export; once it is there, it is a plain file like
+      any other and gets copied in with the rest. restore's own "expanded/"
+      subdirectory, if present, is always skipped (an informational message, not an
+      error) — it is restore's own derived view of components already present as their
+      own *.tar.gz archives, and re-including it would duplicate the payload for no
+      interoperability benefit. Any symlink, or any other unexpected entry shape,
+      anywhere at the top level refuses the whole export rather than silently skipping
+      it.
       Writes bagit.txt, bag-info.txt (Bagging-Date, Bag-Software-Agent, Payload-Oxum),
       manifest-sha256.txt and tagmanifest-sha256.txt per RFC 8493 — every hash is
       computed by re-reading the bytes actually written to <out-dir>, never by trusting
@@ -1184,6 +1205,12 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       published with a single rename, so a failure partway through never leaves a
       half-written directory at --out-dir. --out-dir must not already exist unless
       --force is given, matching this codebase's usual no-clobber convention.
+      Verifying a bag: from inside the written bag directory, "shasum -a 256 -c
+      manifest-sha256.txt" and "shasum -a 256 -c tagmanifest-sha256.txt" confirm its own
+      internal integrity with standard tools alone, no cypher-brain required — both
+      should report OK for every line. A reference BagIt implementation (e.g. Python's
+      "bagit" package) can additionally do a fuller spec-conformance check, if you have
+      one installed; this tool does not depend on it.
       This closes the "is this bag intact and complete" question (structural
       integrity) via a format any BagIt-aware tool can verify, even one that has never
       heard of cypher-brain — it does NOT close the "what am I looking at" question
