@@ -334,18 +334,50 @@ if [ "$HELP_SECTIONS" -ne 1 ]; then
 fi
 grep -q "^Env: CYPHER_BRAIN_HOME" "$TMP/help-verify.txt" \
   || { echo "[FAIL] 'verify --help' dropped the command-agnostic Env/Storage/Spend block"; exit 1; }
-# an unknown command with --help falls back to the full reference rather than
-# nothing. The baseline is re-captured HERE rather than reusing help-dist.txt
-# from (a): HELP interpolates ${IDENTITY}, which (b) changed by exporting
-# CYPHER_BRAIN_HOME, so the two would differ on that line alone.
-node "$DIST" --help > "$TMP/help-full-now.txt" 2>&1 \
-  || { echo "[FAIL] dist --help exited non-zero"; exit 1; }
-node "$DIST" nosuchcommand --help > "$TMP/help-unknown.txt" 2>&1 \
-  || { echo "[FAIL] dist nosuchcommand --help exited non-zero"; exit 1; }
-if ! diff -q "$TMP/help-unknown.txt" "$TMP/help-full-now.txt" >/dev/null; then
-  echo "[FAIL] unknown command + --help did not fall back to the full help"; exit 1
+# #929: an unrecognized command name combined with --help used to be the WORST
+# possible reply to a typo — it silently fell back to dumping the WHOLE ~26KB
+# reference on stdout at exit 0, giving zero indication the command name wasn't
+# real (worse than the exact same typo WITHOUT --help, which (j) below already
+# correctly refuses). Must now behave EXACTLY like the no-`--help` case: exit 2,
+# stdout EMPTY, the same "unknown command" refusal (with a did-you-mean suggestion
+# when one applies) on stderr — never the full reference.
+node "$DIST" totally-bogus-command --help > "$TMP/unknown-help.out" 2> "$TMP/unknown-help.err"
+UNKNOWN_HELP_RC=$?
+[ "$UNKNOWN_HELP_RC" = "2" ] \
+  || { echo "[FAIL] 'totally-bogus-command --help' exited $UNKNOWN_HELP_RC, expected 2"; cat "$TMP/unknown-help.err"; exit 1; }
+[ ! -s "$TMP/unknown-help.out" ] \
+  || { echo "[FAIL] 'totally-bogus-command --help' wrote $(wc -c < "$TMP/unknown-help.out") bytes to stdout, expected none (the whole reference is being dumped again)"; exit 1; }
+grep -Fq 'error: unknown command: totally-bogus-command' "$TMP/unknown-help.err" \
+  || { echo "[FAIL] 'totally-bogus-command --help' did not name the offending command on stderr"; cat "$TMP/unknown-help.err"; exit 1; }
+if grep -qi "did you mean" "$TMP/unknown-help.err"; then
+  echo "[FAIL] 'totally-bogus-command --help' (unrelated to every real command) got a spurious did-you-mean suggestion"; cat "$TMP/unknown-help.err"; exit 1
 fi
-echo "[PASS] dist <command> --help: scoped to that command, keeps the Env block, unknown command falls back to full help"
+UNKNOWN_HELP_LINES=$(wc -l < "$TMP/unknown-help.err" | tr -d ' ')
+[ "$UNKNOWN_HELP_LINES" -le 5 ] \
+  || { echo "[FAIL] 'totally-bogus-command --help' stderr is $UNKNOWN_HELP_LINES lines — the whole help is being dumped again"; exit 1; }
+# Same shape, but with a typo one edit away from a REAL command (the issue's own
+# repro: 'recoverykit' for 'recovery-kit') — the did-you-mean suggestion must still
+# fire here too, reusing the exact same algorithm/wording (j) below already
+# exercises for the no-`--help` case, never re-derived for this combination.
+node "$DIST" recoverykit --help > "$TMP/typo-help.out" 2> "$TMP/typo-help.err"
+TYPO_HELP_RC=$?
+[ "$TYPO_HELP_RC" = "2" ] \
+  || { echo "[FAIL] 'recoverykit --help' (typo for recovery-kit) exited $TYPO_HELP_RC, expected 2"; cat "$TMP/typo-help.err"; exit 1; }
+[ ! -s "$TMP/typo-help.out" ] \
+  || { echo "[FAIL] 'recoverykit --help' wrote $(wc -c < "$TMP/typo-help.out") bytes to stdout, expected none"; exit 1; }
+grep -Fq 'error: unknown command: recoverykit (did you mean recovery-kit?)' "$TMP/typo-help.err" \
+  || { echo "[FAIL] 'recoverykit --help' (typo for recovery-kit) did not get a did-you-mean suggestion"; cat "$TMP/typo-help.err"; exit 1; }
+# Same refusal via the short "-h" spelling — the early scan treats --help/-h
+# identically (issue #171), so an unrecognized command must refuse for both.
+node "$DIST" recoverykit -h > "$TMP/typo-h.out" 2> "$TMP/typo-h.err"
+TYPO_H_RC=$?
+[ "$TYPO_H_RC" = "2" ] \
+  || { echo "[FAIL] 'recoverykit -h' (typo for recovery-kit) exited $TYPO_H_RC, expected 2"; cat "$TMP/typo-h.err"; exit 1; }
+[ ! -s "$TMP/typo-h.out" ] \
+  || { echo "[FAIL] 'recoverykit -h' wrote $(wc -c < "$TMP/typo-h.out") bytes to stdout, expected none"; exit 1; }
+grep -Fq 'error: unknown command: recoverykit (did you mean recovery-kit?)' "$TMP/typo-h.err" \
+  || { echo "[FAIL] 'recoverykit -h' (typo for recovery-kit) did not get a did-you-mean suggestion"; cat "$TMP/typo-h.err"; exit 1; }
+echo "[PASS] dist <command> --help: scoped to that command, keeps the Env block; an unrecognized command + --help/-h refuses like the no-help case (#929) instead of dumping the full reference"
 
 # (j) an unknown command (#269): everything on stderr, stdout EMPTY, exit 2, and a
 # short answer — the command list + where to read more — instead of ~26 KB of help.
