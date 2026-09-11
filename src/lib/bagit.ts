@@ -149,6 +149,43 @@ async function planTopLevel(fromDir: string): Promise<{ files: string[] }> {
   return { files };
 }
 
+// #943: a case-insensitive-but-preserving destination filesystem (the macOS APFS
+// default) or a Unicode-normalization-insensitive one can silently collapse two
+// DISTINCTLY-named source files onto the same path once copied into data/ below — the
+// second copyFile() call (which overwrites by default) then silently drops the first
+// file's content, and since manifest-sha256.txt is built by RE-LISTING data/ AFTER all
+// copies finish (see listFilesRecursive() below), the bag reports success with a
+// passing checksum for whichever file landed — no error, no warning, no way to detect
+// after the fact that a file went missing.
+//
+// This check is a pure string comparison on the SOURCE filenames, deliberately NOT a
+// runtime probe of --out-dir's actual case-sensitivity: a probe is fragile and
+// platform-dependent (and would still miss the normalization-collapse variant on a
+// filesystem that is case-sensitive but normalization-insensitive), whereas comparing
+// every name's lowercased-AND-NFC-normalized form catches both failure modes at once
+// and is correct regardless of what filesystem --out-dir eventually turns out to be.
+// Two names collide here if that comparison key matches — grouped (not just paired) so
+// three-or-more-way collisions are also caught and every real conflicting filename is
+// named, not just the first two found.
+//
+// Exported (only) so the selftest can exercise this deterministic string comparison
+// directly with synthetic name arrays — this repo's own CI matrix runs both
+// macos-latest (APFS folds ASCII case AND Unicode normalization for real on-disk
+// filenames, so two colliding SOURCE names can never both exist as real dirents to
+// begin with) and ubuntu-latest (ext4 is case-sensitive, so they could) — testing this
+// function directly, rather than depending on constructing real colliding files on
+// disk, is the one way to cover this deterministically on every runner.
+export function findNormalizedNameCollisions(fileNames: string[]): string[][] {
+  const groups = new Map<string, string[]>();
+  for (const name of fileNames) {
+    const key = name.normalize('NFC').toLowerCase();
+    const group = groups.get(key);
+    if (group) group.push(name);
+    else groups.set(key, [name]);
+  }
+  return [...groups.values()].filter((group) => group.length > 1);
+}
+
 // List every regular file under `dir`, recursively, as paths relative to `dir` — used
 // for manifest-sha256.txt. Today `dir` (the bag's own data/) is only ever ONE level deep,
 // since planTopLevel() above never recurses into a source subdirectory (it only ever
@@ -262,6 +299,23 @@ export async function exportBagit(opts: BagitExportOptions): Promise<BagitExport
 
   const { files: fileNames } = await planTopLevel(fromDir);
 
+  // #943: refuse BEFORE anything is written if any two of these source filenames would
+  // collapse onto the same destination path on a case-insensitive or
+  // Unicode-normalization-insensitive filesystem — see findNormalizedNameCollisions()'s
+  // own doc comment above for why this check is filesystem-independent and runs on the
+  // source names rather than probing --out-dir.
+  const nameCollisions = findNormalizedNameCollisions(fileNames);
+  if (nameCollisions.length > 0) {
+    const detail = nameCollisions.map((group) => group.map((n) => JSON.stringify(n)).join(' vs ')).join('; ');
+    throw new Error(
+      `--from-restored-dir ${fromDir} contains filenames that would collide on a case-insensitive or ` +
+        `Unicode-normalization-insensitive destination filesystem (e.g. the default on macOS/APFS): ${detail}. ` +
+        'Refusing rather than risk one silently overwriting the other once copied into data/ — with no error, ' +
+        'since manifest-sha256.txt is generated from what actually landed there, not from this original list. ' +
+        'Rename one of the conflicting files in --from-restored-dir before retrying.',
+    );
+  }
+
   // Atomicity: everything is written into a temporary SIBLING directory first (same
   // parent as outDir, so the final publish below is a same-filesystem rename), mirroring
   // keys.ts's writeKeyFile() tmp-then-rename discipline for a single file, adapted here
@@ -282,12 +336,28 @@ export async function exportBagit(opts: BagitExportOptions): Promise<BagitExport
   // threadpool while this function is suspended at `await`) where the directory could
   // already exist on disk but a signal landing in that window would find it still
   // unregistered.
+  //
+  // #944: explicit mode: 0o700 on both this and dataDir's mkdir below — this staging
+  // tree holds a full plaintext copy of --from-restored-dir's payload, and without an
+  // explicit mode a plain mkdir()/mkdirSync() lands at the umask-default (typically
+  // 0o755 under umask 022), exposing that plaintext to other local users even when the
+  // SOURCE directory was deliberately locked down to 0o700. Unlike keys.ts's
+  // keygenAt()/wallet.ts's createKeyFile() (which follow their own mkdir with an
+  // explicit chmod, because THEIR directory can already exist from an earlier run),
+  // tmpOutDir and dataDir are always freshly created here — tmpOutDir's name is a
+  // fresh per-process/per-call random suffix and dataDir is a brand-new subdirectory of
+  // it, so a plain (non-recursive) mkdir with mode: 0o700 at creation time is
+  // sufficient: there is no pre-existing directory whose looser mode a follow-up chmod
+  // would need to correct. (0o700 also has no group/other bits for a default umask to
+  // even mask out.) Once this is done, `rename(tmpOutDir, outDir)` below publishes the
+  // finished bag — rename() preserves a directory's own mode, so --out-dir inherits
+  // 0o700 automatically; confirmed by this file's own selftest.
   installStageSignalGuard();
-  mkdirSync(tmpOutDir);
+  mkdirSync(tmpOutDir, { mode: 0o700 });
   addActiveBagitScratchDir(tmpOutDir);
   try {
     const dataDir = join(tmpOutDir, 'data');
-    await mkdir(dataDir);
+    await mkdir(dataDir, { mode: 0o700 });
     for (const name of fileNames) {
       await copyFile(join(fromDir, name), join(dataDir, name));
     }
