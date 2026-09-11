@@ -166,6 +166,19 @@ const broadcastFailFlagPath = process.argv[12]; // issue #664: if present, POST 
 const contractNeverExistsFlagPath = process.argv[13]; // issue #664: if present, every NON-owner address reports 'nonexist' forever, so the post-broadcast probe stays inconclusive
 const slowAddrFlagPath = process.argv[14]; // issue #949: if present, its CONTENTS name an address -- EVERY request whose URL contains that address substring (accounts/blockchain/seqno alike) is delayed SLOW_ADDR_DELAY_MS before answering normally. A synchronization aid, not a failure mode: it opens a wide, deterministic window between the pending-spend record write and the funding broadcast/confirmation for a test to mutate on-disk state (e.g. revoke write access to the pending-spend log) without racing a normally-instant mocked round trip.
 const SLOW_ADDR_DELAY_MS = 3000;
+// issue #948: if present, EVERY non-owner address unconditionally reports 'nonexist',
+// bypassing the #638 "seen" tracking below entirely (not just delaying it, like
+// neverActiveFlagPath does after a first 'nonexist' reply). Real tonapi state changes
+// only when a transfer actually lands on-chain, never merely from being asked about --
+// the seenAddrs flip-to-'active'-on-any-second-query behavior below is an intentional
+// simplification for every OTHER test in this script, but it happens to make the #948
+// race structurally impossible to reproduce here: whichever of two racing processes'
+// already-active checks lands second would always already read 'active', even with
+// NO lock at all, purely because it was the second query -- never because anything was
+// actually broadcast. This flag lets the #948 positive control hold BOTH processes'
+// checks at 'nonexist' independent of query order, the same way a real tonapi would for
+// two processes whose checks both land before either broadcast is even sent.
+const concurrentRaceFlagPath = process.argv[15];
 
 const seenAddrs = new Set(); // issue #638: first-ever query for an address -> 'nonexist'; every query after that -> 'active' (see header comment above)
 
@@ -251,6 +264,8 @@ function handle(req, res) {
   const isFrozenTarget = frozenAddr && url.pathname.includes(frozenAddr);
   const lowBalance = lowBalanceFlagPath && existsSync(lowBalanceFlagPath) && url.pathname.includes(ownerAddr);
   const neverActive = neverActiveFlagPath && existsSync(neverActiveFlagPath) && !url.pathname.includes(ownerAddr);
+  const concurrentRace =
+    concurrentRaceFlagPath && existsSync(concurrentRaceFlagPath) && !url.pathname.includes(ownerAddr);
   let status;
   if (contractNeverExistsFlagPath && existsSync(contractNeverExistsFlagPath)) {
     // issue #664: nothing ever shows on-chain, so the post-broadcast probe cannot
@@ -259,6 +274,19 @@ function handle(req, res) {
     status = 'nonexist';
   } else if (isFrozenTarget) {
     status = 'frozen';
+  } else if (concurrentRace) {
+    // issue #948: unconditionally 'nonexist' (see this flag's own declaration comment
+    // above), but STILL mark the address seen -- once this flag file is removed, the
+    // very next query for this SAME address must read 'active' immediately (standing in
+    // for the transfer having genuinely landed while the flag was held), not bounce
+    // through one more 'nonexist' reply the way a real first-ever deploy's #638 flow
+    // does in the branch below. This is a deliberately DIFFERENT side effect from that
+    // branch, kept in its own arm rather than folded into it, so no EXISTING test's
+    // seenAddrs timing changes when this flag is not in use.
+    const addrMatch = url.pathname.match(/^\/v2\/(?:blockchain\/)?accounts\/([^/]+)$/);
+    const addr = addrMatch ? addrMatch[1] : null;
+    if (addr) seenAddrs.add(addr);
+    status = 'nonexist';
   } else {
     // issue #638: see the "seen" tracking header comment above this mock's source.
     // `firstQuery` is computed even when neverActive applies (below), so a GENUINELY
@@ -293,8 +321,9 @@ CONTRACT_LOOKUP_FAIL_FLAG="$TMP/contract-lookup-fail-flag"
 BROADCAST_FAIL_FLAG="$TMP/broadcast-fail-flag"
 CONTRACT_NEVER_EXISTS_FLAG="$TMP/contract-never-exists-flag"
 SLOW_ADDR_FLAG="$TMP/slow-addr-flag"
+CONCURRENT_RACE_FLAG="$TMP/concurrent-race-flag" # issue #948
 TONAPI_PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" "$UNFUNDED_ADDR_FLAG" "$LOOKUP_FAIL_ADDR_FLAG" "$CONTRACT_LOOKUP_FAIL_FLAG" "$BROADCAST_FAIL_FLAG" "$CONTRACT_NEVER_EXISTS_FLAG" "$SLOW_ADDR_FLAG" &
+node "$TMP/mock-tonapi.mjs" "$TONAPI_PORT" "$TON_PROVIDER_OWNER_ADDR" "$LOW_BALANCE_FLAG" "$FROZEN_ADDR_FLAG" "$SEQNO_FILE" "$BROADCAST_LOG" "$NEVER_ACTIVE_FLAG" "$UNFUNDED_ADDR_FLAG" "$LOOKUP_FAIL_ADDR_FLAG" "$CONTRACT_LOOKUP_FAIL_FLAG" "$BROADCAST_FAIL_FLAG" "$CONTRACT_NEVER_EXISTS_FLAG" "$SLOW_ADDR_FLAG" "$CONCURRENT_RACE_FLAG" &
 TONAPI_PID=$!
 export CYPHER_BRAIN_TON_TONAPI_URL="http://127.0.0.1:$TONAPI_PORT"
 
@@ -1641,6 +1670,175 @@ MCP_CONFIRMED_WRITE_TEST_TMP="$TMP" \
   MCP_CONFIRMED_WRITE_TEST_WALLET_ADDR_RAW="$TON_WALLET_ADDR_RAW" \
   MCP_CONFIRMED_WRITE_TEST_RECIPIENT="$CYPHER_BRAIN_HOME/recipient.txt" \
   node scripts/selftest-ton-provider-mcp-confirmed-write.mjs
+# issue #948: two SEPARATE processes racing the SAME derived contract must never
+# both fund it. #638 (above) already covers the SEQUENTIAL retry case (one process,
+# checks again later); this is the genuinely concurrent case: two pushes, neither
+# aware of the other, whose already-active checks both land while the contract is
+# still 'nonexist' -- realistically an operator's manual run overlapping a
+# scheduled nightly one, or simply two terminals. See push-lock.ts's module header
+# and ton-provider.ts's #948 comments (around the already-active check) for the
+# full race description and the fix (a cross-process advisory lock keyed on the
+# derived contract address, held from the already-active check through on-chain
+# confirmation).
+#
+# $CONCURRENT_RACE_FLAG (mock-tonapi.mjs, declared above) is what makes this
+# reproducible against a mock at all: the ordinary #638 "seen" tracking flips ANY
+# address to 'active' on its second query regardless of what caused that query,
+# which would make two processes' checks structurally unable to both observe
+# 'nonexist' here (whichever query happens to land second always reads 'active',
+# even with zero broadcasts and zero lock). Holding this flag keeps the derived
+# contract at 'nonexist' for BOTH processes' checks no matter how many times either
+# queries it -- standing in for a real tonapi's indexing lag, or simply two checks
+# that both genuinely ran before either broadcast reached the network.
+# ========================================================================
+mkdir -p "$TMP/issue948-src"
+printf 'ton-provider issue #948 concurrent-fund race test payload\n' >"$TMP/issue948-src/note.txt"
+cb snapshot --dir "$TMP/issue948-src" --out "$TMP/issue948.age"
+I948_SIZE=$(stat -f%z "$TMP/issue948.age" 2>/dev/null || stat -c%s "$TMP/issue948.age")
+echo "$I948_SIZE" >"$TMP/notify-downloaded"
+
+: >"$BROADCAST_LOG"
+touch "$CONCURRENT_RACE_FLAG"
+
+echo "== issue #948: two concurrent pushes racing the SAME contract must broadcast only ONE funding transfer =="
+# Process A: an ordinary auto-sign push. With the race flag held, its own
+# already-active check reads 'nonexist' and it proceeds to broadcast -- exactly
+# the "process A completes its funding transfer first" half of the issue.
+CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS=30000 CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS=200 \
+  CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue948.age" --backend ton-provider >"$TMP/issue948-a.out" 2>"$TMP/issue948-a.err" &
+PID_A=$!
+
+# Wait for A's transfer to actually land (broadcast recorded) before starting B --
+# "process B is delayed relative to A" (the issue's own framing). The race flag
+# keeps the contract reading 'nonexist' regardless, so B's own already-active check
+# below sees exactly what A's did a moment ago.
+A_BROADCAST=0
+for _ in $(seq 1 100); do
+  [ -s "$BROADCAST_LOG" ] && {
+    A_BROADCAST=1
+    break
+  }
+  sleep 0.1
+done
+if [ "$A_BROADCAST" != 1 ]; then
+  echo "[FAIL] issue #948 setup: process A never broadcast within 10s"
+  kill "$PID_A" 2>/dev/null || true
+  rm -f "$CONCURRENT_RACE_FLAG"
+  exit 1
+fi
+
+# Process B: a SEPARATE, independent push for the SAME file + SAME wallet, started
+# only now -- never coordinated with A via --save-locator or any other mechanism,
+# matching the issue's own "two terminals" framing. WITHOUT the #948 fix this races
+# straight to its own broadcast (and then blocks in its OWN waitForContractActive(),
+# same as A, since the race flag is still held); WITH the fix it blocks on
+# push-lock.ts's acquirePushLock('ton-provider-contract', <addr>), which A is still
+# holding (A is itself blocked inside waitForContractActive(), unable to observe
+# 'active' while the race flag is held) -- so B either waits out push-lock.ts's fixed
+# WAIT_MS and is refused (PushLockHeldError / CB-E028), or, if it happens to acquire
+# the lock after A releases it, correctly observes the contract already active and
+# skips funding.
+#
+# Deliberately generous timeouts (60s) on BOTH pushes' own waitForContractActive():
+# in the UNFIXED case, A and B's confirm-polls run CONCURRENTLY (nothing serializes
+# them), and this script does not lift the race flag until it has observed B's own
+# outcome below -- so both loops must comfortably outlast this script's own
+# orchestration overhead (B's setup + the bounded poll below), not just one push's.
+CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS=30000 CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS=200 \
+  CYPHER_BRAIN_TON_WALLET="$TMP/ton-wallet.json" CYPHER_BRAIN_TON_PROVIDER_OWNER= \
+  cb push --in "$TMP/issue948.age" --backend ton-provider >"$TMP/issue948-b.out" 2>"$TMP/issue948-b.err" &
+PID_B=$!
+
+# Do NOT wait for B to run to its own natural completion before lifting the race
+# flag -- in the UNFIXED case B never fails on its own (nothing refuses it), it just
+# broadcasts and then blocks in waitForContractActive() exactly like A, so waiting
+# for B to EXIT here would wait for its own 30s confirm-timeout, racing A's identical
+# deadline (started earlier) and spuriously failing A. Instead, poll (bounded, 15s)
+# for the one thing that actually distinguishes the two outcomes: either a SECOND
+# broadcast appears (the bug), or B's own process has already exited on its own
+# (the fix's fast CB-E028 refusal, which happens well under 15s: push-lock.ts's
+# WAIT_MS is a fixed 5s, plus B's own bag-creation/provider-search setup time).
+B_DIVERGED=0
+for _ in $(seq 1 150); do
+  BROADCASTS_SO_FAR=$(grep -c '"boc"' "$BROADCAST_LOG" || true)
+  if [ "$BROADCASTS_SO_FAR" -ge 2 ] 2>/dev/null; then
+    B_DIVERGED=1
+    break
+  fi
+  if ! kill -0 "$PID_B" 2>/dev/null; then
+    B_DIVERGED=1
+    break
+  fi
+  sleep 0.1
+done
+if [ "$B_DIVERGED" != 1 ]; then
+  echo "[FAIL] issue #948 setup: process B neither broadcast a second transfer nor exited within 15s"
+  kill "$PID_A" "$PID_B" 2>/dev/null || true
+  rm -f "$CONCURRENT_RACE_FLAG"
+  exit 1
+fi
+
+# Only now let A's (and, if it is still running, B's) waitForContractActive()
+# observe the contract as active -- simulating the real broadcast finally being
+# indexed. Both pushes' own confirm-poll is 200ms, so this resolves quickly.
+rm -f "$CONCURRENT_RACE_FLAG"
+A_EXIT=0
+wait "$PID_A" || A_EXIT=$?
+B_EXIT=0
+wait "$PID_B" || B_EXIT=$?
+
+[ "$A_EXIT" = 0 ] || {
+  echo "[FAIL] issue #948: process A (the genuine first push) did not succeed once the race window closed"
+  cat "$TMP/issue948-a.err"
+  exit 1
+}
+A_LOC=$(cat "$TMP/issue948-a.out")
+printf '%s' "$A_LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' || {
+  echo "[FAIL] issue #948: process A did not return a locator: $A_LOC"
+  exit 1
+}
+
+# The single most important assertion in this PR: however B's own push resolved,
+# AT MOST ONE funding transfer for this contract was ever broadcast.
+BROADCASTS=$(grep -c '"boc"' "$BROADCAST_LOG" || true)
+[ "$BROADCASTS" = "1" ] || {
+  echo "[FAIL] issue #948 REGRESSION: $BROADCASTS funding transfer(s) were broadcast for the SAME contract by two concurrent pushes racing it (expected exactly 1) -- this is the double-fund race"
+  cat "$BROADCAST_LOG"
+  echo "--- process A stderr ---"
+  cat "$TMP/issue948-a.err"
+  echo "--- process B stderr ---"
+  cat "$TMP/issue948-b.err"
+  exit 1
+}
+echo "[PASS] issue #948: exactly one funding transfer was broadcast despite two concurrent pushes racing the same contract"
+
+if [ "$B_EXIT" = 0 ]; then
+  B_LOC=$(cat "$TMP/issue948-b.out")
+  [ "$A_LOC" = "$B_LOC" ] || {
+    echo "[FAIL] issue #948: process B succeeded but with a DIFFERENT locator than A ($B_LOC vs $A_LOC)"
+    exit 1
+  }
+  grep -q 'already shows on-chain activity' "$TMP/issue948-b.err" || {
+    echo "[FAIL] issue #948: process B succeeded without reporting the already-active skip"
+    cat "$TMP/issue948-b.err"
+    exit 1
+  }
+  echo "[PASS] issue #948: process B waited behind the cross-process lock and then correctly skipped re-funding an already-active contract"
+else
+  grep -q 'another push is in flight for TON StorageV1 contract' "$TMP/issue948-b.err" || {
+    echo "[FAIL] issue #948: process B failed but not with the expected cross-process contract-lock refusal"
+    cat "$TMP/issue948-b.err"
+    exit 1
+  }
+  grep -q 'CB-E028' "$TMP/issue948-b.err" || {
+    echo "[FAIL] issue #948: process B's refusal did not carry the CB-E028 error code"
+    cat "$TMP/issue948-b.err"
+    exit 1
+  }
+  echo "[PASS] issue #948: process B was refused outright by the cross-process contract lock (CB-E028) rather than sending a second transfer"
+fi
+echo "$SIZE" >"$TMP/notify-downloaded" # restore for later tests
 
 echo "== schedule install --backend ton-provider is eligible ONLY when a TON wallet is configured (#396 PR2) =="
 if CYPHER_BRAIN_TON_WALLET= cb schedule install --backend ton-provider --dir "$SRC" --no-load \
