@@ -94,6 +94,7 @@ export interface CliOptions {
   chain?: string; // wallet create/address/balance --chain arweave|ton (default arweave, #396 PR2): which credential type wallet.ts operates on
   plan?: string; // push --plan <path.json>: re-validate a plan file written by "estimate --out" before proceeding (#231)
   sss?: string; // keygen --sss <m>-of-<n>: Shamir threshold policy for a disaster-recovery share set (#207) — no default, always explicit
+  from_restored_dir?: string; // bagit-export --from-restored-dir <dir>: an already-restored ("restore --out-dir") directory to package as a BagIt 1.0 bag (#217)
 }
 
 /**
