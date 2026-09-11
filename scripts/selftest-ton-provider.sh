@@ -1957,8 +1957,15 @@ PID_A=$!
 # "process B is delayed relative to A" (the issue's own framing). The race flag
 # keeps the contract reading 'nonexist' regardless, so B's own already-active check
 # below sees exactly what A's did a moment ago.
+# issue #951 (widened, not a new race): provider selection/live-terms-checking now
+# runs INSIDE the #948 lock (only once the already-active check finds nothing to
+# skip — see ton-provider.ts's own #951 comment), so process A now does more real
+# work (two local mock HTTP calls plus a subprocess exec for the rates binary)
+# between acquiring the lock and reaching broadcast than it did before that reorder.
+# 20s (was 10s) gives that real work headroom under a loaded machine without
+# masking a genuine hang.
 A_BROADCAST=0
-for _ in $(seq 1 100); do
+for _ in $(seq 1 200); do
   [ -s "$BROADCAST_LOG" ] && {
     A_BROADCAST=1
     break
@@ -1966,7 +1973,7 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 if [ "$A_BROADCAST" != 1 ]; then
-  echo "[FAIL] issue #948 setup: process A never broadcast within 10s"
+  echo "[FAIL] issue #948 setup: process A never broadcast within 20s"
   kill "$PID_A" 2>/dev/null || true
   rm -f "$CONCURRENT_RACE_FLAG"
   exit 1
