@@ -113,6 +113,13 @@ import {
 } from '../push-partial-success.js';
 import { PushUncertainSpendError } from '../push-uncertain-spend.js';
 import { spentSoFar, remainingSpendBudget, chargeSpendTracker } from '../spend-tracker.js';
+// #948: the SAME cross-process advisory lock pushpull.ts (--save-locator, witness
+// catalog) and backends/rclone.ts already use for their own check-then-act races
+// (#806/#807) — see push-lock.ts's module header for why this file's already-active
+// guard is a THIRD instance of that exact shape, not a new problem needing a new fix.
+// Also a leaf module (config/idempotency/util/warn only), so importing it here does not
+// close an import cycle either, same reasoning as the two imports above.
+import { acquirePushLock } from '../push-lock.js';
 // #808/#665: the durable "a paid deploy is about to happen / has happened" sidecar, and
 // the receipt ledger it settles against. Both are leaf modules (config/util only), so
 // neither closes an import cycle back into this file — same reasoning as the
@@ -523,15 +530,26 @@ async function fetchWalletSeqno(addr: TonAddress): Promise<number> {
 // client-side response parsing failed on an unrelated bug, proving the two are separate
 // events).
 //
-// KNOWN LIMITATIONS (Codex review, xhigh pass — accepted as-is, not fixed here):
-// - No cross-process seqno lock: two overlapping pushes against the SAME wallet (a manual
-//   CLI run racing a cron-fired schedule, or two concurrent MCP calls) can read the same
-//   seqno and race to broadcast. TON's own seqno-replay-protection bounds the blast
-//   radius — the SECOND external message to actually land on-chain is rejected outright
-//   (wrong seqno), not silently double-spent or misdirected — so the worst case is "one of
-//   the two pushes fails and needs a retry," not fund loss. A file lock would close this
-//   gap but adds real complexity for a rare edge case with a self-healing failure mode;
-//   left as a documented limitation rather than implemented speculatively.
+// KNOWN LIMITATIONS (Codex review, xhigh pass):
+// - #948 CORRECTED an earlier version of this comment, which assumed TON's own
+//   seqno-replay-protection bounded two overlapping pushes to "one fails and needs a
+//   retry, not fund loss." That is true for a SEQUENTIAL retry against a stale seqno
+//   (the #638 case), but not for genuine cross-process concurrency: if process A's
+//   broadcast lands FIRST, process B — which read the SAME pre-broadcast seqno but was
+//   merely delayed, not rejected — fetches the wallet's now-ADVANCED seqno afterward and
+//   builds its OWN transfer against that fresh, valid seqno. That second transfer is not
+//   a replay at all; it is a second, genuinely valid, irreversible transfer, and TON's
+//   replay protection has nothing to say about it. put() now closes this specific gap by
+//   holding a cross-process advisory lock (push-lock.ts's acquirePushLock, keyed on the
+//   derived contract address — the SAME primitive #806/#807 already use for their own
+//   check-then-act races) around the whole "check the contract isn't already
+//   active" -> "broadcast/deeplink" -> "confirm active on-chain" sequence, so a second
+//   process racing the SAME contract either waits for the first to finish (and then sees
+//   the contract genuinely active, skipping its own funding) or is refused outright
+//   (PushLockHeldError / CB-E028) rather than silently sending a second transfer. This is
+//   a same-machine, same-CYPHER_BRAIN_HOME guarantee (push-lock.ts's own SCOPE section) —
+//   it does not, and cannot, protect against a human manually broadcasting a competing
+//   transfer against this same contract address outside cypher-brain entirely.
 // - CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND caps `deploy.amountNano` (the internal transfer
 //   value), not literally every nanoTON the wallet's balance drops by: SendMode.PAY_GAS_SEPARATELY
 //   means the wallet's own forward/network fee (observed ~0.001 TON in real dogfooding,
@@ -1534,15 +1552,40 @@ export function tonProviderBackend(): StorageBackend {
         // all) is the only status this backend's own first-ever deploy for a bag/owner
         // pair should ever observe here.
         //
-        // A narrower race remains: tonapi's own indexing can lag a JUST-broadcast
-        // transaction by a moment, during which this SAME address can still read back
-        // as 'nonexist' even though a transfer is already in flight. A retry landing in
-        // that indexing-lag window is bounded by the SAME seqno-replay protection
-        // already documented above (at most one of the two transfers is accepted), not
-        // by this check — closing it fully would need a persisted "broadcast in flight"
-        // record surviving process restarts, real complexity for an edge window this
-        // fix does not claim to eliminate, left as a known limitation (see this PR's
-        // description) rather than implemented speculatively.
+        // #948: this check ALONE is a TOCTOU race across PROCESSES — two pushes for the
+        // SAME contract (no `--save-locator` coordination between them; a realistic
+        // shape is an operator's manual run overlapping a scheduled nightly one, or
+        // simply two terminals) can both read 'nonexist' here, both pass, and both go on
+        // to broadcast: if process A's transfer lands first, process B fetches the
+        // wallet's now-ADVANCED seqno afterward and sends its OWN transfer with that
+        // fresh seqno — a second, genuinely valid, ACCEPTED transaction, not a rejected
+        // replay (autoSignAndBroadcastDeploy()'s own KNOWN LIMITATIONS comment above,
+        // corrected by this same fix, explains why the wallet's seqno-replay protection
+        // does not save this the way it might look like it should). Re-running this same
+        // read immediately before the broadcast would only narrow that window, not close
+        // it, for two processes that are genuinely concurrent rather than sequential — so
+        // this whole block (through waitForContractActive() below) is now held under
+        // push-lock.ts's acquirePushLock('ton-provider-contract', <this contract
+        // address>), the SAME cross-process advisory lock #806/#807 already use for their
+        // own check-then-act races: a second process racing this exact contract either
+        // waits for the first to finish confirming on-chain (and then observes it
+        // genuinely active, so it correctly skips funding) or is refused outright
+        // (PushLockHeldError, CB-E028) — never a second silent transfer.
+        //
+        // A narrower race is NOT closed by that lock, stated honestly rather than
+        // claiming a perfect fix: tonapi's own indexing can lag a JUST-broadcast
+        // transaction by a moment, during which this SAME address can still read back as
+        // 'nonexist'. If THIS run's own broadcast outcome is ambiguous (the POST throws —
+        // see the PushUncertainSpendError branch further down), this run correctly
+        // refuses to guess and releases the lock on its way out; a LATER, independent
+        // retry that then acquires the freed lock and lands inside that same brief
+        // indexing-lag window can still read 'nonexist' and double-send. Closing that
+        // fully would need a persisted "broadcast in flight" record surviving process
+        // restarts (the pending-spend intent recorded below is written AFTER this check,
+        // not before, and exists for ledger recovery, not for gating a future run's own
+        // already-active read) — real complexity for an edge window neither this check
+        // nor the lock claims to eliminate, left as a known, narrow, honestly-documented
+        // limitation rather than implemented speculatively.
         //
         // #805: a check that cannot ANSWER now fails CLOSED. This guard originally fell
         // back to "proceed as if the contract is fresh" on a lookup failure, reasoning
@@ -1563,487 +1606,523 @@ export function tonProviderBackend(): StorageBackend {
         // "fresh": the only status this backend's own first-ever deploy for a bag/owner
         // pair should ever see here is `nonexist`, and anything we did not actually read
         // could equally be `uninit`/`active`/`frozen`.
-        let alreadyActive = false;
-        let observedStatus = '';
-        let lastLookupError: unknown = null;
-        for (let attempt = 0; attempt < ALREADY_ACTIVE_CHECK_ATTEMPTS; attempt++) {
-          if (attempt > 0) await sleep(ALREADY_ACTIVE_CHECK_INTERVAL_MS);
-          try {
-            const contractState = await fetchAccountState(deploy.contractAddress);
-            observedStatus = contractState.status;
-            alreadyActive = observedStatus !== 'nonexist';
-            lastLookupError = null;
-            break;
-          } catch (e) {
-            lastLookupError = e;
-          }
-        }
-        if (lastLookupError !== null) {
-          throw new Error(
-            `ton-provider backend: could not determine whether contract ${deploy.contractAddress.toRawString()} ` +
-              `has already been funded (${ALREADY_ACTIVE_CHECK_ATTEMPTS} tonapi lookups failed, last: ` +
-              `${errMsg(lastLookupError)}) — refusing to broadcast a ${deploy.amountNano} nanoTON transfer that ` +
-              'could be a SECOND payment for the same contract. This is a fail-closed refusal: no funds moved. ' +
-              "Check the address's state on a TON explorer, or re-run push once tonapi is reachable again (the " +
-              'same ciphertext resolves to the same bag id and reuses this bag, so nothing is lost by waiting).',
-          );
-        }
-        if (!alreadyActive) {
-          // Charge this deploy's amount against the shared tracker THE MOMENT it is
-          // known to be within budget AND actually going to be broadcast (i.e. after
-          // the #638 already-active check above finds nothing to skip) — before
-          // autoSignAndBroadcastDeploy()/the Tonkeeper deeplink below even run, so a
-          // SECOND put() call in the same push (the ".minisig" sidecar) sees this one
-          // counted regardless of how far the current call gets afterward (#639).
-          // Deliberately NOT charged in the alreadyActive branch: that branch moves no
-          // funds at all (see the money-safety comment above), so charging it there
-          // would falsely shrink the sidecar's remaining budget for a spend that never
-          // happened this run.
-          chargeSpendTracker(opts.spendTracker, deploy.amountNano);
-        }
-        if (alreadyActive) {
-          // warn() (#347), not a raw console.error: this is a safety-relevant skip
-          // decision, not routine progress output — an MCP-driven caller (an agent
-          // retrying a failed push, exactly issue #638's own motivating scenario) must
-          // see this in the structured result's warnings[] array, not only in a
-          // background log nobody is watching.
-          warn(
-            `ton-provider: contract ${deploy.contractAddress.toRawString()} already shows on-chain activity ` +
-              `(status=${observedStatus}) — this looks like a retry of an already-broadcast (or already-completed) ` +
-              `deploy for the same bag/owner. Skipping re-funding (no new ${deploy.amountNano} nanoTON transfer) ` +
-              "and going straight to notify. Which provider is notified is NOT this run's registry pick: it is " +
-              "read back from the contract's own on-chain providers dict, falling back to this machine's " +
-              'pending-spend intent and then the receipt if that read cannot answer, and refusing rather than ' +
-              'guessing if none of them can (#665). The lines below say which source answered.',
-          );
-        }
-
-        // ---------- #808/#665: reconcile with what an EARLIER run durably recorded ----------
-        // Keyed on the contract address for the same reason the #638 guard above is: it
-        // is stable across runs (bag id + owner + size + piece size + merkle hash — never
-        // which provider was picked), and it is the identifier an operator checks on an
-        // explorer.
+        //
+        // #948: the contract address is already known (buildDeploy() derived it above,
+        // from bagId+owner+size+pieceSize+merkleHash alone — never the provider/rate it
+        // was quoted against), so the cross-process lock is acquired BEFORE this read and
+        // held through the check below, the broadcast/deeplink, AND the on-chain
+        // confirmation that follows — one held section, not a re-check bolted on right
+        // before the broadcast (see the comment above this whole guard for why a re-check
+        // alone would only narrow, not close, the race for two genuinely concurrent
+        // processes). `notifyPubkey`/`resumable`/`priorReceipt`/`intent` are declared out
+        // here rather than where they are first assigned below, purely so they stay in
+        // scope past this lock's `finally` — they are read again after the lock is
+        // released (the notify step moves no funds and does not need to hold it).
         const contractAddressRaw = deploy.contractAddress.toRawString();
-        // #665: which provider to notify. On a fresh deploy that is this run's own
-        // selection. On the already-active branch it must NOT be — the contract's
-        // on-chain `providers` dict was written by whichever run actually deployed it,
-        // and `modify_providers` REPLACES rather than merges (see
-        // scripts/go/storage-v1-client/updateproviders.go), so notifying a provider this
-        // run happened to pick from a fresher mytonprovider.org snapshot can address a
-        // provider that never held this bag at all.
+        let alreadyActive = false;
         let notifyPubkey = provider.pubkey;
-        // #808: an earlier run's confirmed-but-unrecorded spend, if there is one.
         let resumable: SpendIntentRecord | null = null;
         let priorReceipt: ReceiptEntry | null = null;
-        if (alreadyActive) {
-          // Read failures propagate rather than degrading to "nothing recorded": the two
-          // decisions below (write a missing receipt / notify the deployed provider) are
-          // both WRONG if taken on a log that could not be read, and this branch has
-          // moved no funds, so refusing costs nothing but a retry — the same fail-closed
-          // posture as the #805 guard above.
-          const { intents, skippedLines: intentSkipped } = await readSpendIntents();
-          const receiptLookup = await ledgerReceiptForContract(contractAddressRaw);
-          priorReceipt = receiptLookup.receipt;
-          // An UNREADABLE line is not an absent one (multi-model review): a line this
-          // version cannot parse — a future schema, a truncated write, a hand edit — could
-          // be the very record that names this contract's provider or its already-written
-          // receipt. Both decisions below therefore treat "some line could not be read" as
-          // "this log cannot answer", not as "the answer is no".
-          const logsFullyReadable = intentSkipped === 0 && receiptLookup.skippedLines === 0;
-          // Authority (a): this backend's own durable records — the intent written before
-          // the deploy that actually paid (#808), else the receipt written after it
-          // (#654/#484). Authority (b) — the contract's own on-chain dict, read just
-          // below — outranks both; this block computes (a) first because (b) also uses
-          // it to disambiguate a contract that names more than one provider, and because
-          // (a) is what stays in charge when the on-chain read cannot answer.
-          //
-          // Ranked, not "most recent wins": a CONFIRMED intent and a receipt each describe
-          // a deploy that was actually observed on-chain, while a `pending` intent records
-          // only that a transfer was attempted — and local append order says nothing about
-          // which `modify_providers` message won on-chain. Two confirmed records that
-          // disagree cannot both be right, so that fails closed rather than picking one.
-          const recorded = recordedProvidersForContract(intents, contractAddressRaw);
-          const receiptPubkey = providerPubkeyFromReceipt(priorReceipt);
-          const attested = [...new Set([...recorded.confirmed, ...(receiptPubkey ? [receiptPubkey] : [])])];
-          const haveSomeRecord =
-            intents.some((i) => i.contract_address === contractAddressRaw) || priorReceipt !== null;
-          // Everything this machine's own logs offer as a candidate, attested or not —
-          // used below both as authority (a)'s answer and, when the chain names more than
-          // one provider, as the tie-break among them. Order is the tie-break's priority
-          // and is load-bearing: confirmed pending-spend intents first, then the receipt,
-          // then unconfirmed intents — strongest evidence that a deploy actually happened
-          // to weakest.
-          const localCandidates = [...new Set([...attested, ...recorded.unconfirmed])];
-          // Unchanged from #824 except for the explicit `attested.length === 0` guard,
-          // which used to be implied by position (this was computed only after the
-          // disagreement throw, so attested.length was 0 or 1 by then). An unconfirmed
-          // candidate is still used only when it is the ONLY one and nothing attested
-          // contradicts it.
-          const recordedPubkey =
-            attested.length === 1
-              ? attested[0]
-              : attested.length === 0 && recorded.unconfirmed.length === 1
-                ? recorded.unconfirmed[0]
-                : null;
-
-          // Authority (b), the top of the ranking: the contract's OWN on-chain
-          // `providers` dict. Read AFTER the logs above because a contract naming more
-          // than one provider still needs a local record (or this run's own pick) to
-          // choose between them — the chain says who is registered, not which of several
-          // registrations this push is a retry of.
-          const { pubkeys: onChainPubkeys, reason: onChainFailure } = await readOnChainProviders(contractAddressRaw);
-          // The tie-break for a contract naming SEVERAL providers considers only what
-          // this machine durably recorded — never this run's registry pick (multi-model
-          // review, Critical). That pick is the untrusted input this whole authority
-          // exists to overrule; letting it break a tie would smuggle it back in as an
-          // answer for a contract nothing local can vouch for.
-          const fromChain =
-            onChainPubkeys === null || onChainPubkeys.length === 0
-              ? null
-              : onChainPubkeys.length === 1
-                ? onChainPubkeys[0]
-                : (localCandidates.find((c) => onChainPubkeys.includes(c)) ?? null);
-          if (onChainPubkeys === null) {
-            // Soft, on purpose: this is exactly the case authority (a) already handles,
-            // and it shipped working in #824. Reported rather than swallowed because a
-            // reader of the run summary must be able to tell an answer that came from the
-            // chain from one that came from a local note (#347's relay contract).
-            warn(
-              `ton-provider: could not read contract ${contractAddressRaw}'s own on-chain providers dict via ` +
-                `scripts/go/storage-v1-client (${onChainFailure ?? 'unknown reason'}) — falling back to this ` +
-                "machine's own records to decide whom to notify (#665).",
-            );
-          }
-
-          if (onChainPubkeys !== null && onChainPubkeys.length === 0) {
-            // An EMPTY dict is an ANSWER, not silence (multi-model review, Critical):
-            // the contract itself says no provider is registered for it, so notifying
-            // anyone — this run's pick or a local record — addresses a provider the
-            // contract does not name, which is precisely what #665 exists to stop. Fail
-            // loudly instead. Free to do here: this branch has moved no funds, and the
-            // same artifact re-derives the same bag and contract on a later run.
-            throw new Error(
-              `ton-provider backend: contract ${contractAddressRaw} is funded on-chain but its own providers dict ` +
-                'is EMPTY — it currently registers NO provider, so notifying anyone would address a provider the ' +
-                'contract does not name. Register one deliberately with `update-providers` ' +
-                '(scripts/go/storage-v1-client) and push again (#665). No funds moved.',
-            );
-          }
-          if (onChainPubkeys !== null && onChainPubkeys.length > 0) {
-            if (fromChain === null) {
-              throw new Error(
-                `ton-provider backend: contract ${contractAddressRaw}'s on-chain providers dict names ` +
-                  `${onChainPubkeys.length} providers (${onChainPubkeys.join(', ')}) and this machine recorded ` +
-                  'none of them — refusing to pick one on your behalf, since notifying the wrong one addresses a ' +
-                  "provider that may never have held this bag, and this run's own registry pick " +
-                  `(${provider.pubkey}) is not evidence of which one did. Re-run \`update-providers\` ` +
-                  '(scripts/go/storage-v1-client) to register a single provider deliberately (#665). No funds moved.',
-              );
-            }
-            notifyPubkey = fromChain;
-            const contradicted = localCandidates.filter((c) => !onChainPubkeys.includes(c));
-            if (contradicted.length > 0) {
-              warn(
-                `ton-provider: this machine's records name provider(s) ${contradicted.join(', ')} for contract ` +
-                  `${contractAddressRaw}, but the contract's OWN on-chain providers dict names ` +
-                  `${onChainPubkeys.join(', ')} — using the on-chain answer (${fromChain}), which outranks a local ` +
-                  'note because `modify_providers` REPLACES the dict rather than merging into it, so whatever the ' +
-                  `chain holds now IS the registration. Reconcile ${PENDING_SPENDS_LOG} / ${RECEIPT_LEDGER} if this ` +
-                  'is a surprise (#665).',
-              );
-            } else if (localCandidates.length === 0) {
-              warn(
-                `ton-provider: no local record names the provider contract ${contractAddressRaw} was deployed with, ` +
-                  `so the contract's own on-chain providers dict was read instead — notifying ${fromChain}, the ` +
-                  'provider the contract itself registers (#665).',
-              );
-            }
-            if (fromChain !== provider.pubkey) {
-              warn(
-                `ton-provider: contract ${contractAddressRaw} was deployed with provider ${fromChain}, but this ` +
-                  `run's registry snapshot selected ${provider.pubkey} — notifying ${fromChain}, the one the ` +
-                  "contract's own on-chain dict names (#665). To hand this bag to a DIFFERENT provider, register " +
-                  'it deliberately with `update-providers` (scripts/go/storage-v1-client) — a retry must not do it ' +
-                  'by accident.',
-              );
-            }
-          } else if (attested.length > 1) {
-            throw new Error(
-              `ton-provider backend: this machine's records disagree about which provider contract ` +
-                `${contractAddressRaw} was deployed with (${attested.join(', ')}) — refusing to notify any of them, ` +
-                'since `modify_providers` REPLACES rather than merges and notifying the wrong one addresses a ' +
-                `provider that may never have held this bag. Reconcile ${PENDING_SPENDS_LOG} and ${RECEIPT_LEDGER}, ` +
-                'or re-run `update-providers` (scripts/go/storage-v1-client) to register one deliberately (#665). ' +
-                'No funds moved.',
-            );
-          } else if (recordedPubkey !== null) {
-            notifyPubkey = recordedPubkey;
-            if (attested.length === 0) {
-              warn(
-                `ton-provider: the only local record of contract ${contractAddressRaw}'s provider ` +
-                  `(${recordedPubkey}) comes from a spend this machine never saw confirm — notifying it as the best ` +
-                  'available answer, but it is not proof of what the contract’s on-chain dict names (#665).',
-              );
-            }
-            if (recordedPubkey !== provider.pubkey) {
-              warn(
-                `ton-provider: contract ${contractAddressRaw} was deployed with provider ${recordedPubkey}, but this ` +
-                  `run's registry snapshot selected ${provider.pubkey} — notifying the RECORDED provider ` +
-                  `${recordedPubkey}, the one the contract's on-chain dict actually names (#665). To hand this bag ` +
-                  'to a DIFFERENT provider, register it deliberately with `update-providers` ' +
-                  '(scripts/go/storage-v1-client) — a retry must not do it by accident.',
-              );
-            }
-          } else if (haveSomeRecord || !logsFullyReadable) {
-            // Either a record for this exact contract exists but names no usable provider
-            // (a hand-edited or foreign line), or several unconfirmed candidates disagree,
-            // or a line could not be read at all. Refusing beats guessing: notifying this
-            // run's freshly selected provider would address one that may never have held
-            // the bag, and no funds move either way on this branch.
-            throw new Error(
-              `ton-provider backend: contract ${contractAddressRaw} is already funded on-chain and this machine has ` +
-                'a record of that spend, but nothing readable names the provider it was deployed with — refusing ' +
-                `to notify this run's freshly selected provider ${provider.pubkey}, which may never have held this ` +
-                `bag. Check ${PENDING_SPENDS_LOG} / ${RECEIPT_LEDGER} for the contract's own provider pubkey, or ` +
-                're-run `update-providers` (scripts/go/storage-v1-client) to register a provider deliberately (#665).',
-            );
-          } else {
-            warn(
-              `ton-provider: no local record names the provider contract ${contractAddressRaw} was deployed with ` +
-                `(no pending-spend intent, no receipt) — notifying this run's selected provider ${provider.pubkey}, ` +
-                'which may not be the one holding the bag. Reading the provider back from the contract itself is ' +
-                'issue #665.',
-            );
-          }
-
-          // #808 recovery candidate. A contract address identifies a CONTRACT, not one
-          // spend, so more than one unsettled intent for it is ambiguous — which of them a
-          // single receipt would be for cannot be decided from a contract-level
-          // observation. That fails closed (record nothing, leave both for doctor and the
-          // operator) rather than settling an arbitrary one, which would leave a real
-          // transfer represented by no ledger entry at all (multi-model review). Unreadable
-          // lines block recovery for the same reason: a receipt may already exist in a line
-          // this version could not parse, and writing a second one would overstate spend.
-          const unsettled = unsettledIntentsForContract(intents, contractAddressRaw);
-          if (unsettled.length > 1) {
-            warn(
-              `ton-provider: ${unsettled.length} unsettled pending-spend records name contract ${contractAddressRaw} ` +
-                '— refusing to decide which of them a receipt would be for. None is being recorded automatically; ' +
-                `check the contract on a TON explorer and reconcile ${PENDING_SPENDS_LOG} by hand (#808).`,
-            );
-          } else if (unsettled.length === 1 && !logsFullyReadable) {
-            warn(
-              `ton-provider: an unrecorded spend for contract ${contractAddressRaw} cannot be safely recovered while ` +
-                `${PENDING_SPENDS_LOG} / ${RECEIPT_LEDGER} contain line(s) this version cannot read — a receipt may ` +
-                'already exist in one of them. Not writing one (#808).',
-            );
-          } else {
-            resumable = unsettled[0] ?? null;
-          }
-        }
-
-        // #808: the durable record goes down BEFORE anything can move funds, so a
-        // SIGKILL/OOM/power loss anywhere after the broadcast leaves evidence that a
-        // spend was attempted. Refuses the push if it cannot be written, rather than
-        // broadcasting a transfer nothing would be able to account for: no funds have
-        // moved at this point, and the same artifact re-derives the same bag and contract
-        // on a later run, so nothing is lost by stopping here (same "fail closed while it
-        // is still free" reasoning as the #805 guard above).
         let intent: SpendIntentRecord | null = null;
-        if (!alreadyActive) {
-          try {
-            intent = await recordSpendIntent({
-              backend: 'ton-provider',
-              contract_address: contractAddressRaw,
-              bag_id: bag.bagId,
-              provider_pubkey: provider.pubkey,
-              amount_nano: deploy.amountNano.toString(),
-              cost_nano: deploy.costNano.toString(),
-              deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
-              locator: tonProviderLocator(bag.bagId),
-            });
-          } catch (e) {
+        const releaseContractLock = await acquirePushLock('ton-provider-contract', contractAddressRaw);
+        try {
+          let observedStatus = '';
+          let lastLookupError: unknown = null;
+          for (let attempt = 0; attempt < ALREADY_ACTIVE_CHECK_ATTEMPTS; attempt++) {
+            if (attempt > 0) await sleep(ALREADY_ACTIVE_CHECK_INTERVAL_MS);
+            try {
+              const contractState = await fetchAccountState(deploy.contractAddress);
+              observedStatus = contractState.status;
+              alreadyActive = observedStatus !== 'nonexist';
+              lastLookupError = null;
+              break;
+            } catch (e) {
+              lastLookupError = e;
+            }
+          }
+          if (lastLookupError !== null) {
             throw new Error(
-              `ton-provider backend: could not write the pending-spend record to ${PENDING_SPENDS_LOG} ` +
-                `(${errMsg(e)}) — refusing to broadcast a ${deploy.amountNano} nanoTON transfer that nothing would ` +
-                'be able to account for if this process died before the receipt reached disk (#808). No funds ' +
-                'moved. Fix the path (permissions, a full disk, or CYPHER_BRAIN_RECEIPT_LEDGER pointing somewhere ' +
-                'unwritable) and re-run push — the same ciphertext reuses the same bag, so nothing is lost.',
+              `ton-provider backend: could not determine whether contract ${deploy.contractAddress.toRawString()} ` +
+                `has already been funded (${ALREADY_ACTIVE_CHECK_ATTEMPTS} tonapi lookups failed, last: ` +
+                `${errMsg(lastLookupError)}) — refusing to broadcast a ${deploy.amountNano} nanoTON transfer that ` +
+                'could be a SECOND payment for the same contract. This is a fail-closed refusal: no funds moved. ' +
+                "Check the address's state on a TON explorer, or re-run push once tonapi is reachable again (the " +
+                'same ciphertext resolves to the same bag id and reuses this bag, so nothing is lost by waiting).',
             );
           }
-        }
-        // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
-        // signer balance, #342) — WARN only, never abort, for BOTH signing paths: a
-        // balance read has no freshness guarantee, so it must never be what blocks a
-        // push (same posture turbo.ts uses for its non-TTY/unattended callers, now that
-        // ton-provider can ALSO run unattended via auto-signing, #396 PR2). Whichever
-        // path actually sends the transaction gives its own unambiguous refusal on a
-        // real shortfall — a human's Tonkeeper app, or the auto-sign broadcast/on-chain
-        // processing itself — so this exists only to save the wait through
-        // waitForContractActive() on a spend that was always going to fail. Left
-        // unconditional even when alreadyActive (the check above never blocks on it
-        // either) — a harmless, still-informative balance read either way.
-        // CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences it for one run (shared with turbo's
-        // check, not a ton-provider-specific flag). Both lines go through warn() (#347),
-        // not a raw console.error, so an agent-driven push (MCP) carries this in the
-        // result's warnings[] array instead of only ever landing in a background log.
-        if (!SKIP_FUNDS_CHECK) {
-          try {
-            const ownerState = await fetchAccountState(owner);
-            if (!Number.isFinite(ownerState.balance)) {
-              throw new Error(`tonapi returned a non-numeric balance: ${JSON.stringify(ownerState.balance)}`);
-            }
-            if (ownerState.balance < Number(deploy.amountNano)) {
+          if (!alreadyActive) {
+            // Charge this deploy's amount against the shared tracker THE MOMENT it is
+            // known to be within budget AND actually going to be broadcast (i.e. after
+            // the #638 already-active check above finds nothing to skip) — before
+            // autoSignAndBroadcastDeploy()/the Tonkeeper deeplink below even run, so a
+            // SECOND put() call in the same push (the ".minisig" sidecar) sees this one
+            // counted regardless of how far the current call gets afterward (#639).
+            // Deliberately NOT charged in the alreadyActive branch: that branch moves no
+            // funds at all (see the money-safety comment above), so charging it there
+            // would falsely shrink the sidecar's remaining budget for a spend that never
+            // happened this run.
+            chargeSpendTracker(opts.spendTracker, deploy.amountNano);
+          }
+          if (alreadyActive) {
+            // warn() (#347), not a raw console.error: this is a safety-relevant skip
+            // decision, not routine progress output — an MCP-driven caller (an agent
+            // retrying a failed push, exactly issue #638's own motivating scenario) must
+            // see this in the structured result's warnings[] array, not only in a
+            // background log nobody is watching.
+            warn(
+              `ton-provider: contract ${deploy.contractAddress.toRawString()} already shows on-chain activity ` +
+                `(status=${observedStatus}) — this looks like a retry of an already-broadcast (or already-completed) ` +
+                `deploy for the same bag/owner. Skipping re-funding (no new ${deploy.amountNano} nanoTON transfer) ` +
+                "and going straight to notify. Which provider is notified is NOT this run's registry pick: it is " +
+                "read back from the contract's own on-chain providers dict, falling back to this machine's " +
+                'pending-spend intent and then the receipt if that read cannot answer, and refusing rather than ' +
+                'guessing if none of them can (#665). The lines below say which source answered.',
+            );
+          }
+
+          // ---------- #808/#665: reconcile with what an EARLIER run durably recorded ----------
+          // Keyed on the contract address for the same reason the #638 guard above is: it
+          // is stable across runs (bag id + owner + size + piece size + merkle hash — never
+          // which provider was picked), and it is the identifier an operator checks on an
+          // explorer. (`contractAddressRaw` itself is declared above, before this lock, for
+          // #948 — see that comment.)
+          //
+          // #665: `notifyPubkey` defaults to this run's own selection (declared above,
+          // before the lock, for #948). On the already-active branch it must NOT stay that
+          // default — the contract's on-chain `providers` dict was written by whichever run
+          // actually deployed it, and `modify_providers` REPLACES rather than merges (see
+          // scripts/go/storage-v1-client/updateproviders.go), so notifying a provider this
+          // run happened to pick from a fresher mytonprovider.org snapshot can address a
+          // provider that never held this bag at all. `resumable`/`priorReceipt` (an
+          // earlier run's confirmed-but-unrecorded spend, #808, also declared above) start
+          // at their default `null` here for the same reason.
+          if (alreadyActive) {
+            // Read failures propagate rather than degrading to "nothing recorded": the two
+            // decisions below (write a missing receipt / notify the deployed provider) are
+            // both WRONG if taken on a log that could not be read, and this branch has
+            // moved no funds, so refusing costs nothing but a retry — the same fail-closed
+            // posture as the #805 guard above.
+            const { intents, skippedLines: intentSkipped } = await readSpendIntents();
+            const receiptLookup = await ledgerReceiptForContract(contractAddressRaw);
+            priorReceipt = receiptLookup.receipt;
+            // An UNREADABLE line is not an absent one (multi-model review): a line this
+            // version cannot parse — a future schema, a truncated write, a hand edit — could
+            // be the very record that names this contract's provider or its already-written
+            // receipt. Both decisions below therefore treat "some line could not be read" as
+            // "this log cannot answer", not as "the answer is no".
+            const logsFullyReadable = intentSkipped === 0 && receiptLookup.skippedLines === 0;
+            // Authority (a): this backend's own durable records — the intent written before
+            // the deploy that actually paid (#808), else the receipt written after it
+            // (#654/#484). Authority (b) — the contract's own on-chain dict, read just
+            // below — outranks both; this block computes (a) first because (b) also uses
+            // it to disambiguate a contract that names more than one provider, and because
+            // (a) is what stays in charge when the on-chain read cannot answer.
+            //
+            // Ranked, not "most recent wins": a CONFIRMED intent and a receipt each describe
+            // a deploy that was actually observed on-chain, while a `pending` intent records
+            // only that a transfer was attempted — and local append order says nothing about
+            // which `modify_providers` message won on-chain. Two confirmed records that
+            // disagree cannot both be right, so that fails closed rather than picking one.
+            const recorded = recordedProvidersForContract(intents, contractAddressRaw);
+            const receiptPubkey = providerPubkeyFromReceipt(priorReceipt);
+            const attested = [...new Set([...recorded.confirmed, ...(receiptPubkey ? [receiptPubkey] : [])])];
+            const haveSomeRecord =
+              intents.some((i) => i.contract_address === contractAddressRaw) || priorReceipt !== null;
+            // Everything this machine's own logs offer as a candidate, attested or not —
+            // used below both as authority (a)'s answer and, when the chain names more than
+            // one provider, as the tie-break among them. Order is the tie-break's priority
+            // and is load-bearing: confirmed pending-spend intents first, then the receipt,
+            // then unconfirmed intents — strongest evidence that a deploy actually happened
+            // to weakest.
+            const localCandidates = [...new Set([...attested, ...recorded.unconfirmed])];
+            // Unchanged from #824 except for the explicit `attested.length === 0` guard,
+            // which used to be implied by position (this was computed only after the
+            // disagreement throw, so attested.length was 0 or 1 by then). An unconfirmed
+            // candidate is still used only when it is the ONLY one and nothing attested
+            // contradicts it.
+            const recordedPubkey =
+              attested.length === 1
+                ? attested[0]
+                : attested.length === 0 && recorded.unconfirmed.length === 1
+                  ? recorded.unconfirmed[0]
+                  : null;
+
+            // Authority (b), the top of the ranking: the contract's OWN on-chain
+            // `providers` dict. Read AFTER the logs above because a contract naming more
+            // than one provider still needs a local record (or this run's own pick) to
+            // choose between them — the chain says who is registered, not which of several
+            // registrations this push is a retry of.
+            const { pubkeys: onChainPubkeys, reason: onChainFailure } = await readOnChainProviders(contractAddressRaw);
+            // The tie-break for a contract naming SEVERAL providers considers only what
+            // this machine durably recorded — never this run's registry pick (multi-model
+            // review, Critical). That pick is the untrusted input this whole authority
+            // exists to overrule; letting it break a tie would smuggle it back in as an
+            // answer for a contract nothing local can vouch for.
+            const fromChain =
+              onChainPubkeys === null || onChainPubkeys.length === 0
+                ? null
+                : onChainPubkeys.length === 1
+                  ? onChainPubkeys[0]
+                  : (localCandidates.find((c) => onChainPubkeys.includes(c)) ?? null);
+            if (onChainPubkeys === null) {
+              // Soft, on purpose: this is exactly the case authority (a) already handles,
+              // and it shipped working in #824. Reported rather than swallowed because a
+              // reader of the run summary must be able to tell an answer that came from the
+              // chain from one that came from a local note (#347's relay contract).
               warn(
-                `ton-provider: owner ${owner.toString({ bounceable: true })}'s on-chain balance ` +
-                  `(${ownerState.balance} nanoTON) looks lower than the ${deploy.amountNano} nanoTON this deploy ` +
-                  `needs; the ${autoSignWallet ? 'auto-sign broadcast' : 'Tonkeeper signature'} below may be ` +
-                  'rejected for insufficient funds. Fund the wallet first, or set ' +
-                  'CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 to silence this check.',
+                `ton-provider: could not read contract ${contractAddressRaw}'s own on-chain providers dict via ` +
+                  `scripts/go/storage-v1-client (${onChainFailure ?? 'unknown reason'}) — falling back to this ` +
+                  "machine's own records to decide whom to notify (#665).",
               );
             }
-          } catch (e) {
-            warn(`ton-provider: could not pre-check the owner's balance (${errMsg(e)}); proceeding`);
-          }
-        }
-        if (alreadyActive) {
-          // Nothing to sign or broadcast — see the money-safety comment above.
-        } else if (autoSignWallet) {
-          console.error(
-            `ton-provider: auto-signing with local wallet ${owner.toString({ bounceable: true })} ` +
-              '(CYPHER_BRAIN_TON_WALLET) — no Tonkeeper deeplink needed',
-          );
-          const submitted = { value: false };
-          try {
-            await autoSignAndBroadcastDeploy(autoSignWallet.wallet, autoSignWallet.secretKey, deploy, submitted);
-          } catch (e) {
-            // Nothing left this process: a frozen wallet, an unreadable seqno, a
-            // StateInit mismatch. No funds can have moved, so this is an ordinary
-            // failure and must stay one — probing the contract here would let an
-            // unrelated on-chain state turn a refusal into a "confirmed spend".
-            if (!submitted.value) {
-              // #808: retire the intent explicitly rather than leaving it `pending`
-              // forever. This is the one branch that can PROVE no funds moved, so the
-              // record it wrote a moment ago is not a possible spend — leaving it as one
-              // would give doctor a permanent false finding and hand a later run a
-              // candidate to write a phantom receipt from (multi-model review).
-              if (intent) {
-                await advanceSpendIntent(intent, 'abandoned').catch((markErr) =>
-                  warn(
-                    `ton-provider: could not retire the pending-spend record for ${contractAddressRaw} after a ` +
-                      `broadcast that never left this process (${errMsg(markErr)}) — it will show up in ` +
-                      "'cypher-brain doctor' as an unsettled spend even though no funds moved",
-                  ),
+
+            if (onChainPubkeys !== null && onChainPubkeys.length === 0) {
+              // An EMPTY dict is an ANSWER, not silence (multi-model review, Critical):
+              // the contract itself says no provider is registered for it, so notifying
+              // anyone — this run's pick or a local record — addresses a provider the
+              // contract does not name, which is precisely what #665 exists to stop. Fail
+              // loudly instead. Free to do here: this branch has moved no funds, and the
+              // same artifact re-derives the same bag and contract on a later run.
+              throw new Error(
+                `ton-provider backend: contract ${contractAddressRaw} is funded on-chain but its own providers dict ` +
+                  'is EMPTY — it currently registers NO provider, so notifying anyone would address a provider the ' +
+                  'contract does not name. Register one deliberately with `update-providers` ' +
+                  '(scripts/go/storage-v1-client) and push again (#665). No funds moved.',
+              );
+            }
+            if (onChainPubkeys !== null && onChainPubkeys.length > 0) {
+              if (fromChain === null) {
+                throw new Error(
+                  `ton-provider backend: contract ${contractAddressRaw}'s on-chain providers dict names ` +
+                    `${onChainPubkeys.length} providers (${onChainPubkeys.join(', ')}) and this machine recorded ` +
+                    'none of them — refusing to pick one on your behalf, since notifying the wrong one addresses a ' +
+                    "provider that may never have held this bag, and this run's own registry pick " +
+                    `(${provider.pubkey}) is not evidence of which one did. Re-run \`update-providers\` ` +
+                    '(scripts/go/storage-v1-client) to register a single provider deliberately (#665). No funds moved.',
                 );
               }
-              throw e;
-            }
-            // issue #664: a broadcast POST that FAILS can still have landed — tonapi can
-            // accept the BOC and then lose the response. Rethrown as-is, the transfer is
-            // invisible: put() never reaches waitForContractActive(), so #654's receipt
-            // checkpoint never fires, and a later retry hits #638's already-active branch
-            // which deliberately writes no receipt (it moved no funds). The spend is then
-            // absent from the ledger forever.
-            //
-            // Probe the derived contract address before letting the error out, the same
-            // bounded way the pre-broadcast guard above asks. If it is no longer
-            // `nonexist` the transfer DID land: fall through to waitForContractActive()
-            // and the normal confirmation/receipt path, which is exactly what would have
-            // happened had the response arrived. If the probe cannot say, the outcome is
-            // genuinely ambiguous — say so and name the address, rather than let it read
-            // as "nothing happened".
-            let landed = false;
-            for (let attempt = 0; attempt < ALREADY_ACTIVE_CHECK_ATTEMPTS && !landed; attempt++) {
-              if (attempt > 0) await sleep(ALREADY_ACTIVE_CHECK_INTERVAL_MS);
-              try {
-                landed = (await fetchAccountState(deploy.contractAddress)).status !== 'nonexist';
-              } catch {
-                // one more inconclusive read; keep the remaining attempts
+              notifyPubkey = fromChain;
+              const contradicted = localCandidates.filter((c) => !onChainPubkeys.includes(c));
+              if (contradicted.length > 0) {
+                warn(
+                  `ton-provider: this machine's records name provider(s) ${contradicted.join(', ')} for contract ` +
+                    `${contractAddressRaw}, but the contract's OWN on-chain providers dict names ` +
+                    `${onChainPubkeys.join(', ')} — using the on-chain answer (${fromChain}), which outranks a local ` +
+                    'note because `modify_providers` REPLACES the dict rather than merging into it, so whatever the ' +
+                    `chain holds now IS the registration. Reconcile ${PENDING_SPENDS_LOG} / ${RECEIPT_LEDGER} if this ` +
+                    'is a surprise (#665).',
+                );
+              } else if (localCandidates.length === 0) {
+                warn(
+                  `ton-provider: no local record names the provider contract ${contractAddressRaw} was deployed with, ` +
+                    `so the contract's own on-chain providers dict was read instead — notifying ${fromChain}, the ` +
+                    'provider the contract itself registers (#665).',
+                );
               }
+              if (fromChain !== provider.pubkey) {
+                warn(
+                  `ton-provider: contract ${contractAddressRaw} was deployed with provider ${fromChain}, but this ` +
+                    `run's registry snapshot selected ${provider.pubkey} — notifying ${fromChain}, the one the ` +
+                    "contract's own on-chain dict names (#665). To hand this bag to a DIFFERENT provider, register " +
+                    'it deliberately with `update-providers` (scripts/go/storage-v1-client) — a retry must not do it ' +
+                    'by accident.',
+                );
+              }
+            } else if (attested.length > 1) {
+              throw new Error(
+                `ton-provider backend: this machine's records disagree about which provider contract ` +
+                  `${contractAddressRaw} was deployed with (${attested.join(', ')}) — refusing to notify any of them, ` +
+                  'since `modify_providers` REPLACES rather than merges and notifying the wrong one addresses a ' +
+                  `provider that may never have held this bag. Reconcile ${PENDING_SPENDS_LOG} and ${RECEIPT_LEDGER}, ` +
+                  'or re-run `update-providers` (scripts/go/storage-v1-client) to register one deliberately (#665). ' +
+                  'No funds moved.',
+              );
+            } else if (recordedPubkey !== null) {
+              notifyPubkey = recordedPubkey;
+              if (attested.length === 0) {
+                warn(
+                  `ton-provider: the only local record of contract ${contractAddressRaw}'s provider ` +
+                    `(${recordedPubkey}) comes from a spend this machine never saw confirm — notifying it as the best ` +
+                    'available answer, but it is not proof of what the contract’s on-chain dict names (#665).',
+                );
+              }
+              if (recordedPubkey !== provider.pubkey) {
+                warn(
+                  `ton-provider: contract ${contractAddressRaw} was deployed with provider ${recordedPubkey}, but this ` +
+                    `run's registry snapshot selected ${provider.pubkey} — notifying the RECORDED provider ` +
+                    `${recordedPubkey}, the one the contract's on-chain dict actually names (#665). To hand this bag ` +
+                    'to a DIFFERENT provider, register it deliberately with `update-providers` ' +
+                    '(scripts/go/storage-v1-client) — a retry must not do it by accident.',
+                );
+              }
+            } else if (haveSomeRecord || !logsFullyReadable) {
+              // Either a record for this exact contract exists but names no usable provider
+              // (a hand-edited or foreign line), or several unconfirmed candidates disagree,
+              // or a line could not be read at all. Refusing beats guessing: notifying this
+              // run's freshly selected provider would address one that may never have held
+              // the bag, and no funds move either way on this branch.
+              throw new Error(
+                `ton-provider backend: contract ${contractAddressRaw} is already funded on-chain and this machine has ` +
+                  'a record of that spend, but nothing readable names the provider it was deployed with — refusing ' +
+                  `to notify this run's freshly selected provider ${provider.pubkey}, which may never have held this ` +
+                  `bag. Check ${PENDING_SPENDS_LOG} / ${RECEIPT_LEDGER} for the contract's own provider pubkey, or ` +
+                  're-run `update-providers` (scripts/go/storage-v1-client) to register a provider deliberately (#665).',
+              );
+            } else {
+              warn(
+                `ton-provider: no local record names the provider contract ${contractAddressRaw} was deployed with ` +
+                  `(no pending-spend intent, no receipt) — notifying this run's selected provider ${provider.pubkey}, ` +
+                  'which may not be the one holding the bag. Reading the provider back from the contract itself is ' +
+                  'issue #665.',
+              );
             }
-            if (!landed) {
-              // #818: a TYPED error, not a plain one — see the identical change on
-              // arweave.ts's own ambiguous-POST branch and PushUncertainSpendError's doc
-              // comment. The contract address travels as structured data
-              // (checkIdentifier) so mcp.ts can persist it under the idempotency key and
-              // refuse a same-key retry, instead of releasing the key and letting the
-              // retry broadcast a second transfer.
+
+            // #808 recovery candidate. A contract address identifies a CONTRACT, not one
+            // spend, so more than one unsettled intent for it is ambiguous — which of them a
+            // single receipt would be for cannot be decided from a contract-level
+            // observation. That fails closed (record nothing, leave both for doctor and the
+            // operator) rather than settling an arbitrary one, which would leave a real
+            // transfer represented by no ledger entry at all (multi-model review). Unreadable
+            // lines block recovery for the same reason: a receipt may already exist in a line
+            // this version could not parse, and writing a second one would overstate spend.
+            const unsettled = unsettledIntentsForContract(intents, contractAddressRaw);
+            if (unsettled.length > 1) {
+              warn(
+                `ton-provider: ${unsettled.length} unsettled pending-spend records name contract ${contractAddressRaw} ` +
+                  '— refusing to decide which of them a receipt would be for. None is being recorded automatically; ' +
+                  `check the contract on a TON explorer and reconcile ${PENDING_SPENDS_LOG} by hand (#808).`,
+              );
+            } else if (unsettled.length === 1 && !logsFullyReadable) {
+              warn(
+                `ton-provider: an unrecorded spend for contract ${contractAddressRaw} cannot be safely recovered while ` +
+                  `${PENDING_SPENDS_LOG} / ${RECEIPT_LEDGER} contain line(s) this version cannot read — a receipt may ` +
+                  'already exist in one of them. Not writing one (#808).',
+              );
+            } else {
+              resumable = unsettled[0] ?? null;
+            }
+          }
+
+          // #808: the durable record goes down BEFORE anything can move funds, so a
+          // SIGKILL/OOM/power loss anywhere after the broadcast leaves evidence that a
+          // spend was attempted. Refuses the push if it cannot be written, rather than
+          // broadcasting a transfer nothing would be able to account for: no funds have
+          // moved at this point, and the same artifact re-derives the same bag and contract
+          // on a later run, so nothing is lost by stopping here (same "fail closed while it
+          // is still free" reasoning as the #805 guard above). (`intent` itself is declared
+          // above, before the #948 lock, so it survives past that lock's release.)
+          if (!alreadyActive) {
+            try {
+              intent = await recordSpendIntent({
+                backend: 'ton-provider',
+                contract_address: contractAddressRaw,
+                bag_id: bag.bagId,
+                provider_pubkey: provider.pubkey,
+                amount_nano: deploy.amountNano.toString(),
+                cost_nano: deploy.costNano.toString(),
+                deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
+                locator: tonProviderLocator(bag.bagId),
+              });
+            } catch (e) {
+              throw new Error(
+                `ton-provider backend: could not write the pending-spend record to ${PENDING_SPENDS_LOG} ` +
+                  `(${errMsg(e)}) — refusing to broadcast a ${deploy.amountNano} nanoTON transfer that nothing would ` +
+                  'be able to account for if this process died before the receipt reached disk (#808). No funds ' +
+                  'moved. Fix the path (permissions, a full disk, or CYPHER_BRAIN_RECEIPT_LEDGER pointing somewhere ' +
+                  'unwritable) and re-run push — the same ciphertext reuses the same bag, so nothing is lost.',
+              );
+            }
+          }
+          // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
+          // signer balance, #342) — WARN only, never abort, for BOTH signing paths: a
+          // balance read has no freshness guarantee, so it must never be what blocks a
+          // push (same posture turbo.ts uses for its non-TTY/unattended callers, now that
+          // ton-provider can ALSO run unattended via auto-signing, #396 PR2). Whichever
+          // path actually sends the transaction gives its own unambiguous refusal on a
+          // real shortfall — a human's Tonkeeper app, or the auto-sign broadcast/on-chain
+          // processing itself — so this exists only to save the wait through
+          // waitForContractActive() on a spend that was always going to fail. Left
+          // unconditional even when alreadyActive (the check above never blocks on it
+          // either) — a harmless, still-informative balance read either way.
+          // CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences it for one run (shared with turbo's
+          // check, not a ton-provider-specific flag). Both lines go through warn() (#347),
+          // not a raw console.error, so an agent-driven push (MCP) carries this in the
+          // result's warnings[] array instead of only ever landing in a background log.
+          if (!SKIP_FUNDS_CHECK) {
+            try {
+              const ownerState = await fetchAccountState(owner);
+              if (!Number.isFinite(ownerState.balance)) {
+                throw new Error(`tonapi returned a non-numeric balance: ${JSON.stringify(ownerState.balance)}`);
+              }
+              if (ownerState.balance < Number(deploy.amountNano)) {
+                warn(
+                  `ton-provider: owner ${owner.toString({ bounceable: true })}'s on-chain balance ` +
+                    `(${ownerState.balance} nanoTON) looks lower than the ${deploy.amountNano} nanoTON this deploy ` +
+                    `needs; the ${autoSignWallet ? 'auto-sign broadcast' : 'Tonkeeper signature'} below may be ` +
+                    'rejected for insufficient funds. Fund the wallet first, or set ' +
+                    'CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 to silence this check.',
+                );
+              }
+            } catch (e) {
+              warn(`ton-provider: could not pre-check the owner's balance (${errMsg(e)}); proceeding`);
+            }
+          }
+          if (alreadyActive) {
+            // Nothing to sign or broadcast — see the money-safety comment above.
+          } else if (autoSignWallet) {
+            console.error(
+              `ton-provider: auto-signing with local wallet ${owner.toString({ bounceable: true })} ` +
+                '(CYPHER_BRAIN_TON_WALLET) — no Tonkeeper deeplink needed',
+            );
+            const submitted = { value: false };
+            try {
+              await autoSignAndBroadcastDeploy(autoSignWallet.wallet, autoSignWallet.secretKey, deploy, submitted);
+            } catch (e) {
+              // Nothing left this process: a frozen wallet, an unreadable seqno, a
+              // StateInit mismatch. No funds can have moved, so this is an ordinary
+              // failure and must stay one — probing the contract here would let an
+              // unrelated on-chain state turn a refusal into a "confirmed spend".
+              if (!submitted.value) {
+                // #808: retire the intent explicitly rather than leaving it `pending`
+                // forever. This is the one branch that can PROVE no funds moved, so the
+                // record it wrote a moment ago is not a possible spend — leaving it as one
+                // would give doctor a permanent false finding and hand a later run a
+                // candidate to write a phantom receipt from (multi-model review).
+                if (intent) {
+                  await advanceSpendIntent(intent, 'abandoned').catch((markErr) =>
+                    warn(
+                      `ton-provider: could not retire the pending-spend record for ${contractAddressRaw} after a ` +
+                        `broadcast that never left this process (${errMsg(markErr)}) — it will show up in ` +
+                        "'cypher-brain doctor' as an unsettled spend even though no funds moved",
+                    ),
+                  );
+                }
+                throw e;
+              }
+              // issue #664: a broadcast POST that FAILS can still have landed — tonapi can
+              // accept the BOC and then lose the response. Rethrown as-is, the transfer is
+              // invisible: put() never reaches waitForContractActive(), so #654's receipt
+              // checkpoint never fires, and a later retry hits #638's already-active branch
+              // which deliberately writes no receipt (it moved no funds). The spend is then
+              // absent from the ledger forever.
+              //
+              // Probe the derived contract address before letting the error out, the same
+              // bounded way the pre-broadcast guard above asks. If it is no longer
+              // `nonexist` the transfer DID land: fall through to waitForContractActive()
+              // and the normal confirmation/receipt path, which is exactly what would have
+              // happened had the response arrived. If the probe cannot say, the outcome is
+              // genuinely ambiguous — say so and name the address, rather than let it read
+              // as "nothing happened".
+              let landed = false;
+              for (let attempt = 0; attempt < ALREADY_ACTIVE_CHECK_ATTEMPTS && !landed; attempt++) {
+                if (attempt > 0) await sleep(ALREADY_ACTIVE_CHECK_INTERVAL_MS);
+                try {
+                  landed = (await fetchAccountState(deploy.contractAddress)).status !== 'nonexist';
+                } catch {
+                  // one more inconclusive read; keep the remaining attempts
+                }
+              }
+              if (!landed) {
+                // #818: a TYPED error, not a plain one — see the identical change on
+                // arweave.ts's own ambiguous-POST branch and PushUncertainSpendError's doc
+                // comment. The contract address travels as structured data
+                // (checkIdentifier) so mcp.ts can persist it under the idempotency key and
+                // refuse a same-key retry, instead of releasing the key and letting the
+                // retry broadcast a second transfer.
+                throw new PushUncertainSpendError({
+                  backend: 'ton-provider',
+                  checkKind: 'ton_contract_address',
+                  checkIdentifier: deploy.contractAddress.toRawString(),
+                  detail:
+                    `broadcasting the deploy failed (${errMsg(e)}) — the transfer of ${deploy.amountNano} nanoTON ` +
+                    `to ${deploy.contractAddress.toRawString()} may or may not have been accepted (a probe could ` +
+                    'not find the contract, which is not proof it is absent)',
+                  verifyHint: "the address's state on a TON explorer",
+                  cause: e,
+                });
+              }
+              // Attribution is inferential, not proven (Codex review): what is observed is
+              // that this address read `nonexist` moments ago, immediately before this run
+              // broadcast, and does not now. A concurrent push against the SAME bag+owner,
+              // or someone funding the address by hand inside that window, would produce
+              // the same transition. Correlating the exact message (seqno / balance delta)
+              // would settle it and is not done here. The alternative — treating a landed
+              // transfer as "nothing happened" — is the strictly worse error, because it
+              // is the one that leads to paying twice.
+              warn(
+                `ton-provider: the deploy broadcast reported a failure (${errMsg(e)}) but contract ` +
+                  `${deploy.contractAddress.toRawString()} — which read as 'nonexist' immediately before this run ` +
+                  'broadcast — now shows on-chain activity, so the transfer is treated as having landed despite the ' +
+                  'error. Continuing with confirmation and the receipt for that spend (#664). If something else ' +
+                  'funded this exact address inside that window, the receipt below is attributed to this run in error.',
+              );
+            }
+          } else {
+            console.error(`ton-provider: sign this to deploy the contract (bag stays seeded locally while you do):`);
+            console.error(`  ${deploy.deeplink}`);
+          }
+
+          // issue #949: nested inside #948's outer try/finally (which holds the
+          // cross-process contract lock across this whole already-active-check ->
+          // broadcast -> confirm sequence) — this inner try/catch narrows ONLY
+          // waitForContractActive()'s own timeout into a typed PushUncertainSpendError,
+          // it does not change #948's lock-release timing (still in the outer
+          // `finally` below, which fires whether this inner try succeeds or re-throws).
+          try {
+            await waitForContractActive(
+              deploy.contractAddress,
+              alreadyActive ? 'skipped' : autoSignWallet ? 'auto-sign' : 'deeplink',
+            );
+          } catch (e) {
+            // issue #949: only the auto-sign path broadcasts a real transfer FROM THIS
+            // PROCESS (the block above, `autoSignAndBroadcastDeploy()`) — a timeout here
+            // right after that means tonapi accepted the signed BOC (HTTP 200) but this
+            // run could not observe the contract confirm active before giving up (a
+            // TonAPI outage, most likely — not proof the transfer failed).
+            // autoSignAndBroadcastDeploy()'s own doc comment already establishes that a
+            // 200 here "proves nothing about 'will confirm'" (tonapi accepts a doomed,
+            // insufficient-gas transaction the same as a good one), so this is genuinely
+            // UNCERTAIN, not confirmed — thrown as PushUncertainSpendError, never
+            // PushFundingConfirmedButIncompleteError/PushFundingConfirmedIntentWriteError,
+            // which both assert a confirmation this process never observed. Before this,
+            // the timeout below surfaced as a plain Error indistinguishable from "nothing
+            // was spent", which let an MCP idempotency-key retry release its claim and
+            // pay a second time for the same deploy.
+            //
+            // Deliberately excludes 'skipped' (this run moved no funds at all — see the
+            // money-safety comment at this function's own alreadyActive branch above) and
+            // 'deeplink' (a human's own Tonkeeper wallet broadcasts on that path, never
+            // this process — waitForContractActive()'s own doc comment already calls that
+            // timeout "a real, expected outcome, not a bug", unchanged here).
+            if (!alreadyActive && autoSignWallet) {
               throw new PushUncertainSpendError({
                 backend: 'ton-provider',
                 checkKind: 'ton_contract_address',
                 checkIdentifier: deploy.contractAddress.toRawString(),
                 detail:
-                  `broadcasting the deploy failed (${errMsg(e)}) — the transfer of ${deploy.amountNano} nanoTON ` +
-                  `to ${deploy.contractAddress.toRawString()} may or may not have been accepted (a probe could ` +
-                  'not find the contract, which is not proof it is absent)',
+                  `the deploy broadcast was accepted (HTTP 200) but waiting for contract ` +
+                  `${deploy.contractAddress.toRawString()} to confirm active on-chain failed: ${errMsg(e)} — the ` +
+                  `transfer of ${deploy.amountNano} nanoTON may or may not have landed (tonapi accepts a doomed ` +
+                  'transaction, e.g. insufficient gas, with the same HTTP 200 as a good one)',
                 verifyHint: "the address's state on a TON explorer",
                 cause: e,
               });
             }
-            // Attribution is inferential, not proven (Codex review): what is observed is
-            // that this address read `nonexist` moments ago, immediately before this run
-            // broadcast, and does not now. A concurrent push against the SAME bag+owner,
-            // or someone funding the address by hand inside that window, would produce
-            // the same transition. Correlating the exact message (seqno / balance delta)
-            // would settle it and is not done here. The alternative — treating a landed
-            // transfer as "nothing happened" — is the strictly worse error, because it
-            // is the one that leads to paying twice.
-            warn(
-              `ton-provider: the deploy broadcast reported a failure (${errMsg(e)}) but contract ` +
-                `${deploy.contractAddress.toRawString()} — which read as 'nonexist' immediately before this run ` +
-                'broadcast — now shows on-chain activity, so the transfer is treated as having landed despite the ' +
-                'error. Continuing with confirmation and the receipt for that spend (#664). If something else ' +
-                'funded this exact address inside that window, the receipt below is attributed to this run in error.',
-            );
+            throw e;
           }
-        } else {
-          console.error(`ton-provider: sign this to deploy the contract (bag stays seeded locally while you do):`);
-          console.error(`  ${deploy.deeplink}`);
+          console.error(`ton-provider: contract ${deploy.contractAddress.toRawString()} is active on-chain`);
+        } finally {
+          // #948: released only now — after the contract is either confirmed active
+          // on-chain or this run has thrown out of the try above — never earlier. A
+          // second process racing this SAME contract that was waiting on this lock (or
+          // that acquires it fresh right after this release) now either observes a
+          // genuinely active contract (correct: skip funding) or finds the lock free
+          // because THIS run itself never got past the already-active check (correct:
+          // free to try). See the comment above this lock's acquisition for the one
+          // narrower race this release does NOT close (an ambiguous broadcast outcome
+          // followed by a later retry inside tonapi's own indexing-lag window).
+          await releaseContractLock();
         }
-
-        try {
-          await waitForContractActive(
-            deploy.contractAddress,
-            alreadyActive ? 'skipped' : autoSignWallet ? 'auto-sign' : 'deeplink',
-          );
-        } catch (e) {
-          // issue #949: only the auto-sign path broadcasts a real transfer FROM THIS
-          // PROCESS (the block above, `autoSignAndBroadcastDeploy()`) — a timeout here
-          // right after that means tonapi accepted the signed BOC (HTTP 200) but this
-          // run could not observe the contract confirm active before giving up (a
-          // TonAPI outage, most likely — not proof the transfer failed).
-          // autoSignAndBroadcastDeploy()'s own doc comment already establishes that a
-          // 200 here "proves nothing about 'will confirm'" (tonapi accepts a doomed,
-          // insufficient-gas transaction the same as a good one), so this is genuinely
-          // UNCERTAIN, not confirmed — thrown as PushUncertainSpendError, never
-          // PushFundingConfirmedButIncompleteError/PushFundingConfirmedIntentWriteError,
-          // which both assert a confirmation this process never observed. Before this,
-          // the timeout below surfaced as a plain Error indistinguishable from "nothing
-          // was spent", which let an MCP idempotency-key retry release its claim and
-          // pay a second time for the same deploy.
-          //
-          // Deliberately excludes 'skipped' (this run moved no funds at all — see the
-          // money-safety comment at this function's own alreadyActive branch above) and
-          // 'deeplink' (a human's own Tonkeeper wallet broadcasts on that path, never
-          // this process — waitForContractActive()'s own doc comment already calls that
-          // timeout "a real, expected outcome, not a bug", unchanged here).
-          if (!alreadyActive && autoSignWallet) {
-            throw new PushUncertainSpendError({
-              backend: 'ton-provider',
-              checkKind: 'ton_contract_address',
-              checkIdentifier: deploy.contractAddress.toRawString(),
-              detail:
-                `the deploy broadcast was accepted (HTTP 200) but waiting for contract ` +
-                `${deploy.contractAddress.toRawString()} to confirm active on-chain failed: ${errMsg(e)} — the ` +
-                `transfer of ${deploy.amountNano} nanoTON may or may not have landed (tonapi accepts a doomed ` +
-                'transaction, e.g. insufficient gas, with the same HTTP 200 as a good one)',
-              verifyHint: "the address's state on a TON explorer",
-              cause: e,
-            });
-          }
-          throw e;
-        }
-        console.error(`ton-provider: contract ${deploy.contractAddress.toRawString()} is active on-chain`);
 
         // issue #654: computed HERE (not re-derived at the old, later `return` site)
         // because it is now needed twice — once for the receipt event immediately

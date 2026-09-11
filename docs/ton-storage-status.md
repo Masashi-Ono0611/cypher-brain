@@ -250,16 +250,34 @@ full remediation is intentionally left as future work:
   retry takes settles it — writing the missing receipt from that intent — once a
   receipt is verifiably on disk; #824), and the already-active branch resolves which
   provider to notify from the contract's own on-chain `providers` dict rather than a
-  possibly-stale local registry pick (#830). One
-  residual risk remains, documented as a known limitation rather than fixed:
-  TonAPI's own indexing can lag a just-broadcast transaction by a moment, during
-  which a retry landing in that window can still read the contract back as
-  `nonexist`. The code's own analysis (`src/lib/backends/ton-provider.ts`, the
-  #805 fail-closed comment) considers that narrower race bounded by the wallet's
-  seqno-replay protection rather than by this check, but does not claim to
-  eliminate it — closing it fully would need a persisted "broadcast in flight"
-  record surviving process restarts, left as a known limitation rather than
-  implemented speculatively.
+  possibly-stale local registry pick (#830).
+- **Cross-process double-funding the same contract (issue #948): fixed.** #638
+  (above) only covers ONE process retrying sequentially; it does nothing for TWO
+  separate processes racing the same contract with no `--save-locator` coordination
+  (an operator's manual run overlapping a scheduled nightly one, or simply two
+  terminals) — both can pass the #638 already-active check while it still reads
+  `nonexist`, and, once one process's transfer lands, the OTHER fetches the wallet's
+  now-advanced seqno and sends its own transfer with that fresh, valid seqno: a
+  second, genuinely accepted transaction, not a replay TON's seqno-replay protection
+  rejects (an earlier version of this doc, and of the code's own analysis, wrongly
+  assumed that protection bounded this case — corrected by #948). `push
+  --backend ton-provider` now holds a same-machine cross-process advisory lock
+  (`src/lib/push-lock.ts`'s `acquirePushLock('ton-provider-contract', <address>)` —
+  the same primitive `--save-locator`/rclone already use for their own analogous
+  races, #806/#807) around the whole already-active-check → broadcast/deeplink →
+  on-chain-confirmation sequence, so a second process racing the same contract
+  either waits behind the first and then correctly observes it active, or is
+  refused outright (`CB-E028`) rather than sending a second transfer. **One
+  residual risk remains, honestly documented rather than claimed fixed**: TonAPI's
+  own indexing can lag a just-broadcast transaction by a moment, and if THIS run's
+  own broadcast outcome is itself ambiguous (the POST throws — #664's own uncertain-
+  spend branch), this run correctly refuses to guess and releases the lock on its
+  way out; a LATER, independent retry that then acquires the freed lock can still
+  land inside that same brief indexing-lag window and read `nonexist`. Closing that
+  fully would need a persisted "broadcast in flight" record surviving process
+  restarts, left as a known limitation rather than implemented speculatively — see
+  `src/lib/backends/ton-provider.ts`'s own #948 comments (around the already-active
+  check) for the full analysis.
 
 ## Testnet — third-party providers (C++ lane)
 

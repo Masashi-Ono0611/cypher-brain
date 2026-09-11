@@ -1,7 +1,7 @@
-// A same-machine advisory lock for push's two check-then-act sequences (#806, #807).
+// A same-machine advisory lock for push's check-then-act sequences (#806, #807, #948).
 //
-// Both bugs have the identical shape — read a destination's current state, act on what
-// was read, and write the result, with nothing serializing the three steps across
+// All three bugs have the identical shape — read a destination's current state, act on
+// what was read, and write the result, with nothing serializing the three steps across
 // PROCESSES (a `schedule`d run overlapping a manual one, or an MCP agent call overlapping
 // either):
 //
@@ -15,6 +15,19 @@
 //         replaces the earlier — and an rclone --remote is the one locator in this tool
 //         that is NOT content-addressed (NON_CONTENT_ADDRESSED_BACKENDS, config.ts), so
 //         that overwrite destroys a distinct snapshot rather than rewriting equal bytes.
+//   #948  backends/ton-provider.ts: the #638 already-active guard reads the derived
+//         StorageV1 contract's on-chain state, put() acts on what it read (broadcasts a
+//         funding transfer or prints a Tonkeeper deeplink), and the transfer landing is
+//         what changes that state. Two pushes racing the SAME contract (same bag id +
+//         owner + size + piece size + merkle hash — see buildDeploy()) both read
+//         'nonexist', both pass the guard, and — unlike #806/#807's local files — TON's
+//         own seqno-replay protection does NOT save this one: the two broadcasts are
+//         built SEQUENTIALLY against a wallet whose seqno only advances once the FIRST
+//         transfer lands, so the second one carries its own fresh, valid seqno and is a
+//         second genuine, valid, irreversible transfer to the same address, not a
+//         rejected replay. This is a DIFFERENT bug from the sequential-retry case #638
+//         itself closed (a single process retrying after its own broadcast's outcome was
+//         ambiguous) — #948 is two processes that were never sequential to begin with.
 //
 // The primitive is idempotency.ts's existing claim/release lock file, deliberately reused
 // rather than reinvented: an exclusive create of a file holding a `newLockToken()` owner
@@ -24,15 +37,15 @@
 //
 // What that primitive is and is NOT, stated up front because the difference decides how
 // much this can promise. Exclusive creation IS atomic, so of N processes racing for a
-// free lock exactly one wins — that is the guarantee the two races above needed. Every
+// free lock exactly one wins — that is the guarantee all three races above needed. Every
 // path that reads a lock and then acts on what it read (recovering an abandoned one;
 // removing one's own on release) is a check-then-act built out of separate syscalls, and
 // no path-based lock can make those atomic; the code below narrows each such window to
 // adjacent syscalls, prefers the fail-safe branch when a check is inconclusive, and says
 // so where it cannot. The bound that makes that acceptable: losing one of those races
-// degrades to the UNLOCKED behaviour that shipped before this file existed — the race
-// #806/#807 describe — never to something worse. A guarantee stronger than that needs an
-// OS-level lock (flock/fcntl) or a backend-native conditional create, which is a
+// degrades to the UNLOCKED behaviour that shipped before this file existed — the races
+// #806/#807/#948 describe — never to something worse. A guarantee stronger than that
+// needs an OS-level lock (flock/fcntl) or a backend-native conditional create, which is a
 // different change from this one.
 //
 // TWO deliberate differences from claimIdempotencyKey, both forced by the caller:
@@ -73,7 +86,7 @@ import { sleep } from './util.js';
 import { warn } from './warn.js';
 
 /** What a lock is keyed by — the wording of every message below branches on it. */
-export type PushLockKind = 'save-locator' | 'rclone-remote' | 'witness-catalog';
+export type PushLockKind = 'save-locator' | 'rclone-remote' | 'witness-catalog' | 'ton-provider-contract';
 
 /**
  * Thrown when the lock is still held by a LIVE process after the bounded wait — the one
@@ -402,15 +415,33 @@ async function directPublish(lockPath: string, body: string): Promise<boolean> {
 }
 
 function subjectFor(kind: PushLockKind, key: string): string {
-  if (kind === 'witness-catalog') return `witness catalog ${key}`;
-  return kind === 'save-locator' ? `locator file ${key}` : `rclone remote ${key}`;
+  switch (kind) {
+    case 'witness-catalog':
+      return `witness catalog ${key}`;
+    case 'save-locator':
+      return `locator file ${key}`;
+    case 'rclone-remote':
+      return `rclone remote ${key}`;
+    case 'ton-provider-contract':
+      return `TON StorageV1 contract ${key}`;
+  }
 }
 
 function riskFor(kind: PushLockKind): string {
-  if (kind === 'witness-catalog') return 'publishing competing witness entries for the same sequence';
-  return kind === 'save-locator'
-    ? 'paying twice for the same content and recording only one of the two locators'
-    : 'silently overwriting the object the other push is uploading';
+  switch (kind) {
+    case 'witness-catalog':
+      return 'publishing competing witness entries for the same sequence';
+    case 'save-locator':
+      return 'paying twice for the same content and recording only one of the two locators';
+    case 'rclone-remote':
+      return 'silently overwriting the object the other push is uploading';
+    case 'ton-provider-contract':
+      // #948: two processes racing the same derived contract address — the
+      // already-active check and the funding transfer are a check-then-act sequence,
+      // exactly the shape #806/#807 exist to close, just for a THIRD destination type
+      // (an on-chain contract address instead of a local file or an rclone remote).
+      return 'sending two separate on-chain transfers that both fund the same StorageV1 contract';
+  }
 }
 
 /**
