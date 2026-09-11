@@ -1410,24 +1410,41 @@ interface NotifyIncompleteRecord {
   resolved: boolean;
 }
 
-// Mirrors pushpull.ts's own contentDigestFor() sidecar convention exactly (the
-// "<in>.digest" file `snapshot` writes next to its output) MINUS that function's
-// explicit --digest CLI override branch, which put() has no access to without
-// importing pushpull.ts (see the header comment above PushFundingConfirmedButIncompleteError's
-// import for why this file never imports from pushpull.ts — that would close an import
-// cycle). Never throws: a missing/unreadable sidecar (a foreign, non-cypher-brain-
-// produced artifact) just means this advisory guard has nothing to key off, same
-// "unknown degrades to skip the optimization" contract pushpull.ts's own copy documents.
+// Mirrors pushpull.ts's own contentDigestFor() sidecar convention (the "<in>.digest"
+// file `snapshot` writes next to its output) MINUS that function's explicit --digest
+// CLI override branch, which put() has no access to without importing pushpull.ts (see
+// the header comment above PushFundingConfirmedButIncompleteError's import for why this
+// file never imports from pushpull.ts — that would close an import cycle).
+//
+// UNLIKE pushpull.ts's own copy (#950 review, codex xhigh pass, Warning): a genuinely
+// ABSENT sidecar (ENOENT — a foreign, non-cypher-brain-produced artifact) degrades to
+// "unknown, skip the guard" exactly the same way, but any OTHER read failure (EACCES, a
+// transient EIO, a permissions change) is NOT swallowed here. pushpull.ts's own copy can
+// safely treat every error the same because it only ever powers the --skip-unchanged
+// OPTIMIZATION — degrading it just means one extra, harmless re-upload. This copy also
+// gates a MONEY-SAFETY refusal (put()'s #950 guard below): if an existing sidecar were
+// swallowed into "unknown" on a transient error, a genuinely unresolved prior payment for
+// this exact content would go undetected and this run would pay for a second contract —
+// exactly the fail-open direction unresolvedNotifyIncompleteFor()'s own read path already
+// refuses to take. A non-ENOENT failure here is therefore let through to the caller.
 async function sourceContentDigestFor(file: string): Promise<string | null> {
+  let text: string;
   try {
-    const line = (await readFile(`${file}.digest`, 'utf8'))
-      .split('\n')
-      .map((l) => l.trim())
-      .find((l) => l && !l.startsWith('#'));
-    return line ? line.toLowerCase() : null;
-  } catch {
-    return null;
+    text = await readFile(`${file}.digest`, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw new Error(
+      `ton-provider backend: could not read the source content digest sidecar at ${file}.digest (${errMsg(e)}) — ` +
+        'refusing to proceed without being able to check for a prior unresolved payment attempt for this exact ' +
+        'source content (issue #950). This is a fail-closed refusal: no funds moved. Fix the path (permissions, a ' +
+        'full disk) and re-run.',
+    );
   }
+  const line = text
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith('#'));
+  return line ? line.toLowerCase() : null;
 }
 
 function validateNotifyIncomplete(parsed: unknown): NotifyIncompleteRecord | null {
@@ -1498,29 +1515,44 @@ async function recordNotifyIncomplete(
 }
 
 // Every still-OPEN (unresolved, not self-expired) notify-incomplete record for a
-// content digest, newest-first — deliberately every match, not just the newest one
-// (#950 review, codex xhigh pass, Warning): repeated re-encrypts can leave SEVERAL
-// different contract addresses abandoned for the SAME content digest (that repeated
-// abandonment is exactly what #950 exists to stop), and an operator's manual recovery
-// could retain and retry ANY one of those original ciphertext files, not necessarily
-// the one behind the most-recently-recorded address. Comparing against only the
-// newest record would wrongly refuse a legitimate resume of an OLDER one. "Open" here
-// combines two independent signals folded per contract_address (append-only, last
-// line for an address wins, same contract pending-spend.ts's own log uses): not
-// `resolved` (a LATER run's notify for that address never completed) and within
-// windowMs of when it was written (self-expires — see
-// TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS's own comment, config.ts).
+// content digest, newest-first. The caller (put(), below) only ever calls this once it
+// already knows — from the #638 already-active check's REAL on-chain answer, not from
+// this guard's own bookkeeping — that this run is genuinely about to broadcast a NEW
+// transfer (#950 review, codex xhigh pass, Warning, second pass: an earlier version
+// compared THIS run's own derived address against the open list here, which wrongly
+// refused retrying an already-resolved or externally-deployed contract that this log
+// simply never named). Returning every match rather than just the newest one is for the
+// refusal MESSAGE's quality (repeated re-encrypts can leave several different addresses
+// abandoned for the same content — "plus N more still-open contract(s)" — see #950's own
+// header comment), not for a resume decision, since a resume decision no longer needs
+// this function's answer at all. "Open" combines two independent signals folded per
+// contract_address (append-only, last line for an address wins, same contract
+// pending-spend.ts's own log uses): not `resolved` (a LATER run's notify for that
+// address never completed) and within windowMs of when it was written (self-expires —
+// see TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS's own comment, config.ts).
+// Read the whole log, folded to the LAST line per contract_address (append-only —
+// same "last line wins" contract pending-spend.ts's own log uses). Shared by both
+// unresolvedNotifyIncompleteFor() (pre-spend, must fail closed — see its own comment)
+// and notifyIncompleteRecordForContract() (post-spend/best-effort — see its own
+// comment), so the two never fold the log two different ways.
+async function readNotifyIncompleteFolded(): Promise<Map<string, NotifyIncompleteRecord>> {
+  const { items } = await readJsonlLog(
+    TON_PROVIDER_NOTIFY_INCOMPLETE_LOG,
+    'ton-provider notify-incomplete log',
+    validateNotifyIncomplete,
+  );
+  const latestPerAddress = new Map<string, NotifyIncompleteRecord>();
+  for (const item of items) latestPerAddress.set(item.contract_address, item);
+  return latestPerAddress;
+}
+
 async function unresolvedNotifyIncompleteFor(
   contentDigest: string,
   windowMs: number,
 ): Promise<NotifyIncompleteRecord[]> {
-  let items: NotifyIncompleteRecord[];
+  let folded: Map<string, NotifyIncompleteRecord>;
   try {
-    ({ items } = await readJsonlLog(
-      TON_PROVIDER_NOTIFY_INCOMPLETE_LOG,
-      'ton-provider notify-incomplete log',
-      validateNotifyIncomplete,
-    ));
+    folded = await readNotifyIncompleteFolded();
   } catch (e) {
     // Fail CLOSED (#950 review, codex xhigh pass, Warning) — matching this file's own
     // #805/#638 money-safety posture, not the "advisory, never block" posture this
@@ -1540,11 +1572,35 @@ async function unresolvedNotifyIncompleteFor(
     );
   }
   const now = Date.now();
-  const latestPerAddress = new Map<string, NotifyIncompleteRecord>();
-  for (const item of items) latestPerAddress.set(item.contract_address, item); // append-only, last line per address wins
-  return [...latestPerAddress.values()]
+  return [...folded.values()]
     .filter((i) => i.content_digest === contentDigest && !i.resolved && now - Date.parse(i.timestamp) <= windowMs)
     .sort((a, b) => (a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0));
+}
+
+// The latest notify-incomplete record for ONE contract address (any content digest,
+// resolved or not), or null. Used only by the notify-SUCCESS path below to close out
+// whatever record this exact contract may have left open — keyed by contract_address,
+// deliberately NOT requiring this run's own `sourceDigest` to be available at all (#950
+// review, codex xhigh pass, Warning, second pass): a recovery push of a retained
+// ciphertext whose ".digest" sidecar is missing/foreign would otherwise never resolve
+// the very record it just finished notifying, leaving it open to wrongly block a LATER,
+// genuinely new push of the same content until the window expires. Best-effort — read
+// failures here degrade to "nothing to resolve" (warned, not thrown): notify has already
+// fully succeeded by this point, so this is bookkeeping cleanup, not a money-safety
+// gate (the gate is unresolvedNotifyIncompleteFor()'s own read path, above, which fails
+// closed because IT runs before funds move).
+async function notifyIncompleteRecordForContract(contractAddress: string): Promise<NotifyIncompleteRecord | null> {
+  let folded: Map<string, NotifyIncompleteRecord>;
+  try {
+    folded = await readNotifyIncompleteFolded();
+  } catch (e) {
+    warn(
+      `ton-provider: could not read the notify-incomplete guard log at ${TON_PROVIDER_NOTIFY_INCOMPLETE_LOG} ` +
+        `(${errMsg(e)}) — could not check whether contract ${contractAddress} had an open record to resolve (#950)`,
+    );
+    return null;
+  }
+  return folded.get(contractAddress) ?? null;
 }
 
 export function tonProviderBackend(): StorageBackend {
@@ -1721,54 +1777,6 @@ export function tonProviderBackend(): StorageBackend {
           owner,
         });
 
-        // ---------- #950: nightly-schedule notify-abandonment guard ----------
-        // Checked HERE — after the address is derived, but still before the #638
-        // already-active check and BEFORE any provider is selected — rather than before
-        // bag creation: this run's OWN derived `contractAddress` is what tells apart a
-        // legitimate RESUME of the exact contract a prior run's notify never confirmed
-        // (this run derives the SAME address — e.g. an operator re-running push with the
-        // retained original ciphertext file, exactly the recovery step this guard's own
-        // refusal message recommends) from the actual bug this guard exists to catch (a
-        // re-encrypted ciphertext deriving a DIFFERENT address for the SAME underlying
-        // content, which the #638 check below could never recognize as a retry at all).
-        // Refusing before knowing which of those two this is would block the very
-        // recovery path this guard tells the operator to use.
-        if (sourceDigest) {
-          // #950 review (codex xhigh pass, Warning): check against EVERY open record for
-          // this content digest, not just the newest — repeated re-encrypts can abandon
-          // SEVERAL different addresses for the SAME content (exactly what #950 exists to
-          // stop), and an operator's retained recovery file could target any one of them.
-          // If THIS run's own derived address already matches one of them, this IS that
-          // legitimate resume — let it through to the #638 check below rather than
-          // refusing it. Only refuse when there is at least one open record and NONE of
-          // them is this run's own address (i.e. this run would abandon yet another one).
-          const openPriors = await unresolvedNotifyIncompleteFor(
-            sourceDigest,
-            TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS,
-          );
-          const resumesOneOfThem = openPriors.some((p) => p.contract_address === contractAddress.toRawString());
-          if (openPriors.length > 0 && !resumesOneOfThem) {
-            const prior = openPriors[0]; // newest-first — see unresolvedNotifyIncompleteFor()'s own sort
-            throw new Error(
-              `ton-provider backend: a PRIOR push of this exact source content (digest ${sourceDigest}) already paid ` +
-                `to deploy contract ${prior.contract_address} (recorded ${prior.timestamp}, bag ${prior.bag_id}` +
-                `${openPriors.length > 1 ? `, plus ${openPriors.length - 1} more still-open contract(s) for this same content` : ''}), ` +
-                'and notifying the storage provider did not confirm a full download before that run gave up ' +
-                'waiting — that contract may still be actively transferring. This run would derive a DIFFERENT, ' +
-                `NEW contract (${contractAddress.toRawString()}) for the same unchanged content — refusing to fund ` +
-                'a SECOND, unrelated contract for it (issue #950). To resume an EXISTING contract instead: if the ' +
-                `original ciphertext this backend pushed for it is still on disk (recorded source: ` +
-                `${prior.source_file}), re-run \`cypher-brain push\` with THAT exact file — it will derive the ` +
-                `SAME contract address, detect it is already active, and skip re-funding, going straight back to ` +
-                'notify (issue #638). If that file is gone, this payment cannot be auto-resumed; check ' +
-                `${prior.contract_address} on a TON explorer, or re-run \`notify\`/\`providers\` ` +
-                '(scripts/go/storage-v1-client) against it directly. If you decide it is truly lost, this refusal ' +
-                `self-expires ${Math.round(TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS / 3_600_000)}h after ` +
-                `${prior.timestamp} (or set CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS lower and re-run).`,
-            );
-          }
-        }
-
         // ---------- money-safety: skip re-funding a non-fresh contract (issue #638) ----------
         // A retry of the SAME file (same content -> same bag hash -> identical
         // StateInit) after ANY broadcast-adjacent failure derives the IDENTICAL contract
@@ -1846,6 +1854,48 @@ export function tonProviderBackend(): StorageBackend {
               "Check the address's state on a TON explorer, or re-run push once tonapi is reachable again (the " +
               'same ciphertext resolves to the same bag id and reuses this bag, so nothing is lost by waiting).',
           );
+        }
+
+        // ---------- #950: nightly-schedule notify-abandonment guard ----------
+        // Checked HERE — after the #638 already-active determination just above, using
+        // its REAL on-chain answer, rather than inferring "would this run pay for a new
+        // contract" from this guard's own bookkeeping (#950 review, codex xhigh pass,
+        // Warning — the second pass): comparing this run's derived address against only
+        // this guard's own open-record list is a WEAKER signal than `alreadyActive`
+        // itself — a contract this guard never recorded at all (deployed by a different
+        // tool/session) or one it already marked `resolved` would incorrectly read as
+        // "not one of the open ones" and get refused here even though retrying it moves
+        // no funds at all. `!alreadyActive` is the fact that actually matters: it is
+        // true if and only if THIS run is genuinely about to broadcast a NEW transfer,
+        // which is exactly the moment a sibling open record for the same content digest
+        // matters. When alreadyActive is true, the #638 branch below already handles
+        // everything correctly (skip re-funding) regardless of what this guard's own log
+        // says, so this check does not run at all.
+        if (!alreadyActive && sourceDigest) {
+          const openPriors = await unresolvedNotifyIncompleteFor(
+            sourceDigest,
+            TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS,
+          );
+          if (openPriors.length > 0) {
+            const prior = openPriors[0]; // newest-first — see unresolvedNotifyIncompleteFor()'s own sort
+            throw new Error(
+              `ton-provider backend: a PRIOR push of this exact source content (digest ${sourceDigest}) already paid ` +
+                `to deploy contract ${prior.contract_address} (recorded ${prior.timestamp}, bag ${prior.bag_id}` +
+                `${openPriors.length > 1 ? `, plus ${openPriors.length - 1} more still-open contract(s) for this same content` : ''}), ` +
+                'and notifying the storage provider did not confirm a full download before that run gave up ' +
+                'waiting — that contract may still be actively transferring. This run would derive a DIFFERENT, ' +
+                `NEW contract (${contractAddress.toRawString()}) for the same unchanged content — refusing to fund ` +
+                'a SECOND, unrelated contract for it (issue #950). To resume an EXISTING contract instead: if the ' +
+                `original ciphertext this backend pushed for it is still on disk (recorded source: ` +
+                `${prior.source_file}), re-run \`cypher-brain push\` with THAT exact file — it will derive the ` +
+                `SAME contract address, detect it is already active, and skip re-funding, going straight back to ` +
+                'notify (issue #638). If that file is gone, this payment cannot be auto-resumed; check ' +
+                `${prior.contract_address} on a TON explorer, or re-run \`notify\`/\`providers\` ` +
+                '(scripts/go/storage-v1-client) against it directly. If you decide it is truly lost, this refusal ' +
+                `self-expires ${Math.round(TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS / 3_600_000)}h after ` +
+                `${prior.timestamp} (or set CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS lower and re-run).`,
+            );
+          }
         }
 
         // ---------- #951: only select (and price-check) a provider for a GENUINELY new
@@ -2549,22 +2599,28 @@ export function tonProviderBackend(): StorageBackend {
           }
           throw new PushFundingConfirmedButIncompleteError(locator, e);
         }
-        // #950 review (codex xhigh pass, Warning): notify just SUCCEEDED for this exact
-        // contract — close out any open notify-incomplete record for it (append-only
-        // "last line for an address wins", so this is safe to write unconditionally
-        // whether or not one was ever open) so a LATER push of the SAME still-unchanged
-        // content is not wrongly refused after this contract has genuinely finished
-        // transferring. Best-effort/warn-only, same posture as the write above: notify
-        // has already fully succeeded by this point, so a bookkeeping failure here must
-        // not turn a completed push into a reported failure.
-        if (sourceDigest) {
+        // #950 review (codex xhigh pass, Warning, second pass): notify just SUCCEEDED for
+        // this exact contract — close out its open notify-incomplete record, if it has
+        // one, so a LATER push of the SAME still-unchanged content is not wrongly refused
+        // after this contract has genuinely finished transferring. Looked up by
+        // CONTRACT ADDRESS (notifyIncompleteRecordForContract(), not this run's own
+        // `sourceDigest`) so a recovery push whose own ".digest" sidecar happens to be
+        // missing/foreign can still resolve the record — it reuses that record's OWN
+        // stored content_digest, which is what a later push actually keys its lookup on.
+        // Only writes when a record genuinely exists and is not already resolved (avoids
+        // growing the log on the common case of a fresh push with no history at all).
+        // Best-effort/warn-only inside recordNotifyIncomplete() itself: notify has
+        // already fully succeeded by this point, so a bookkeeping failure here must not
+        // turn a completed push into a reported failure.
+        const openForThisContract = await notifyIncompleteRecordForContract(contractAddressRaw);
+        if (openForThisContract && !openForThisContract.resolved) {
           await recordNotifyIncomplete({
-            content_digest: sourceDigest,
+            content_digest: openForThisContract.content_digest,
             contract_address: contractAddressRaw,
-            bag_id: bag.bagId,
-            provider_pubkey: notifyPubkey,
-            locator,
-            source_file: file,
+            bag_id: openForThisContract.bag_id,
+            provider_pubkey: openForThisContract.provider_pubkey,
+            locator: openForThisContract.locator,
+            source_file: openForThisContract.source_file,
             resolved: true,
           });
         }

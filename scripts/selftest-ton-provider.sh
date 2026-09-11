@@ -1603,6 +1603,48 @@ printf '%s' "$NIGHT3_LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' \
 echo "[PASS] issue #950: a successful resume resolves the guard record, so a later push of the same unchanged content is a normal fresh deploy again, not wrongly refused"
 echo "$SIZE" > "$TMP/notify-downloaded" # restore
 
+echo "== issue #950 (codex xhigh review, second pass): retrying an ALREADY-ACTIVE sibling contract is never blocked by an unrelated open record for the same content digest =="
+# An earlier version of this guard compared THIS run's own derived address against its
+# open-record list, refusing whenever no open record named it — which wrongly refused
+# retrying a contract that IS already active on-chain but was never itself incomplete
+# (deployed by a prior run that fully succeeded, or by a different tool/session), just
+# because an UNRELATED sibling contract for the same content digest happened to be open.
+# The fix checks the guard only when the #638 already-active check's REAL on-chain
+# answer says a NEW transfer is actually about to happen — retrying an already-active
+# contract must always be able to proceed to the #638 resume path regardless of what
+# this guard's own log says about a sibling.
+mkdir -p "$TMP/issue950b-src"
+printf 'ton-provider issue #950 (b) sibling-open-record-does-not-block-active-retry payload\n' > "$TMP/issue950b-src/note.txt"
+cb snapshot --dir "$TMP/issue950b-src" --out "$TMP/issue950b-a.age" # contract A: this one will succeed fully first
+I950B_SIZE=$(stat -f%z "$TMP/issue950b-a.age" 2>/dev/null || stat -c%s "$TMP/issue950b-a.age")
+echo "$I950B_SIZE" > "$TMP/notify-downloaded"
+A_LOC=$(cb push --in "$TMP/issue950b-a.age" --backend ton-provider 2>"$TMP/issue950b-a.err") \
+  || { echo "[FAIL] issue #950 (b) setup: contract A's first push should have succeeded outright"; cat "$TMP/issue950b-a.err"; exit 1; }
+printf '%s' "$A_LOC" | grep -Eq '^ton-provider:v1:[0-9a-f]{64}$' \
+  || { echo "[FAIL] issue #950 (b) setup: contract A did not return a locator: $A_LOC"; exit 1; }
+echo "[PASS] issue #950 (b) setup: contract A succeeds fully (never incomplete — no open record for it at all)"
+
+cb snapshot --dir "$TMP/issue950b-src" --out "$TMP/issue950b-b.age" # SAME source dir -> same content digest, DIFFERENT ciphertext -> contract B
+echo "1" > "$TMP/notify-downloaded" # far short of the real size -- contract B's notify genuinely times out
+if CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS=2000 CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INTERVAL_MS=500 \
+  cb push --in "$TMP/issue950b-b.age" --backend ton-provider 2>"$TMP/issue950b-b.err"; then
+  echo "[FAIL] issue #950 (b) setup: contract B's push should have failed once notify timed out"; cat "$TMP/issue950b-b.err"; exit 1
+fi
+grep -q 'contract funding is CONFIRMED on-chain' "$TMP/issue950b-b.err" \
+  || { echo "[FAIL] issue #950 (b) setup: contract B did not report confirmed-funding-notify-incomplete"; cat "$TMP/issue950b-b.err"; exit 1; }
+echo "[PASS] issue #950 (b) setup: contract B (a genuinely DIFFERENT, unrelated deploy for the same content digest) times out and stays open"
+
+echo "$I950B_SIZE" > "$TMP/notify-downloaded" # restore for the retry below
+if ! A_RETRY_LOC=$(cb push --in "$TMP/issue950b-a.age" --backend ton-provider 2>"$TMP/issue950b-a-retry.err"); then
+  echo "[FAIL] issue #950 REGRESSION: retrying an already-active contract (A) was blocked by an UNRELATED sibling contract's (B) open record"; cat "$TMP/issue950b-a-retry.err"; exit 1
+fi
+[ "$A_RETRY_LOC" = "$A_LOC" ] \
+  || { echo "[FAIL] issue #950 (b): retrying contract A derived a DIFFERENT locator ($A_RETRY_LOC vs $A_LOC)"; exit 1; }
+grep -q 'already shows on-chain activity' "$TMP/issue950b-a-retry.err" \
+  || { echo "[FAIL] issue #950 (b): retrying contract A did not take the #638 already-active branch"; cat "$TMP/issue950b-a-retry.err"; exit 1; }
+echo "[PASS] issue #950 (codex xhigh review, second pass): retrying already-active contract A succeeds via #638 resume, unaffected by sibling contract B's still-open notify-incomplete record"
+echo "$SIZE" > "$TMP/notify-downloaded" # restore
+
 echo "== issue #654 (MCP-level): a snapshot_now notify timeout classifies as funding_confirmed, not a generic partial-success bucket =="
 # Reuses this run's ALREADY-RUNNING tonapi/mytonprovider/notify mocks (env vars
 # exported above) — the dedicated companion script only adds the MCP stdio/JSON-RPC
