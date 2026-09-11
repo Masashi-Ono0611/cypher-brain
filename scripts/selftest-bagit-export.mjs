@@ -278,7 +278,92 @@ try {
     );
   }
 
-  // ---- 10. CLI surface: --json shape, exit codes, missing-flag messages ----
+  // ---- 10. --out-dir overlapping --from-restored-dir (same path, --out-dir nested
+  //          inside it, or --out-dir an ancestor of it) refuses BEFORE anything is
+  //          written or removed, even with --force — regression test for a Critical
+  //          multi-model review finding: without this check, --force would have this
+  //          function's own destination-clobber rm() delete the restore output it
+  //          promises to only ever read. ----
+  {
+    const from = await makeRestoreDir('overlap-same');
+    await checkThrows(
+      'overlap: --out-dir identical to --from-restored-dir refuses, even with --force',
+      () => exportBagit({ fromDir: from, outDir: from, force: true }),
+      (e) => /overlaps/.test(e.message),
+    );
+    check(
+      'overlap (same): --from-restored-dir/manifest.json survives untouched',
+      await pathExists(join(from, 'manifest.json')),
+    );
+
+    const fromNested = await makeRestoreDir('overlap-nested');
+    const insideIt = join(fromNested, 'bag-goes-here');
+    await checkThrows(
+      'overlap: --out-dir nested INSIDE --from-restored-dir refuses, even with --force',
+      () => exportBagit({ fromDir: fromNested, outDir: insideIt, force: true }),
+      (e) => /overlaps/.test(e.message),
+    );
+    check(
+      'overlap (nested-in): --from-restored-dir/manifest.json survives untouched',
+      await pathExists(join(fromNested, 'manifest.json')),
+    );
+
+    const ancestorOut = join(tmp, 'overlap-ancestor-out');
+    const fromInsideOut = join(ancestorOut, 'restored');
+    await mkdir(fromInsideOut, { recursive: true });
+    await writeFile(join(fromInsideOut, 'manifest.json'), '{}');
+    await checkThrows(
+      'overlap: --out-dir an ANCESTOR of --from-restored-dir refuses, even with --force',
+      () => exportBagit({ fromDir: fromInsideOut, outDir: ancestorOut, force: true }),
+      (e) => /overlaps/.test(e.message),
+    );
+    check(
+      'overlap (ancestor-out): --from-restored-dir/manifest.json survives untouched',
+      await pathExists(join(fromInsideOut, 'manifest.json')),
+    );
+  }
+
+  // ---- 11. a top-level filename containing a literal CR or LF is refused, rather than
+  //          silently corrupting manifest-sha256.txt's line-oriented format ----
+  {
+    const from = await makeRestoreDir('crlf-name');
+    await writeFile(join(from, 'bad\nname.tar.gz'), 'x');
+    await checkThrows(
+      'crlf: a top-level filename containing LF refuses the export',
+      () => exportBagit({ fromDir: from, outDir: join(tmp, 'crlf-out') }),
+      (e) => /CR or LF/.test(e.message),
+    );
+  }
+
+  // ---- 12. --json output is never corrupted by the "skipping expanded/" informational
+  //          message — regression test for a Warning multi-model review finding
+  //          (that message must go to stderr, never stdout) ----
+  {
+    const from = await makeRestoreDir('json-with-expanded', { expanded: true });
+    const out = join(tmp, 'json-with-expanded-out');
+    const cli = (args) => spawnSync(process.execPath, [dist, ...args], { encoding: 'utf8', timeout: 30000 });
+    const r = cli(['bagit-export', '--from-restored-dir', from, '--out-dir', out, '--json']);
+    check('json+expanded: exits 0', r.status === 0, `${r.stdout}${r.stderr}`);
+    check('json+expanded: the "skipping expanded" message appears on stderr', /skipping/.test(r.stderr ?? ''));
+    let parsed;
+    try {
+      parsed = JSON.parse(r.stdout);
+    } catch (e) {
+      check(
+        'json+expanded: stdout is valid JSON, not polluted by the informational message',
+        false,
+        `${e.message} — stdout was: ${JSON.stringify(r.stdout)}`,
+      );
+    }
+    if (parsed) {
+      check(
+        'json+expanded: stdout parses to exactly the result object',
+        parsed.outDir === out && typeof parsed.fileCount === 'number',
+      );
+    }
+  }
+
+  // ---- 13. CLI surface: --json shape, exit codes, missing-flag messages ----
   {
     const cli = (args) => {
       const r = spawnSync(process.execPath, [dist, ...args], { encoding: 'utf8', timeout: 30000 });

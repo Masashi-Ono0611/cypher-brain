@@ -23,13 +23,14 @@
 // oversized for what we need, or a license mismatch"), a narrow, spec-correct writer
 // using only Node builtins (node:fs, node:crypto) is that exception, not a shortcut
 // around it.
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { copyFile, lstat, mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
-import { dirname, join, relative, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { sha256 } from './util.js';
 import { printJson } from './ui.js';
 import { UsageError } from './errors.js';
+import { installStageSignalGuard, addActiveBagitScratchDir, removeActiveBagitScratchDir } from './signal-guard.js';
 import type { CliOptions } from './types.js';
 
 export interface BagitExportOptions {
@@ -111,6 +112,20 @@ async function planTopLevel(fromDir: string): Promise<{ files: string[] }> {
           'how to handle this entry type, refusing rather than silently skipping it',
       );
     }
+    // BagIt's manifest/tagmanifest files are LINE-oriented (one "<hash>  <path>" record
+    // per line, see MANIFEST_LINE_SEP below) — a filename containing a literal CR or LF
+    // would inject a bogus extra "line" into manifest-sha256.txt, corrupting it for any
+    // BagIt-aware reader (multi-model review finding). RFC 8493's own historical
+    // convention is to percent-encode CR/LF/percent in manifest path fields rather than
+    // refuse them outright, but implementing that encode/decode round-trip is out of
+    // proportion for a shape restore() itself never produces — refusing is simpler and
+    // strictly safer than silently writing a manifest a reader could misparse.
+    if (/[\r\n]/.test(entry.name)) {
+      throw new Error(
+        `${abs} has a CR or LF character in its filename — bagit-export refuses this rather than risk corrupting ` +
+          "the line-oriented manifest-sha256.txt/tagmanifest-sha256.txt files' record boundaries",
+      );
+    }
     if (entry.name === 'manifest.json') sawManifest = true;
     files.push(entry.name);
   }
@@ -122,7 +137,10 @@ async function planTopLevel(fromDir: string): Promise<{ files: string[] }> {
     );
   }
   if (expandedSkipped) {
-    console.log(
+    // stderr, not stdout (multi-model review finding): bagitExportCommand()'s --json
+    // path prints ONLY the JSON result object to stdout — an informational message on
+    // stdout ahead of it would corrupt that for any caller parsing stdout as JSON.
+    console.error(
       `bagit-export: skipping "${join(fromDir, 'expanded')}" — this is restore's own derived/expanded view of ` +
         'components already present as their own *.tar.gz archives; re-including it would duplicate the payload ' +
         'and inflate the bag for no interoperability benefit',
@@ -186,11 +204,41 @@ function resolveOwnVersion(): string {
   );
 }
 
+// true if `child` is `parent` itself, or nested anywhere under it, once both are made
+// absolute (path.resolve — string normalization against cwd, no filesystem access, no
+// symlink resolution). This is a straightforward misuse guard, not a hardened
+// canonicalization boundary: it will not catch a symlink placed somewhere in either
+// path's ancestry that makes two textually-different paths alias the same inode. That
+// residual is accepted here the same way the rest of this module treats
+// --from-restored-dir/--out-dir as operator-local, non-adversarial inputs (this tool's
+// own top-level symlink refusal in planTopLevel() already covers the entries WITHIN
+// fromDir; this check is specifically about the two ROOT paths' own relationship).
+function pathsOverlap(parent: string, child: string): boolean {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
 // The core writer. See this module's own header comment for scope, and RFC 8493 for the
 // exact normative shapes below — every format decision here was checked against the
 // RFC's own text, not written from memory of what a "bag" generally looks like.
 export async function exportBagit(opts: BagitExportOptions): Promise<BagitExportResult> {
   const { fromDir, outDir, force } = opts;
+
+  // Multi-model review finding: without this check, `--force` with --out-dir equal to
+  // (or an ancestor/descendant of) --from-restored-dir would have this function's own
+  // later `rm(outDir, {recursive:true})` delete the restore output this tool promises
+  // to only ever READ — directly contradicting its own "non-destructive" contract
+  // (see this module's header comment). Checked before anything else runs, using only
+  // the two paths given — no filesystem access needed to catch the common case.
+  if (pathsOverlap(fromDir, outDir) || pathsOverlap(outDir, fromDir)) {
+    throw new Error(
+      `--out-dir ${outDir} overlaps --from-restored-dir ${fromDir} (one contains the other, or they are the ` +
+        'same path) — bagit-export refuses this because --force would otherwise delete the restore output it ' +
+        'promises to only ever read. Pick an --out-dir that is not inside, and does not contain, ' +
+        '--from-restored-dir.',
+    );
+  }
+
   const { files: fileNames } = await planTopLevel(fromDir);
 
   // --force semantics: refuse an existing destination outright unless --force, matching
@@ -216,7 +264,22 @@ export async function exportBagit(opts: BagitExportOptions): Promise<BagitExport
   // other file has already been written and hashed successfully.
   await mkdir(dirname(outDir), { recursive: true });
   const tmpOutDir = join(dirname(outDir), `.bagit-export-${process.pid}-${randomBytes(4).toString('hex')}.partial`);
-  await mkdir(tmpOutDir);
+  // Multi-model review finding: this staging directory holds the whole in-progress bag
+  // (a full plaintext copy of --from-restored-dir's payload) but was never registered
+  // with signal-guard.ts — a SIGINT/SIGTERM/SIGHUP mid-export left it orphaned under
+  // --out-dir's parent forever. installStageSignalGuard() is idempotent (see its own
+  // call sites in ton-dns.ts/restore.ts), so calling it here is safe even when another
+  // caller already installed it. mkdirSync (not the async mkdir used everywhere else in
+  // this function) + an IMMEDIATE, same-tick register with no await in between — the
+  // exact same reasoning ton-dns.ts's assertBagAvailable() and restore.ts's
+  // expandComponents() both document at their own mkdtempSync/register call sites: an
+  // async mkdir() leaves a real window (the underlying fs call runs on the libuv
+  // threadpool while this function is suspended at `await`) where the directory could
+  // already exist on disk but a signal landing in that window would find it still
+  // unregistered.
+  installStageSignalGuard();
+  mkdirSync(tmpOutDir);
+  addActiveBagitScratchDir(tmpOutDir);
   try {
     const dataDir = join(tmpOutDir, 'data');
     await mkdir(dataDir);
@@ -287,9 +350,23 @@ export async function exportBagit(opts: BagitExportOptions): Promise<BagitExport
     // race (mkdir/rename failing at exactly this line, e.g. ENOSPC/EIO).
     if (force && outExists) await rm(outDir, { recursive: true, force: true });
     await rename(tmpOutDir, outDir);
+    // Deregister only AFTER the rename actually moved it away from tmpOutDir (same
+    // "delete() only after confirmed gone" convention keys.ts's writeKeyFile() and
+    // restore.ts's expandComponents() both use) — a signal landing between the rename
+    // above and this line would find tmpOutDir already gone (ENOENT), so
+    // forceRmSync's own swallowed-ENOENT handling makes that harmless either way.
+    removeActiveBagitScratchDir(tmpOutDir);
     return { outDir, fileCount: relFiles.length, octetCount, files: relFiles };
   } catch (e) {
-    await rm(tmpOutDir, { recursive: true, force: true }).catch(() => {});
+    try {
+      await rm(tmpOutDir, { recursive: true, force: true });
+      removeActiveBagitScratchDir(tmpOutDir);
+    } catch {
+      // Leave it registered on a genuine removal failure (not swallowed): the same
+      // keys.ts writeKeyFile() convention — a later signal's own forceRmSync gets
+      // another chance, instead of the bookkeeping wrongly saying it was already
+      // handled.
+    }
     throw e;
   }
 }
