@@ -100,7 +100,7 @@ function parseFrames(buf) {
 
 // One snapshot_now call against a server started with `env`. Returns the tool result
 // frame. The server is always torn down, including on a thrown assertion.
-async function callSnapshotNow(env, args) {
+async function callSnapshotNow(env, args, tool = 'snapshot_now') {
   const child = spawn(process.execPath, [SERVER_PATH], { stdio: ['pipe', 'pipe', 'pipe'], env });
   let stdoutBuf = '';
   let stderrBuf = '';
@@ -130,7 +130,7 @@ async function callSnapshotNow(env, args) {
     await waitFor(1);
     send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     await wait(100);
-    send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'snapshot_now', arguments: args } });
+    send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: tool, arguments: args } });
     return await waitFor(2);
   } finally {
     await killAndWait(child);
@@ -469,6 +469,30 @@ async function run(tmp) {
     if (!outMsg.includes('CYPHER_BRAIN_MCP_SOURCE_ROOTS')) fail('containment refusal did not name the variable to fix');
     console.log('  [PASS] containment refusal names the variable, not the resolved target or the root list');
   }
+
+  // A caller can name any readable file as a recipient file. Refusing an unpinned
+  // entry must not reveal that file's contents through the policy error itself.
+  const recipientDisclosureErrors = [];
+  for (const tool of ['snapshot_now', 'schedule_install']) {
+    const decoy = join(outside, `recipient-decoy-${tool}.txt`);
+    const secret = `PRIVATE-DECOY-${tool}-do-not-disclose`;
+    await writeFile(decoy, `${secret}\n`);
+    const out = nextOut();
+    const args =
+      tool === 'snapshot_now'
+        ? baseArgs(out, { recipients: [decoy] })
+        : { backend: 'file', dirs: [contained], recipients: [decoy], no_load: true, confirm_install: true };
+    const frame = await callSnapshotNow(withRoots(okRoots), args, tool);
+    assertPolicyDenied(`${tool} rejects a non-recipient file`, frame);
+    if (JSON.stringify(frame.result).includes(secret))
+      recipientDisclosureErrors.push(`${tool}: policy denial disclosed recipient-file bytes`);
+    await assertNoArtifacts(tool, { out, store, idempotencyLog });
+    if (existsSync(join(home, 'schedule'))) fail(`${tool}: denied call installed a schedule`);
+    if (!JSON.stringify(frame.result).includes(secret))
+      console.log(`  [PASS] ${tool} does not quote rejected recipient-file contents`);
+  }
+
+  if (recipientDisclosureErrors.length) fail(recipientDisclosureErrors.join('; '));
 
   // ── 11c. snapshot.ts's own pin check is still there underneath ────────────
   // The MCP gate shadows it, which is exactly how a duplicated check rots unnoticed.

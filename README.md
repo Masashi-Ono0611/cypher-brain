@@ -1966,6 +1966,15 @@ Arweave is the mainline because its durability is purchasable (pay once) — see
 
 ## MCP server
 
+MCP recovery tools (`verify_restore` and `restore_now`) accept `locator_file` only
+when it resolves to a regular file inside `CYPHER_BRAIN_HOME`, at most 1 MiB.
+Rejected locator files and rejected recipient-file entries are not quoted into
+errors. Use `locator` with `backend` and `sha256` to recover from an off-box record.
+
+Schedules installed over MCP run the CLI shipped alongside the server. Reinstall
+an existing MCP-created schedule to replace a runner that points at `mcp.mjs`
+instead of `cli.mjs` (or the CLI shim in a source checkout).
+
 `cypher-brain-mcp` (stdio) lets an AI agent snapshot, verify and restore its own
 brain by calling the same `src/lib` functions the CLI uses:
 

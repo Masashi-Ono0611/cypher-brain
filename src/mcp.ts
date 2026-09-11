@@ -20,7 +20,7 @@
 // env escape hatch the CLI honors is deliberately NOT honored here, so an
 // agent can never spend without saying so in the call itself.
 
-import { stat, lstat, rm, copyFile, realpath, open } from 'node:fs/promises';
+import { stat, lstat, rm, copyFile, realpath, open, writeFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import type { Stats } from 'node:fs';
@@ -28,6 +28,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep, dirname, basename } from 'node:path';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -89,7 +90,7 @@ import {
   IdempotencyStoreError,
   IdempotencyClaimHeldError,
 } from './lib/idempotency.js';
-import { schedule, scheduleStatusReport, ScheduleNotInstalledError } from './lib/schedule.js';
+import { installSchedule, scheduleStatusReport, ScheduleNotInstalledError } from './lib/schedule.js';
 import { estimateCost } from './lib/estimate.js';
 import { keygenAt, recipientEntries, resolvePinnedRecipients } from './lib/keys.js';
 // #800: the exact-or-separator-bounded containment predicate, already written (and
@@ -1139,9 +1140,11 @@ async function assertSnapshotPolicy(dirs: readonly string[], recipients: readonl
       );
     }
     for (const entry of entries) {
+      // An entry came from a caller-named file, which may contain secrets rather
+      // than public keys. Report only the supplied path, never the rejected bytes.
       if (!pinned.has(entry)) {
         throw snapshotPolicyDenied(
-          `recipient ${JSON.stringify(entry)} (via ${JSON.stringify(rec)}) is not on the ` +
+          `recipient input ${JSON.stringify(rec)} contains an entry that is not on the ` +
             'CYPHER_BRAIN_PIN_RECIPIENTS allowlist this server enforces',
           'Pass a recipient the operator has pinned. If this key SHOULD be able to decrypt, the operator adds ' +
             `it to CYPHER_BRAIN_PIN_RECIPIENTS and restarts this server. ${POLICY_DOC_REF}`,
@@ -2357,7 +2360,7 @@ async function handleVerifyRestore(args: ToolArgs): Promise<CallToolResult> {
         backend: isStr(backend) ? backend : undefined,
         out: target,
         sha256: effectivePin,
-        from_locator_file: isStr(locatorFile) ? locatorFile : undefined,
+        from_locator_file: isStr(locatorFile) ? await stageRecoveryLocatorFile(locatorFile, tdir) : undefined,
         dirs: [],
         tables: [],
         recipients: [],
@@ -2457,6 +2460,18 @@ interface ResolvedRestoreTarget {
   warning?: string;
 }
 
+// Recovery must use the same contained, bounded reader as last_snapshot_status.
+// Validate without echoing rejected file contents, then let pull() parse a private
+// copy of the checked bytes so its signature fields and legacy formats stay intact.
+// Passing the original pathname after checking would let pull() read a swapped file.
+async function stageRecoveryLocatorFile(path: string, tdir: string): Promise<string> {
+  const read = await readContainedFileWithinHome(path, 'locator_file');
+  parseLocatorFile(path, read.text, read.mtime);
+  const staged = join(tdir, 'locator.tsv');
+  await writeFile(staged, read.text, { flag: 'wx', mode: 0o600 });
+  return staged;
+}
+
 async function resolveRestoreTarget(args: ToolArgs): Promise<ResolvedRestoreTarget> {
   const { locator, file, locator_file: locatorFile, backend, sha256: pin } = args;
   let target: string | undefined = isStr(file) ? file : undefined;
@@ -2487,7 +2502,7 @@ async function resolveRestoreTarget(args: ToolArgs): Promise<ResolvedRestoreTarg
         backend: isStr(backend) ? backend : undefined,
         out: target,
         sha256: effectivePin,
-        from_locator_file: isStr(locatorFile) ? locatorFile : undefined,
+        from_locator_file: isStr(locatorFile) ? await stageRecoveryLocatorFile(locatorFile, tdir) : undefined,
         dirs: [],
         tables: [],
         recipients: [],
@@ -2775,7 +2790,7 @@ async function handleEstimateCost(args: ToolArgs): Promise<CallToolResult> {
   return structuredOk({ ...(await estimateCost(backend, size)) });
 }
 
-// schedule({_: 'install', ...}) is the SAME function + dispatch branch the CLI's
+// installSchedule() is the SAME function the CLI's
 // `schedule install` subcommand uses — install() itself returns void (progress
 // only via console.error, no console.log data lines), so this returns the
 // captured log verbatim plus an echo of the args that were actually consented
@@ -2871,7 +2886,14 @@ async function handleScheduleInstall(args: ToolArgs): Promise<CallToolResult> {
   };
   let res: CaptureResult<void>;
   try {
-    res = await captureCall(() => schedule(installOpts));
+    // The runner needs the CLI entrypoint, not process.argv[1] (this MCP server).
+    // Source checkouts use the CLI shim, which supplies its own TypeScript loader;
+    // shipped bundles use the sibling CLI, independent of npm's executable symlink.
+    const cliPath = fileURLToPath(
+      new URL(import.meta.url.endsWith('/mcp.ts') ? '../bin/cypher-brain.mjs' : './cli.mjs', import.meta.url),
+    );
+    await requireFile(cliPath);
+    res = await captureCall(() => installSchedule(installOpts, cliPath));
   } catch (e) {
     // #726: same reclassification/translation as handleSnapshotNow's — schedule()'s
     // --max-spend/--ping-url-fail flag guidance rewritten to this tool's own

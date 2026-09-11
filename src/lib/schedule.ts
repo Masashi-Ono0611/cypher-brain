@@ -1103,6 +1103,7 @@ async function buildScheduleConfig(
     minute: number;
     gitleaksBin: string | null;
     effectiveScan: ScanSecretsMode | undefined;
+    cliPath: string;
   },
 ): Promise<ScheduleConfig> {
   const { backend, at, hour, minute, gitleaksBin, effectiveScan } = args;
@@ -1158,7 +1159,7 @@ async function buildScheduleConfig(
     logs_dir: LOGS_DIR,
     runner: RUNNER,
     node: process.execPath,
-    cli: resolve(process.argv[1]),
+    cli: resolve(args.cliPath),
     trigger:
       process.platform === 'darwin' ? { type: 'launchd', path: PLIST } : { type: 'cron', entry_file: CRON_ENTRY_FILE },
     // Same reasoning as --vault/--zip/--dir/--recipient above, applied to the ambient
@@ -1316,7 +1317,7 @@ function printInstallSummary(cfg: ScheduleConfig): void {
 }
 
 // ---------- install() — orchestrates the above in the ORIGINAL sequential order ----------
-async function install(o: CliOptions): Promise<void> {
+export async function installSchedule(o: CliOptions, cliPath = process.argv[1]): Promise<void> {
   // Checked here, BEFORE scheduleableBackends() (which does a filesystem check for a TON
   // wallet) — same order the original single function had: a plain "--backend missing"
   // usage error must never pay for that extra I/O (Codex review).
@@ -1337,7 +1338,7 @@ async function install(o: CliOptions): Promise<void> {
   const priorCfg = await tryReadConfig();
   const priorCronEntry = await readOwnCronEntry();
 
-  const cfg = await buildScheduleConfig(o, { backend, at, hour, minute, gitleaksBin, effectiveScan });
+  const cfg = await buildScheduleConfig(o, { backend, at, hour, minute, gitleaksBin, effectiveScan, cliPath });
   await writeScheduleArtifacts(cfg);
   await registerTrigger(cfg, priorCfg, priorCronEntry, o.no_load);
   printInstallSummary(cfg);
@@ -1896,7 +1897,7 @@ const SCHEDULE_SUBCOMMANDS = ['install', 'status', 'uninstall'];
 export async function schedule(o: CliOptions): Promise<void> {
   switch (o._) {
     case 'install':
-      return install(o);
+      return installSchedule(o);
     case 'status':
       return status(o);
     case 'uninstall':

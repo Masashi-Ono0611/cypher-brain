@@ -50,6 +50,12 @@ stderr is load-bearing, not decoration. If you run cypher-brain on a human's beh
   comes from the call. Relay the message to your human; it names the variable to set. The
   CLI `snapshot` has no such gate.
 
+MCP `verify_restore` / `restore_now` require `locator_file` to resolve to a regular
+file inside `CYPHER_BRAIN_HOME`, at most 1 MiB. Rejected locator/recipient file
+contents are not echoed into errors. For off-box pointers, pass `locator`,
+`backend`, and `sha256` directly. Reinstall older MCP-created schedules after
+upgrading so their nightly runner invokes the CLI instead of the MCP server.
+
 ## Turbo upload status (CLI only)
 
 `push-status --locator <data-item-id> [--json]` performs one manual public lookup
