@@ -71,6 +71,7 @@ const ENV_NAMES = [
   'CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS', // test-only override (#480) — a real deploy-confirm wait is bounded at 20 real minutes
   'CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS', // test-only override, same reason
   'CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS', // test-only override, same reason (#480 progress-line cadence)
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS', // #950: how long the notify-incomplete repeated-payment guard treats a prior unresolved attempt as still relevant (test-only override; a real run uses the 24h default)
   'CYPHER_BRAIN_TON_WALLET', // PR2: local TON wallet mnemonic file — when set, ton-provider auto-signs (no Tonkeeper deeplink) and derives `owner` from this wallet
   'CYPHER_BRAIN_YES',
   'CYPHER_BRAIN_MAX_SPEND',
@@ -885,6 +886,19 @@ export const TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS = parsePositiveMsOverride(
   readEnv('CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS'),
   30_000,
   'CYPHER_BRAIN_TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS',
+);
+// #950: how long the notify-incomplete repeated-payment guard (backends/ton-provider.ts)
+// treats a PRIOR run's "notify never confirmed a full download" record as still
+// relevant before it self-expires and stops refusing a new deploy for the same source
+// content digest. 24h real default — long enough to span a single missed nightly
+// schedule slot (the scenario this guard exists for) without requiring an operator to
+// intervene just to get an ordinary next-day push moving again if they decide the
+// earlier contract is truly lost; scripts/selftest-ton-provider.sh overrides this to
+// a tiny value so its positive control does not need to wait a real day.
+export const TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS = parsePositiveMsOverride(
+  readEnv('CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS'),
+  24 * 60 * 60_000,
+  'CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS',
 );
 // PR2 (auto-signing): path to a local TON wallet mnemonic file (`wallet create --chain ton`,
 // src/lib/wallet.ts). When set AND present on disk, ton-provider.ts's put() signs and

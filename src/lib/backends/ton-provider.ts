@@ -56,10 +56,10 @@
 // here, because this backend never operates a seeder of its own — a P2P failure is a
 // hard error, not a silent downgrade to a less-verified path.
 import { mkdtempSync } from 'node:fs';
-import { mkdir, copyFile, access } from 'node:fs/promises';
+import { mkdir, copyFile, access, open, readFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 // `@ton/ton` is an optionalDependency (package.json) — like `arweave` (wallet.ts's
 // getArweave()) and `@ardrive/turbo-sdk` (estimate.ts/turbo.ts), it must be a LAZY
@@ -87,6 +87,7 @@ import {
   TON_PROVIDER_DEPLOY_CONFIRM_TIMEOUT_MS,
   TON_PROVIDER_DEPLOY_CONFIRM_POLL_MS,
   TON_PROVIDER_DEPLOY_CONFIRM_PROGRESS_MS,
+  TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS,
   TON_TONAPI_URL,
   TON_BIN,
   TON_NETWORK_CONFIG,
@@ -95,7 +96,7 @@ import {
   RECEIPT_LEDGER,
 } from '../config.js';
 import { run } from '../proc.js';
-import { sleep, rmrf, errMsg, throwForSdkImport, makeBagLocator } from '../util.js';
+import { sleep, rmrf, errMsg, throwForSdkImport, makeBagLocator, readJsonlLog, syncDirectoryChain } from '../util.js';
 import { warn } from '../warn.js';
 import { installStageSignalGuard, addActiveTonTmpDir, removeActiveTonTmpDir } from '../signal-guard.js';
 import { tonApi, startLocalTonDaemon, type TonBagDetails, type LocalTonDaemon } from './ton-client.js';
@@ -360,6 +361,56 @@ export interface BuildDeployResult {
 }
 
 const UINT32_MAX = 4_294_967_295n;
+
+// ---------- #951: contract-address derivation, independent of any provider ----------
+export interface DeriveContractAddressParams {
+  bagId: Buffer; // 32 bytes
+  merkleHash: Buffer; // 32 bytes
+  dataSizeBytes: bigint;
+  pieceSize: number;
+  owner: TonAddress;
+}
+
+// The StorageV1 contract ADDRESS is fully determined by bagId + owner + dataSizeBytes +
+// pieceSize + merkleHash (buildDeploy()'s own `data` cell below) — NONE of which depend
+// on which provider was picked or its rate/span (see the #638 money-safety comment in
+// put() below, which this function lets run BEFORE a provider is ever selected). Kept as
+// its OWN small, standalone function — deliberately NOT refactored out of buildDeploy()
+// itself and reused from there — so buildDeploy()'s existing validation order/behavior
+// (which also validates provider/span/rate/max-spend fields this function never touches)
+// stays byte-for-byte unchanged; the two independently build the identical `data` cell
+// below, so a future change to StorageV1's data-cell layout must update both (the same
+// duplication risk buildDeploy()'s own header comment already accepts for the Go
+// reference this ports — a second small copy of ~10 lines, not a design that can drift
+// silently, since any divergence would show up immediately as a WRONG contract address).
+export async function deriveContractAddress(p: DeriveContractAddressParams): Promise<TonAddress> {
+  if (p.bagId.length !== 32) throw new Error(`ton-provider backend: bag id must be 32 bytes, got ${p.bagId.length}`);
+  if (p.merkleHash.length !== 32)
+    throw new Error(`ton-provider backend: merkle hash must be 32 bytes, got ${p.merkleHash.length}`);
+  if (p.dataSizeBytes <= 0n || p.dataSizeBytes > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(
+      `ton-provider backend: data size must be a positive integer no larger than ${Number.MAX_SAFE_INTEGER} bytes, got ${p.dataSizeBytes}`,
+    );
+  }
+  if (p.pieceSize <= 0 || p.pieceSize > 0xffffffff || !Number.isInteger(p.pieceSize)) {
+    throw new Error(`ton-provider backend: piece size must be a positive uint32, got ${p.pieceSize}`);
+  }
+
+  const { beginCell, contractAddress } = await getTon();
+  // Same StorageV1 data cell layout as buildDeploy() below — see that function's own
+  // comment for the field-by-field byte-for-byte provenance.
+  const data = beginCell()
+    .storeBuffer(p.bagId)
+    .storeBit(0) // ActiveProviders — Maybe ^Dict, absent
+    .storeAddress(p.owner)
+    .storeUint(p.dataSizeBytes, 64)
+    .storeUint(p.pieceSize, 32)
+    .storeBuffer(p.merkleHash)
+    .storeUint(0, 8) // KeyLen
+    .endCell();
+  const code = await v1Code();
+  return contractAddress(0, { code, data });
+}
 
 export async function buildDeploy(p: BuildDeployParams): Promise<BuildDeployResult> {
   if (p.bagId.length !== 32) throw new Error(`ton-provider backend: bag id must be 32 bytes, got ${p.bagId.length}`);
@@ -1322,9 +1373,267 @@ async function notifyProviderWithRetry(
   }
 }
 
+// ---------- #950: nightly-schedule notify-abandonment guard ----------
+// A nightly `schedule install` run can pay for a StorageV1 deploy, have it confirmed
+// on-chain, and then have notifyProviderWithRetry() above time out because the
+// PROVIDER's own P2P download of the bag genuinely needs longer than
+// CYPHER_BRAIN_TON_PROVIDER_NOTIFY_RETRY_MS (10 minutes by default) — a real
+// possibility this backend's own put() `finally` block then makes irreversible: once
+// that timeout fires, the LOCAL ephemeral seed daemon (this run's only source for the
+// provider's download) is torn down, so the provider can never actually finish
+// fetching the bag even though the contract stays funded and active on-chain forever.
+//
+// Before this guard, the NEXT scheduled run had no way to know this happened: the
+// schedule.ts-generated runner always re-encrypts a FRESH snapshot with age's own
+// ephemeral (random) per-run file key, so even byte-identical underlying plaintext
+// produces a DIFFERENT ciphertext -> a different bag id -> a DIFFERENT StorageV1
+// contract address (buildDeploy()'s/deriveContractAddress()'s address depends on the
+// CIPHERTEXT's own hash, not the plaintext) — the #638 already-active check in put()
+// below can never recognize "this is a retry of last night's still-transferring
+// deploy" by address alone, and pushpull.ts's own --skip-unchanged content-digest
+// comparison only ever updates once a push FULLY completes (including notify), which
+// this scenario never reaches (put() throws PushFundingConfirmedButIncompleteError
+// instead of returning). The result: a fresh, unrelated contract gets paid for and
+// funded EVERY night the transfer genuinely needs more than the wait window, for the
+// SAME unchanged source data — with no existing check catching it, since each night's
+// spend individually clears CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND.
+//
+// This is deliberately the SMALLEST fix that closes the REPEATED PAYMENT specifically,
+// not a full automatic-resumption redesign: a small, durable, append-only log records
+// "notify did not confirm a full download for source content with digest <hash>" the
+// moment that happens, and a LATER put() call for the SAME plaintext content (matched
+// by content digest — the one thing that stays constant across a re-encrypt, not by
+// contract address) refuses to fund a brand-new contract while a recent, unresolved
+// record exists for it, rather than silently paying again. It does NOT resume the
+// stuck transfer automatically: the local seed that fed it is already gone, and
+// re-deriving the SAME bag id requires the exact original ciphertext bytes, which are
+// only recoverable if the operator still has the file that produced them (schedule.ts's
+// nightly runner keeps dated snapshots under $SNAP_DIR by default, so it usually does)
+// — see the refusal message below for that manual recovery step.
+const NOTIFY_INCOMPLETE_LOG_VERSION = 1;
+export const TON_PROVIDER_NOTIFY_INCOMPLETE_LOG = `${RECEIPT_LEDGER}.ton-provider-notify-incomplete.jsonl`;
+
+interface NotifyIncompleteRecord {
+  cypher_brain_notify_incomplete_version: typeof NOTIFY_INCOMPLETE_LOG_VERSION;
+  timestamp: string; // when THIS line was written (first-write time for an open record, resolution time for a resolved one)
+  content_digest: string; // the PLAINTEXT digest — see sourceContentDigestFor() below
+  contract_address: string; // the fold key: the LAST line for a given address wins (APPEND-ONLY, same "last line wins" contract pending-spend.ts's own log uses)
+  bag_id: string;
+  provider_pubkey: string;
+  locator: string;
+  source_file: string; // an OPERATOR-facing hint only (the ciphertext path this run pushed) — never read back by this code
+  // #950 review (codex xhigh pass, Warning): without this, a SUCCESSFUL manual recovery
+  // (the exact remediation this guard's own refusal message recommends) never clears the
+  // record it left behind — a LATER, genuinely new push for the same still-unchanged
+  // content would keep being refused for the full window even though nothing is stuck
+  // anymore. `false`/absent = still open; `true` = a later run's notify for THIS
+  // contract_address completed, so this address no longer blocks anything.
+  resolved: boolean;
+}
+
+// Mirrors pushpull.ts's own contentDigestFor() sidecar convention (the "<in>.digest"
+// file `snapshot` writes next to its output) MINUS that function's explicit --digest
+// CLI override branch, which put() has no access to without importing pushpull.ts (see
+// the header comment above PushFundingConfirmedButIncompleteError's import for why this
+// file never imports from pushpull.ts — that would close an import cycle).
+//
+// UNLIKE pushpull.ts's own copy (#950 review, codex xhigh pass, Warning): a genuinely
+// ABSENT sidecar (ENOENT — a foreign, non-cypher-brain-produced artifact) degrades to
+// "unknown, skip the guard" exactly the same way, but any OTHER read failure (EACCES, a
+// transient EIO, a permissions change) is NOT swallowed here. pushpull.ts's own copy can
+// safely treat every error the same because it only ever powers the --skip-unchanged
+// OPTIMIZATION — degrading it just means one extra, harmless re-upload. This copy also
+// gates a MONEY-SAFETY refusal (put()'s #950 guard below): if an existing sidecar were
+// swallowed into "unknown" on a transient error, a genuinely unresolved prior payment for
+// this exact content would go undetected and this run would pay for a second contract —
+// exactly the fail-open direction unresolvedNotifyIncompleteFor()'s own read path already
+// refuses to take. A non-ENOENT failure here is therefore let through to the caller.
+async function sourceContentDigestFor(file: string): Promise<string | null> {
+  let text: string;
+  try {
+    text = await readFile(`${file}.digest`, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw new Error(
+      `ton-provider backend: could not read the source content digest sidecar at ${file}.digest (${errMsg(e)}) — ` +
+        'refusing to proceed without being able to check for a prior unresolved payment attempt for this exact ' +
+        'source content (issue #950). This is a fail-closed refusal: no funds moved. Fix the path (permissions, a ' +
+        'full disk) and re-run.',
+    );
+  }
+  const line = text
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith('#'));
+  return line ? line.toLowerCase() : null;
+}
+
+function validateNotifyIncomplete(parsed: unknown): NotifyIncompleteRecord | null {
+  const p = parsed as Partial<NotifyIncompleteRecord> | null;
+  if (
+    !p ||
+    typeof p !== 'object' ||
+    p.cypher_brain_notify_incomplete_version !== NOTIFY_INCOMPLETE_LOG_VERSION ||
+    typeof p.timestamp !== 'string' ||
+    !p.timestamp ||
+    typeof p.content_digest !== 'string' ||
+    !p.content_digest ||
+    typeof p.contract_address !== 'string' ||
+    typeof p.bag_id !== 'string' ||
+    typeof p.provider_pubkey !== 'string' ||
+    typeof p.locator !== 'string' ||
+    typeof p.source_file !== 'string' ||
+    (p.resolved !== undefined && typeof p.resolved !== 'boolean')
+  ) {
+    return null;
+  }
+  return {
+    cypher_brain_notify_incomplete_version: NOTIFY_INCOMPLETE_LOG_VERSION,
+    timestamp: p.timestamp,
+    content_digest: p.content_digest,
+    contract_address: p.contract_address,
+    bag_id: p.bag_id,
+    provider_pubkey: p.provider_pubkey,
+    locator: p.locator,
+    source_file: p.source_file,
+    resolved: p.resolved === true,
+  };
+}
+
+// fsync'd the same way pending-spend.ts's own appendLine() is (util.ts's fsyncPath/
+// syncDirectoryChain) — cheap, and this is exactly the kind of record that must
+// survive a crash right after being written for it to do its job on a later run.
+// Failure here is swallowed (warn()-only, #347): this guard is advisory on top of an
+// already-durable, already-successful funding+receipt record (settleIntentAgainstLedger,
+// called before this ever runs) — failing the whole push over a bookkeeping write for a
+// SEPARATE guard would report a real, confirmed spend as an outright failure.
+async function recordNotifyIncomplete(
+  fields: Omit<NotifyIncompleteRecord, 'cypher_brain_notify_incomplete_version' | 'timestamp'>,
+): Promise<void> {
+  const record: NotifyIncompleteRecord = {
+    cypher_brain_notify_incomplete_version: NOTIFY_INCOMPLETE_LOG_VERSION,
+    timestamp: new Date().toISOString(),
+    ...fields,
+  };
+  try {
+    const dir = dirname(TON_PROVIDER_NOTIFY_INCOMPLETE_LOG);
+    const firstCreated = await mkdir(dir, { recursive: true });
+    const fh = await open(TON_PROVIDER_NOTIFY_INCOMPLETE_LOG, 'a');
+    try {
+      await fh.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    await syncDirectoryChain(dir, firstCreated);
+  } catch (e) {
+    warn(
+      `ton-provider: could not record the notify-incomplete guard entry for contract ${fields.contract_address} at ` +
+        `${TON_PROVIDER_NOTIFY_INCOMPLETE_LOG} (${errMsg(e)}) — a later push of this exact source content will NOT ` +
+        'be protected against paying for a second contract while this one may still be transferring (#950)',
+    );
+  }
+}
+
+// Every still-OPEN (unresolved, not self-expired) notify-incomplete record for a
+// content digest, newest-first. The caller (put(), below) only ever calls this once it
+// already knows — from the #638 already-active check's REAL on-chain answer, not from
+// this guard's own bookkeeping — that this run is genuinely about to broadcast a NEW
+// transfer (#950 review, codex xhigh pass, Warning, second pass: an earlier version
+// compared THIS run's own derived address against the open list here, which wrongly
+// refused retrying an already-resolved or externally-deployed contract that this log
+// simply never named). Returning every match rather than just the newest one is for the
+// refusal MESSAGE's quality (repeated re-encrypts can leave several different addresses
+// abandoned for the same content — "plus N more still-open contract(s)" — see #950's own
+// header comment), not for a resume decision, since a resume decision no longer needs
+// this function's answer at all. "Open" combines two independent signals folded per
+// contract_address (append-only, last line for an address wins, same contract
+// pending-spend.ts's own log uses): not `resolved` (a LATER run's notify for that
+// address never completed) and within windowMs of when it was written (self-expires —
+// see TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS's own comment, config.ts).
+// Read the whole log, folded to the LAST line per contract_address (append-only —
+// same "last line wins" contract pending-spend.ts's own log uses). Shared by both
+// unresolvedNotifyIncompleteFor() (pre-spend, must fail closed — see its own comment)
+// and notifyIncompleteRecordForContract() (post-spend/best-effort — see its own
+// comment), so the two never fold the log two different ways.
+async function readNotifyIncompleteFolded(): Promise<Map<string, NotifyIncompleteRecord>> {
+  const { items } = await readJsonlLog(
+    TON_PROVIDER_NOTIFY_INCOMPLETE_LOG,
+    'ton-provider notify-incomplete log',
+    validateNotifyIncomplete,
+  );
+  const latestPerAddress = new Map<string, NotifyIncompleteRecord>();
+  for (const item of items) latestPerAddress.set(item.contract_address, item);
+  return latestPerAddress;
+}
+
+async function unresolvedNotifyIncompleteFor(
+  contentDigest: string,
+  windowMs: number,
+): Promise<NotifyIncompleteRecord[]> {
+  let folded: Map<string, NotifyIncompleteRecord>;
+  try {
+    folded = await readNotifyIncompleteFolded();
+  } catch (e) {
+    // Fail CLOSED (#950 review, codex xhigh pass, Warning) — matching this file's own
+    // #805/#638 money-safety posture, not the "advisory, never block" posture this
+    // guard's write side (recordNotifyIncomplete, below) correctly uses: reading this
+    // log answers a question that gates whether funds are about to move a SECOND time,
+    // so an unreadable log must not silently read as "nothing recorded" — that fail-
+    // open direction is exactly what would let a repeated payment through undetected
+    // while the log happens to be broken. No funds have moved yet at this point in
+    // put() (the caller runs this before any provider is selected), so refusing here
+    // costs nothing but a retry once the log is readable again.
+    throw new Error(
+      `ton-provider backend: could not read the notify-incomplete guard log at ${TON_PROVIDER_NOTIFY_INCOMPLETE_LOG} ` +
+        `(${errMsg(e)}) — refusing to proceed without being able to check whether a prior unresolved attempt ` +
+        'exists for this exact source content (issue #950). This is a fail-closed refusal: no funds moved. Fix ' +
+        'the path (permissions, a full disk) and re-run — the same ciphertext resolves to the same bag id and ' +
+        'reuses this bag, so nothing is lost by waiting.',
+    );
+  }
+  const now = Date.now();
+  return [...folded.values()]
+    .filter((i) => i.content_digest === contentDigest && !i.resolved && now - Date.parse(i.timestamp) <= windowMs)
+    .sort((a, b) => (a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0));
+}
+
+// The latest notify-incomplete record for ONE contract address (any content digest,
+// resolved or not), or null. Used only by the notify-SUCCESS path below to close out
+// whatever record this exact contract may have left open — keyed by contract_address,
+// deliberately NOT requiring this run's own `sourceDigest` to be available at all (#950
+// review, codex xhigh pass, Warning, second pass): a recovery push of a retained
+// ciphertext whose ".digest" sidecar is missing/foreign would otherwise never resolve
+// the very record it just finished notifying, leaving it open to wrongly block a LATER,
+// genuinely new push of the same content until the window expires. Best-effort — read
+// failures here degrade to "nothing to resolve" (warned, not thrown): notify has already
+// fully succeeded by this point, so this is bookkeeping cleanup, not a money-safety
+// gate (the gate is unresolvedNotifyIncompleteFor()'s own read path, above, which fails
+// closed because IT runs before funds move).
+async function notifyIncompleteRecordForContract(contractAddress: string): Promise<NotifyIncompleteRecord | null> {
+  let folded: Map<string, NotifyIncompleteRecord>;
+  try {
+    folded = await readNotifyIncompleteFolded();
+  } catch (e) {
+    warn(
+      `ton-provider: could not read the notify-incomplete guard log at ${TON_PROVIDER_NOTIFY_INCOMPLETE_LOG} ` +
+        `(${errMsg(e)}) — could not check whether contract ${contractAddress} had an open record to resolve (#950)`,
+    );
+    return null;
+  }
+  return folded.get(contractAddress) ?? null;
+}
+
 export function tonProviderBackend(): StorageBackend {
   return {
     async put(file: string, opts: PutOpts = {}): Promise<string> {
+      // #950: the PLAINTEXT content digest, read once up front — reused twice below:
+      // once (after the contract address is derived) to refuse paying for a brand-new
+      // contract while a PRIOR run's unresolved attempt for this same content exists,
+      // and once more (in the notify-timeout catch) to record this run's own failure
+      // for a LATER push to match against. See recentNotifyIncompleteFor()'s own header
+      // comment for the full nightly-schedule-abandonment scenario this guard closes.
+      const sourceDigest = await sourceContentDigestFor(file);
       const { Address } = await getTon();
       // PR2: when a local TON wallet is configured, IT is the owner — auto-signing
       // requires sender===owner (storage-contract.fc's modify_providers throws
@@ -1474,74 +1783,35 @@ export function tonProviderBackend(): StorageBackend {
         daemon = await startLocalTonDaemon(TON_BIN, dbDir, TON_NETWORK_CONFIG || undefined);
         const bag = await createLocalBag(daemon.apiUrl, bagDir);
 
-        const candidates = await searchProviders(Number(bag.dataSizeBytes));
-        const provider = selectProvider(candidates);
-        const rateNanoPerMB = providerRateNanoPerMB(provider.price);
-        const spanDays = spanDaysFor(provider);
-
-        // #651: confirm the provider's CURRENT ADNL-reported terms (rate/span/capacity)
-        // still match the registry snapshot above, BEFORE building/broadcasting a deploy
-        // against them — see checkProviderLiveTerms()'s own doc comment for why this is
-        // a separate call site from the broadcast step further down. The returned
-        // liveRates also carries the provider's own live bounty floor, used below in
-        // place of the existing advisory bounty check's static assumption (issue #403).
-        const liveRates = await checkProviderLiveTerms(provider.pubkey, bag.dataSizeBytes, rateNanoPerMB, spanDays);
-
-        const deploy = await buildDeploy({
+        // ---------- #951: derive the contract address BEFORE selecting a provider ----------
+        // The StorageV1 contract ADDRESS is fully determined by bagId + owner +
+        // dataSizeBytes + pieceSize + merkleHash — NONE of which depend on which
+        // provider is picked or its rate/span (see deriveContractAddress()'s own doc
+        // comment). Computing it here, before searchProviders()/selectProvider() ever
+        // run, is what lets the #638 already-active check just below run BEFORE any
+        // provider is chosen or price-checked at all.
+        const contractAddress = await deriveContractAddress({
           bagId: Buffer.from(bag.bagId, 'hex'),
           merkleHash: bag.merkleHash,
           dataSizeBytes: bag.dataSizeBytes,
           pieceSize: bag.pieceSize,
           owner,
-          providerPubkey: Buffer.from(provider.pubkey, 'hex'),
-          rateNanoPerMB,
-          spanDays,
-          // #639: the REMAINING budget (TON_PROVIDER_MAX_SPEND minus whatever this same
-          // push already committed via an earlier put() call), not the full cap — see
-          // the comment above spentSoFarNano/remainingMaxSpendNano for why.
-          maxSpendNano: remainingMaxSpendNano,
         });
-        console.error(
-          `ton-provider: selected provider ${provider.pubkey} (rating ${provider.rating.toFixed(2)}, uptime ${provider.uptime.toFixed(1)}%)`,
-        );
-        console.error(
-          `ton-provider: storage cost ${deploy.costNano} nanoTON + ${DEPLOY_BUFFER_NANO} nanoTON deploy buffer = ${deploy.amountNano} nanoTON`,
-        );
-        // Advisory pre-deploy bounty check (issue #403) — see estimatedBountyNano()'s
-        // own comment for what this is and why it warns rather than refuses. Placed
-        // BEFORE the deploy is signed (both paths below) so the warning is visible to
-        // whoever/whatever is about to commit real funds, not discovered only after a
-        // 10-minute notify timeout. Compared against liveRates.minBountyNano — this
-        // SAME provider's own LIVE-reported floor (checkProviderLiveTerms() above,
-        // issue #651) — rather than the static PROVIDER_BOUNTY_FLOOR_NANO assumption,
-        // since an actual measured value is strictly more accurate than a guess about
-        // which tonutils-storage-provider library default this specific provider runs.
-        const bounty = estimatedBountyNano(rateNanoPerMB, bag.dataSizeBytes, spanDays);
-        if (bounty < liveRates.minBountyNano) {
-          warn(
-            `ton-provider: the computed bounty for this deploy (${bounty} nanoTON, from rate ${rateNanoPerMB} ` +
-              `nanoTON/MB/day × ${bag.dataSizeBytes} bytes × ${spanDays} day(s)) looks BELOW the provider's own ` +
-              `LIVE-reported minimum bounty (${liveRates.minBountyNano} nanoTON, via ADNL ratesRequest) — this ` +
-              "specific provider's notify may refuse to ever fetch the bag even though the deploy itself will " +
-              'still succeed and be paid for. A bigger bag, a longer span, or a higher rate would raise this estimate.',
-          );
-        }
+
         // ---------- money-safety: skip re-funding a non-fresh contract (issue #638) ----------
-        // The StorageV1 contract ADDRESS is fully determined by bagId + owner +
-        // dataSizeBytes + pieceSize + merkleHash (buildDeploy()'s `data` cell above) —
-        // NONE of which depend on which provider was picked or its rate. A retry of the
-        // SAME file (same content -> same bag hash -> identical StateInit) after ANY
-        // broadcast-adjacent failure therefore derives the IDENTICAL contract address,
-        // whether the previous attempt's HTTP response was lost after tonapi already
-        // accepted the BOC (the broadcast POST throws but the transfer still lands), or
-        // the deploy itself landed and only the LATER notify() step timed out. Before
-        // this fix, autoSignAndBroadcastDeploy() (or a human re-approving the same
-        // Tonkeeper deeplink) unconditionally sent `amountNano` again with a fresh
-        // seqno/query id — funding an already-funded contract a second time, and a
+        // A retry of the SAME file (same content -> same bag hash -> identical
+        // StateInit) after ANY broadcast-adjacent failure derives the IDENTICAL contract
+        // address, whether the previous attempt's HTTP response was lost after tonapi
+        // already accepted the BOC (the broadcast POST throws but the transfer still
+        // lands), or the deploy itself landed and only the LATER notify() step timed
+        // out. Before this fix, autoSignAndBroadcastDeploy() (or a human re-approving
+        // the same Tonkeeper deeplink) unconditionally sent `amountNano` again with a
+        // fresh seqno/query id — funding an already-funded contract a second time, and a
         // newly-selected provider on the retry could also silently replace the
         // first one in the on-chain dict (modify_providers REPLACES, not merges — see
         // scripts/go/storage-v1-client/updateproviders.go's own field notes), stranding
-        // the first payment. Checking here, BEFORE any funds move, closes that gap.
+        // the first payment. Checking here, BEFORE any funds move (and, since #951,
+        // BEFORE a provider is even selected), closes that gap.
         //
         // Checked as "anything other than 'nonexist'" (Codex review, xhigh pass), not
         // literal 'active' only: tonapi's `status` vocabulary also has 'uninit' (funded,
@@ -1606,32 +1876,43 @@ export function tonProviderBackend(): StorageBackend {
         // "fresh": the only status this backend's own first-ever deploy for a bag/owner
         // pair should ever see here is `nonexist`, and anything we did not actually read
         // could equally be `uninit`/`active`/`frozen`.
-        //
-        // #948: the contract address is already known (buildDeploy() derived it above,
-        // from bagId+owner+size+pieceSize+merkleHash alone — never the provider/rate it
-        // was quoted against), so the cross-process lock is acquired BEFORE this read and
-        // held through the check below, the broadcast/deeplink, AND the on-chain
-        // confirmation that follows — one held section, not a re-check bolted on right
-        // before the broadcast (see the comment above this whole guard for why a re-check
-        // alone would only narrow, not close, the race for two genuinely concurrent
-        // processes). `notifyPubkey`/`resumable`/`priorReceipt`/`intent` are declared out
-        // here rather than where they are first assigned below, purely so they stay in
-        // scope past this lock's `finally` — they are read again after the lock is
-        // released (the notify step moves no funds and does not need to hold it).
-        const contractAddressRaw = deploy.contractAddress.toRawString();
-        let alreadyActive = false;
-        let notifyPubkey = provider.pubkey;
+        // #948: the cross-process advisory lock (push-lock.ts's acquirePushLock, the
+        // same primitive #806/#807 already use for their own check-then-act races) is
+        // acquired BEFORE the already-active read below and held through it, the #950
+        // guard, provider selection/pricing (#951: now conditional, only on a genuinely
+        // fresh deploy), the broadcast/deeplink, and the on-chain confirmation that
+        // follows -- one held section, not a re-check bolted on right before the
+        // broadcast. A second process racing this exact contract either waits and then
+        // observes it genuinely active (correctly skips funding) or is refused outright
+        // (PushLockHeldError, CB-E028) -- never a second silent transfer. A narrower
+        // race is NOT closed by this lock: an ambiguous broadcast outcome (this run's
+        // own POST throws) followed by a LATER, independent retry landing inside
+        // tonapi's own indexing-lag window can still read 'nonexist' and double-send --
+        // closing that fully would need a persisted 'broadcast in flight' record
+        // surviving process restarts, real complexity for an edge window neither this
+        // check nor the lock claims to eliminate.
+        const contractAddressRaw = contractAddress.toRawString();
+        // Declared here, OUTSIDE the lock's try/finally below, purely so they stay in
+        // scope past its `finally` — the #665 provider-notify reconciliation and the
+        // #654 receipt-recording that follow are read-only w.r.t. the lock's own
+        // concern (no funds move there) and do not need to hold it, but DO need the
+        // values this try block computes (same reasoning theirs-948.ts's original
+        // comment gave for `notifyPubkey`/`resumable`/`priorReceipt`/`intent`; `active`
+        // is #951's own discriminated union, same "must survive past this point" need).
+        let active: { fresh: true; provider: ProviderCandidate; deploy: BuildDeployResult } | { fresh: false };
+        let notifyPubkey = '';
         let resumable: SpendIntentRecord | null = null;
         let priorReceipt: ReceiptEntry | null = null;
         let intent: SpendIntentRecord | null = null;
         const releaseContractLock = await acquirePushLock('ton-provider-contract', contractAddressRaw);
         try {
+          let alreadyActive = false;
           let observedStatus = '';
           let lastLookupError: unknown = null;
           for (let attempt = 0; attempt < ALREADY_ACTIVE_CHECK_ATTEMPTS; attempt++) {
             if (attempt > 0) await sleep(ALREADY_ACTIVE_CHECK_INTERVAL_MS);
             try {
-              const contractState = await fetchAccountState(deploy.contractAddress);
+              const contractState = await fetchAccountState(contractAddress);
               observedStatus = contractState.status;
               alreadyActive = observedStatus !== 'nonexist';
               lastLookupError = null;
@@ -1642,15 +1923,145 @@ export function tonProviderBackend(): StorageBackend {
           }
           if (lastLookupError !== null) {
             throw new Error(
-              `ton-provider backend: could not determine whether contract ${deploy.contractAddress.toRawString()} ` +
+              `ton-provider backend: could not determine whether contract ${contractAddress.toRawString()} ` +
                 `has already been funded (${ALREADY_ACTIVE_CHECK_ATTEMPTS} tonapi lookups failed, last: ` +
-                `${errMsg(lastLookupError)}) — refusing to broadcast a ${deploy.amountNano} nanoTON transfer that ` +
+                `${errMsg(lastLookupError)}) — refusing to select a provider and broadcast a transfer that ` +
                 'could be a SECOND payment for the same contract. This is a fail-closed refusal: no funds moved. ' +
                 "Check the address's state on a TON explorer, or re-run push once tonapi is reachable again (the " +
                 'same ciphertext resolves to the same bag id and reuses this bag, so nothing is lost by waiting).',
             );
           }
+
+          // ---------- #950: nightly-schedule notify-abandonment guard ----------
+          // Checked HERE — after the #638 already-active determination just above, using
+          // its REAL on-chain answer, rather than inferring "would this run pay for a new
+          // contract" from this guard's own bookkeeping (#950 review, codex xhigh pass,
+          // Warning — the second pass): comparing this run's derived address against only
+          // this guard's own open-record list is a WEAKER signal than `alreadyActive`
+          // itself — a contract this guard never recorded at all (deployed by a different
+          // tool/session) or one it already marked `resolved` would incorrectly read as
+          // "not one of the open ones" and get refused here even though retrying it moves
+          // no funds at all. `!alreadyActive` is the fact that actually matters: it is
+          // true if and only if THIS run is genuinely about to broadcast a NEW transfer,
+          // which is exactly the moment a sibling open record for the same content digest
+          // matters. When alreadyActive is true, the #638 branch below already handles
+          // everything correctly (skip re-funding) regardless of what this guard's own log
+          // says, so this check does not run at all.
+          if (!alreadyActive && sourceDigest) {
+            const openPriors = await unresolvedNotifyIncompleteFor(
+              sourceDigest,
+              TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS,
+            );
+            if (openPriors.length > 0) {
+              const prior = openPriors[0]; // newest-first — see unresolvedNotifyIncompleteFor()'s own sort
+              throw new Error(
+                `ton-provider backend: a PRIOR push of this exact source content (digest ${sourceDigest}) already paid ` +
+                  `to deploy contract ${prior.contract_address} (recorded ${prior.timestamp}, bag ${prior.bag_id}` +
+                  `${openPriors.length > 1 ? `, plus ${openPriors.length - 1} more still-open contract(s) for this same content` : ''}), ` +
+                  'and notifying the storage provider did not confirm a full download before that run gave up ' +
+                  'waiting — that contract may still be actively transferring. This run would derive a DIFFERENT, ' +
+                  `NEW contract (${contractAddress.toRawString()}) for the same unchanged content — refusing to fund ` +
+                  'a SECOND, unrelated contract for it (issue #950). To resume an EXISTING contract instead: if the ' +
+                  `original ciphertext this backend pushed for it is still on disk (recorded source: ` +
+                  `${prior.source_file}), re-run \`cypher-brain push\` with THAT exact file — it will derive the ` +
+                  `SAME contract address, detect it is already active, and skip re-funding, going straight back to ` +
+                  'notify (issue #638). If that file is gone, this payment cannot be auto-resumed; check ' +
+                  `${prior.contract_address} on a TON explorer, or re-run \`notify\`/\`providers\` ` +
+                  '(scripts/go/storage-v1-client) against it directly. If you decide it is truly lost, this refusal ' +
+                  `self-expires ${Math.round(TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS / 3_600_000)}h after ` +
+                  `${prior.timestamp} (or set CYPHER_BRAIN_TON_PROVIDER_NOTIFY_INCOMPLETE_WINDOW_MS lower and re-run).`,
+              );
+            }
+          }
+
+          // ---------- #951: only select (and price-check) a provider for a GENUINELY new
+          // deploy ----------
+          // Before this reorder, searchProviders()/selectProvider()/checkProviderLiveTerms()
+          // ran UNCONDITIONALLY, before the #638 already-active check above even existed in
+          // this function's flow — so an unrelated failure picking or live-price-checking a
+          // brand-new provider (a DIFFERENT provider now ranked highest, whose live ADNL
+          // rate no longer matches the mytonprovider.org registry snapshot that ranked it)
+          // could throw before this run ever reached the "is this contract already active,
+          // resume it" check, blocking a legitimate resumption of an already-PAID contract
+          // on a condition that has nothing to do with that payment (issue #951). An
+          // already-active contract is resumed using whichever provider it was ACTUALLY
+          // deployed with (resolved below, #665) — never this run's own fresh registry pick.
+          // A discriminated union, not two independently-nullable variables: TypeScript's
+          // control-flow narrowing cannot carry "these were both assigned together, back
+          // when `!alreadyActive` was checked" across the SEPARATE `if (active.fresh)`
+          // checks scattered through the rest of this function (verified — a plain
+          // `let x: T | null` pair loses that correlation the moment a second, unrelated
+          // `if` re-tests the same boolean), and this file's lint config forbids the
+          // non-null-assertion escape hatch that would otherwise paper over it. Tying
+          // `provider`/`deploy` together in ONE value, discriminated on `fresh`, is what
+          // lets every later `if (active.fresh)` re-narrow correctly instead.
           if (!alreadyActive) {
+            const candidates = await searchProviders(Number(bag.dataSizeBytes));
+            const provider = selectProvider(candidates);
+            const rateNanoPerMB = providerRateNanoPerMB(provider.price);
+            const spanDays = spanDaysFor(provider);
+
+            // #651: confirm the provider's CURRENT ADNL-reported terms (rate/span/capacity)
+            // still match the registry snapshot above, BEFORE building/broadcasting a
+            // deploy against them — see checkProviderLiveTerms()'s own doc comment for why
+            // this is a separate call site from the broadcast step further down. The
+            // returned liveRates also carries the provider's own live bounty floor, used
+            // below in place of the existing advisory bounty check's static assumption
+            // (issue #403).
+            const liveRates = await checkProviderLiveTerms(provider.pubkey, bag.dataSizeBytes, rateNanoPerMB, spanDays);
+
+            const deploy = await buildDeploy({
+              bagId: Buffer.from(bag.bagId, 'hex'),
+              merkleHash: bag.merkleHash,
+              dataSizeBytes: bag.dataSizeBytes,
+              pieceSize: bag.pieceSize,
+              owner,
+              providerPubkey: Buffer.from(provider.pubkey, 'hex'),
+              rateNanoPerMB,
+              spanDays,
+              // #639: the REMAINING budget (TON_PROVIDER_MAX_SPEND minus whatever this same
+              // push already committed via an earlier put() call), not the full cap — see
+              // the comment above spentSoFarNano/remainingMaxSpendNano for why.
+              maxSpendNano: remainingMaxSpendNano,
+            });
+            // Sanity check, not a real-world possibility: buildDeploy() builds the exact
+            // same StorageV1 `data` cell deriveContractAddress() above just built from the
+            // identical inputs (bagId/owner/dataSizeBytes/pieceSize/merkleHash) — a mismatch
+            // here would mean the two have silently drifted apart (deriveContractAddress()'s
+            // own doc comment flags this as the one risk of keeping them as two separate
+            // functions rather than having buildDeploy() call the other).
+            if (!deploy.contractAddress.equals(contractAddress)) {
+              throw new Error(
+                'ton-provider backend: internal error — buildDeploy() derived a different contract address than ' +
+                  `deriveContractAddress() did for the same inputs (${deploy.contractAddress.toRawString()} vs ` +
+                  `${contractAddress.toRawString()}) — refusing to proceed. This should be impossible; please report it.`,
+              );
+            }
+            console.error(
+              `ton-provider: selected provider ${provider.pubkey} (rating ${provider.rating.toFixed(2)}, uptime ${provider.uptime.toFixed(1)}%)`,
+            );
+            console.error(
+              `ton-provider: storage cost ${deploy.costNano} nanoTON + ${DEPLOY_BUFFER_NANO} nanoTON deploy buffer = ${deploy.amountNano} nanoTON`,
+            );
+            // Advisory pre-deploy bounty check (issue #403) — see estimatedBountyNano()'s
+            // own comment for what this is and why it warns rather than refuses. Placed
+            // BEFORE the deploy is signed (both paths below) so the warning is visible to
+            // whoever/whatever is about to commit real funds, not discovered only after a
+            // 10-minute notify timeout. Compared against liveRates.minBountyNano — this
+            // SAME provider's own LIVE-reported floor (checkProviderLiveTerms() above,
+            // issue #651) — rather than the static PROVIDER_BOUNTY_FLOOR_NANO assumption,
+            // since an actual measured value is strictly more accurate than a guess about
+            // which tonutils-storage-provider library default this specific provider runs.
+            const bounty = estimatedBountyNano(rateNanoPerMB, bag.dataSizeBytes, spanDays);
+            if (bounty < liveRates.minBountyNano) {
+              warn(
+                `ton-provider: the computed bounty for this deploy (${bounty} nanoTON, from rate ${rateNanoPerMB} ` +
+                  `nanoTON/MB/day × ${bag.dataSizeBytes} bytes × ${spanDays} day(s)) looks BELOW the provider's own ` +
+                  `LIVE-reported minimum bounty (${liveRates.minBountyNano} nanoTON, via ADNL ratesRequest) — this ` +
+                  "specific provider's notify may refuse to ever fetch the bag even though the deploy itself will " +
+                  'still succeed and be paid for. A bigger bag, a longer span, or a higher rate would raise this estimate.',
+              );
+            }
             // Charge this deploy's amount against the shared tracker THE MOMENT it is
             // known to be within budget AND actually going to be broadcast (i.e. after
             // the #638 already-active check above finds nothing to skip) — before
@@ -1662,40 +2073,43 @@ export function tonProviderBackend(): StorageBackend {
             // would falsely shrink the sidecar's remaining budget for a spend that never
             // happened this run.
             chargeSpendTracker(opts.spendTracker, deploy.amountNano);
-          }
-          if (alreadyActive) {
+            active = { fresh: true, provider, deploy };
+          } else {
             // warn() (#347), not a raw console.error: this is a safety-relevant skip
             // decision, not routine progress output — an MCP-driven caller (an agent
             // retrying a failed push, exactly issue #638's own motivating scenario) must
             // see this in the structured result's warnings[] array, not only in a
             // background log nobody is watching.
             warn(
-              `ton-provider: contract ${deploy.contractAddress.toRawString()} already shows on-chain activity ` +
+              `ton-provider: contract ${contractAddress.toRawString()} already shows on-chain activity ` +
                 `(status=${observedStatus}) — this looks like a retry of an already-broadcast (or already-completed) ` +
-                `deploy for the same bag/owner. Skipping re-funding (no new ${deploy.amountNano} nanoTON transfer) ` +
+                'deploy for the same bag/owner. Skipping provider selection and re-funding entirely (issue #951) ' +
                 "and going straight to notify. Which provider is notified is NOT this run's registry pick: it is " +
                 "read back from the contract's own on-chain providers dict, falling back to this machine's " +
                 'pending-spend intent and then the receipt if that read cannot answer, and refusing rather than ' +
                 'guessing if none of them can (#665). The lines below say which source answered.',
             );
+            active = { fresh: false };
           }
 
           // ---------- #808/#665: reconcile with what an EARLIER run durably recorded ----------
+          // (contractAddressRaw was already derived right after contractAddress, above, for #948's lock.)
           // Keyed on the contract address for the same reason the #638 guard above is: it
           // is stable across runs (bag id + owner + size + piece size + merkle hash — never
           // which provider was picked), and it is the identifier an operator checks on an
-          // explorer. (`contractAddressRaw` itself is declared above, before this lock, for
-          // #948 — see that comment.)
-          //
-          // #665: `notifyPubkey` defaults to this run's own selection (declared above,
-          // before the lock, for #948). On the already-active branch it must NOT stay that
-          // default — the contract's on-chain `providers` dict was written by whichever run
-          // actually deployed it, and `modify_providers` REPLACES rather than merges (see
+          // explorer.
+          // #665: which provider to notify. On a fresh deploy that is this run's own
+          // selection. On the already-active branch it must NOT be — the contract's
+          // on-chain `providers` dict was written by whichever run actually deployed it,
+          // and `modify_providers` REPLACES rather than merges (see
           // scripts/go/storage-v1-client/updateproviders.go), so notifying a provider this
           // run happened to pick from a fresher mytonprovider.org snapshot can address a
-          // provider that never held this bag at all. `resumable`/`priorReceipt` (an
-          // earlier run's confirmed-but-unrecorded spend, #808, also declared above) start
-          // at their default `null` here for the same reason.
+          // provider that never held this bag at all. #951: `active.fresh` is false on the
+          // alreadyActive branch (no provider was ever selected there) — the placeholder
+          // `''` below is never actually used, since every branch of the `if (alreadyActive)`
+          // block just below either reassigns notifyPubkey to a real answer or throws.
+          notifyPubkey = active.fresh ? active.provider.pubkey : '';
+          // #808: an earlier run's confirmed-but-unrecorded spend, if there is one.
           if (alreadyActive) {
             // Read failures propagate rather than degrading to "nothing recorded": the two
             // decisions below (write a missing receipt / notify the deployed provider) are
@@ -1796,8 +2210,8 @@ export function tonProviderBackend(): StorageBackend {
                   `ton-provider backend: contract ${contractAddressRaw}'s on-chain providers dict names ` +
                     `${onChainPubkeys.length} providers (${onChainPubkeys.join(', ')}) and this machine recorded ` +
                     'none of them — refusing to pick one on your behalf, since notifying the wrong one addresses a ' +
-                    "provider that may never have held this bag, and this run's own registry pick " +
-                    `(${provider.pubkey}) is not evidence of which one did. Re-run \`update-providers\` ` +
+                    'provider that may never have held this bag (#951: this run never selected a provider of its ' +
+                    'own to fall back to). Re-run `update-providers` ' +
                     '(scripts/go/storage-v1-client) to register a single provider deliberately (#665). No funds moved.',
                 );
               }
@@ -1819,15 +2233,17 @@ export function tonProviderBackend(): StorageBackend {
                     'provider the contract itself registers (#665).',
                 );
               }
-              if (fromChain !== provider.pubkey) {
-                warn(
-                  `ton-provider: contract ${contractAddressRaw} was deployed with provider ${fromChain}, but this ` +
-                    `run's registry snapshot selected ${provider.pubkey} — notifying ${fromChain}, the one the ` +
-                    "contract's own on-chain dict names (#665). To hand this bag to a DIFFERENT provider, register " +
-                    'it deliberately with `update-providers` (scripts/go/storage-v1-client) — a retry must not do it ' +
-                    'by accident.',
-                );
-              }
+              // #951: no "this run's registry snapshot selected X" comparison here anymore
+              // — an already-active resumption never selects a provider of its own (see the
+              // block above), so there is nothing left to compare the on-chain answer
+              // against; ${fromChain} above is simply used as-is. Still reported
+              // unconditionally (not just on a surprise/mismatch, unlike the pre-#951
+              // comparison this replaces) so an operator/log reader can see which provider
+              // an already-active retry is actually resuming with.
+              console.error(
+                `ton-provider: contract ${contractAddressRaw} was deployed with provider ${fromChain} — resuming ` +
+                  'notify with it (issue #665).',
+              );
             } else if (attested.length > 1) {
               throw new Error(
                 `ton-provider backend: this machine's records disagree about which provider contract ` +
@@ -1846,34 +2262,41 @@ export function tonProviderBackend(): StorageBackend {
                     'available answer, but it is not proof of what the contract’s on-chain dict names (#665).',
                 );
               }
-              if (recordedPubkey !== provider.pubkey) {
-                warn(
-                  `ton-provider: contract ${contractAddressRaw} was deployed with provider ${recordedPubkey}, but this ` +
-                    `run's registry snapshot selected ${provider.pubkey} — notifying the RECORDED provider ` +
-                    `${recordedPubkey}, the one the contract's on-chain dict actually names (#665). To hand this bag ` +
-                    'to a DIFFERENT provider, register it deliberately with `update-providers` ' +
-                    '(scripts/go/storage-v1-client) — a retry must not do it by accident.',
-                );
-              }
+              // #951: no "this run's registry snapshot selected X" comparison here anymore
+              // — see the identical note above the fromChain branch. Reported
+              // unconditionally for the same reason.
+              console.error(
+                `ton-provider: contract ${contractAddressRaw} was deployed with provider ${recordedPubkey} — resuming ` +
+                  'notify with it (issue #665).',
+              );
             } else if (haveSomeRecord || !logsFullyReadable) {
               // Either a record for this exact contract exists but names no usable provider
               // (a hand-edited or foreign line), or several unconfirmed candidates disagree,
-              // or a line could not be read at all. Refusing beats guessing: notifying this
-              // run's freshly selected provider would address one that may never have held
-              // the bag, and no funds move either way on this branch.
+              // or a line could not be read at all. Refusing beats guessing: nothing here or
+              // on-chain can say who to notify (#951: this run never selected a provider of
+              // its own to fall back to guessing with), and no funds move either way on this
+              // branch.
               throw new Error(
                 `ton-provider backend: contract ${contractAddressRaw} is already funded on-chain and this machine has ` +
                   'a record of that spend, but nothing readable names the provider it was deployed with — refusing ' +
-                  `to notify this run's freshly selected provider ${provider.pubkey}, which may never have held this ` +
-                  `bag. Check ${PENDING_SPENDS_LOG} / ${RECEIPT_LEDGER} for the contract's own provider pubkey, or ` +
-                  're-run `update-providers` (scripts/go/storage-v1-client) to register a provider deliberately (#665).',
+                  `to guess which provider to notify. Check ${PENDING_SPENDS_LOG} / ${RECEIPT_LEDGER} for the ` +
+                  "contract's own provider pubkey, or re-run `update-providers` (scripts/go/storage-v1-client) to " +
+                  'register a provider deliberately (#665).',
               );
             } else {
-              warn(
-                `ton-provider: no local record names the provider contract ${contractAddressRaw} was deployed with ` +
-                  `(no pending-spend intent, no receipt) — notifying this run's selected provider ${provider.pubkey}, ` +
-                  'which may not be the one holding the bag. Reading the provider back from the contract itself is ' +
-                  'issue #665.',
+              // #951: before this reorder, this branch fell back to "notifying this run's
+              // freshly selected provider" — but that fresh registry pick is exactly the
+              // untrusted-for-an-existing-contract input #665 exists to overrule, and since
+              // #951 this run never even selects a provider of its own on the alreadyActive
+              // branch (see the reorder above), there is no fallback pick left to use at
+              // all. Refuse instead of guessing: neither the chain nor this machine's own
+              // records can say who to notify.
+              throw new Error(
+                `ton-provider backend: contract ${contractAddressRaw} is already funded on-chain, but neither its ` +
+                  "own on-chain providers dict nor this machine's records (no pending-spend intent, no receipt) name " +
+                  'a provider it was deployed with — refusing to guess. Re-run `update-providers` ' +
+                  '(scripts/go/storage-v1-client) to register a provider deliberately (#665), or check the contract ' +
+                  'on a TON explorer.',
               );
             }
 
@@ -1909,56 +2332,58 @@ export function tonProviderBackend(): StorageBackend {
           // broadcasting a transfer nothing would be able to account for: no funds have
           // moved at this point, and the same artifact re-derives the same bag and contract
           // on a later run, so nothing is lost by stopping here (same "fail closed while it
-          // is still free" reasoning as the #805 guard above). (`intent` itself is declared
-          // above, before the #948 lock, so it survives past that lock's release.)
-          if (!alreadyActive) {
+          // is still free" reasoning as the #805 guard above).
+          if (active.fresh) {
             try {
               intent = await recordSpendIntent({
                 backend: 'ton-provider',
                 contract_address: contractAddressRaw,
                 bag_id: bag.bagId,
-                provider_pubkey: provider.pubkey,
-                amount_nano: deploy.amountNano.toString(),
-                cost_nano: deploy.costNano.toString(),
+                provider_pubkey: active.provider.pubkey,
+                amount_nano: active.deploy.amountNano.toString(),
+                cost_nano: active.deploy.costNano.toString(),
                 deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
                 locator: tonProviderLocator(bag.bagId),
               });
             } catch (e) {
               throw new Error(
                 `ton-provider backend: could not write the pending-spend record to ${PENDING_SPENDS_LOG} ` +
-                  `(${errMsg(e)}) — refusing to broadcast a ${deploy.amountNano} nanoTON transfer that nothing would ` +
-                  'be able to account for if this process died before the receipt reached disk (#808). No funds ' +
-                  'moved. Fix the path (permissions, a full disk, or CYPHER_BRAIN_RECEIPT_LEDGER pointing somewhere ' +
-                  'unwritable) and re-run push — the same ciphertext reuses the same bag, so nothing is lost.',
+                  `(${errMsg(e)}) — refusing to broadcast a ${active.deploy.amountNano} nanoTON transfer that nothing ` +
+                  'would be able to account for if this process died before the receipt reached disk (#808). No ' +
+                  'funds moved. Fix the path (permissions, a full disk, or CYPHER_BRAIN_RECEIPT_LEDGER pointing ' +
+                  'somewhere unwritable) and re-run push — the same ciphertext reuses the same bag, so nothing is lost.',
               );
             }
           }
           // Advisory pre-deploy funds check (turbo.ts has the equivalent for its own
-          // signer balance, #342) — WARN only, never abort, for BOTH signing paths: a
-          // balance read has no freshness guarantee, so it must never be what blocks a
-          // push (same posture turbo.ts uses for its non-TTY/unattended callers, now that
-          // ton-provider can ALSO run unattended via auto-signing, #396 PR2). Whichever
-          // path actually sends the transaction gives its own unambiguous refusal on a
-          // real shortfall — a human's Tonkeeper app, or the auto-sign broadcast/on-chain
-          // processing itself — so this exists only to save the wait through
-          // waitForContractActive() on a spend that was always going to fail. Left
-          // unconditional even when alreadyActive (the check above never blocks on it
-          // either) — a harmless, still-informative balance read either way.
-          // CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences it for one run (shared with turbo's
-          // check, not a ton-provider-specific flag). Both lines go through warn() (#347),
-          // not a raw console.error, so an agent-driven push (MCP) carries this in the
-          // result's warnings[] array instead of only ever landing in a background log.
-          if (!SKIP_FUNDS_CHECK) {
+          // signer balance, #342) — WARN only, never abort: a balance read has no
+          // freshness guarantee, so it must never be what blocks a push (same posture
+          // turbo.ts uses for its non-TTY/unattended callers, now that ton-provider can
+          // ALSO run unattended via auto-signing, #396 PR2). Whichever path actually sends
+          // the transaction gives its own unambiguous refusal on a real shortfall — a
+          // human's Tonkeeper app, or the auto-sign broadcast/on-chain processing itself —
+          // so this exists only to save the wait through waitForContractActive() on a
+          // spend that was always going to fail. Gated on `!alreadyActive` (#951: it used
+          // to run unconditionally, as a harmless "still-informative" balance read even
+          // when alreadyActive — but since #951 no provider is selected and no `deploy` is
+          // built on that branch at all, there is no `deploy.amountNano` left to compare
+          // the balance against; that branch moves no funds regardless, so nothing is lost
+          // by skipping this check there). CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 silences it for
+          // one run (shared with turbo's check, not a ton-provider-specific flag). Both
+          // lines go through warn() (#347), not a raw console.error, so an agent-driven
+          // push (MCP) carries this in the result's warnings[] array instead of only ever
+          // landing in a background log.
+          if (active.fresh && !SKIP_FUNDS_CHECK) {
             try {
               const ownerState = await fetchAccountState(owner);
               if (!Number.isFinite(ownerState.balance)) {
                 throw new Error(`tonapi returned a non-numeric balance: ${JSON.stringify(ownerState.balance)}`);
               }
-              if (ownerState.balance < Number(deploy.amountNano)) {
+              if (ownerState.balance < Number(active.deploy.amountNano)) {
                 warn(
                   `ton-provider: owner ${owner.toString({ bounceable: true })}'s on-chain balance ` +
-                    `(${ownerState.balance} nanoTON) looks lower than the ${deploy.amountNano} nanoTON this deploy ` +
-                    `needs; the ${autoSignWallet ? 'auto-sign broadcast' : 'Tonkeeper signature'} below may be ` +
+                    `(${ownerState.balance} nanoTON) looks lower than the ${active.deploy.amountNano} nanoTON this ` +
+                    `deploy needs; the ${autoSignWallet ? 'auto-sign broadcast' : 'Tonkeeper signature'} below may be ` +
                     'rejected for insufficient funds. Fund the wallet first, or set ' +
                     'CYPHER_BRAIN_SKIP_FUNDS_CHECK=1 to silence this check.',
                 );
@@ -1967,7 +2392,7 @@ export function tonProviderBackend(): StorageBackend {
               warn(`ton-provider: could not pre-check the owner's balance (${errMsg(e)}); proceeding`);
             }
           }
-          if (alreadyActive) {
+          if (!active.fresh) {
             // Nothing to sign or broadcast — see the money-safety comment above.
           } else if (autoSignWallet) {
             console.error(
@@ -1976,7 +2401,12 @@ export function tonProviderBackend(): StorageBackend {
             );
             const submitted = { value: false };
             try {
-              await autoSignAndBroadcastDeploy(autoSignWallet.wallet, autoSignWallet.secretKey, deploy, submitted);
+              await autoSignAndBroadcastDeploy(
+                autoSignWallet.wallet,
+                autoSignWallet.secretKey,
+                active.deploy,
+                submitted,
+              );
             } catch (e) {
               // Nothing left this process: a frozen wallet, an unreadable seqno, a
               // StateInit mismatch. No funds can have moved, so this is an ordinary
@@ -2017,7 +2447,7 @@ export function tonProviderBackend(): StorageBackend {
               for (let attempt = 0; attempt < ALREADY_ACTIVE_CHECK_ATTEMPTS && !landed; attempt++) {
                 if (attempt > 0) await sleep(ALREADY_ACTIVE_CHECK_INTERVAL_MS);
                 try {
-                  landed = (await fetchAccountState(deploy.contractAddress)).status !== 'nonexist';
+                  landed = (await fetchAccountState(contractAddress)).status !== 'nonexist';
                 } catch {
                   // one more inconclusive read; keep the remaining attempts
                 }
@@ -2032,10 +2462,10 @@ export function tonProviderBackend(): StorageBackend {
                 throw new PushUncertainSpendError({
                   backend: 'ton-provider',
                   checkKind: 'ton_contract_address',
-                  checkIdentifier: deploy.contractAddress.toRawString(),
+                  checkIdentifier: contractAddress.toRawString(),
                   detail:
-                    `broadcasting the deploy failed (${errMsg(e)}) — the transfer of ${deploy.amountNano} nanoTON ` +
-                    `to ${deploy.contractAddress.toRawString()} may or may not have been accepted (a probe could ` +
+                    `broadcasting the deploy failed (${errMsg(e)}) — the transfer of ${active.deploy.amountNano} ` +
+                    `nanoTON to ${contractAddress.toRawString()} may or may not have been accepted (a probe could ` +
                     'not find the contract, which is not proof it is absent)',
                   verifyHint: "the address's state on a TON explorer",
                   cause: e,
@@ -2051,7 +2481,7 @@ export function tonProviderBackend(): StorageBackend {
               // is the one that leads to paying twice.
               warn(
                 `ton-provider: the deploy broadcast reported a failure (${errMsg(e)}) but contract ` +
-                  `${deploy.contractAddress.toRawString()} — which read as 'nonexist' immediately before this run ` +
+                  `${contractAddress.toRawString()} — which read as 'nonexist' immediately before this run ` +
                   'broadcast — now shows on-chain activity, so the transfer is treated as having landed despite the ' +
                   'error. Continuing with confirmation and the receipt for that spend (#664). If something else ' +
                   'funded this exact address inside that window, the receipt below is attributed to this run in error.',
@@ -2059,18 +2489,16 @@ export function tonProviderBackend(): StorageBackend {
             }
           } else {
             console.error(`ton-provider: sign this to deploy the contract (bag stays seeded locally while you do):`);
-            console.error(`  ${deploy.deeplink}`);
+            console.error(`  ${active.deploy.deeplink}`);
           }
 
-          // issue #949: nested inside #948's outer try/finally (which holds the
-          // cross-process contract lock across this whole already-active-check ->
-          // broadcast -> confirm sequence) — this inner try/catch narrows ONLY
-          // waitForContractActive()'s own timeout into a typed PushUncertainSpendError,
-          // it does not change #948's lock-release timing (still in the outer
-          // `finally` below, which fires whether this inner try succeeds or re-throws).
+          // #951: `contractAddress` (derived independently of any provider, above), not
+          // `deploy.contractAddress`/`active.deploy.contractAddress` — `active.deploy` does
+          // not exist on the alreadyActive branch, and the two are guaranteed equal on the
+          // other branch (see the sanity check above).
           try {
             await waitForContractActive(
-              deploy.contractAddress,
+              contractAddress,
               alreadyActive ? 'skipped' : autoSignWallet ? 'auto-sign' : 'deeplink',
             );
           } catch (e) {
@@ -2094,15 +2522,15 @@ export function tonProviderBackend(): StorageBackend {
             // 'deeplink' (a human's own Tonkeeper wallet broadcasts on that path, never
             // this process — waitForContractActive()'s own doc comment already calls that
             // timeout "a real, expected outcome, not a bug", unchanged here).
-            if (!alreadyActive && autoSignWallet) {
+            if (active.fresh && autoSignWallet) {
               throw new PushUncertainSpendError({
                 backend: 'ton-provider',
                 checkKind: 'ton_contract_address',
-                checkIdentifier: deploy.contractAddress.toRawString(),
+                checkIdentifier: contractAddress.toRawString(),
                 detail:
                   `the deploy broadcast was accepted (HTTP 200) but waiting for contract ` +
-                  `${deploy.contractAddress.toRawString()} to confirm active on-chain failed: ${errMsg(e)} — the ` +
-                  `transfer of ${deploy.amountNano} nanoTON may or may not have landed (tonapi accepts a doomed ` +
+                  `${contractAddress.toRawString()} to confirm active on-chain failed: ${errMsg(e)} — the transfer ` +
+                  `of ${active.deploy.amountNano} nanoTON may or may not have landed (tonapi accepts a doomed ` +
                   'transaction, e.g. insufficient gas, with the same HTTP 200 as a good one)',
                 verifyHint: "the address's state on a TON explorer",
                 cause: e,
@@ -2110,20 +2538,12 @@ export function tonProviderBackend(): StorageBackend {
             }
             throw e;
           }
-          console.error(`ton-provider: contract ${deploy.contractAddress.toRawString()} is active on-chain`);
+          console.error(`ton-provider: contract ${contractAddress.toRawString()} is active on-chain`);
         } finally {
-          // #948: released only now — after the contract is either confirmed active
-          // on-chain or this run has thrown out of the try above — never earlier. A
-          // second process racing this SAME contract that was waiting on this lock (or
-          // that acquires it fresh right after this release) now either observes a
-          // genuinely active contract (correct: skip funding) or finds the lock free
-          // because THIS run itself never got past the already-active check (correct:
-          // free to try). See the comment above this lock's acquisition for the one
-          // narrower race this release does NOT close (an ambiguous broadcast outcome
-          // followed by a later retry inside tonapi's own indexing-lag window).
+          // #948: released only now -- after the contract is either confirmed active
+          // on-chain or this run has thrown out of the try above -- never earlier.
           await releaseContractLock();
         }
-
         // issue #654: computed HERE (not re-derived at the old, later `return` site)
         // because it is now needed twice — once for the receipt event immediately
         // below, once for the typed error the notify try/catch further down can throw.
@@ -2173,7 +2593,7 @@ export function tonProviderBackend(): StorageBackend {
         // contract, the provider and the exact amount, which is what lets the
         // already-active branch below finish the job on a later run instead of skipping
         // silently forever.
-        if (!alreadyActive) {
+        if (active.fresh) {
           if (intent) {
             try {
               intent = await advanceSpendIntent(intent, 'confirmed');
@@ -2199,10 +2619,10 @@ export function tonProviderBackend(): StorageBackend {
             raw: {
               contract_address: contractAddressRaw,
               bag_id: bag.bagId,
-              provider_pubkey: provider.pubkey,
-              cost_nano: deploy.costNano.toString(),
+              provider_pubkey: active.provider.pubkey,
+              cost_nano: active.deploy.costNano.toString(),
               deploy_buffer_nano: DEPLOY_BUFFER_NANO.toString(),
-              amount_nano: deploy.amountNano.toString(),
+              amount_nano: active.deploy.amountNano.toString(),
               // #808: links this receipt back to the pending-spend record written before
               // the broadcast, so settlement is a 1:1 match rather than an inference from
               // the contract address alone.
@@ -2212,7 +2632,7 @@ export function tonProviderBackend(): StorageBackend {
             // used to write lowercase 'nanoton', the one place this physical unit's
             // casing disagreed with every other surface (estimate --json, this file's
             // own comments/errors, the Go client's own output).
-            cost: { amount: deploy.amountNano.toString(), unit: 'nanoTON' },
+            cost: { amount: active.deploy.amountNano.toString(), unit: 'nanoTON' },
           });
           if (intent) await settleIntentAgainstLedger(intent, contractAddressRaw);
         } else if (resumable !== null) {
@@ -2297,7 +2717,51 @@ export function tonProviderBackend(): StorageBackend {
           // above).
           await notifyProviderWithRetry(notifyPubkey, contractAddressRaw, bag.dataSizeBytes);
         } catch (e) {
+          // #950: durable, best-effort note so a LATER push of this SAME source content
+          // (matched by `sourceDigest`, the one thing stable across a re-encrypt — see
+          // this guard's own header comment above unresolvedNotifyIncompleteFor()) refuses
+          // to fund a brand-new contract while THIS one may still be transferring, instead
+          // of silently abandoning it and paying again every night. Recorded only when a
+          // content digest was actually available for this run — a push with no
+          // ".digest" sidecar (a foreign artifact) has nothing this guard can match a
+          // later run against, so there is nothing useful to record.
+          if (sourceDigest) {
+            await recordNotifyIncomplete({
+              content_digest: sourceDigest,
+              contract_address: contractAddressRaw,
+              bag_id: bag.bagId,
+              provider_pubkey: notifyPubkey,
+              locator,
+              source_file: file,
+              resolved: false,
+            });
+          }
           throw new PushFundingConfirmedButIncompleteError(locator, e);
+        }
+        // #950 review (codex xhigh pass, Warning, second pass): notify just SUCCEEDED for
+        // this exact contract — close out its open notify-incomplete record, if it has
+        // one, so a LATER push of the SAME still-unchanged content is not wrongly refused
+        // after this contract has genuinely finished transferring. Looked up by
+        // CONTRACT ADDRESS (notifyIncompleteRecordForContract(), not this run's own
+        // `sourceDigest`) so a recovery push whose own ".digest" sidecar happens to be
+        // missing/foreign can still resolve the record — it reuses that record's OWN
+        // stored content_digest, which is what a later push actually keys its lookup on.
+        // Only writes when a record genuinely exists and is not already resolved (avoids
+        // growing the log on the common case of a fresh push with no history at all).
+        // Best-effort/warn-only inside recordNotifyIncomplete() itself: notify has
+        // already fully succeeded by this point, so a bookkeeping failure here must not
+        // turn a completed push into a reported failure.
+        const openForThisContract = await notifyIncompleteRecordForContract(contractAddressRaw);
+        if (openForThisContract && !openForThisContract.resolved) {
+          await recordNotifyIncomplete({
+            content_digest: openForThisContract.content_digest,
+            contract_address: contractAddressRaw,
+            bag_id: openForThisContract.bag_id,
+            provider_pubkey: openForThisContract.provider_pubkey,
+            locator: openForThisContract.locator,
+            source_file: openForThisContract.source_file,
+            resolved: true,
+          });
         }
         // #652: made explicit here (not just in this file's own doc comments) since this
         // is the line an operator actually sees before their local seed stops — "safe"
