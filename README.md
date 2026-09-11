@@ -351,6 +351,15 @@ sees it either. If you want the signature preserved in the bag, copy `<in>.age.m
 into `--from-restored-dir` yourself before running `bagit-export`; once it is there, it
 is a plain file like any other and is copied in with the rest.
 
+Two safety checks run before anything is written: source filenames that would collide
+on a case-insensitive or Unicode-normalization-insensitive destination filesystem
+(e.g. default macOS/APFS) refuse the whole export, naming both conflicting files —
+otherwise the second copy would silently overwrite the first with no error, since the
+manifest is generated from what actually landed on disk, not from the original file
+list. The staging directory that briefly holds the plaintext payload while the bag is
+being assembled is also created mode `0700`, so it is never readable by other local
+users even under a permissive umask.
+
 Verifying a bag: once written, a bag's own internal integrity can be checked with
 standard tools alone, no cypher-brain required — from inside the bag directory, run
 `shasum -a 256 -c manifest-sha256.txt` and `shasum -a 256 -c tagmanifest-sha256.txt`;
@@ -1205,14 +1214,19 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       own *.tar.gz archives, and re-including it would duplicate the payload for no
       interoperability benefit. Any symlink, or any other unexpected entry shape,
       anywhere at the top level refuses the whole export rather than silently skipping
-      it.
+      it. Two source filenames that would collapse onto the same path on a
+      case-insensitive or Unicode-normalization-insensitive destination filesystem
+      (e.g. default macOS/APFS) also refuse the whole export up front, naming both —
+      copying both would otherwise silently drop one with no error, since the manifest
+      is built from what actually landed in data/, not from this original file list.
       Writes bagit.txt, bag-info.txt (Bagging-Date, Bag-Software-Agent, Payload-Oxum),
       manifest-sha256.txt and tagmanifest-sha256.txt per RFC 8493 — every hash is
       computed by re-reading the bytes actually written to <out-dir>, never by trusting
-      the source. Everything is staged in a temporary sibling directory first and
-      published with a single rename, so a failure partway through never leaves a
-      half-written directory at --out-dir. --out-dir must not already exist unless
-      --force is given, matching this codebase's usual no-clobber convention.
+      the source. Everything is staged in a temporary sibling directory (mode 0700,
+      since it holds a plaintext copy of the payload) first and published with a single
+      rename, so a failure partway through never leaves a half-written directory at
+      --out-dir. --out-dir must not already exist unless --force is given, matching
+      this codebase's usual no-clobber convention.
       Verifying a bag: from inside the written bag directory, "shasum -a 256 -c
       manifest-sha256.txt" and "shasum -a 256 -c tagmanifest-sha256.txt" confirm its own
       internal integrity with standard tools alone, no cypher-brain required — both

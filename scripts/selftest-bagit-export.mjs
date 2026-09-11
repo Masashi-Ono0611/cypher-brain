@@ -52,7 +52,7 @@ const sha256hex = async (path) =>
 
 const tmp = await mkdtemp(join(tmpdir(), 'cb-bagit-export-'));
 try {
-  const { exportBagit } = await import('../src/lib/bagit.ts');
+  const { exportBagit, findNormalizedNameCollisions } = await import('../src/lib/bagit.ts');
 
   // ---- fixture builder: a tiny fake "restore --out-dir" output ----
   async function makeRestoreDir(name, opts = {}) {
@@ -425,6 +425,296 @@ try {
       !/skipping/.test(r.stderr ?? ''),
       r.stderr,
     );
+  }
+  // ---- 15. #943: two top-level filenames that would collapse onto the same path on a
+  //          case-insensitive or Unicode-normalization-insensitive destination
+  //          filesystem (default macOS/APFS) refuse the whole export, naming both.
+  //
+  //          This repo's own CI matrix runs both macos-latest AND ubuntu-latest (see
+  //          scripts/check-help-docs.mjs's own header comment). Two real files named
+  //          e.g. "component-a.tar.gz" and "Component-A.tar.gz" CANNOT both exist as
+  //          distinct dirents on macOS's default APFS -- the OS itself folds the second
+  //          write onto the first (verified empirically while writing this test: doing
+  //          exactly that on this machine left only ONE real file behind, before
+  //          bagit-export's own code ever ran) -- while on ext4 (ubuntu-latest) they
+  //          could. Building this test's SOURCE fixture from real same-named files
+  //          would therefore only exercise the intended code path on ONE of the two CI
+  //          runners and silently no-op (not fail -- just prove nothing) on the other.
+  //          Per this task's own fallback instruction, the fix is tested at the level
+  //          that IS deterministic on every runner: the exported, pure
+  //          findNormalizedNameCollisions() itself, with synthetic string arrays that
+  //          never touch a real filesystem, plus a non-colliding-fixture smoke check
+  //          that the wiring does not false-positive on an ordinary export. ----
+  {
+    check(
+      'findNormalizedNameCollisions: no collision among genuinely distinct names returns no groups',
+      findNormalizedNameCollisions(['component-a.tar.gz', 'db.dump', 'manifest.json']).length === 0,
+    );
+    check(
+      'findNormalizedNameCollisions: two names differing only by ASCII case are grouped together',
+      (() => {
+        const groups = findNormalizedNameCollisions(['component-a.tar.gz', 'Component-A.tar.gz', 'db.dump']);
+        return (
+          groups.length === 1 &&
+          groups[0].length === 2 &&
+          groups[0].includes('component-a.tar.gz') &&
+          groups[0].includes('Component-A.tar.gz')
+        );
+      })(),
+    );
+    {
+      // A precomposed vs. decomposed accented character, built from \u escapes (not
+      // typed literals) so the source bytes of THIS file cannot silently collapse both
+      // into the same form the way two visually-identical typed characters did in an
+      // earlier draft of this test (caught during review). NFC form is one codepoint
+      // (U+00E9 "e with acute"); NFD form is two codepoints ("e" U+0065 + a combining
+      // acute accent U+0301) -- visually identical, byte-distinct.
+      const nfc = 'caf\u00e9.tar.gz';
+      const nfd = 'cafe\u0301.tar.gz';
+      assert.notStrictEqual(nfc, nfd, 'test fixture bug: NFC/NFD forms must be byte-distinct to be a real test');
+      assert.strictEqual(nfc, nfd.normalize('NFC'), 'test fixture bug: nfd must actually normalize to nfc');
+      const groups = findNormalizedNameCollisions([nfc, nfd, 'unrelated.txt']);
+      check(
+        'findNormalizedNameCollisions: NFC vs NFD forms of the same visible name are grouped together',
+        groups.length === 1 && groups[0].length === 2 && groups[0].includes(nfc) && groups[0].includes(nfd),
+        JSON.stringify(groups),
+      );
+    }
+    check(
+      'findNormalizedNameCollisions: a 3-way collision group names all three conflicting filenames, not just the first two',
+      (() => {
+        const groups = findNormalizedNameCollisions(['FOO.TXT', 'foo.txt', 'Foo.Txt', 'bar.txt']);
+        return groups.length === 1 && groups[0].length === 3;
+      })(),
+    );
+
+    // Regression test for a multi-model review finding: normalizing BEFORE lowercasing
+    // (the original order this fix shipped with) left this specific pair undetected. A
+    // decomposed uppercase "J" (U+004A) + combining caron (U+030C) does not compose to
+    // anything under NFC while still uppercase (there is no precomposed uppercase
+    // "J WITH CARON"), so it must be lowercased FIRST — collapsing to the same
+    // decomposed "j" + combining caron as the precomposed lowercase "ǰ" (U+01F0) — and
+    // only THEN normalized to land on an identical key. See bagit.ts's own doc comment
+    // on findNormalizedNameCollisions() for the fix (toLowerCase().normalize('NFC')).
+    {
+      const precomposedLowerJCaron = '\u01f0.tar.gz'; // precomposed "j with caron", already lowercase
+      const decomposedUpperJCaron = 'J\u030c.tar.gz'; // "J" + combining caron, uppercase
+      assert.notStrictEqual(
+        precomposedLowerJCaron,
+        decomposedUpperJCaron,
+        'test fixture bug: these two forms must be byte-distinct to be a real test',
+      );
+      const groups = findNormalizedNameCollisions([precomposedLowerJCaron, decomposedUpperJCaron, 'unrelated.txt']);
+      check(
+        'findNormalizedNameCollisions: precomposed lowercase "ǰ" and decomposed uppercase "J+combining caron" are grouped together (order-of-operations regression)',
+        groups.length === 1 &&
+          groups[0].length === 2 &&
+          groups[0].includes(precomposedLowerJCaron) &&
+          groups[0].includes(decomposedUpperJCaron),
+        JSON.stringify(groups),
+      );
+    }
+
+    // Documented, deliberately accepted residual (multi-model review finding, see
+    // bagit.ts's own doc comment on findNormalizedNameCollisions()): a simple
+    // toLowerCase() case-fold does NOT catch Greek context-sensitive special-casing
+    // pairs like "Σ"/final-form "ς" — "Σ".toLowerCase() is always "σ", never "ς". This
+    // test documents that CURRENT, intentional behavior (full Unicode case-folding
+    // would need a CaseFolding.txt table this file's own header comment says it
+    // deliberately does not carry as a new dependency) so a future reader sees this
+    // gap as a recorded decision, not a silent regression waiting to be "discovered".
+    {
+      const groups = findNormalizedNameCollisions([
+        '\u03c3.tar.gz' /* \u03c3 (sigma) */,
+        '\u03c2.tar.gz' /* \u03c2 (final sigma) */,
+      ]);
+      check(
+        'findNormalizedNameCollisions: KNOWN LIMITATION (documented, not a bug) — Greek "σ" vs final-form "ς" is not detected as a case-fold collision',
+        groups.length === 0,
+        JSON.stringify(groups),
+      );
+    }
+
+    // exportBagit() calls this exact function immediately after planTopLevel() (see
+    // bagit.ts) and throws naming every colliding filename if it returns any groups --
+    // covered directly by reading that call site plus the coverage above of the
+    // function itself. This smoke check instead confirms the wiring does NOT
+    // false-positive on an ordinary, non-colliding fixture (an over-eager check would
+    // be its own bug).
+    const from = await makeRestoreDir('collision-wiring-smoke');
+    const out = join(tmp, 'collision-wiring-smoke-out');
+    const result = await exportBagit({ fromDir: from, outDir: out });
+    check(
+      'collision check does not false-positive on a normal, non-colliding fixture (no accidental over-refusal)',
+      result.fileCount > 0,
+    );
+
+    // ---- 15c. positive control: confirm the underlying defect this refusal exists to
+    //           prevent actually holds — a NAIVE per-name copy loop (exactly what
+    //           exportBagit()'s own copy loop does, minus the #943 refusal) that copies
+    //           two DIFFERENT real source files onto the SAME destination path silently
+    //           drops the first one's content, with the destination directory afterward
+    //           looking completely normal (one file, one passing checksum) — exactly
+    //           the "reports success, no error, no way to detect after the fact"
+    //           failure mode #943 describes. This does not depend on the two SOURCE
+    //           names actually colliding on this filesystem (the platform-dependent
+    //           part 15's own header explains): it demonstrates the copyFile-overwrite
+    //           mechanism directly, using two ordinary, genuinely-coexisting real files
+    //           and manually directing both copies at one shared destination path,
+    //           exactly as a case/normalization-folding destination filesystem would. ----
+    {
+      const collideDir = join(tmp, 'positive-control-collide-dest');
+      await mkdir(collideDir, { recursive: true });
+      const { copyFile: rawCopyFile } = await import('node:fs/promises');
+      const destPath = join(collideDir, 'landed.tar.gz'); // both copies below target this ONE path
+      await rawCopyFile(join(from, 'component-a.tar.gz'), destPath);
+      const firstLanded = await readFile(destPath, 'utf8');
+      await rawCopyFile(join(from, 'db.dump'), destPath); // simulates a case/normalization-folding destination
+      const secondLanded = await readFile(destPath, 'utf8');
+      const entries = await readdir(collideDir);
+      check(
+        'positive control (RED without #943): a naive per-name copy loop onto a shared/folded destination path silently drops the first file — this is the exact defect class #943 refuses to let happen',
+        firstLanded !== secondLanded && entries.length === 1,
+        `first=${JSON.stringify(firstLanded)} second=${JSON.stringify(secondLanded)} entries=${JSON.stringify(entries)}`,
+      );
+    }
+
+    // ---- 15d. real, adaptive integration test through exportBagit() itself —
+    //           regression test for a multi-model review finding: without this, the
+    //           ENTIRE #943 refusal block in exportBagit() could be deleted and every
+    //           test above would still pass (15a-c only test the standalone function
+    //           and a generic copy loop, never exportBagit() with a real collision).
+    //
+    //           This repo's CI matrix runs both macos-latest (APFS folds these names —
+    //           see this test's own header comment above) and ubuntu-latest (ext4 does
+    //           not). Rather than skip the integration path entirely on the
+    //           non-cooperating runner, this tries several candidate colliding pairs
+    //           and — for whichever ones this runner's filesystem actually lets exist
+    //           as two distinct real dirents — runs exportBagit() for real and asserts
+    //           it refuses, naming both files, with no --out-dir or leftover
+    //           .bagit-export-*.partial created. On a runner where every candidate
+    //           folds (as this fix's own local development machine's does), this is
+    //           reported as an explicit, visible SKIP (not a silent no-op or false
+    //           PASS) rather than a failing check — the deterministic 15a coverage
+    //           above still exercises the exact function exportBagit() calls. ----
+    {
+      const candidates = [
+        { label: 'ASCII case', a: 'Collide-A.tar.gz', b: 'collide-a.tar.gz' },
+        { label: 'NFC vs NFD', a: 'caf\u00e9-collide.tar.gz', b: 'cafe\u0301-collide.tar.gz' },
+        { label: 'precomposed/decomposed j-caron', a: '\u01f0collide.tar.gz', b: 'J\u030ccollide.tar.gz' },
+      ];
+      let ranAtLeastOneIntegrationCase = false;
+      for (const [candidateIndex, { label, a, b }] of candidates.entries()) {
+        const collideFrom = await makeRestoreDir(`collision-integration-${candidateIndex}`);
+        await writeFile(join(collideFrom, a), 'first colliding file bytes');
+        await writeFile(join(collideFrom, b), 'second colliding file bytes, deliberately different');
+        const entries = await readdir(collideFrom);
+        if (!(entries.includes(a) && entries.includes(b))) {
+          console.log(
+            `[SKIP] collision-integration (${label}): this filesystem folds "${a}" and "${b}" onto the same real dirent before bagit-export's own code runs — platform-dependent, not exercisable here (see 15a for deterministic coverage of the same check)`,
+          );
+          continue;
+        }
+        ranAtLeastOneIntegrationCase = true;
+        const collideOut = join(tmp, `collision-integration-${label.replace(/\s+/g, '-')}-out`);
+        await checkThrows(
+          `collision-integration (${label}): exportBagit() itself refuses a real on-disk collision, naming both files`,
+          () => exportBagit({ fromDir: collideFrom, outDir: collideOut }),
+          (e) => /collide/.test(e.message) && e.message.includes(a) && e.message.includes(b),
+        );
+        check(`collision-integration (${label}): no --out-dir was created at all`, !(await pathExists(collideOut)));
+        const siblings = await readdir(tmp);
+        check(
+          `collision-integration (${label}): no leftover .bagit-export-*.partial temp directory either`,
+          !siblings.some((n) => n.startsWith('.bagit-export-')),
+        );
+      }
+      if (!ranAtLeastOneIntegrationCase) {
+        console.log(
+          '[SKIP] collision-integration: every candidate pair folded to one real dirent on this filesystem — no real on-disk integration case could run here this time',
+        );
+      }
+    }
+  }
+
+  // ---- 16. #944: the bag's staging directories (the tmp `.bagit-export-*.partial`
+  //          sibling AND its `data/` subdirectory, published as --out-dir via rename())
+  //          are created mode 0700 even under a permissive process umask — regression
+  //          test with a real red/green positive control: temporarily revert the fix
+  //          (plain mkdir/mkdirSync with no explicit mode) and confirm the mode comes
+  //          out world/group-readable (0755) under umask 022, THEN confirm the actual
+  //          fixed code produces 0700, THEN confirm rename() really does preserve that
+  //          mode rather than assuming it (per the task's own instruction to verify,
+  //          not assume, this). ----
+  {
+    const originalUmask = process.umask(0o022); // permissive, matching the issue's own repro
+    try {
+      const { mkdirSync: rawMkdirSync } = await import('node:fs');
+      const {
+        mkdir: rawMkdir,
+        chmod: rawChmod,
+        mkdtemp: rawMkdtemp,
+        rename: rawRename,
+        stat: rawStat,
+      } = await import('node:fs/promises');
+
+      // ---- positive control: the NAIVE pre-fix shape (no explicit mode) really does
+      //      land at 0755 under umask 022 — confirms the test itself can detect the
+      //      defect before trusting it to confirm the fix. ----
+      const naiveParent = await rawMkdtemp(join(tmpdir(), 'cb-bagit-permcontrol-'));
+      try {
+        const naiveTmpOutDir = join(naiveParent, '.bagit-export-naive.partial');
+        rawMkdirSync(naiveTmpOutDir); // the exact pre-fix call shape: no mode option
+        const naiveDataDir = join(naiveTmpOutDir, 'data');
+        await rawMkdir(naiveDataDir); // ditto
+        const naiveTmpMode = (await rawStat(naiveTmpOutDir)).mode & 0o777;
+        const naiveDataMode = (await rawStat(naiveDataDir)).mode & 0o777;
+        check(
+          'permissions positive control (RED): naive mkdir/mkdirSync with no explicit mode lands at 0755 under umask 022 — confirms this test can actually detect the #944 defect',
+          naiveTmpMode === 0o755 && naiveDataMode === 0o755,
+          `tmpOutDir mode=${naiveTmpMode.toString(8)} dataDir mode=${naiveDataMode.toString(8)}`,
+        );
+      } finally {
+        await rm(naiveParent, { recursive: true, force: true });
+      }
+
+      // ---- GREEN: the actual fixed exportBagit() produces 0700 on both the published
+      //      --out-dir (post-rename) and its data/ subdirectory, under the same
+      //      permissive umask. ----
+      const from = await makeRestoreDir('permissions-test');
+      const out = join(tmp, 'permissions-out');
+      await exportBagit({ fromDir: from, outDir: out });
+      const outMode = (await rawStat(out)).mode & 0o777;
+      const dataMode = (await rawStat(join(out, 'data'))).mode & 0o777;
+      check(
+        'permissions: published --out-dir is mode 0700 even under umask 022',
+        outMode === 0o700,
+        outMode.toString(8),
+      );
+      check('permissions: --out-dir/data is mode 0700 even under umask 022', dataMode === 0o700, dataMode.toString(8));
+
+      // ---- rename() actually preserves mode across the publish step — verified
+      //      directly here (task's own instruction: confirm, don't assume), isolated
+      //      from exportBagit()'s own logic. ----
+      const renameParent = await rawMkdtemp(join(tmpdir(), 'cb-bagit-renamecontrol-'));
+      try {
+        const preRename = join(renameParent, 'pre-rename-0700');
+        const postRename = join(renameParent, 'post-rename');
+        rawMkdirSync(preRename, { mode: 0o700 });
+        await rawChmod(preRename, 0o700); // belt-and-suspenders against this OS's own umask folding the literal mkdir mode
+        await rawRename(preRename, postRename);
+        const preservedMode = (await rawStat(postRename)).mode & 0o777;
+        check(
+          "rename() preserves a directory's own mode across a publish step (verified directly, not assumed)",
+          preservedMode === 0o700,
+          preservedMode.toString(8),
+        );
+      } finally {
+        await rm(renameParent, { recursive: true, force: true });
+      }
+    } finally {
+      process.umask(originalUmask);
+    }
   }
 } finally {
   await rm(tmp, { recursive: true, force: true });
