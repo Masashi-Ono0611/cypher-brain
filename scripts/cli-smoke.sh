@@ -147,8 +147,8 @@ echo "[PASS] dist estimate --backend ton --json: same fix reaches the JSON path 
 # change could add it): branch on its actual resolvability instead of assuming absence,
 # so this test can't silently start failing on a healthy install.
 #
-# This is checked via `require.resolve` run FROM $DIST's own directory — NOT via
-# `[ -d "$ROOT/node_modules/@ardrive/turbo-sdk" ]` (the form this line used before a
+# This is checked via a real dynamic `import()`, run FROM $DIST's own directory — NOT
+# via `[ -d "$ROOT/node_modules/@ardrive/turbo-sdk" ]` (the form this line used before a
 # multi-model review of #915 flagged it): Node's module resolution for a bare specifier
 # walks UP the directory tree from the importing file, so it can find an ANCESTOR
 # directory's node_modules even when $ROOT's own node_modules lacks the package
@@ -159,13 +159,15 @@ echo "[PASS] dist estimate --backend ton --json: same fix reaches the JSON path 
 # reported "absent" while the CLI's actual `import('@ardrive/turbo-sdk')` still resolved
 # through the ancestor real checkout's node_modules and returned a real quote —
 # a spurious FAIL entirely unrelated to whatever change was actually being tested.
-# `require.resolve` and dynamic `import()` share the identical node_modules directory-
-# walk algorithm for a bare specifier (they differ only in which exports-map condition
-# they pick, not which directories they search), so this predicts the real outcome
-# correctly regardless of directory nesting.
+# A `require.resolve()` probe (this line's first-draft form, per a second multi-model
+# review round) would search the same directories but is NOT guaranteed to agree with
+# `import()` on the OUTCOME: a package whose "exports" map declares only an "import"
+# condition (no "require"/default fallback) can resolve for real ESM import() while
+# `require.resolve()` throws `ERR_PACKAGE_PATH_NOT_EXPORTED` for the very same package —
+# so this probes the EXACT mechanism estimate.ts itself uses, not an approximation of it.
 node "$DIST" estimate --in "$CYPHER_BRAIN_HOME/recipient.txt" --backend turbo > "$TMP/estimate-turbo.log" 2>&1 \
   || { echo "[FAIL] dist estimate --backend turbo exited non-zero"; cat "$TMP/estimate-turbo.log"; exit 1; }
-if (cd "$(dirname "$DIST")" && node -e "require.resolve('@ardrive/turbo-sdk')") > /dev/null 2>&1; then
+if (cd "$(dirname "$DIST")" && node --input-type=module -e "await import('@ardrive/turbo-sdk')") > /dev/null 2>&1; then
   grep -q "^backend: turbo$" "$TMP/estimate-turbo.log" \
     || { echo "[FAIL] estimate --backend turbo (sdk installed) did not report backend: turbo"; cat "$TMP/estimate-turbo.log"; exit 1; }
   echo "[PASS] dist estimate --backend turbo: SDK installed, ran without crashing"
