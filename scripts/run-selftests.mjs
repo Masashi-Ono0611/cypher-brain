@@ -177,6 +177,11 @@ const PARALLEL = [
   npmTest('selftest:arweave-nodeps'),
   npmTest('selftest:sdk-advice'),
   npmTest('selftest:usd-rate'),
+  // #927. Same isolation shape as selftest:usd-rate right above: its own mkdtemp tree
+  // (removed in a `finally`), its own mock Arweave-price HTTP server on
+  // `listen(0, '127.0.0.1')` (an ephemeral port), a fresh CYPHER_BRAIN_HOME per case, and
+  // it only READS dist/cli.mjs. Binds no other port, writes no LaunchAgent.
+  npmTest('selftest:estimate-spend-cap'),
   npmTest('selftest:progress'),
   npmTest('selftest:cctv-age'),
   npmTest('selftest:file-toctou'),

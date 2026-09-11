@@ -65,6 +65,22 @@
 #   (ab) mcp-snapshot-policy: both vars set to a genuinely valid value is a PASS.
 #   (ac) mcp-snapshot-policy: a malformed CYPHER_BRAIN_MCP_SOURCE_ROOTS is a WARN
 #       naming the underlying parse error.
+#   (ad) #925: spend-budget-usage / spend-budget-cap-config SKIP for BOTH families
+#       (arweave/turbo AND ton-provider) when no cumulative spend caps are configured —
+#       having no budget configured is not itself a problem.
+#   (ae) #925: a settled receipt (500) plus a REAL open reservation (200, via
+#       reserveSpendBudget() itself, not a hand-authored fixture) fold into "700 of 1000
+#       used (70%)" against a configured 1000 daily cap; spend-budget-cap-config PASSes.
+#   (af) POSITIVE CONTROL — an unreadable line in the spend-budget log degrades
+#       spend-budget-usage to WARN (an undercount), never FAIL — same data-quality
+#       posture as receipt-ledger-readability's own unreadable-line WARN.
+#   (ag) POSITIVE CONTROL — #926: CYPHER_BRAIN_MAX_SPEND_DAILY set without the required
+#       CYPHER_BRAIN_MAX_SPEND is a FAIL naming both vars, doctor VERDICT FAIL (exit 1) —
+#       spend-budget.ts's reserveSpendBudget() already treats this as a hard, push-time
+#       error; doctor now catches it proactively.
+#   (ah) sibling symmetry (#926): the identical misconfiguration in the ton-provider
+#       family (CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY without
+#       CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND) FAILs too, naming its own env vars.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -819,6 +835,116 @@ if (!c.message.includes('not valid JSON')) {
 }
 " "$TMP/u5.json"
 echo "[PASS] malformed CYPHER_BRAIN_MCP_SOURCE_ROOTS: mcp-snapshot-policy WARNs naming the parse error"
+
+echo "== (ad) #925: spend-budget-usage / spend-budget-cap-config SKIP for BOTH families when no cumulative spend caps are configured =="
+export CYPHER_BRAIN_HOME="$TMP/spend-skip-home"
+cb keygen > "$TMP/ad-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/ad-keygen.log"; exit 1; }
+mcp_policy_ok
+cb doctor --json > "$TMP/ad.json" 2>&1 || { echo "[FAIL] doctor --json exited non-zero with no spend caps configured"; cat "$TMP/ad.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const byId = Object.fromEntries(j.checks.map((c) => [c.id, c]));
+for (const id of ['spend-budget-usage', 'spend-budget-cap-config', 'ton-provider-spend-budget-usage', 'ton-provider-spend-budget-cap-config']) {
+  if (!byId[id] || byId[id].status !== 'skip') {
+    throw new Error(id + ' expected status skip with no spend caps configured, got ' + JSON.stringify(byId[id]));
+  }
+}
+" "$TMP/ad.json"
+echo "[PASS] no CYPHER_BRAIN{,_TON_PROVIDER}_MAX_SPEND_{DAILY,MONTHLY} configured: all four spend-budget checks SKIP for both families"
+
+echo "== (ae) #925: spend-budget-usage folds a settled receipt + an open reservation correctly when a cap IS configured =="
+export CYPHER_BRAIN_HOME="$TMP/spend-usage-home"
+cb keygen > "$TMP/ae-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/ae-keygen.log"; exit 1; }
+mcp_policy_ok
+export CYPHER_BRAIN_MAX_SPEND=1200
+export CYPHER_BRAIN_MAX_SPEND_DAILY=1000
+node --experimental-strip-types --import ./scripts/dev-cli-loader.mjs -e "
+Promise.all([import('./src/lib/receipt.ts'), import('./src/lib/spend-budget.ts')]).then(async ([receipt, budget]) => {
+  await receipt.appendReceipt({
+    timestamp: new Date().toISOString(),
+    backend: 'turbo',
+    locator: 'ae-locator',
+    artifact_sha256: 'b'.repeat(64),
+    size_bytes: 100,
+    payer_address: null,
+    cost: '500',
+    unit: 'winc',
+    raw: {},
+  });
+  // A REAL open reservation via the actual admission path (not a hand-authored JSONL
+  // line): CYPHER_BRAIN_MAX_SPEND(1200) - spentThisPush(1000) = a 200 reservation.
+  await budget.reserveSpendBudget('turbo', 1000n);
+});
+"
+cb doctor --json > "$TMP/ae.json" 2>&1 || true
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const byId = Object.fromEntries(j.checks.map((c) => [c.id, c]));
+const u = byId['spend-budget-usage'];
+if (!u || u.status !== 'pass') throw new Error('expected spend-budget-usage pass, got ' + JSON.stringify(u));
+if (!u.message.includes('daily: 700 of 1000 used (70%)')) throw new Error('expected \"daily: 700 of 1000 used (70%)\" in message: ' + u.message);
+const cfg = byId['spend-budget-cap-config'];
+if (!cfg || cfg.status !== 'pass') throw new Error('expected spend-budget-cap-config pass, got ' + JSON.stringify(cfg));
+" "$TMP/ae.json"
+unset CYPHER_BRAIN_MAX_SPEND CYPHER_BRAIN_MAX_SPEND_DAILY
+echo "[PASS] spend-budget-usage folds a settled receipt (500) + an open reservation (200) against the configured 1000 daily cap: 700 used (70%); spend-budget-cap-config PASSes"
+
+echo "== (af) POSITIVE CONTROL — an unreadable line in the spend-budget log degrades spend-budget-usage to WARN (undercount), never FAIL =="
+export CYPHER_BRAIN_HOME="$TMP/spend-degraded-home"
+cb keygen > "$TMP/af-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/af-keygen.log"; exit 1; }
+mcp_policy_ok
+export CYPHER_BRAIN_MAX_SPEND=1000000
+export CYPHER_BRAIN_MAX_SPEND_DAILY=1000
+SPEND_BUDGET_LOG_PATH="$CYPHER_BRAIN_HOME/receipt-ledger.jsonl.spend-budget.jsonl"
+printf 'not json at all\n' >> "$SPEND_BUDGET_LOG_PATH"
+cb doctor --json > "$TMP/af.json" 2>&1 || true
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const byId = Object.fromEntries(j.checks.map((c) => [c.id, c]));
+const u = byId['spend-budget-usage'];
+if (!u || u.status !== 'warn') throw new Error('expected spend-budget-usage warn (degraded), got ' + JSON.stringify(u));
+if (!/UNDERCOUNT/.test(u.message)) throw new Error('expected the UNDERCOUNT warning: ' + u.message);
+if (j.checks.some((c) => c.id === 'spend-budget-usage' && c.status === 'fail')) {
+  throw new Error('an unreadable spend-budget log line must never escalate spend-budget-usage to FAIL');
+}
+" "$TMP/af.json"
+unset CYPHER_BRAIN_MAX_SPEND CYPHER_BRAIN_MAX_SPEND_DAILY
+echo "[PASS] an unreadable spend-budget log line degrades spend-budget-usage to WARN (undercount), never FAIL"
+
+echo "== (ag) POSITIVE CONTROL — #926: CYPHER_BRAIN_MAX_SPEND_DAILY set without CYPHER_BRAIN_MAX_SPEND is a FAIL naming both vars, doctor VERDICT FAIL (exit 1) =="
+export CYPHER_BRAIN_HOME="$TMP/spend-misconfig-home"
+cb keygen > "$TMP/ag-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/ag-keygen.log"; exit 1; }
+mcp_policy_ok
+RC=0
+CYPHER_BRAIN_MAX_SPEND_DAILY=1000 cb doctor --json > "$TMP/ag.json" 2>&1 || RC=$?
+[ "$RC" = "1" ] || { echo "[FAIL] doctor with CYPHER_BRAIN_MAX_SPEND_DAILY set but CYPHER_BRAIN_MAX_SPEND unset exited $RC, expected 1 (FAIL)"; cat "$TMP/ag.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const byId = Object.fromEntries(j.checks.map((c) => [c.id, c]));
+const c = byId['spend-budget-cap-config'];
+if (!c || c.status !== 'fail') throw new Error('expected spend-budget-cap-config fail, got ' + JSON.stringify(c));
+if (!c.message.includes('CYPHER_BRAIN_MAX_SPEND_DAILY')) throw new Error('message missing CYPHER_BRAIN_MAX_SPEND_DAILY: ' + c.message);
+if (!c.message.includes('CYPHER_BRAIN_MAX_SPEND is not')) throw new Error('message missing \"CYPHER_BRAIN_MAX_SPEND is not\": ' + c.message);
+if (j.verdict !== 'FAIL') throw new Error('expected verdict FAIL, got ' + j.verdict);
+" "$TMP/ag.json"
+echo "[PASS] CYPHER_BRAIN_MAX_SPEND_DAILY without CYPHER_BRAIN_MAX_SPEND: spend-budget-cap-config FAILs naming both vars, doctor VERDICT FAIL (exit 1)"
+
+echo "== (ah) sibling symmetry (#926): the SAME misconfiguration in the ton-provider family also FAILs, naming its OWN env vars =="
+export CYPHER_BRAIN_HOME="$TMP/spend-misconfig-ton-home"
+cb keygen > "$TMP/ah-keygen.log" 2>&1 || { echo "[FAIL] keygen exited non-zero"; cat "$TMP/ah-keygen.log"; exit 1; }
+mcp_policy_ok
+RC=0
+CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY=5000 cb doctor --json > "$TMP/ah.json" 2>&1 || RC=$?
+[ "$RC" = "1" ] || { echo "[FAIL] doctor with CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY set but CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND unset exited $RC, expected 1 (FAIL)"; cat "$TMP/ah.json"; exit 1; }
+node -e "
+const j = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+const byId = Object.fromEntries(j.checks.map((c) => [c.id, c]));
+const c = byId['ton-provider-spend-budget-cap-config'];
+if (!c || c.status !== 'fail') throw new Error('expected ton-provider-spend-budget-cap-config fail, got ' + JSON.stringify(c));
+if (!c.message.includes('CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY')) throw new Error('message missing the monthly var: ' + c.message);
+if (!c.message.includes('CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND is not')) throw new Error('message missing \"CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND is not\": ' + c.message);
+" "$TMP/ah.json"
+echo "[PASS] the ton-provider family has the SAME cap-config misconfiguration check (sibling symmetry) — FAILs naming its own env vars"
 
 echo
 echo "all cypher-brain doctor selftests passed"

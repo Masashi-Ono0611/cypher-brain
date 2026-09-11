@@ -60,6 +60,12 @@ import {
   AGE_ARMOR_HEADER,
   AUDIT_LOG,
   RECEIPT_LEDGER,
+  AR_MAX_SPEND,
+  AR_MAX_SPEND_DAILY,
+  AR_MAX_SPEND_MONTHLY,
+  TON_PROVIDER_MAX_SPEND,
+  TON_PROVIDER_MAX_SPEND_DAILY,
+  TON_PROVIDER_MAX_SPEND_MONTHLY,
 } from './config.js';
 import { exists, errMsg } from './util.js';
 import { parsePubkeyFile } from './minisign.js';
@@ -71,6 +77,7 @@ import { readAuditLog, verifyAuditChain } from './audit.js';
 import { readWitnessHints, WITNESS_HINT_FILE } from './witness.js';
 import { readReceipts } from './receipt.js';
 import { readSpendIntents, isUnsettled, PENDING_SPENDS_LOG, type SpendIntentRecord } from './pending-spend.js';
+import { getSpendUsage, SPEND_BUDGET_LOG } from './spend-budget.js';
 import { detectGbrainEngine, resolveGbrainConfigPath } from './gbrain.js';
 import { printJson, printMascot, moodForVerdict } from './ui.js';
 import type { CliOptions } from './types.js';
@@ -964,6 +971,160 @@ async function checkPendingSpends(): Promise<DoctorCheck> {
   };
 }
 
+// #925/#926/#927: cumulative spend admission control (spend-budget.ts, #907) had ZERO
+// visibility anywhere outside an actual push attempt — an operator could not tell how
+// close they were to a configured CYPHER_BRAIN_MAX_SPEND_DAILY/_MONTHLY without
+// deliberately trying to exceed it (#925), and a misconfiguration spend-budget.ts
+// already treats as a hard, push-time error — a positive per-push cap
+// (CYPHER_BRAIN_MAX_SPEND) is REQUIRED once either cumulative cap is enabled — went
+// undetected here until a real (possibly unattended, nightly) push crashed on it (#926).
+//
+// Both checks below are family-symmetric (arweave+turbo share one 'ar' family;
+// ton-provider is separate): config.ts and spend-budget.ts's own reserveSpendBudget()
+// already treat the two families identically, so fixing one family's blind spot with no
+// equivalent for the sibling would just leave the same defect sitting in the other
+// backend (the sibling-symmetry most bugs in this admission-control code have shown).
+interface SpendFamilyConfig {
+  /** Base id these two checks derive their own ids from ("<id>-usage" / "<id>-cap-config"). */
+  id: string;
+  label: string; // human-facing family name, used in messages
+  backend: string; // any backend in this family — getSpendUsage() resolves the family from it
+  daily: bigint;
+  monthly: bigint;
+  cap: bigint; // the required per-push cap (AR_MAX_SPEND / TON_PROVIDER_MAX_SPEND)
+  dailyEnv: string;
+  monthlyEnv: string;
+  capEnv: string;
+}
+
+const SPEND_FAMILIES: readonly SpendFamilyConfig[] = [
+  {
+    id: 'spend-budget',
+    label: 'arweave/turbo',
+    backend: 'turbo',
+    daily: AR_MAX_SPEND_DAILY,
+    monthly: AR_MAX_SPEND_MONTHLY,
+    cap: AR_MAX_SPEND,
+    dailyEnv: 'CYPHER_BRAIN_MAX_SPEND_DAILY',
+    monthlyEnv: 'CYPHER_BRAIN_MAX_SPEND_MONTHLY',
+    capEnv: 'CYPHER_BRAIN_MAX_SPEND',
+  },
+  {
+    id: 'ton-provider-spend-budget',
+    label: 'ton-provider',
+    backend: 'ton-provider',
+    daily: TON_PROVIDER_MAX_SPEND_DAILY,
+    monthly: TON_PROVIDER_MAX_SPEND_MONTHLY,
+    cap: TON_PROVIDER_MAX_SPEND,
+    dailyEnv: 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY',
+    monthlyEnv: 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY',
+    capEnv: 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND',
+  },
+];
+
+// Bigint->Number conversion for a percentage DISPLAY only — the same precision posture
+// this codebase already accepts for its USD-line math (estimate.ts's
+// `Number(BigInt(winc)) / 1e12`); never used for an admission decision.
+function pctUsed(used: bigint, cap: bigint): number {
+  if (cap <= 0n) return 0;
+  return Math.round((Number(used) / Number(cap)) * 100);
+}
+
+// #925: "X of Y daily/monthly budget used" — SKIP (not PASS/FAIL) when neither cap is
+// configured for this family, mirroring receipt-ledger-readability's own "no receipt
+// ledger yet" SKIP just above: having no budget configured is not itself a problem.
+// Read-only: reuses spend-budget.ts's getSpendUsage() rather than re-folding receipts/
+// reservations here, so this can never disagree with what reserveSpendBudget()'s own
+// admission check would compute.
+async function checkSpendBudgetUsage(f: SpendFamilyConfig): Promise<DoctorCheck> {
+  const id = `${f.id}-usage`;
+  if (f.daily === 0n && f.monthly === 0n) {
+    return {
+      id,
+      status: 'skip',
+      message: `no ${f.dailyEnv}/${f.monthlyEnv} configured for ${f.label} — no cumulative spend budget to report (optional)`,
+    };
+  }
+  let usage: Awaited<ReturnType<typeof getSpendUsage>>;
+  try {
+    usage = await getSpendUsage(f.backend);
+  } catch (e) {
+    return {
+      id,
+      status: 'fail',
+      message: `could not compute ${f.label} cumulative spend-budget usage: ${errMsg(e)}`,
+      remediation: `check that every path component of ${RECEIPT_LEDGER} and ${SPEND_BUDGET_LOG} is accessible`,
+    };
+  }
+  if (!usage) {
+    // Cannot actually happen given the daily/monthly guard above (getSpendUsage() only
+    // returns null when neither cap is configured, or the backend has no family at all)
+    // — kept as a defensive fallback rather than a non-null assertion.
+    return { id, status: 'skip', message: `no ${f.label} cumulative spend budget to report (optional)` };
+  }
+  const unit = f.label === 'ton-provider' ? 'nanoTON' : 'winc/winston (1e12 = 1 AR; the two are pegged 1:1)';
+  const parts: string[] = [];
+  if (f.daily > 0n) {
+    const used = usage.daySpent + usage.openReservations;
+    parts.push(`daily: ${used} of ${f.daily} used (${pctUsed(used, f.daily)}%)`);
+  }
+  if (f.monthly > 0n) {
+    const used = usage.monthSpent + usage.openReservations;
+    parts.push(`monthly: ${used} of ${f.monthly} used (${pctUsed(used, f.monthly)}%)`);
+  }
+  const base = `${f.label} cumulative spend budget — ${parts.join('; ')} [${unit}]`;
+  if (usage.degraded) {
+    return {
+      id,
+      status: 'warn',
+      message: `${base} — one or more unreadable/unpriceable receipt or reservation line(s) may make this an UNDERCOUNT`,
+      remediation: `inspect ${RECEIPT_LEDGER} and ${SPEND_BUDGET_LOG} directly for the malformed line(s)`,
+    };
+  }
+  const atCap =
+    (f.daily > 0n && usage.daySpent + usage.openReservations >= f.daily) ||
+    (f.monthly > 0n && usage.monthSpent + usage.openReservations >= f.monthly);
+  if (atCap) {
+    return {
+      id,
+      status: 'warn',
+      message: `${base} — at or over a configured cap; the next ${f.label} push will be refused until it resets (UTC day/month boundary) or an open reservation reconciles`,
+      remediation: `wait for the next UTC day/month, resolve any open reservation in ${SPEND_BUDGET_LOG}, or raise the exceeded cap`,
+    };
+  }
+  return { id, status: 'pass', message: base };
+}
+
+// #926: spend-budget.ts's reserveSpendBudget() already treats CYPHER_BRAIN_MAX_SPEND_DAILY
+// (or _MONTHLY) set without a positive CYPHER_BRAIN_MAX_SPEND as a hard, push-time error —
+// same class of active, operator-made misconfiguration as pin-recipients-config's
+// "explicitly set but EMPTY" FAIL above (not an unconfigured-and-fine default), and every
+// push in that family would be refused until fixed — so this is FAIL, not WARN, catching
+// it proactively instead of letting it surface as a crash on the next (possibly
+// unattended) real push.
+function checkSpendBudgetCapConfig(f: SpendFamilyConfig): DoctorCheck {
+  const id = `${f.id}-cap-config`;
+  if (f.daily === 0n && f.monthly === 0n) {
+    return { id, status: 'skip', message: `no ${f.label} cumulative spend caps configured (optional)` };
+  }
+  if (f.cap > 0n) {
+    return {
+      id,
+      status: 'pass',
+      message: `${f.capEnv} is set — ${f.label}'s configured cumulative spend cap(s) have the required per-push cap they depend on`,
+    };
+  }
+  const set = [f.daily > 0n ? f.dailyEnv : null, f.monthly > 0n ? f.monthlyEnv : null].filter(
+    (v): v is string => v !== null,
+  );
+  return {
+    id,
+    status: 'fail',
+    message: `${set.join(' and ')} ${set.length > 1 ? 'are' : 'is'} set but ${f.capEnv} is not — every ${f.label} push will be refused (spend-budget.ts requires a positive ${f.capEnv} once a daily/monthly cap is enabled)`,
+    remediation: `set ${f.capEnv} to a positive integer (native units), or unset ${set.join(' and ')} to disable cumulative admission control for ${f.label}`,
+  };
+}
+
 // #542: detectGbrainEngine() (gbrain.ts, #367) was, until now, wired ONLY into the init
 // wizard's one-time snapshot-source prompt — and `init` itself refuses to rerun once an
 // identity already exists, so a gbrain install that later CHANGES engine (e.g. migrates
@@ -1444,6 +1605,10 @@ const CHECK_DEFS: ReadonlyArray<{
   { id: 'receipt-ledger-readability', run: () => checkReceiptLedger() },
   { id: 'witness-coverage', run: () => checkWitnessCoverage() },
   { id: 'pending-spend-intents', run: () => checkPendingSpends() },
+  { id: 'spend-budget-usage', run: () => checkSpendBudgetUsage(SPEND_FAMILIES[0]) },
+  { id: 'ton-provider-spend-budget-usage', run: () => checkSpendBudgetUsage(SPEND_FAMILIES[1]) },
+  { id: 'spend-budget-cap-config', run: () => checkSpendBudgetCapConfig(SPEND_FAMILIES[0]) },
+  { id: 'ton-provider-spend-budget-cap-config', run: () => checkSpendBudgetCapConfig(SPEND_FAMILIES[1]) },
   { id: 'gbrain-engine-detection', run: () => checkGbrainEngine() },
   { id: 'identity-backup-accumulation', run: () => checkIdentityBackups() },
 ];

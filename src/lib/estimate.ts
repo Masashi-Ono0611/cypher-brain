@@ -12,6 +12,10 @@ import {
   AR_TURBO_RATES_URL,
   TON_TONAPI_URL,
   TON_WALLET,
+  AR_MAX_SPEND_DAILY,
+  AR_MAX_SPEND_MONTHLY,
+  TON_PROVIDER_MAX_SPEND_DAILY,
+  TON_PROVIDER_MAX_SPEND_MONTHLY,
 } from './config.js';
 import { requireFile, errMsg, fmtBytes, sdkImportAdvice, exists, sha256, importQuietly } from './util.js';
 import { printJson } from './ui.js';
@@ -20,6 +24,7 @@ import { didYouMean, nearestName } from './suggest.js';
 import { UsageError } from './errors.js';
 import { STORAGE_BACKEND_NAMES, type CliOptions } from './types.js';
 import { signedDataItemSize } from './backends/ans104.js';
+import { getSpendUsage } from './spend-budget.js';
 
 // Every field is REQUIRED and nullable rather than optional (#268): a `--json`
 // consumer — the whole point of #211 — gets one stable object shape, so
@@ -149,8 +154,50 @@ export async function tonUsdRate(): Promise<number | null> {
 // (types.ts) — any other value is a caller bug (mcp.ts validates via requireBackend
 // before calling this; the CLI estimate() below validates too), so it is rejected
 // explicitly rather than silently falling through to the arweave branch.
+// #927: estimate never cross-checked its cost against configured cumulative spend caps
+// (CYPHER_BRAIN_MAX_SPEND_DAILY/_MONTHLY, or their ton-provider counterparts) — an
+// operator could only discover an eventual push-time refusal by actually attempting the
+// push. Reuses spend-budget.ts's OWN getSpendUsage() (the SAME read-only aggregation
+// reserveSpendBudget() itself folds from — see doctor.ts's #925 checks, which reuse the
+// identical function) rather than re-implementing the day/month fold here, so this can
+// never disagree with what a real push's admission check would compute. Deliberately
+// NEVER refuses: estimate/estimate_cost is a read-only, dry-run surface by design — this
+// only adds an INFORMATIONAL warning (never blocks the number from being shown) when
+// this upload's cost, added to what is already receipted/reserved today or this month,
+// would exceed a configured cap.
+async function spendCapWarning(backend: string, cost: string | null): Promise<string | null> {
+  if (cost === null || !/^\d+$/.test(cost)) return null; // no priced native cost to check (free backend, or the price query itself failed)
+  let usage: Awaited<ReturnType<typeof getSpendUsage>>;
+  try {
+    usage = await getSpendUsage(backend);
+  } catch {
+    // Never let a spend-budget read failure break a read-only estimate — the same
+    // never-throw posture arUsdRate()/turboUsdRate() above take for their own optional
+    // USD line.
+    return null;
+  }
+  if (!usage) return null; // no cumulative caps configured for this backend's family (or no family at all)
+  const thisCost = BigInt(cost);
+  const ton = usage.family === 'ton-provider';
+  const daily = ton ? TON_PROVIDER_MAX_SPEND_DAILY : AR_MAX_SPEND_DAILY;
+  const monthly = ton ? TON_PROVIDER_MAX_SPEND_MONTHLY : AR_MAX_SPEND_MONTHLY;
+  const dailyEnv = ton ? 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY' : 'CYPHER_BRAIN_MAX_SPEND_DAILY';
+  const monthlyEnv = ton ? 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY' : 'CYPHER_BRAIN_MAX_SPEND_MONTHLY';
+  const exceeded: string[] = [];
+  if (daily > 0n && usage.daySpent + usage.openReservations + thisCost > daily) exceeded.push(`${dailyEnv}=${daily}`);
+  if (monthly > 0n && usage.monthSpent + usage.openReservations + thisCost > monthly)
+    exceeded.push(`${monthlyEnv}=${monthly}`);
+  if (exceeded.length === 0) return null;
+  return (
+    `this upload's cost (${cost}) would push cumulative spend over ${exceeded.join(' and ')} if pushed right ` +
+    "now (today's/this month's receipted spend plus any open reservations, per spend-budget.ts's own admission " +
+    'check) — a real push would be refused'
+  );
+}
+
 export async function estimateCost(backend: string, sizeBytes: number): Promise<CostEstimate> {
   const e = await estimateCostFor(backend, sizeBytes);
+  const capWarning = await spendCapWarning(backend, e.cost ?? null);
   // The single normalization point described on PartialCostEstimate above. Written
   // out key by key rather than spread over defaults so the emitted JSON also comes
   // out in the order --help and the estimate_cost tool description list the fields.
@@ -161,8 +208,8 @@ export async function estimateCost(backend: string, sizeBytes: number): Promise<
     unit: e.unit ?? null,
     approx_ar: e.approx_ar ?? null,
     usd_estimate: e.usd_estimate ?? null,
-    note: e.note,
-    warnings: e.warnings ?? [],
+    note: capWarning ? `${e.note} ⚠ ${capWarning}.` : e.note,
+    warnings: [...(e.warnings ?? []), ...(capWarning ? [capWarning] : [])],
   };
 }
 
