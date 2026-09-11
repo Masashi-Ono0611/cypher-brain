@@ -254,10 +254,13 @@ export interface SpendUsage {
  * (#925/#927): how much has been receipted today/this UTC calendar month, plus any
  * still-open reservations — WITHOUT reserving or writing anything, unlike
  * reserveSpendBudget() (which reserves the remaining per-push cap as a side effect).
- * Shares the exact fold/date-window logic reserveSpendBudget() uses above (same UTC
- * day/month boundaries, same "open reservations count against both windows" rule), so a
- * totals-and-caps view (doctor, estimate) can never disagree with what a real push's
- * admission check would compute.
+ * Mirrors the same fold/date-window logic reserveSpendBudget() uses above (same UTC
+ * day/month boundaries, same "open reservations count against both windows" rule) — kept
+ * as a SEPARATE, more lenient function rather than a shared internal helper the two call
+ * (see the "Deliberately more lenient" paragraph below), so a caller comparing its own
+ * result against a real push's admission check should still expect the SAME daySpent/
+ * monthSpent/openReservations numbers on well-formed data, but not identical behavior on
+ * malformed data (that function fails closed; this one degrades).
  *
  * Returns null when `backend` has no admission-control family at all (file/rclone/ton)
  * OR when neither family's daily nor monthly cap is configured — mirroring

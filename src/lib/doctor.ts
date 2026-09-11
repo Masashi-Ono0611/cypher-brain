@@ -1022,20 +1022,25 @@ const SPEND_FAMILIES: readonly SpendFamilyConfig[] = [
   },
 ];
 
-// Bigint->Number conversion for a percentage DISPLAY only — the same precision posture
-// this codebase already accepts for its USD-line math (estimate.ts's
-// `Number(BigInt(winc)) / 1e12`); never used for an admission decision.
-function pctUsed(used: bigint, cap: bigint): number {
-  if (cap <= 0n) return 0;
-  return Math.round((Number(used) / Number(cap)) * 100);
+// Pure bigint round-half-up percentage — never used for an admission decision, only a
+// human-readable display. Deliberately NOT `Number(used) / Number(cap)`: a bigint
+// (Codex review, Suggestion) converts to `Infinity` once it exceeds
+// Number.MAX_VALUE, which a config typo (an absurdly large spend cap) could reach,
+// printing a misleading "Infinity%"/"NaN%" instead of a real integer — bigint division
+// has no such ceiling, whatever the magnitude of `used`/`cap`.
+function pctUsed(used: bigint, cap: bigint): bigint {
+  if (cap <= 0n) return 0n;
+  return (used * 100n + cap / 2n) / cap;
 }
 
 // #925: "X of Y daily/monthly budget used" — SKIP (not PASS/FAIL) when neither cap is
 // configured for this family, mirroring receipt-ledger-readability's own "no receipt
 // ledger yet" SKIP just above: having no budget configured is not itself a problem.
 // Read-only: reuses spend-budget.ts's getSpendUsage() rather than re-folding receipts/
-// reservations here, so this can never disagree with what reserveSpendBudget()'s own
-// admission check would compute.
+// reservations here — the SAME day/month-window fold reserveSpendBudget()'s own
+// admission check uses (kept in one place, not two independent copies of that
+// arithmetic), though getSpendUsage() is its own function with its own, more lenient
+// posture on bad data (degrades instead of failing closed — see its own doc comment).
 async function checkSpendBudgetUsage(f: SpendFamilyConfig): Promise<DoctorCheck> {
   const id = `${f.id}-usage`;
   if (f.daily === 0n && f.monthly === 0n) {

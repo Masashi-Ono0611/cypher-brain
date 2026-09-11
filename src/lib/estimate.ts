@@ -12,8 +12,10 @@ import {
   AR_TURBO_RATES_URL,
   TON_TONAPI_URL,
   TON_WALLET,
+  AR_MAX_SPEND,
   AR_MAX_SPEND_DAILY,
   AR_MAX_SPEND_MONTHLY,
+  TON_PROVIDER_MAX_SPEND,
   TON_PROVIDER_MAX_SPEND_DAILY,
   TON_PROVIDER_MAX_SPEND_MONTHLY,
 } from './config.js';
@@ -157,14 +159,28 @@ export async function tonUsdRate(): Promise<number | null> {
 // #927: estimate never cross-checked its cost against configured cumulative spend caps
 // (CYPHER_BRAIN_MAX_SPEND_DAILY/_MONTHLY, or their ton-provider counterparts) — an
 // operator could only discover an eventual push-time refusal by actually attempting the
-// push. Reuses spend-budget.ts's OWN getSpendUsage() (the SAME read-only aggregation
-// reserveSpendBudget() itself folds from — see doctor.ts's #925 checks, which reuse the
-// identical function) rather than re-implementing the day/month fold here, so this can
-// never disagree with what a real push's admission check would compute. Deliberately
-// NEVER refuses: estimate/estimate_cost is a read-only, dry-run surface by design — this
-// only adds an INFORMATIONAL warning (never blocks the number from being shown) when
-// this upload's cost, added to what is already receipted/reserved today or this month,
-// would exceed a configured cap.
+// push. Reuses spend-budget.ts's OWN getSpendUsage() (the SAME read-only fold/date-window
+// logic reserveSpendBudget() itself uses — see doctor.ts's #925 checks, which reuse the
+// identical function) rather than re-implementing it here. Deliberately NEVER refuses:
+// estimate/estimate_cost is a read-only, dry-run surface by design — this only adds an
+// INFORMATIONAL warning (never blocks the number from being shown).
+//
+// Codex review (#927 follow-up): this does NOT compare `cost` (this estimate's own
+// displayed price) against the daily/monthly cap. reserveSpendBudget() reserves the
+// REMAINING SINGLE-PUSH CAP (CYPHER_BRAIN_MAX_SPEND / CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND)
+// for a push, not its displayed estimate — spend-budget.ts's own comment on that
+// function explains why ("the earlier display estimate can go stale ... this can
+// conservatively refuse a cheaper upload"). For a FRESH push (no spend already tracked
+// earlier in the SAME push — the case estimate has no way to know about anyway) that
+// reservation equals the single-push cap itself. So the number that actually threatens
+// the daily/monthly cap is the single-push cap, not `cost` — using `cost` here would
+// systematically UNDER-warn whenever the configured single-push cap is larger than this
+// particular upload's real price (the common case: a cap sized for a worst-case upload,
+// not this one). If that single-push cap itself is 0/unset (a #926 misconfiguration),
+// reserveSpendBudget() throws a DIFFERENT, unrelated error before ever reaching the
+// daily/monthly comparison — surfaced here too (in the same words `doctor`'s
+// spend-budget-cap-config check uses) rather than silently saying nothing, since a real
+// push in that state is just as doomed, only for a different reason.
 async function spendCapWarning(backend: string, cost: string | null): Promise<string | null> {
   if (cost === null || !/^\d+$/.test(cost)) return null; // no priced native cost to check (free backend, or the price query itself failed)
   let usage: Awaited<ReturnType<typeof getSpendUsage>>;
@@ -177,22 +193,53 @@ async function spendCapWarning(backend: string, cost: string | null): Promise<st
     return null;
   }
   if (!usage) return null; // no cumulative caps configured for this backend's family (or no family at all)
-  const thisCost = BigInt(cost);
   const ton = usage.family === 'ton-provider';
   const daily = ton ? TON_PROVIDER_MAX_SPEND_DAILY : AR_MAX_SPEND_DAILY;
   const monthly = ton ? TON_PROVIDER_MAX_SPEND_MONTHLY : AR_MAX_SPEND_MONTHLY;
+  const cap = ton ? TON_PROVIDER_MAX_SPEND : AR_MAX_SPEND; // the single-push cap a fresh push would actually reserve
   const dailyEnv = ton ? 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_DAILY' : 'CYPHER_BRAIN_MAX_SPEND_DAILY';
   const monthlyEnv = ton ? 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND_MONTHLY' : 'CYPHER_BRAIN_MAX_SPEND_MONTHLY';
-  const exceeded: string[] = [];
-  if (daily > 0n && usage.daySpent + usage.openReservations + thisCost > daily) exceeded.push(`${dailyEnv}=${daily}`);
-  if (monthly > 0n && usage.monthSpent + usage.openReservations + thisCost > monthly)
-    exceeded.push(`${monthlyEnv}=${monthly}`);
-  if (exceeded.length === 0) return null;
-  return (
-    `this upload's cost (${cost}) would push cumulative spend over ${exceeded.join(' and ')} if pushed right ` +
-    "now (today's/this month's receipted spend plus any open reservations, per spend-budget.ts's own admission " +
-    'check) — a real push would be refused'
-  );
+  const capEnv = ton ? 'CYPHER_BRAIN_TON_PROVIDER_MAX_SPEND' : 'CYPHER_BRAIN_MAX_SPEND';
+  const messages: string[] = [];
+  // Data quality first: an unreadable/unpriceable line means daySpent/monthSpent/
+  // openReservations below may UNDERCOUNT actual spend — a real push's OWN admission
+  // check fails CLOSED on the identical condition (spend-budget.ts's reserveSpendBudget()
+  // throws "cannot verify totals"), so silence here would be the opposite of that
+  // caution. Surfaced regardless of whether the check below finds an excess, since an
+  // undercount could be hiding one.
+  if (usage.degraded) {
+    messages.push(
+      `spend-budget usage could not be fully computed for this backend's family (an unreadable or unpriceable ` +
+        `receipt/reservation line) — the totals a real push's admission check uses may be an UNDERCOUNT, and that ` +
+        'check itself fails closed on the same condition',
+    );
+  }
+  if (cap <= 0n) {
+    if (daily > 0n || monthly > 0n) {
+      const set = [daily > 0n ? dailyEnv : null, monthly > 0n ? monthlyEnv : null].filter(
+        (v): v is string => v !== null,
+      );
+      messages.push(
+        `${set.join(' and ')} ${set.length > 1 ? 'are' : 'is'} set but ${capEnv} is not — a real push would refuse ` +
+          `outright (spend-budget.ts requires a positive ${capEnv} once a daily/monthly cap is enabled), before ` +
+          'ever reaching its cost check',
+      );
+    }
+  } else {
+    const exceeded: string[] = [];
+    if (daily > 0n && usage.daySpent + usage.openReservations + cap > daily) exceeded.push(`${dailyEnv}=${daily}`);
+    if (monthly > 0n && usage.monthSpent + usage.openReservations + cap > monthly)
+      exceeded.push(`${monthlyEnv}=${monthly}`);
+    if (exceeded.length > 0) {
+      messages.push(
+        `a fresh push's admission check reserves the full ${capEnv} cap (${cap}, NOT this estimate's own cost of ` +
+          `${cost} — a real push can conservatively refuse a cheaper upload) and would push cumulative spend over ` +
+          `${exceeded.join(' and ')} if pushed right now (today's/this month's receipted spend plus any open ` +
+          "reservations, per spend-budget.ts's own admission check) — a real push would be refused",
+      );
+    }
+  }
+  return messages.length > 0 ? messages.join(' ') : null;
 }
 
 export async function estimateCost(backend: string, sizeBytes: number): Promise<CostEstimate> {
