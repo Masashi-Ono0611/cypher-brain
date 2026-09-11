@@ -107,7 +107,10 @@ import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 // an import cycle — pushpull.ts imports backendFor() from backends/index.ts, which
 // imports this file; if this file imported from pushpull.ts, that would close the loop.
 // See push-partial-success.ts's own header comment.
-import { PushFundingConfirmedButIncompleteError } from '../push-partial-success.js';
+import {
+  PushFundingConfirmedButIncompleteError,
+  PushFundingConfirmedIntentWriteError,
+} from '../push-partial-success.js';
 import { PushUncertainSpendError } from '../push-uncertain-spend.js';
 import { spentSoFar, remainingSpendBudget, chargeSpendTracker } from '../spend-tracker.js';
 // #808/#665: the durable "a paid deploy is about to happen / has happened" sidecar, and
@@ -1998,10 +2001,48 @@ export function tonProviderBackend(): StorageBackend {
           console.error(`  ${deploy.deeplink}`);
         }
 
-        await waitForContractActive(
-          deploy.contractAddress,
-          alreadyActive ? 'skipped' : autoSignWallet ? 'auto-sign' : 'deeplink',
-        );
+        try {
+          await waitForContractActive(
+            deploy.contractAddress,
+            alreadyActive ? 'skipped' : autoSignWallet ? 'auto-sign' : 'deeplink',
+          );
+        } catch (e) {
+          // issue #949: only the auto-sign path broadcasts a real transfer FROM THIS
+          // PROCESS (the block above, `autoSignAndBroadcastDeploy()`) — a timeout here
+          // right after that means tonapi accepted the signed BOC (HTTP 200) but this
+          // run could not observe the contract confirm active before giving up (a
+          // TonAPI outage, most likely — not proof the transfer failed).
+          // autoSignAndBroadcastDeploy()'s own doc comment already establishes that a
+          // 200 here "proves nothing about 'will confirm'" (tonapi accepts a doomed,
+          // insufficient-gas transaction the same as a good one), so this is genuinely
+          // UNCERTAIN, not confirmed — thrown as PushUncertainSpendError, never
+          // PushFundingConfirmedButIncompleteError/PushFundingConfirmedIntentWriteError,
+          // which both assert a confirmation this process never observed. Before this,
+          // the timeout below surfaced as a plain Error indistinguishable from "nothing
+          // was spent", which let an MCP idempotency-key retry release its claim and
+          // pay a second time for the same deploy.
+          //
+          // Deliberately excludes 'skipped' (this run moved no funds at all — see the
+          // money-safety comment at this function's own alreadyActive branch above) and
+          // 'deeplink' (a human's own Tonkeeper wallet broadcasts on that path, never
+          // this process — waitForContractActive()'s own doc comment already calls that
+          // timeout "a real, expected outcome, not a bug", unchanged here).
+          if (!alreadyActive && autoSignWallet) {
+            throw new PushUncertainSpendError({
+              backend: 'ton-provider',
+              checkKind: 'ton_contract_address',
+              checkIdentifier: deploy.contractAddress.toRawString(),
+              detail:
+                `the deploy broadcast was accepted (HTTP 200) but waiting for contract ` +
+                `${deploy.contractAddress.toRawString()} to confirm active on-chain failed: ${errMsg(e)} — the ` +
+                `transfer of ${deploy.amountNano} nanoTON may or may not have landed (tonapi accepts a doomed ` +
+                'transaction, e.g. insufficient gas, with the same HTTP 200 as a good one)',
+              verifyHint: "the address's state on a TON explorer",
+              cause: e,
+            });
+          }
+          throw e;
+        }
         console.error(`ton-provider: contract ${deploy.contractAddress.toRawString()} is active on-chain`);
 
         // issue #654: computed HERE (not re-derived at the old, later `return` site)
@@ -2054,7 +2095,26 @@ export function tonProviderBackend(): StorageBackend {
         // already-active branch below finish the job on a later run instead of skipping
         // silently forever.
         if (!alreadyActive) {
-          if (intent) intent = await advanceSpendIntent(intent, 'confirmed');
+          if (intent) {
+            try {
+              intent = await advanceSpendIntent(intent, 'confirmed');
+            } catch (e) {
+              // issue #949: funding is ALREADY confirmed on-chain by this point (the
+              // waitForContractActive() call above returned) — exactly as irreversible as
+              // the notify-failure case PushFundingConfirmedButIncompleteError already
+              // names, just one step earlier. A plain Error here (a full disk, a
+              // permissions change under PENDING_SPENDS_LOG) used to be indistinguishable
+              // from "nothing was spent", so an MCP idempotency-key retry released its
+              // claim and paid a second time. Thrown here BEFORE onReceipt (this run's own
+              // receipt write never runs) rather than forcing it through regardless: the
+              // intent this leaves behind stays at `'pending'`, which is exactly the state
+              // issue #808's own already-active-branch recovery (this function's own
+              // `resumable.state === 'pending'` handling, below) already knows how to
+              // settle on a later retry — reusing that existing self-healing path instead
+              // of adding a second one.
+              throw new PushFundingConfirmedIntentWriteError(locator, e);
+            }
+          }
           await opts.onReceipt?.({
             locator,
             raw: {
