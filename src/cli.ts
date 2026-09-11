@@ -955,6 +955,9 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       (file: store path; arweave: tx id; turbo: ANS-104 data item id; rclone: the
       --remote value itself; ton: "ton:v1:<bag-id>"; ton-provider: "ton-provider:v1:<bag-id>").
       Storage sees ciphertext only.
+      --backend turbo: check upload-processing status afterward with "cypher-brain
+      push-status --locator <locator>" (see "push-status" below) — a natural follow-up,
+      no wallet or SDK required.
       Transfer progress (#283) is printed to stderr on the backends that can actually be
       slow: turbo uploads (from the SDK's own progress events), rclone transfers (rclone's
       periodic stats, translated), an arweave gateway READ during pull, and ton-provider's

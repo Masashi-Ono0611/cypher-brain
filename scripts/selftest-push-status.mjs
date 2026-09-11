@@ -45,13 +45,22 @@ if (process.env.CB_PUSH_STATUS_FIXTURE) {
     assert.ok(options.signal instanceof AbortSignal);
     assert.equal(options.headers, undefined, 'public lookup must send no credentials');
     if (fixture.kind === 'network') throw new TypeError('fixture network unavailable');
+    // #920: a real Node `fetch` network/DNS failure is a TypeError('fetch failed') whose
+    // ACTUAL reason rides in `.cause` (e.g. an ECONNREFUSED/ENOTFOUND Error) — reproduce
+    // that exact shape so errMsg()'s cause-appending is exercised the same way it would
+    // be against a real misconfigured CYPHER_BRAIN_TURBO_STATUS_URL.
+    if (fixture.kind === 'network-with-cause') {
+      throw new TypeError('fetch failed', {
+        cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:1'), { code: 'ECONNREFUSED' }),
+      });
+    }
     if (fixture.kind === 'timeout') return waitForAbort(options.signal);
     if (fixture.kind === 'body-timeout') {
       return { ok: true, status: 200, json: () => waitForAbort(options.signal) };
     }
     return new Response(fixture.body ?? JSON.stringify(CONFIRMED), {
       status: fixture.http ?? 200,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': fixture.contentType ?? 'application/json' },
     });
   };
   process.on('exit', () => assert.equal(calls, fixture.calls ?? 1, 'exactly one lookup; no polling or retries'));
@@ -121,10 +130,32 @@ if (process.env.CB_PUSH_STATUS_FIXTURE) {
       success({ body: JSON.stringify(raw) }, { found: true, status: raw.status, raw });
     });
     for (const library of [false, true]) {
-      check(`${library ? 'helper' : 'CLI'} genuine 404 is only found:false, exit 0`, () =>
-        success({ http: 404, body: JSON.stringify({ error: "TX doesn't exist" }) }, { found: false }, library),
+      // #918: the REAL production endpoint (https://upload.ardrive.io) answers a genuine
+      // "TX doesn't exist" with a PLAIN-TEXT body, not JSON — this mock used to hide that
+      // (the old JSON-body fixture below never exercised the res.json()-throws-on-plain-
+      // text bug at all). Confirmed via `curl -sv https://upload.ardrive.io/v1/tx/<fake>/
+      // status`: HTTP 404, `content-type: text/plain`, body literally `TX doesn't exist`.
+      check(
+        `${library ? 'helper' : 'CLI'} genuine 404 (real plain-text body, not JSON) is only found:false, exit 0`,
+        () => success({ http: 404, body: "TX doesn't exist", contentType: 'text/plain' }, { found: false }, library),
       );
     }
+    // Positive control for the fix's actual claim (#918): a 404 is decisive ON ITS OWN —
+    // the body is never inspected, so ANY body shape at a 404 status still means
+    // found:false, not just the one real shape above. This trio of bodies is exactly what
+    // the PRE-FIX code used to reject as "unexpected HTTP 404 response" (a `failures`
+    // entry each, asserting exit 1) — moved here and re-asserted as found:false, exit 0,
+    // to lock in that the fix is a strict widening (still {found:false}), never a
+    // narrowing that could let a genuinely different failure slip through as "not found".
+    check('404 with an unrelated JSON body is still found:false (status code alone is sufficient, #918)', () =>
+      success({ http: 404, body: JSON.stringify({ error: 'route missing' }) }, { found: false }),
+    );
+    check('404 with a malformed error-shaped JSON body is still found:false', () =>
+      success({ http: 404, body: JSON.stringify({ error: { message: "TX doesn't exist" } }) }, { found: false }),
+    );
+    check('404 with a plain non-JSON, non-matching body is still found:false', () =>
+      success({ http: 404, body: 'not found', contentType: 'text/plain' }, { found: false }),
+    );
     check('human output prints raw status and honest caveat', () => {
       const r = run({}, ['--locator', ID]);
       assert.equal(r.status, 0, r.stderr);
@@ -145,6 +176,16 @@ if (process.env.CB_PUSH_STATUS_FIXTURE) {
     });
     const failures = [
       ['network failure', { kind: 'network' }, /fixture network unavailable/],
+      // #920: errMsg() now appends a fetch failure's `.cause` (ECONNREFUSED/ENOTFOUND/etc)
+      // instead of dropping it. This is the only regression coverage for that change —
+      // errMsg() has no standalone unit test elsewhere — so it also confirms the cause
+      // text survives all the way through checkTurboUploadStatus()'s catch and the CLI's
+      // error-printing path, not merely that errMsg() itself returns it.
+      [
+        'network failure with a real fetch .cause (#920)',
+        { kind: 'network-with-cause' },
+        /fetch failed \(cause: ECONNREFUSED — connect ECONNREFUSED 127\.0\.0\.1:1\)/,
+      ],
       ['request timeout', { kind: 'timeout' }, /timeout/i],
       ['body timeout', { kind: 'body-timeout' }, /timeout/i],
       ['non-JSON body', { body: '<html>bad gateway</html>' }, /JSON/],
@@ -154,9 +195,6 @@ if (process.env.CB_PUSH_STATUS_FIXTURE) {
       ['missing status', { body: '{}' }, /status string/],
       ['numeric status', { body: '{"status":42}' }, /status string/],
       ['empty status', { body: '{"status":" "}' }, /status string/],
-      ['unrelated JSON 404', { http: 404, body: '{"error":"route missing"}' }, /unexpected HTTP 404/],
-      ['malformed error 404', { http: 404, body: '{"error":{"message":"TX doesn\'t exist"}}' }, /unexpected HTTP 404/],
-      ['non-JSON 404', { http: 404, body: 'not found' }, /JSON/],
       ['rate limit', { http: 429 }, /HTTP 429/],
       ['server error', { http: 503 }, /HTTP 503/],
     ];

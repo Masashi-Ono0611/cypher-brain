@@ -42,7 +42,7 @@ import { PushUncertainSpendError } from '../push-uncertain-spend.js';
 import type { StorageBackend, PutOpts, FetchShape } from '../types.js';
 
 export interface TurboUploadStatus {
-  found: boolean; // false only for Turbo's genuine "TX doesn't exist" 404
+  found: boolean; // false for any HTTP 404 from the status endpoint (see #918 below)
   status?: string; // Turbo's raw upload-processing status, verbatim
   raw?: unknown; // full parsed JSON response, verbatim
 }
@@ -59,16 +59,22 @@ export async function checkTurboUploadStatus(dataItemId: string): Promise<TurboU
     const res = await fetch(`${TURBO_STATUS_URL.replace(/\/+$/, '')}/${encodeURIComponent(dataItemId)}/status`, {
       signal: AbortSignal.timeout(AR_HTTP_TIMEOUT_MS),
     });
-    if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
+    // #918: the real production endpoint (https://upload.ardrive.io) answers a genuine
+    // "TX doesn't exist" 404 with a PLAIN-TEXT body ("TX doesn't exist"), not the JSON
+    // `{"error":"TX doesn't exist"}` shape this code used to assume — unconditionally
+    // calling res.json() on it threw a JSON-parse error that fell into the generic catch
+    // below and was reported as "lookup failed; status unknown" instead of the documented
+    // {found:false}, making the found:false path unreachable against the real API. The
+    // status code is checked FIRST, before any body parsing is attempted: a 404 is
+    // decisive on its own and the body is never inspected (shape or content) — this
+    // trades the old (already-defeated) "maybe a proxy/router 404" suspicion for matching
+    // what the real endpoint actually does. A non-404 failure status still throws below,
+    // and a non-404 response still has its JSON body validated exactly as before.
+    if (res.status === 404) return { found: false };
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const raw: unknown = await res.json();
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
       throw new Error(`malformed response (HTTP ${res.status}): expected a JSON object`);
-    }
-    if (res.status === 404) {
-      // A proxy/router 404 is not evidence about this item. Require the service's
-      // missing-item error, checking the shape rather than assuming it exists.
-      if ('error' in raw && raw.error === "TX doesn't exist") return { found: false };
-      throw new Error('unexpected HTTP 404 response: missing Turbo "TX doesn\'t exist" error');
     }
     if (!('status' in raw) || typeof raw.status !== 'string' || !raw.status.trim()) {
       throw new Error('malformed response: expected a non-empty status string');
