@@ -156,6 +156,57 @@ export class PushFundingConfirmedButIncompleteError extends PushPartialSuccessEr
   }
 }
 
+// issue #949: ton-provider ONLY. A sibling of PushFundingConfirmedButIncompleteError,
+// not a reuse of it: that class's message and its very `stage` field (a literal
+// `'provider_notify'` type, not a plain string) are specific to notifyProviderWithRetry()
+// failing — reusing it here would report "notifying the storage provider failed" for a
+// failure that has nothing to do with the provider at all. This one instead names the
+// step BEFORE notify even starts: waitForContractActive() has already confirmed the
+// contract on-chain (the spend is exactly as irreversible as PushFundingConfirmedBut-
+// IncompleteError's own case), but advancing this run's pending-spend record to
+// `'confirmed'` (backends/ton-provider.ts's own advanceSpendIntent() call, right after
+// that confirmation) then threw — a full disk, a permissions change, `CYPHER_BRAIN_
+// RECEIPT_LEDGER` pointing somewhere that stopped being writable mid-run. Before this
+// error existed, that failure surfaced as a plain Error indistinguishable from "nothing
+// was spent", which is exactly the shape issue #949 exists to close: an MCP idempotency-
+// key retry reading a plain Error released its claim and let a normal-looking retry pay a
+// SECOND time for the same deploy.
+//
+// Deliberately thrown BEFORE the onReceipt callback that persists the actual cost
+// receipt (backends/ton-provider.ts's own call site) — the record write that failed is
+// the ONE piece of bookkeeping standing between "an unattended crash right here" and
+// "recorded" (#808's own reconciliation), and pending-spend.ts's `appendLine()` has no
+// internal catch of its own (unlike pushpull.ts's persistReceipt(), which swallows and
+// warns — see PushFundingConfirmedButIncompleteError's own doc comment for why that
+// asymmetry is safe to rely on there but not here). Leaving the intent at `'pending'`
+// rather than advancing it keeps issue #808's own self-healing recovery path intact: a
+// later retry lands on the already-active branch, finds this contract's intent still
+// unsettled, and records the missing receipt on this run's behalf — the exact recovery
+// backends/ton-provider.ts already performs for a process that crashed at this same
+// checkpoint (see that file's own `resumable.state === 'pending'` branch).
+//
+// `sigLocator` follows every other subclass's own convention: undefined at the backend's
+// own throw site (a single backend.put() call), set to the SIDECAR's own confirmed
+// locator only when re-thrown from pushpull.ts's ".minisig" catch block for a signed
+// push whose sidecar deploy hits this exact scenario.
+export class PushFundingConfirmedIntentWriteError extends PushPartialSuccessError {
+  readonly stage = 'confirmed_intent_write' as const;
+  readonly fundingConfirmed = true as const;
+  constructor(locator: string, cause: unknown, sigLocator?: string) {
+    super(
+      `ton-provider: contract funding is CONFIRMED on-chain (locator: ${sigLocator ?? locator}) but recording the ` +
+        `confirmed-state pending-spend record failed: ${cause instanceof Error ? cause.message : String(cause)} — ` +
+        'the deploy transfer already happened; the storage provider has not been notified yet and the receipt-' +
+        'ledger entry for this spend may be missing. Retry to resume (the retry will detect the contract is ' +
+        'already active, skip re-funding per issue #638, and recover the missing bookkeeping per issue #808). If ' +
+        'you need to confirm what actually landed, check `cypher-brain ledger` and the address on a TON explorer.',
+      locator,
+      sigLocator,
+    );
+    this.name = 'PushFundingConfirmedIntentWriteError';
+  }
+}
+
 // Primary storage is already confirmed; retrying the whole push can pay twice.
 export class PushWitnessUploadError extends PushPartialSuccessError {
   readonly witnessEntryLocator?: string;
