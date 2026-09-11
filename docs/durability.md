@@ -138,6 +138,91 @@ rather than a service you keep alive. Recovery matches: the pull is a plain gate
 fetch, so a fresh machine needs only the locator and the identity. Storage sees only
 ciphertext.
 
+## Rebuilding a secondary replica (#906)
+
+There is no automatic reconciliation across backends today, and this is a deliberate
+scope decision, not an oversight — see below for why. If your `ton`/`ton-provider`
+seeder goes down, or an `rclone` target becomes unreachable, but your permanent
+Arweave/Turbo copy is still retrievable (per the "Recommended model" above, that
+copy is *designed* not to disappear the way a single provider/seeder can — but a
+gateway hiccup, or the source itself being unreachable, are still real possibilities
+this runbook assumes you've ruled out first), here is how to manually rebuild the
+missing secondary replica from it. This is a **one-directional recovery runbook**
+(Arweave/Turbo → another backend), not general N-way reconciliation — see "Why not a
+general reconciliation engine?" below for why that's the right scope.
+
+**Stop and investigate at ANY failed/unexpected step below** — do not skip ahead or
+treat a later step's success as retroactively fixing an earlier problem.
+
+```sh
+# 0. Use a FRESH, private staging directory every time — never a fixed/reused path,
+#    which could let a stale file or sidecar from a previous (possibly failed)
+#    attempt silently satisfy a later step's checks.
+STAGE=$(mktemp -d)
+
+# 1. Fetch the source into staging, pinned to a hash you already trust (from your
+#    recovery-kit / save-locator file / index.tsv — never a hash you just read off
+#    the same fetch you're about to verify). A non-zero exit here means STOP —
+#    do not proceed with a partial/corrupt staged file.
+cypher-brain pull --locator <source-locator> --backend turbo \
+  --sha256 <trusted-sha256> --sig-locator <source-sig-locator> \
+  --out "$STAGE/staging.age"
+
+# 2. Sidecar fetch is BEST-EFFORT (pull never fails just because the signature
+#    didn't come along) — if the source was signed, its mere PRESENCE proves
+#    nothing; verify it actually validates against the ciphertext under your
+#    trusted signing public key before trusting the rebuild:
+cypher-brain verify --in "$STAGE/staging.age" --sign-recipient <trusted-sign-recipient.pub> \
+  --require-signature
+#    A FAIL or a missing-signature refusal here means STOP — do not push an
+#    unverified or wrongly-signed source into the new replica.
+
+# 3. Push to the replacement destination. If step 1 fetched a .minisig, push
+#    uploads it automatically alongside the ciphertext (same rule as a normal
+#    snapshot->push flow) — no separate command needed.
+cypher-brain push --in "$STAGE/staging.age" --backend rclone \
+  --remote myremote:brain-backups --yes --save-locator "$STAGE/dest-locator.tsv"
+#   (for ton/ton-provider: --backend ton / ton-provider instead, per their own setup)
+
+# 4. Verify the NEW destination against the ORIGINAL source hash — not a hash
+#    freshly recorded from this same rebuild, which would just confirm the bytes
+#    didn't change in transit, not that they were the right bytes to begin with.
+#    Fetch its sidecar too and re-verify the signature on THIS copy — a bit-perfect
+#    ciphertext with a lost/corrupted sidecar is still a degraded replica.
+cypher-brain pull --locator <new-destination-locator> --backend rclone \
+  --remote myremote:brain-backups --sha256 <same-trusted-sha256> \
+  --sig-locator <new-destination-sig-locator> --out "$STAGE/verify.age" --force
+cypher-brain verify --in "$STAGE/verify.age" --sign-recipient <trusted-sign-recipient.pub> \
+  --require-signature
+
+# 5. For a `ton`/`ton-provider` destination specifically, prove real P2P
+#    availability rather than a same-box seeder-cache hit:
+CYPHER_BRAIN_TON_NO_FALLBACK=1 cypher-brain pull --locator <bag-id> --backend ton \
+  --sha256 <same-trusted-sha256> --out "$STAGE/verify.age" --force
+```
+
+Keep the source untouched throughout — this procedure only ever reads it. The hash
+check in step 4 proves ciphertext integrity only; it says nothing about authenticity
+on its own, which is exactly why that step's `verify --require-signature` call is not
+optional. A partially-rebuilt replica (ciphertext present, signature missing or
+unverified) is worse than an honestly-absent one, since nothing here marks it as
+degraded for you — that judgment call is yours to make at the first failed step.
+
+**Why not a general reconciliation engine?** An earlier draft of this issue proposed a
+persistent per-artifact "placement journal" and automatic cross-backend repair. Cut
+after a design review, for three reasons: (1) Arweave/Turbo have no "provider" to
+disappear in the way `rclone`'s target or a lone `ton` seeder can — the risk this
+issue is really about is narrower than "N backends reconciling with each other," and
+one-directional recovery (the permanent copy repairs the non-permanent ones) covers
+the real cases; (2) the CLI's existing `pull`/`push`/`--sha256` primitives already do
+everything a bounded, human-run rebuild needs — a persistent state file would track
+information this runbook derives on demand instead; (3) genuine unattended automation
+would still need to decide things a human currently decides here (transient outage vs.
+real loss, which replacement destination, bounded retries/spend) — building the
+storage format first wouldn't have resolved those. If this manual runbook turns out to
+be a recurring, high-friction burden in practice, that's the concrete signal to revisit
+automating it.
+
 ## What actually closing #7 needs (a funding decision)
 
 Proving durability — not just documenting it — needs real money: fund a wallet with AR
