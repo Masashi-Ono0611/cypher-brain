@@ -630,11 +630,19 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       Verify signed, hash-linked witness entries using the trusted minisign public key
       (default sign-recipient.pub). Local hints resolve predecessor/signature locators;
       --sig-locator lets an offline recovery kit supply the starting detached signature.
+      The local hint cache (witness-catalog.local.jsonl) is untrusted and never proof,
+      but it IS load-bearing for chain DEPTH: prev_entry_hash is a hash, not a locator,
+      and no backend can discover/list entries, so losing the hint file caps how far
+      back a chain can be walked to whichever locator+sig-locator pairs you still hold
+      elsewhere (e.g. an offline recovery kit). Preserve it off-box to walk older entries.
       Prints confirmed / conflicting / freshness-unknown. With --to-sequence, confirmed
       means ONLY the requested bounded segment verified; it never proves global freshness.
       Without that bounded request, unavailable discovery yields freshness-unknown even
-      for a consistent chain. Conflicts and unknown freshness exit 1; invalid signatures
-      or hash links are errors. Arweave-only; file is for offline tests, not independent evidence.
+      for a consistent chain. Conflicts and unknown freshness are benign OUTCOMES and
+      exit 1; an invalid signature or a broken hash link is a genuine authenticity
+      failure and exits 3 instead, so exit-code-only automation can tell them apart
+      (--json's outcome vs top-level error field already could). Arweave-only; file is
+      for offline tests, not independent evidence.
 
   cypher-brain audit [--json]
       Read-only hash-chain verification (#226): every "push"/"restore"/"verify" run

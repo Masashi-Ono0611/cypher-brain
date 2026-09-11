@@ -12,7 +12,7 @@ import { loadSignIdentity, parsePubkeyFile, signDetached, verifyDetached } from 
 import type { LoadedSignIdentity, ParsedPubkey } from './minisign.js';
 import type { CliOptions, PutOpts, StorageBackend } from './types.js';
 import { installStageSignalGuard, addActiveWitnessDir, removeActiveWitnessDir } from './signal-guard.js';
-import { UsageError } from './errors.js';
+import { UsageError, WitnessAuthenticityError } from './errors.js';
 import { printJson } from './ui.js';
 import { warn } from './warn.js';
 
@@ -162,8 +162,13 @@ export async function buildWitnessEntry(
 export async function loadWitnessIdentity(o: CliOptions): Promise<LoadedSignIdentity | undefined> {
   if (!o.witness) return undefined;
   const path = o.sign_identity || SIGN_IDENTITY;
+  // #932: both preconditions below are pure usage mistakes — decidable from local
+  // flags/state alone, no I/O needed to know they're wrong — so both throw
+  // UsageError for the SAME exit-code class. This one used to throw a plain Error
+  // (exit 1) while the very next check threw UsageError (exit 2): equally
+  // usage-mistake-shaped checks producing different exit codes.
   if (!(await exists(path)))
-    throw new Error(
+    throw new UsageError(
       `--witness requires a signing identity at ${path}; run keygen --sign or pass --sign-identity <path>`,
     );
   // Turbo also publishes on Arweave. file is solely an offline test/demonstration store.
@@ -334,7 +339,10 @@ export async function verifyWitnessChain(
     // The caller-supplied STARTING point failing authentication is not "one bad
     // hint among many" — the operator handed us a specific locator/signature pair
     // and it does not check out, which is a hard refusal, not a soft incomplete.
-    if ('invalid' in start) throw new Error(`witness: ${start.invalid}`);
+    // #930: a GENUINE authenticity failure (signature verification failed, or a
+    // signing-key fingerprint mismatch) — distinct from the benign freshness-
+    // unknown/conflicting OUTCOMES below, which are return values, never thrown.
+    if ('invalid' in start) throw new WitnessAuthenticityError(`witness: ${start.invalid}`);
     const bySequence = new Map<number, FetchedOk[]>();
     const add = (value: FetchedOk) => {
       const group = bySequence.get(value.entry.sequence) ?? [];
@@ -372,12 +380,15 @@ export async function verifyWitnessChain(
         return unknown(
           `Cannot resolve predecessor sequence ${current.entry.sequence - 1}; local locator mapping is incomplete.`,
         );
+      // #930: a broken hash link is the other half of --help's "invalid signatures
+      // or hash links are errors" — a genuine authenticity/integrity failure, not
+      // a benign freshness-unknown/conflicting outcome.
       if (current.entry.prev_entry_hash !== previous.hash)
-        throw new Error(`witness: hash link mismatch at sequence ${current.entry.sequence}`);
+        throw new WitnessAuthenticityError(`witness: hash link mismatch at sequence ${current.entry.sequence}`);
       current = previous;
     }
     if (o.anchor && (current.entry.sequence !== o.anchor.sequence || current.hash !== o.anchor.entry_hash))
-      throw new Error('witness: pinned anchor mismatch');
+      throw new WitnessAuthenticityError('witness: pinned anchor mismatch');
     if (incomplete) return unknown('Some known candidates could not be checked; discovery/coverage is incomplete.');
     if (o.toSequence !== undefined || o.anchor)
       return {

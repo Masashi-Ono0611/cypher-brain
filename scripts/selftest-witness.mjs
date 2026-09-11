@@ -21,6 +21,7 @@ const scenarios = [
   'wrong-key',
   'hint-forgery',
   'missing-identity',
+  'exit-codes',
   'integration',
   'doctor',
   'kit',
@@ -276,13 +277,80 @@ if (!process.env.CB_WITNESS_SCENARIO) {
       assert.equal((await w.verifyWitnessChain(store, { ...options, locator })).outcome, 'confirmed');
     }
   } else if (scenario === 'missing-identity') {
+    // #932: loadWitnessIdentity()'s two adjacent preconditions are both pure usage
+    // mistakes ("you invoked this wrong", decidable from local flags/state alone,
+    // no I/O needed to know it) and must produce the SAME exit-code class (2).
     const r = cli(['push', '--in', input, '--backend', 'file', '--witness']);
-    assert.notEqual(r.status, 0);
+    assert.equal(r.status, 2, r.output);
     assert.match(r.output, /--witness requires a signing identity/);
     assert.deepEqual(await readdir(process.env.CYPHER_BRAIN_FILE_DIR).catch(() => []), []);
     const identity = await makeSigningIdentity();
+    // The sibling precondition (unsupported --backend for --witness) — now signing
+    // identity exists, so this exercises ONLY the second check.
+    const badBackend = cli(['push', '--in', input, '--backend', 'rclone', '--remote', ':local:/never', '--witness']);
+    assert.equal(badBackend.status, 2, badBackend.output);
+    assert.match(badBackend.output, /--witness requires --backend arweave or turbo/);
     await writeFile(`${input}.minisig`, await mini.signDetached(identity.privateKey, identity.keyId, input));
     ok(cli(['push', '--in', input, '--backend', 'file', '--witness']));
+  } else if (scenario === 'exit-codes') {
+    // #930: a GENUINE authenticity/integrity failure (mismatched --sig-locator or
+    // --pubkey) must exit with a distinct code from the benign freshness-unknown
+    // OUTCOME — both used to exit 1, indistinguishable to a script gating on $?
+    // alone. Mirrors the issue's own repro (a)/(b)/(c) at the CLI layer, since the
+    // exit code is only assigned in cli.ts's dispatch (exitCodeFor()), not by the
+    // library call verifyWitnessChain() itself.
+    const identity = await makeSigningIdentity();
+    await writeFile(`${input}.minisig`, await mini.signDetached(identity.privateKey, identity.keyId, input));
+    ok(cli(['push', '--in', input, '--backend', 'file', '--witness']));
+    const first = await w.latestWitnessHint();
+    await writeFile(input, 'age-encryption.org/v1\nsecond snapshot\n');
+    await writeFile(`${input}.minisig`, await mini.signDetached(identity.privateKey, identity.keyId, input));
+    ok(cli(['push', '--in', input, '--backend', 'file', '--witness']));
+    const second = await w.latestWitnessHint();
+    assert.notEqual(first.entry_locator, second.entry_locator);
+
+    // (a) repro (a): healthy chain, no --to-sequence -> freshness-unknown, a
+    // benign OUTCOME (not a thrown error) that still exits 1, unchanged by #930.
+    const benign = cli(['witness', 'verify', '--backend', 'file', '--locator', second.entry_locator, '--json']);
+    assert.equal(benign.status, 1, benign.output);
+    assert.equal(JSON.parse(benign.stdout).outcome, 'freshness-unknown');
+
+    // (b) repro (b): mismatched --sig-locator (entry 2's JSON paired with entry 1's
+    // signature) -> a genuine authenticity failure, now exit 3, not 1.
+    const mismatchedSig = cli([
+      'witness',
+      'verify',
+      '--backend',
+      'file',
+      '--locator',
+      second.entry_locator,
+      '--sig-locator',
+      first.sig_locator,
+    ]);
+    assert.equal(mismatchedSig.status, 3, mismatchedSig.output);
+    assert.match(mismatchedSig.output, /signature verification failed/);
+
+    // (c) repro (c): mismatched --pubkey (verifying against the wrong signer's
+    // key) -> also a genuine authenticity failure, exit 3.
+    const otherHome = join(home, 'other-signer');
+    await mkdir(otherHome);
+    await mini.keygenSignAt({
+      home: otherHome,
+      identityPath: join(otherHome, 'sign-identity.key'),
+      recipientPath: join(otherHome, 'sign-recipient.pub'),
+    });
+    const mismatchedKey = cli([
+      'witness',
+      'verify',
+      '--backend',
+      'file',
+      '--locator',
+      second.entry_locator,
+      '--pubkey',
+      join(otherHome, 'sign-recipient.pub'),
+    ]);
+    assert.equal(mismatchedKey.status, 3, mismatchedKey.output);
+    assert.match(mismatchedKey.output, /signature key id does not match|signature verification failed/);
   } else if (scenario === 'integration') {
     const identity = await makeSigningIdentity();
     await writeFile(`${input}.minisig`, await mini.signDetached(identity.privateKey, identity.keyId, input));

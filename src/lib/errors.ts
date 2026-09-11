@@ -248,7 +248,9 @@ export const ERROR_CODES: readonly ErrorCodeEntry[] = [
     pattern: /signature (?:does not verify|verification failed)/,
     origin: 'ours',
     source:
-      'src/lib/restore.ts (restoreImpl) + src/lib/minisign.ts (verifyDetached), "… signature does not verify …" / "… signature verification failed …"',
+      'src/lib/restore.ts (restoreImpl) + src/lib/minisign.ts (verifyDetached), "… signature does not verify …" / "… signature verification failed …"; ' +
+      'also src/lib/witness.ts (verifyWitnessChain, the "witness: signature verification failed at …" refusal for a ' +
+      'mismatched --sig-locator or --pubkey, #933)',
   },
   {
     code: 'CB-E017',
@@ -462,9 +464,39 @@ export class UsageError extends Error {
   }
 }
 
-/** The process exit code an error should produce: 2 for a UsageError, 1 otherwise. */
-export function exitCodeFor(e: unknown): 1 | 2 {
-  return e instanceof UsageError ? 2 : 1;
+// #930: `witness verify`'s own --help text promises a three-way split — "Conflicts
+// and unknown freshness exit 1; invalid signatures or hash links are errors" — but
+// every thrown Error in witness.ts's verification path fell into exitCodeFor()'s
+// generic 1 alongside those benign, non-error OUTCOMES (freshness-unknown/
+// conflicting; see witness.ts's witnessVerify(), which sets process.exitCode = 1
+// directly for those, no throw involved). A script gating on `$?` alone could not
+// tell "nothing to worry about yet" from "someone forged your chain" — --json's
+// `outcome` vs top-level `error` field already could, but exit-code-only
+// automation could not. This class exists so witness.ts can throw something
+// exitCodeFor() recognizes as a GENUINE authenticity/integrity failure (a
+// signature that does not verify, or a broken hash link between chained entries)
+// distinct from both UsageError (a malformed invocation) and the generic 1 every
+// other thrown Error still gets. Not thrown from anywhere outside witness.ts as of
+// writing, but the class lives here (not witness.ts) so exitCodeFor() — the single
+// place that must recognize it — doesn't need to import from a leaf module.
+export class WitnessAuthenticityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WitnessAuthenticityError';
+  }
+}
+
+// The process exit code an error should produce: 2 for a UsageError (a malformed
+// invocation — decidable from local flags/state alone, no I/O needed), 3 for a
+// WitnessAuthenticityError (#930 — a genuine forged/mismatched signature or broken
+// hash link, never a benign outcome), 1 for everything else. 3 is unused by any
+// other exitCodeFor()-routed path and is deliberately distinct from doctor.ts's/
+// restore.ts's own PARTIAL=2 convention, which is set directly via
+// process.exitCode and never reaches this function.
+export function exitCodeFor(e: unknown): 1 | 2 | 3 {
+  if (e instanceof UsageError) return 2;
+  if (e instanceof WitnessAuthenticityError) return 3;
+  return 1;
 }
 
 // Append "[CB-E0xx] see MANAGEMENT.md#error-codes" to an already-formatted error message
