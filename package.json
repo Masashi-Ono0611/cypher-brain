@@ -160,5 +160,8 @@
     "age-encryption": "^0.3.0",
     "ignore": "^7.0.6",
     "shamir-secret-sharing": "^0.0.4"
+  },
+  "overrides": {
+    "elliptic": "6.6.1"
   }
 }
