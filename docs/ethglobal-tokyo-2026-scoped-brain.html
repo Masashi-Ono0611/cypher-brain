@@ -106,6 +106,7 @@
     h1{font-size:40px;} .tagline{font-size:20px;} h2{font-size:24px;}
     .pillars,.stats,.caps,.ba{grid-template-columns:1fr;}
     .row{grid-template-columns:1fr;} .row .rk{border-right:none; border-bottom:1px solid var(--line);}
+    table{display:block; overflow-x:auto; -webkit-overflow-scrolling:touch;}
   }
   @media print{
     *{ -webkit-print-color-adjust:exact !important; print-color-adjust:exact !important; }
@@ -124,7 +125,7 @@
     <div class="stats">
       <div class="stat accent"><div class="v">11</div><div class="k">gbrain sources today — all connector-scoped, none use-case-scoped</div></div>
       <div class="stat"><div class="v">7189</div><div class="k">pages in the unscoped <code class="mono">default</code> source</div></div>
-      <div class="stat"><div class="v">1</div><div class="k">MCP client registered, full read/write, no per-agent boundary</div></div>
+      <div class="stat"><div class="v">1</div><div class="k">MCP client registered, grant declares read+write, no per-agent boundary</div></div>
     </div>
   </header>
 
@@ -136,15 +137,15 @@
       <svg viewBox="0 0 780 190" role="img" aria-label="Three layer architecture: gbrain, Cypher Brain, ENS">
         <rect x="16" y="40" width="230" height="100" rx="10" fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.5"/>
         <text x="131" y="68" text-anchor="middle" class="svg-o">gbrain</text>
-        <text x="131" y="90" text-anchor="middle" class="svg-s">logical isolation</text>
-        <text x="131" y="106" text-anchor="middle" class="svg-s">sources + per-client</text>
-        <text x="131" y="120" text-anchor="middle" class="svg-s">read/write grants</text>
+        <text x="131" y="90" text-anchor="middle" class="svg-l">logical isolation</text>
+        <text x="131" y="106" text-anchor="middle" class="svg-l">sources + per-client</text>
+        <text x="131" y="120" text-anchor="middle" class="svg-l">read/write grants</text>
 
         <rect x="276" y="40" width="230" height="100" rx="10" fill="var(--good-tint)" stroke="var(--good-line)"/>
         <text x="391" y="68" text-anchor="middle" class="svg-t" style="fill:var(--good)">Cypher Brain</text>
-        <text x="391" y="90" text-anchor="middle" class="svg-s">cryptographic isolation</text>
-        <text x="391" y="106" text-anchor="middle" class="svg-s">scoped snapshot, per-</text>
-        <text x="391" y="120" text-anchor="middle" class="svg-s">scope ciphertext</text>
+        <text x="391" y="90" text-anchor="middle" class="svg-l">cryptographic isolation</text>
+        <text x="391" y="106" text-anchor="middle" class="svg-l">scoped snapshot, per-</text>
+        <text x="391" y="120" text-anchor="middle" class="svg-l">scope ciphertext</text>
 
         <rect x="536" y="40" width="230" height="100" rx="10" fill="var(--surface)" stroke="var(--line)"/>
         <text x="651" y="68" text-anchor="middle" class="svg-t">ENS</text>
@@ -175,7 +176,7 @@
     <div class="rows">
       <div class="row"><div class="rk">11 sources registered<span class="rs">gbrain sources status --json</span></div><div class="rv">One per connector: <code>default</code>, <code>antigravity-cli</code>, <code>apple-notes</code>, <code>chatgpt</code>, <code>coast</code>, <code>codex-cli</code>, <code>grok-cli</code>, <code>omi</code>, <code>photos</code>, <code>twitter</code>, <code>workspace-8c4c17df</code>.</div></div>
       <div class="row"><div class="rk"><code>default</code> source<span class="rs">largest, federated</span></div><div class="rv"><b>7189 pages</b>, <code>federated: true</code> — crosses into every cross-source search by design. This is where unclassified content accumulates.</div></div>
-      <div class="row"><div class="rk">MCP client grants<span class="rs">gbrain mcp admin clients</span></div><div class="rv">One client (<code>air-claude-test</code>) registered: <code>scopes: [read,write]</code>, <code>sourceId: "default"</code>, <code>boundSlugPrefixes: null</code>. &nbsp;<span class="tag warn">! no per-agent boundary set</span></div></div>
+      <div class="row"><div class="rk">MCP client grants<span class="rs">gbrain mcp admin clients</span></div><div class="rv">One client (<code>air-claude-test</code>) registered with a grant declaring <code>scopes: [read,write]</code>, <code>sourceId: "default"</code>, <code>boundSlugPrefixes: null</code> — read/write on that grant was not separately exercised. &nbsp;<span class="tag warn">! no per-agent boundary set</span></div></div>
       <div class="row"><div class="rk">Per-agent scoping mechanism<span class="rs">gbrain mcp grant --help</span></div><div class="rv">Confirmed to exist as a CLI primitive: <code>--federated-read S1,S2</code>, <code>--bound-slug-prefixes P1/,P2/</code>, <code>--delegated-slug-prefixes</code>. &nbsp;<span class="tag good">✓ available, just unused</span></div></div>
     </div>
   </section>
@@ -184,12 +185,12 @@
     <div class="label"><span class="n">03</span> &nbsp;Verified capability matrix</div>
     <h2>What was actually tested, live, this session</h2>
     <div class="legend">
-      <b>Verified</b> = exercised against the real macmini gbrain instance and observed directly, 2026‑09‑26. <b>Not verified</b> = confirmed absent in source, or out of scope this session (not "planned").
+      <b>✅ Verified</b> = exercised against the real macmini gbrain instance and observed directly, 2026‑09‑26 (single-page, single-source smoke test — not exhaustive). <b>△ Available, unused</b> = CLI primitive confirmed to exist (via <code>--help</code> or source), not exercised for this behavior. <b>❌ Confirmed absent</b> = checked in source/CLI and not present. <b>— Not tested</b> = out of scope this session, not the same as unavailable.
     </div>
     <table>
       <thead><tr><th>Capability</th><th>Status</th><th>Evidence</th></tr></thead>
       <tbody>
-        <tr><td>List pages scoped to one source</td><td class="yes">✅</td><td><code>gbrain list --source-id work-test</code> returned exactly 1/7189 pages</td></tr>
+        <tr><td>List pages scoped to one source</td><td class="yes">✅</td><td><code>gbrain list --source-id work-test</code> returned exactly 1 page, scoped to that source only — none of the 7189 <code>default</code>-source pages or the other 9 sources leaked in</td></tr>
         <tr><td>Read a single page scoped to one source</td><td class="yes">✅</td><td><code>gbrain get &lt;slug&gt; --source-id work-test</code> returned only that page's markdown</td></tr>
         <tr><td>Bulk export scoped to one source</td><td class="no">❌</td><td><code>gbrain export --repo &lt;source-path&gt;</code> exported all 44,485 pages, not just the target source; <code>export.ts</code> comment: "D26 — exports include everything"</td></tr>
         <tr><td>Cypher Brain scoped snapshot (per-source ciphertext)</td><td class="no">❌</td><td><code>src/lib/snapshot.ts</code> has no gbrain-source concept — its own "source" means input file/dir path, not a gbrain source_id</td></tr>
@@ -215,19 +216,19 @@
 
         <rect x="418" y="42" width="170" height="64" rx="9" fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.5"/>
         <text x="503" y="68" text-anchor="middle" class="svg-o">tmp export dir</text>
-        <text x="503" y="86" text-anchor="middle" class="svg-s">new — thin wrapper</text>
+        <text x="503" y="86" text-anchor="middle" class="svg-l">new — thin wrapper</text>
 
         <rect x="620" y="42" width="150" height="64" rx="9" fill="var(--good-tint)" stroke="var(--good-line)"/>
         <text x="695" y="68" text-anchor="middle" class="svg-t" style="fill:var(--good)">cypher-brain --dir</text>
-        <text x="695" y="86" text-anchor="middle" class="svg-s">no code change</text>
+        <text x="695" y="86" text-anchor="middle" class="svg-l">no code change</text>
 
         <path d="M184 74 L214 74 M386 74 L416 74 M588 74 L618 74" stroke="var(--faint)" stroke-width="1.4" marker-end="url(#ar2)"/>
         <defs><marker id="ar2" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M1 1 L6 4 L1 7" fill="none" stroke="var(--faint)" stroke-width="1.3"/></marker></defs>
       </svg>
-      <div class="fig-cap">Only the middle step (tmp export dir assembly) is new code — everything on either side already exists and was verified live</div>
+      <div class="fig-cap">Only the middle step (tmp export dir assembly) is new code — the two left boxes were verified live this session; <code>cypher-brain --dir</code> on the right is existing, unmodified code, not re-exercised this session</div>
     </div>
     <div class="ba">
-      <div class="col before"><span class="clabel">BEFORE</span><ul><li><code>default</code> source: 7189 pages, unclassified, federated</li><li>1 MCP client, full read/write, no agent boundary</li><li>Cypher Brain: one ciphertext for the whole brain</li></ul></div>
+      <div class="col before"><span class="clabel">BEFORE</span><ul><li><code>default</code> source: 7189 pages, unclassified, federated</li><li>1 MCP client, grant declares read/write, no agent boundary</li><li>Cypher Brain: one ciphertext for the whole brain (per <code>snapshot.ts</code> inspection, not executed this session)</li></ul></div>
       <div class="col after"><span class="clabel">AFTER (hackathon target)</span><ul><li>use-case sources (<code>work</code> / <code>travel</code> / <code>private</code>)</li><li>per-agent MCP grants via <code>--federated-read</code></li><li>scoped export → encrypt → Arweave, one ciphertext per scope → ENS pointer</li></ul></div>
     </div>
   </section>
@@ -238,8 +239,8 @@
     <table>
       <thead><tr><th>Question</th><th>Decision</th><th>Why</th></tr></thead>
       <tbody>
-        <tr><td>Add a <code>--source</code> filter to gbrain's own <code>export</code> command?</td><td><b>Skip</b></td><td><code>list --source-id</code> + <code>get --source-id</code> already give exact per-source page sets; no upstream gbrain change needed</td></tr>
-        <tr><td>Rewrite Cypher Brain's snapshot core to understand gbrain sources?</td><td><b>Skip</b></td><td><code>snapshot.ts</code> only needs a pre-assembled <code>--dir</code>; the scoping happens one layer above it, in a new wrapper script</td></tr>
+        <tr><td>Add a <code>--source</code> filter to gbrain's own <code>export</code> command?</td><td><b>Skip (provisional)</b></td><td>The single live smoke test showed <code>list --source-id</code> + <code>get --source-id</code> return exact per-source results with no cross-source leakage; a fuller pass (multiple sources, duplicate slugs, pagination) should confirm before committing to this path over an upstream fix</td></tr>
+        <tr><td>Rewrite Cypher Brain's snapshot core to understand gbrain sources?</td><td><b>Skip</b></td><td><code>snapshot.ts</code> only needs a pre-assembled <code>--dir</code> (confirmed by source inspection); the scoping happens one layer above it, in a new wrapper script — not yet built or run</td></tr>
         <tr><td>Verify ENS permissioned-resolver delegation this session?</td><td><b>Deferred</b></td><td>ENSv2 contracts are pre-final; needs a dedicated testnet pass, out of scope for a read-only gbrain check</td></tr>
       </tbody>
     </table>
