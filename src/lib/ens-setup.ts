@@ -2,17 +2,11 @@
 // The owner key is entered only in a masked TTY prompt and is never written to disk.
 import { lstat, readFile } from 'node:fs/promises';
 import { isCancel, password, confirm } from '@clack/prompts';
-import type { Address } from 'viem';
 import { AGENT_WALLET_DEFAULT_PATH } from './agent-wallet.js';
 import { UsageError } from './errors.js';
+import { ETH_REGISTRY, ETH_REGISTRY_ABI, PERMISSIONED_RESOLVER_ABI, ROLE_SET_TEXT_ADMIN } from './ens-contracts.js';
 import type { CliOptions } from './types.js';
 import { installStageSignalGuard, setActiveRawInputRestore } from './signal-guard.js';
-
-// ENS contracts-v2 tag sepolia-deployment-2026-09-15. Deployment addresses churn;
-// refresh these from ENS's deployment docs before using this command after a redeploy.
-const ETH_REGISTRY = '0x657ea849311d3d5823348dded7c2aaafb3ede09e' as Address;
-const ROLE_SET_TEXT = 1n << 4n;
-const ROLE_SET_TEXT_ADMIN = ROLE_SET_TEXT << 128n;
 
 // viem is loaded on demand (not a top-level import) so that commands unrelated to the
 // ENS agent wallet — doctor included — never require it to be installed, the same
@@ -102,13 +96,8 @@ export async function ensSetup(o: CliOptions): Promise<void> {
   const { createPublicClient, createWalletClient, encodeFunctionData, http, parseAbi, privateKeyToAccount, sepolia } =
     await loadViem();
 
-  const registryAbi = parseAbi(['function getResolver(string label) view returns (address)']);
-  const resolverAbi = parseAbi([
-    'function initialize((address account,uint256 roleBitmap)[] grants, bytes[] calls)',
-    'function hasRootRoles(uint256 roleBitmap, address account) view returns (bool)',
-    'function grantSetterRoles(bytes setter, address account) returns (bool)',
-    'function setText(bytes name, string key, string value)',
-  ]);
+  const registryAbi = parseAbi(ETH_REGISTRY_ABI);
+  const resolverAbi = parseAbi(PERMISSIONED_RESOLVER_ABI);
 
   // Codex review (#974): viem/Noble's own error for an out-of-range secp256k1 scalar
   // includes the ENTIRE offending value in its message (reproduced) — a regex that only

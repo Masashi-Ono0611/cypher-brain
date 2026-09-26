@@ -43,7 +43,7 @@ import {
 import { keygen, sssSplitCommand, sssCombineCommand } from './lib/keys.js';
 import { snapshot } from './lib/snapshot.js';
 import { restore, verify } from './lib/restore.js';
-import { push, pull } from './lib/pushpull.js';
+import { push, pushWithLocator, pull } from './lib/pushpull.js';
 import { pushStatus } from './lib/push-status.js';
 import { bagitExportCommand } from './lib/bagit.js';
 import { publishLatest } from './lib/ton-dns.js';
@@ -51,6 +51,7 @@ import { schedule } from './lib/schedule.js';
 import { wallet } from './lib/wallet.js';
 import { agentWallet, AGENT_WALLET_DEFAULT_PATH } from './lib/agent-wallet.js';
 import { ensSetup } from './lib/ens-setup.js';
+import { prepareEnsPublisher } from './lib/ens-publish.js';
 import { estimate } from './lib/estimate.js';
 import { doctor } from './lib/doctor.js';
 import { ledger } from './lib/ledger.js';
@@ -69,6 +70,7 @@ import type { CliOptions } from './lib/types.js';
 
 const BOOL_FLAGS = new Set([
   'witness',
+  'publish_ens',
   'force',
   'passphrase',
   'wrap_in_place',
@@ -993,13 +995,17 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       has to fall back to scraping stderr; "code" is the CB-E0xx identifier when the failure
       matches a known one (MANAGEMENT.md#error-codes), null otherwise.
 
-  cypher-brain push --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--remote <name>:<path>] [--yes] [--plan <path.json>] [--save-locator <path>] [--skip-unchanged] [--digest <hex>] [--force] [--witness] [--sign-identity <path>]
+  cypher-brain push --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--remote <name>:<path>] [--yes] [--plan <path.json>] [--save-locator <path>] [--skip-unchanged] [--digest <hex>] [--force] [--witness] [--sign-identity <path>] [--publish-ens --name <label> --text-key <key> --rpc-url <sepolia-rpc-url>]
       --witness opts into TWO additional Arweave uploads: a public signed catalog entry
       and its detached signature, sharing the same per-run/daily/monthly spend caps.
       Requires the existing sign-identity.key (or --sign-identity); supports arweave/turbo,
       with file for offline tests only. A skipped unchanged push publishes no witness.
       Records locators/digest/time/key id publicly; no plaintext contents are included.
       Regenerate recovery-kit afterward to keep an offline witness anchor current.
+      --publish-ens --name <label> --text-key <key> --rpc-url <sepolia-rpc-url>
+      After a successful upload, write its actual returned locator to that ENSv2 text
+      record using the local agent wallet. Simulates the transaction and asks before
+      sending; skipped --skip-unchanged runs are refused. Use a trusted HTTPS RPC URL.
       Upload ciphertext to storage. Prints ONLY the locator to stdout
       (file: store path; arweave: tx id; turbo: ANS-104 data item id; rclone: the
       --remote value itself; ton: "ton:v1:<bag-id>"; ton-provider: "ton-provider:v1:<bag-id>").
@@ -1937,6 +1943,10 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     'digest',
     'force',
     'wallet',
+    'publish_ens',
+    'name',
+    'text_key',
+    'rpc_url',
   ],
   pull: ['out', 'locator', 'backend', 'remote', 'from_locator_file', 'wait', 'sha256', 'sig_locator', 'force'],
   'push-status': ['locator', 'json'],
@@ -2303,14 +2313,33 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
       // at the CLI-only dispatch site, rather than inside push() itself, where it
       // would otherwise leak the ASCII art into an MCP tool result's `log` field.
       // Decoration only, on stderr (see printMascot in ui.ts).
+      const ensPublisher = o.publish_ens ? await prepareEnsPublisher(o) : undefined;
+      if (!o.publish_ens && (o.name !== undefined || o.text_key !== undefined || o.rpc_url !== undefined)) {
+        throw new UsageError('--name, --text-key, and --rpc-url on push require --publish-ens');
+      }
       let uploaded: boolean;
+      let pushedLocator: string | null = null;
       try {
-        uploaded = await push(o);
+        if (ensPublisher) {
+          const result = await pushWithLocator(o);
+          uploaded = result.uploaded;
+          pushedLocator = result.locator;
+        } else {
+          uploaded = await push(o);
+        }
       } catch (e) {
         printMascot('sad');
         throw e;
       }
       printMascot('happy');
+      if (ensPublisher) {
+        if (!uploaded || !pushedLocator) {
+          throw new Error(
+            'ENS publish requires a new successful upload; this push was skipped (for example by --skip-unchanged)',
+          );
+        }
+        await ensPublisher(pushedLocator);
+      }
       // A cited precursor quote after a successful upload to a PAID,
       // permanent backend only (issue #195) — never the free `file` backend,
       // and never a --skip-unchanged run that hit its early SKIPPED return
