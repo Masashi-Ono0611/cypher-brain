@@ -302,17 +302,17 @@
     <h2>One Epic, five P0 issues, Codex-led implementation</h2>
     <p class="lead">Claude designs, files issues, reviews, and integrates; <b>Codex implements</b> each issue in its own branch against this repo's existing PR flow (CI + changeset + doc-sync gates unchanged).</p>
     <div class="legend">
-      <b>P0</b> = required for a functional Track 2 submission. <b>P1</b> = bonus scope if time remains. Issue numbers are filled in once filed on <code>Masashi-Ono0611/cypher-brain</code>. <b>Order:</b> P0‑1 → P0‑2 → P0‑3 → P0‑4, strictly (each depends on the previous landing). <b>Doc sync is per-issue, not deferred</b> — every behavior-changing issue (P0‑1 to P0‑4) carries its own README/MANAGEMENT.md/llms.txt update in the same PR, per this repo's own <code>pr-hygiene.yml</code>; P0‑5 below only covers this HTML brief's final reconciliation. <b>Scope note:</b> this Epic is ENS-only — Section 04's scoped-export wrapper (gbrain <code>--source-id</code> plumbing) is a separate, non-blocking workstream.
+      <b>P0</b> = required for a functional Track 2 submission. <b>P1</b> = bonus scope if time remains. Filed on <code>Masashi-Ono0611/cypher-brain</code> as Epic <code>#972</code> with sub-issues <code>#966</code>–<code>#971</code>, all open / not yet implemented. <b>Order:</b> P0‑1 → P0‑2 → P0‑3 → P0‑4, strictly (each depends on the previous landing). <b>Doc sync is per-issue, not deferred</b> — every behavior-changing issue (P0‑1 to P0‑4) carries its own README/MANAGEMENT.md/llms.txt update in the same PR, per this repo's own <code>pr-hygiene.yml</code>; P0‑5 below only covers this HTML brief's final reconciliation. <b>Scope note:</b> this Epic is ENS-only — Section 04's scoped-export wrapper (gbrain <code>--source-id</code> plumbing) is a separate, non-blocking workstream.
     </div>
     <table>
       <thead><tr><th>#</th><th>Issue</th><th>What it proves</th></tr></thead>
       <tbody>
-        <tr><td>P0‑1</td><td>Add <code>viem</code> dependency + agent-wallet keygen</td><td>New Ethereum keypair, held via the existing <code>writeKeyFile()</code> pattern (atomic, 0600, backed up on <code>--force</code>) — no new key-handling code path</td></tr>
-        <tr><td>P0‑2</td><td><code>ens-setup</code> — owner-side one-time registration + role grant</td><td>Owner wallet only ever runs this once, interactively; never persisted by cypher-brain</td></tr>
-        <tr><td>P0‑3</td><td><code>ens-publish</code> — agent wallet publishes the brain pointer</td><td>Reads the real locator from the just-completed push — the "no hard-coded values" requirement</td></tr>
-        <tr><td>P0‑4</td><td><code>ens-verify</code> / doctor extension</td><td>The two-part proof from Section 07 (granted-key write lands, out-of-scope write reverts) — the fence actually holds, not just documented</td></tr>
-        <tr><td>P0‑5</td><td>Final brief reconciliation</td><td>Update this HTML's Section 08 status column and footer once P0‑1 to P0‑4 are merged — not a separate code PR</td></tr>
-        <tr><td>P1‑6</td><td>ENSIP‑26 <code>agent-context</code> / <code>agent-endpoint</code> records</td><td>Self-description keys per the ENSIP‑26 spec (confirmed via docs.ens.domains this session) — sets up the later multi-agent extension of Section 04's AFTER state</td></tr>
+        <tr><td>P0‑1<span class="rng">#966</span></td><td>Add <code>viem</code> dependency + agent-wallet keygen</td><td>New Ethereum keypair, held via the existing <code>writeKeyFile()</code> pattern (atomic, 0600, backed up on <code>--force</code>) — no new key-handling code path</td></tr>
+        <tr><td>P0‑2<span class="rng">#967</span></td><td><code>ens-setup</code> — owner-side one-time registration + role grant</td><td>Owner wallet only ever runs this once, interactively; never persisted by cypher-brain</td></tr>
+        <tr><td>P0‑3<span class="rng">#968</span></td><td><code>ens-publish</code> — agent wallet publishes the brain pointer</td><td>Reads the real locator from the just-completed push — the "no hard-coded values" requirement</td></tr>
+        <tr><td>P0‑4<span class="rng">#969</span></td><td><code>ens-verify</code> / doctor extension</td><td>The two-part proof from Section 07 (granted-key write lands, out-of-scope write reverts) — the fence actually holds, not just documented</td></tr>
+        <tr><td>P0‑5<span class="rng">#970</span></td><td>Final brief reconciliation</td><td>Update this HTML's Section 08 status column and footer once P0‑1 to P0‑4 are merged — not a separate code PR</td></tr>
+        <tr><td>P1‑6<span class="rng">#971</span></td><td>ENSIP‑26 <code>agent-context</code> / <code>agent-endpoint</code> records</td><td>Self-description keys per the ENSIP‑26 spec (confirmed via docs.ens.domains this session) — sets up the later multi-agent extension of Section 04's AFTER state</td></tr>
       </tbody>
     </table>
   </section>
