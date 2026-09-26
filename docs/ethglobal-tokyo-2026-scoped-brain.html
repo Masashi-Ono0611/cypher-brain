@@ -299,10 +299,10 @@
 
   <section>
     <div class="label"><span class="n">08</span> &nbsp;Work breakdown</div>
-    <h2>One Epic, five P0 issues, Codex-led implementation</h2>
+    <h2>One Epic, six issues, Codex-led implementation</h2>
     <p class="lead">Claude designs, files issues, reviews, and integrates; <b>Codex implements</b> each issue in its own branch against this repo's existing PR flow (CI + changeset + doc-sync gates unchanged).</p>
     <div class="legend">
-      <b>P0</b> = required for a functional Track 2 submission. <b>P1</b> = bonus scope, done ahead of schedule below. Filed on <code>Masashi-Ono0611/cypher-brain</code> as Epic <code>#972</code> with sub-issues <code>#966</code>–<code>#971</code>. <b>Order:</b> P0‑1 → P0‑2 → P0‑3 → P0‑4, strictly (each depended on the previous landing). <b>Doc sync is per-issue, not deferred</b> — every behavior-changing issue (P0‑1 to P0‑4) carries its own README/MANAGEMENT.md/llms.txt update in the same PR, per this repo's own <code>pr-hygiene.yml</code>; P0‑5 below is this HTML brief's own final reconciliation. <b>Scope note:</b> this Epic is ENS-only — Section 04's scoped-export wrapper (gbrain <code>--source-id</code> plumbing) is a separate, non-blocking workstream.
+      <b>P0</b> = required for a functional Track 2 submission. <b>P1</b> = bonus scope, delivered alongside it. Filed on <code>Masashi-Ono0611/cypher-brain</code> as Epic <code>#972</code> with sub-issues <code>#966</code>–<code>#971</code>, all closed. <b>Order:</b> P0‑1 → P0‑2 → P0‑3 → P0‑4, strictly (each depended on the previous landing). <b>Doc sync is per-issue, not deferred</b> — every behavior-changing issue (P0‑1 to P0‑4) carries its own README/MANAGEMENT.md/llms.txt update in the same PR, per this repo's own <code>pr-hygiene.yml</code>; P0‑5 covered this HTML brief's own final reconciliation. <b>Scope note:</b> this Epic is ENS-only — Section 04's scoped-export wrapper (gbrain <code>--source-id</code> plumbing) is a separate, non-blocking workstream.
     </div>
     <table>
       <thead><tr><th>#</th><th>Issue</th><th>What it proves</th><th>Status</th></tr></thead>
@@ -310,14 +310,14 @@
         <tr><td>P0‑1<span class="rng">#966</span></td><td>Add <code>viem</code> dependency + agent-wallet keygen</td><td>New Ethereum keypair, held via the existing <code>writeKeyFile()</code> pattern (atomic, 0600, backed up on <code>--force</code>) — no new key-handling code path</td><td><span class="tag good">✓ MERGED</span><br><span class="rng">PR #973</span></td></tr>
         <tr><td>P0‑2<span class="rng">#967</span></td><td><code>ens-setup</code> — owner-side one-time registration + role grant</td><td>Owner wallet only ever runs this once, interactively; never persisted by cypher-brain</td><td><span class="tag good">✓ MERGED</span><br><span class="rng">PR #974</span></td></tr>
         <tr><td>P0‑3<span class="rng">#968</span></td><td><code>ens-publish</code> — agent wallet publishes the brain pointer</td><td>Reads the real locator from the just-completed push — the "no hard-coded values" requirement</td><td><span class="tag good">✓ MERGED</span><br><span class="rng">PR #975</span></td></tr>
-        <tr><td>P0‑4<span class="rng">#969</span></td><td><code>ens-verify</code> — two-part proof</td><td>The two-part proof from Section 07 (granted-key write lands, out-of-scope write reverts, decoded against the resolver's own <code>EACUnauthorizedAccountRoles</code> error) — the fence actually holds, not just documented</td><td><span class="tag good">✓ MERGED</span><br><span class="rng">PR #976</span></td></tr>
-        <tr><td>P0‑5<span class="rng">#970</span></td><td>Final brief reconciliation</td><td>Update this HTML's Section 08 status column and footer once P0‑1 to P0‑4 are merged — not a separate code PR</td><td><span class="tag good">✓ MERGED</span><br><span class="rng">this PR</span></td></tr>
-        <tr><td>P1‑6<span class="rng">#971</span></td><td>ENSIP‑26 <code>agent-context</code> / <code>agent-endpoint</code> records</td><td>Self-description keys per the ENSIP‑26 spec (confirmed via docs.ens.domains this session) — sets up the later multi-agent extension of Section 04's AFTER state</td><td><span class="tag warn">! IN PROGRESS</span><br>write path via <code>ens-set-text</code> merged in <span class="rng">PR #976</span>; canonical key-name/bracket-syntax verification open</td></tr>
+        <tr><td>P0‑4<span class="rng">#969</span></td><td><code>ens-verify</code> — two-part proof</td><td>The two-part proof from Section 07 (granted-key write lands, out-of-scope write reverts, decoded against the resolver's own <code>EACUnauthorizedAccountRoles</code> error) — the fence actually holds, not just documented</td><td><span class="tag good">✓ MERGED</span><br><span class="rng">PR #976, #978</span></td></tr>
+        <tr><td>P0‑5<span class="rng">#970</span></td><td>Final brief reconciliation</td><td>Update this HTML's Section 08 status column and footer once P0‑1 to P0‑4 are merged — not a separate code PR</td><td><span class="tag good">✓ MERGED</span><br><span class="rng">PR #977</span></td></tr>
+        <tr><td>P1‑6<span class="rng">#971</span></td><td>ENSIP‑26 <code>agent-context</code> / <code>agent-endpoint</code> records</td><td>Self-description keys per the ENSIP‑26 spec — a live registered name (<code>masashi-ono0611.eth</code>) carries both an <code>agent-context</code> record and a bracketed <code>agent-endpoint[mcp]</code> record, each independently scoped and verified with the same positive/negative proof as the brain-pointer key</td><td><span class="tag good">✓ CLOSED</span><br>write path in <span class="rng">PR #976</span>; live on-chain verification, no code change needed</td></tr>
       </tbody>
     </table>
   </section>
 
-  <div class="footer">cypher-brain · gbrain · ETHGlobal Tokyo 2026 scoping brief — verification pass 2026-09-26, implementation plan added 2026-09-26, all five P0 issues (#966–#970) merged 2026-09-26; P1 (#971) write path merged, key-name verification in progress</div>
+  <div class="footer">cypher-brain · gbrain · ETHGlobal Tokyo 2026 scoping brief — verification pass 2026-09-26, implementation plan added 2026-09-26, all six issues (#966–#971) closed 2026-09-27, live end-to-end on Sepolia ENSv2 (<code>masashi-ono0611.eth</code>)</div>
 
 </div>
 </body>
