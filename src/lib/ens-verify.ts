@@ -141,6 +141,7 @@ export async function ensVerify(o: {
     parseAbi,
     encodeFunctionData,
     decodeAbiParameters,
+    namehash,
     privateKeyToAccount,
     sepolia,
     BaseError,
@@ -192,14 +193,21 @@ export async function ensVerify(o: {
   // real ENSv2 source (see the comment on `resolve` in ens-contracts.ts). Text records are
   // only readable through the ENSIP-10 wildcard-resolution entrypoint: encode the profile
   // call (`text(node, key)`) as the inner `data`, pass the DNS-encoded `name` as resolve()'s
-  // own first argument (that's what the resolver actually uses to look the record up --
-  // the bytes32 inside `data` is discarded, so a zero placeholder is fine here), then
-  // decode the outer `bytes` return as the ABI-encoded string it wraps.
-  const zeroNode = `0x${'00'.repeat(32)}` as const;
+  // own first argument (that's what THIS resolver actually uses to look the record up --
+  // it discards the bytes32 inside `data`), then decode the outer `bytes` return as the
+  // ABI-encoded string it wraps.
+  //
+  // Codex review: pass the real namehash here rather than a zero placeholder, even though
+  // this specific resolver ignores it — the address read back from the registry is trusted
+  // input for this read (the same resolver ens-setup/ens-publish already write through),
+  // but a different resolver implementation behind that address in the future could honor
+  // the inner node, and there's no cost to being correct instead of relying on this one
+  // implementation's discard behavior.
+  const node = namehash(`${o.name}.eth`);
   const innerCalldata = encodeFunctionData({
     abi: textResolverAbi,
     functionName: 'text',
-    args: [zeroNode, o.text_key],
+    args: [node, o.text_key],
   });
   const resolved = await withRedactedRpcErrors(() =>
     client.readContract({
