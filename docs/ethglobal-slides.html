@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<!-- htmlslide-craft version: 27 -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cypher Brain × ENSv2</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../_tools/slide_style/slide_style.css">
+<style>
+  /* Deck-local additions only (no new colors, no new layout system) --
+     kept minimal per the skill's "copy the template, don't rewrite CSS" rule. */
+  .cover-mascot{position:absolute; right:64px; top:50%; transform:translateY(-50%); width:220px; height:220px;}
+  .arch-diagram{display:flex; align-items:stretch; gap:0; height:100%;}
+  .arch-layer{flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:20px 16px; border-radius:12px; text-align:center;}
+  .arch-layer h3{font-size:19px; font-weight:700; margin:0 0 6px; color:var(--base);}
+  .arch-layer.is-current h3{color:#fff;}
+  .arch-layer p{font-size:14px; margin:0; color:var(--base);}
+  .arch-layer.is-current p{color:#fff;}
+  .arch-layer .tag{display:inline-block; font-size:13px; font-weight:700; padding:2px 10px; border-radius:999px; margin-bottom:8px;}
+  .arch-arrow{width:36px; display:flex; align-items:center; justify-content:center; font-size:24px; color:var(--sub-accent); flex-shrink:0;}
+  .wallet-diagram{display:flex; align-items:center; justify-content:center; gap:0; height:100%;}
+  .wallet-box{width:200px; padding:20px; border-radius:12px; background:var(--base-sub-light); text-align:center;}
+  .wallet-box .icon{font-size:32px; margin-bottom:8px;}
+  .wallet-box h4{font-size:17px; margin:0 0 6px; font-weight:700; color:var(--base);}
+  .wallet-box p{font-size:13px; margin:0; color:var(--base);}
+  .wallet-arrow{width:120px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px;}
+  .wallet-arrow .line{width:100%; height:2px; background:var(--main);}
+  .wallet-arrow .label{font-size:12px; font-weight:700; color:var(--main); text-align:center;}
+</style>
+</head>
+<body>
+
+<!-- ============ 1. Cover ============ -->
+<section class="slide cover">
+  <div class="cover-bar"></div>
+  <h1 class="cover-title">Cypher Brain <span style="color:var(--main);">×</span> ENSv2</h1>
+  <p class="cover-sub">Scoped Brain — Give every AI agent only the part of your brain it needs.</p>
+  <p class="cover-meta">ETHGlobal Tokyo 2026 · ENS Prize · Continuity Track · Track 2: Best Integration of ENSv2 into an Existing Project</p>
+  <img class="cover-mascot" src="../mascot.svg" alt="Cypher Brain mascot">
+  <footer class="slide-footer"><span>cypher-brain (continuation of an existing OSS project)</span></footer>
+</section>
+
+<!-- ============ 2. What is this a continuation of ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">What this builds on<span class="divider">｜</span>not a new project, an extension of existing OSS</h2>
+    <p class="lead">We added ENSv2-based permission control to <span class="em-hl">Cypher Brain</span>, an existing open-source project.</p>
+  </header>
+  <div class="slide-body">
+    <div class="cols">
+      <div class="figure" style="background:var(--base-sub-light); display:flex; align-items:center; justify-content:center;">
+        <img src="../mascot.svg" alt="Cypher Brain mascot" style="width:55%; height:auto;">
+      </div>
+      <div style="display:flex; flex-direction:column; gap:16px;">
+        <p class="subhead">What Cypher Brain is</p>
+        <div class="box" style="flex:1;">
+          <p class="subhead subhead-main" style="font-size:17px;">An already-running OSS project</p>
+          <ul>
+            <li>A CLI tool that encrypts and protects a personal "second brain" (gbrain)</li>
+            <li>MIT license, single maintainer, a mature CI / release pipeline</li>
+            <li>This submission adds new features to that existing project</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="takeaway">A genuine extension of Cypher Brain, matching Track 2's "integration into an existing project" requirement</div>
+  </div>
+  <footer class="slide-footer"><span>github.com/Masashi-Ono0611/cypher-brain</span><span>2</span></footer>
+</section>
+
+<!-- ============ 3. What is gbrain ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">What is gbrain?<span class="divider">｜</span>a personal knowledge base that updates every day</h2>
+    <p class="lead">gbrain is my own "second brain." It records my conversations, decisions, and what I learn, automatically.</p>
+  </header>
+  <div class="slide-body">
+    <div class="cols">
+      <div class="box">
+        <span class="num">1</span>
+        <p class="subhead subhead-main">Daily record</p>
+        <p>Conversations, decisions, and insights accumulate automatically, every day.</p>
+        <p class="note">This is my own personal knowledge base, not a shared tool</p>
+      </div>
+      <div class="box">
+        <span class="num">2</span>
+        <p class="subhead subhead-main">Always up to date</p>
+        <p>A nightly job refreshes it automatically. No human updates it by hand.</p>
+        <p class="note">The update itself is what an AI agent handles (next slide)</p>
+      </div>
+      <div class="box">
+        <span class="num">3</span>
+        <p class="subhead subhead-main">Sensitive personal data</p>
+        <p>Who can access it, and how much, must be tightly controlled.</p>
+        <p class="note">This is exactly the problem ENSv2 solves in this project</p>
+      </div>
+    </div>
+    <div class="takeaway">Protecting "personal data that updates itself every night" is the starting point for everything that follows</div>
+  </div>
+  <footer class="slide-footer"><span>Cypher Brain × ENSv2</span><span>3</span></footer>
+</section>
+
+<!-- ============ 4. What Cypher Brain already does ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">What Cypher Brain already does<span class="divider">｜</span>encrypt, store, publish a pointer</h2>
+    <p class="lead">Every night, these three steps run automatically to protect gbrain's contents.</p>
+  </header>
+  <div class="slide-body">
+    <div class="figure" style="padding:40px 20px;">
+      <div class="flow">
+        <div class="step">① Encrypt<small>seal gbrain into one file</small></div><div class="arrow"></div>
+        <div class="step">② Store<small>upload to external storage (Arweave, etc.)</small></div><div class="arrow"></div>
+        <div class="step highlight">③ Publish pointer<small>announce "this is the latest version"</small></div>
+      </div>
+    </div>
+    <div class="box" style="margin-top:16px;">
+      <p class="subhead subhead-main" style="font-size:17px;">Who actually does this?</p>
+      <p>Every night, an <span class="em">AI agent</span> — not a human — runs these three steps automatically. Step ③, "update the pointer," is the one the agent has to be trusted with.</p>
+    </div>
+    <div class="takeaway">That "trust" in step ③ is exactly where the problem in the next slide comes from</div>
+  </div>
+  <footer class="slide-footer"><span>Cypher Brain × ENSv2</span><span>4</span></footer>
+</section>
+
+<!-- ============ 5. The problem ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">The problem we had<span class="divider">｜</span>no good way to hand an agent this one job</h2>
+    <p class="lead">There was no way to give an agent only the permission it needs, in a way anyone could check.</p>
+  </header>
+  <div class="slide-body">
+    <table>
+      <thead><tr><th style="width:22%;">Approach</th><th style="width:39%;">How it works</th><th style="width:39%;">The problem</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Option A</strong><br>Share the key</td><td>Give the agent the owner's own wallet key</td><td><span class="em" style="color:var(--accent);">The agent can now do anything you can do, including moving money</span></td></tr>
+        <tr><td><strong>Option B</strong><br>Private database</td><td>Manage access with a central server and an API key</td><td>A server can go down or be censored, and <span class="em" style="color:var(--accent);">outsiders cannot verify the key is really limited</span></td></tr>
+        <tr><td><strong>Our solution</strong></td><td>Use ENSv2's Enhanced Access Control</td><td><span class="em">A permission limited to one field, provable by anyone</span></td></tr>
+      </tbody>
+    </table>
+    <div class="takeaway">What was missing was not just "limiting" the permission, but making that limit verifiable by outsiders</div>
+  </div>
+  <footer class="slide-footer"><span>Cypher Brain × ENSv2</span><span>5</span></footer>
+</section>
+
+<!-- ============ 6. Our solution ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">Our solution<span class="divider">｜</span>two wallets, one narrow permission</h2>
+    <p class="lead">The owner uses their real wallet once, to grant a separate agent wallet permission for exactly one field.</p>
+  </header>
+  <div class="slide-body">
+    <div class="figure" style="padding:24px;">
+      <div class="wallet-diagram">
+        <div class="wallet-box" style="background:var(--sub-hl);">
+          <div class="icon">🔑</div>
+          <h4>Owner wallet</h4>
+          <p>The real key. Used only once. Never saved to disk.</p>
+        </div>
+        <div class="wallet-arrow">
+          <div class="label">ens-setup</div>
+          <div class="line"></div>
+          <div class="label">grants a permission for one field</div>
+        </div>
+        <div class="wallet-box" style="background:var(--main-sub);">
+          <div class="icon">🤖</div>
+          <h4>Agent wallet</h4>
+          <p>Generated by cypher-brain. Handles all daily updates by itself.</p>
+        </div>
+      </div>
+    </div>
+    <div class="box" style="margin-top:16px;">
+      <p class="subhead subhead-main" style="font-size:17px;">ens-verify: proving the permission is really narrow</p>
+      <p><span class="em">Positive check</span> — did the expected value actually get written? <span class="em">Negative check</span> — does the same wallet really fail to write to a different field? Both together are what make this a proof, not a claim.</p>
+    </div>
+    <div class="takeaway">No custom smart contract was written -- this uses only what ENSv2 already provides</div>
+  </div>
+  <footer class="slide-footer"><span>Cypher Brain × ENSv2</span><span>6</span></footer>
+</section>
+
+<!-- ============ 7. What this makes possible ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">What this makes possible<span class="divider">｜</span>limited blast radius, verifiable by anyone</h2>
+    <p class="lead">If the agent's key is ever stolen, the damage stays limited to that one field.</p>
+  </header>
+  <div class="slide-body">
+    <div class="cols">
+      <div class="box">
+        <span class="num">1</span>
+        <p class="subhead subhead-main">Real key used once</p>
+        <p>The owner's real key is used only during setup. It never appears in daily operation.</p>
+        <p class="note">ens-setup runs once per key, interactively, then is never needed again</p>
+      </div>
+      <div class="box">
+        <span class="num">2</span>
+        <p class="subhead subhead-main">Limited blast radius</p>
+        <p>Even if the agent key leaks, it cannot move funds or touch anything else.</p>
+        <p class="note">Confirmed live: a write to any other key reverts on-chain</p>
+      </div>
+      <div class="box">
+        <span class="num">3</span>
+        <p class="subhead subhead-main">Verifiable by anyone</p>
+        <p>This is not just a claim -- anyone in the world can check it on-chain.</p>
+        <p class="note">ens-verify's output is the reusable proof, not our word for it</p>
+      </div>
+    </div>
+    <div class="takeaway">This proves the integration is functionally central, not a cosmetic add-on</div>
+  </div>
+  <footer class="slide-footer"><span>Cypher Brain × ENSv2</span><span>7</span></footer>
+</section>
+
+<!-- ============ 8. Full architecture ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">The full architecture<span class="divider">｜</span>three layers, each narrowing the scope</h2>
+    <p class="lead">This submission builds layer three. Layers one and two already existed in Cypher Brain.</p>
+  </header>
+  <div class="slide-body">
+    <div class="figure" style="padding:28px 20px;">
+      <div class="arch-diagram">
+        <div class="arch-layer" style="background:var(--base-sub-light);">
+          <span class="tag" style="background:var(--sub-hl); color:var(--base);">① Existing</span>
+          <h3>gbrain</h3>
+          <p>Picks which sources<br>an agent can see</p>
+        </div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-layer" style="background:var(--base-sub-light);">
+          <span class="tag" style="background:var(--sub-hl); color:var(--base);">② Existing</span>
+          <h3>Cypher Brain</h3>
+          <p>Encrypts it into<br>one sealed file</p>
+        </div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-layer is-current" style="background:var(--main);">
+          <span class="tag" style="background:#fff; color:var(--main);">③ Built now</span>
+          <h3>ENSv2</h3>
+          <p>Limits who can update it,<br>in a way anyone can verify</p>
+        </div>
+      </div>
+    </div>
+    <div class="takeaway">Layer three's permission model is per text-key, so it already generalizes to multiple brain slices (next slide)</div>
+  </div>
+  <footer class="slide-footer"><span>Cypher Brain × ENSv2</span><span>8</span></footer>
+</section>
+
+<!-- ============ 9. Future extension (foundation-expansion diagram) ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">Where this can go next<span class="divider">｜</span>one permission foundation, many brain slices</h2>
+    <p class="lead">Once gbrain can export per use case, today's permission model already supports splitting the brain by use case.</p>
+  </header>
+  <div class="slide-body">
+    <div class="foundation-diagram">
+      <div class="fd-branches">
+        <div class="fd-branch">
+          <p class="fd-branch-title">work-brain</p>
+          <p class="fd-branch-value">for a work-only agent</p>
+          <p class="fd-branch-note">can touch only this key</p>
+          <span class="fd-connector-label">independent grant</span>
+        </div>
+        <div class="fd-branch">
+          <p class="fd-branch-title">travel-brain</p>
+          <p class="fd-branch-value">for a travel-booking agent</p>
+          <p class="fd-branch-note">can touch only this key</p>
+          <span class="fd-connector-label">independent grant</span>
+        </div>
+        <div class="fd-branch">
+          <p class="fd-branch-title">private-brain</p>
+          <p class="fd-branch-value">for the most trusted agent only</p>
+          <p class="fd-branch-note">can touch only this key</p>
+          <span class="fd-connector-label">independent grant</span>
+        </div>
+      </div>
+      <div class="fd-base">
+        ENSv2 Enhanced Access Control (the permission foundation built in this Epic)
+        <div class="fd-base-sub">any number of independent per-key permissions, using only what already exists today</div>
+      </div>
+    </div>
+    <div class="takeaway">Splitting the brain by use case only needs work on gbrain's side -- the permission mechanism is already general-purpose</div>
+  </div>
+  <footer class="slide-footer"><span>Cypher Brain × ENSv2</span><span>9</span></footer>
+</section>
+
+<!-- ============ 10. Live demo ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">The live demo<span class="divider">｜</span>every step run for real, on Sepolia testnet</h2>
+    <p class="lead">Not a simulation -- this is what actually happened on-chain.</p>
+  </header>
+  <div class="slide-body">
+    <div class="figure" style="padding:32px 16px;">
+      <div class="flow">
+        <div class="step">① Register ENS name<small>masashi-ono0611.eth</small></div><div class="arrow"></div>
+        <div class="step">② Grant permission<small>ens-setup (owner key)</small></div><div class="arrow"></div>
+        <div class="step">③ Write pointer<small>ens-set-text (agent key only)</small></div><div class="arrow"></div>
+        <div class="step highlight">④ Verify<small>ens-verify (positive + negative PASS)</small></div>
+      </div>
+    </div>
+    <div class="box" style="margin-top:16px;">
+      <p class="subhead subhead-main" style="font-size:17px;">Repeated with three independent keys</p>
+      <p><span class="em">masa-brain</span> (the brain pointer), <span class="em">agent-context</span> (self-description), and <span class="em">agent-endpoint[mcp]</span> (server address) -- each one independently granted, written, and verified. Every transaction hash is listed in the written submission.</p>
+    </div>
+    <div class="takeaway">Proven live, on real Sepolia transactions, that the permission model actually works</div>
+  </div>
+  <footer class="slide-footer"><span>Cypher Brain × ENSv2</span><span>10</span></footer>
+</section>
+
+<!-- ============ 11. Closing ============ -->
+<section class="slide chapter">
+  <p class="chapter-no">Thank you</p>
+  <h2 class="chapter-title">Give your AI only what it needs.<br>Nothing more.</h2>
+  <p class="chapter-caption">github.com/Masashi-Ono0611/cypher-brain　·　Epic #972</p>
+  <footer class="slide-footer"><span>Cypher Brain × ENSv2 — ETHGlobal Tokyo 2026</span></footer>
+</section>
+
+</body>
+</html>
