@@ -25,6 +25,22 @@ the identity (below) **and** the latest locator (`#3`).
 
 cypher-brain gives you two independent defenses for the identity; **use both**.
 
+## ENS agent wallet
+
+For ENS integration, create a dedicated agent signing key with:
+
+```sh
+cypher-brain agent-wallet keygen
+```
+
+The private key is written to `$CYPHER_BRAIN_HOME/agent-wallet.key` (default
+`~/.cypher-brain/agent-wallet.key`) with mode 0600; stdout contains only the public
+address. The owner wallet is not stored. Back up the key securely. `--force` first
+preserves an existing key in a sibling `.bak-<timestamp>-<random>` file, then rotates
+the agent address. If rotated, review and update on-chain permissions for the old and
+new addresses separately. This wallet's security boundary is the authority granted
+to its address; it is not the age identity used to decrypt snapshots.
+
 ### 1. Encrypt to a backup key (recommended, built in)
 
 `snapshot --recipient` is repeatable. Give it a **primary** and an **offline

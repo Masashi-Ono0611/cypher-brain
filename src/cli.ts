@@ -49,6 +49,7 @@ import { bagitExportCommand } from './lib/bagit.js';
 import { publishLatest } from './lib/ton-dns.js';
 import { schedule } from './lib/schedule.js';
 import { wallet } from './lib/wallet.js';
+import { agentWallet, AGENT_WALLET_DEFAULT_PATH } from './lib/agent-wallet.js';
 import { estimate } from './lib/estimate.js';
 import { doctor } from './lib/doctor.js';
 import { ledger } from './lib/ledger.js';
@@ -167,7 +168,7 @@ const KNOWN_FLAG_NAMES: string[] = [
 // inferred from FLAG_IRRELEVANT, which is about specific --flag names, a different
 // axis) so parseArgs() knows, for a KNOWN command, how many bare (non "--") tokens
 // its own o._ slot is allowed to hold — see the positional-argument check below.
-const POSITIONAL_COMMANDS = new Set(['schedule', 'wallet', 'witness']);
+const POSITIONAL_COMMANDS = new Set(['schedule', 'wallet', 'witness', 'agent-wallet']);
 
 // The four repeatable array flags parseArgs()'s loop below consumes a following value
 // for in their own branches (before VALUE_FLAGS/BOOL_FLAGS is ever consulted) — pulled
@@ -510,6 +511,13 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       cypher-brain will sign with (for --chain ton, this is also the address that
       becomes the StorageV1 contract's owner — see push's --backend ton-provider
       section).
+
+  cypher-brain agent-wallet keygen [--force]
+      Generate a local Ethereum agent wallet for ENS integration. Writes the private
+      key to ${AGENT_WALLET_DEFAULT_PATH} (mode 0600) and prints only the public address.
+      The operator/owner wallet is not stored by cypher-brain. --force first backs up
+      an existing key to a sibling .bak-<timestamp>-<random> file. Replacing this key
+      changes the agent address; review and update any on-chain permissions separately.
 
   cypher-brain wallet balance [--wallet <path>] [--address <addr>] [--json] [--chain arweave|ton]
       --chain arweave (default): print what an address can actually spend on the turbo
@@ -1584,6 +1592,7 @@ interface FlagIrrelevance {
 const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   'push-status': [],
   witness: [],
+  'agent-wallet': [],
   // restore's destination is --out-dir; src/lib/restore.ts's restore() never reads o.out.
   // The single highest-traffic instance, since --out means the output on snapshot, pull and
   // wallet create — restore is the one command that spells it differently.
@@ -1829,6 +1838,8 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
  * every command still accepts its own whole entry without this check firing.
  */
 const COMMAND_FLAGS: Record<string, readonly string[]> = {
+  'agent-wallet': [],
+  'agent-wallet keygen': ['force'],
   // init(_o) ignores the options bag entirely (src/lib/wizard.ts) — it is an interactive
   // wizard that asks for everything. Empty is the honest answer, and now a load-bearing
   // one: under the deny-list, `init --pq` was accepted and dropped.
@@ -2309,6 +2320,8 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
       return schedule(o);
     case 'wallet':
       return wallet(o);
+    case 'agent-wallet':
+      return agentWallet(o);
     case 'doctor':
       return doctor(o);
     case 'ledger':

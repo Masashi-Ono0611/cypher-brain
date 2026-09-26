@@ -159,7 +159,8 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "age-encryption": "^0.3.0",
     "ignore": "^7.0.6",
-    "shamir-secret-sharing": "^0.0.4"
+    "shamir-secret-sharing": "^0.0.4",
+    "viem": "^2.56.9"
   },
   "overrides": {
     "elliptic": "6.6.1"
