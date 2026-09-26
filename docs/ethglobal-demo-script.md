@@ -33,14 +33,21 @@ The second wallet is the agent wallet. This wallet does the daily
 work. It can update only one small piece of information. It cannot do
 anything else.
 
-Without ENSv2, there are two common choices. Give the agent your wallet
-key, and it can sign as you and spend your funds. Or use a central server
-with a database; it can go down or block requests, and other people cannot
-check if its API key is limited to one field. Both choices mean trusting
-someone or building custom access rules. ENSv2 lets the owner grant the
-agent access to one text key, with no custom contract. Anyone can check
-that grant on-chain, and ens-verify shows the agent being rejected when it
-tries a different key.
+Why do we need ENSv2 for this? Let's think about it without ENSv2 first.
+
+One way: give the agent your own wallet key. But then the agent can do
+everything you can do. It could even spend your money. Not safe.
+
+Another way: use a private server with a password. But that server can
+go down. And no one outside can check that the password really works
+for only one small job. You just have to trust it.
+
+ENSv2 gives us a better way. The owner can give the agent power for
+just one small piece of information. This happens in public. No one
+has to write new code to make it safe. And anyone in the world can
+check that this power is really small. Our tool, ens-verify, proves
+it: the agent tries to touch something else, and it fails. Everyone
+can see this proof for themselves.
 
 Now let's watch it work.
 

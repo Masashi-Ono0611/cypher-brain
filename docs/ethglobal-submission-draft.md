@@ -27,9 +27,9 @@ The owner wallet is entered through a hidden interactive prompt for setup and is
 
 ## 4. What ENSv2 changes
 
-ENS is part of the working flow, not a profile badge. After a successful push, `push --publish-ens` writes the locator returned by that push to the granted text record using the agent wallet. `ens-verify` then performs both sides of the permission check:
-
 Without ENSv2, the practical alternatives are to give the agent the owner's wallet key, which lets it sign as the owner and spend the owner's funds, or to put a centralized server in front of a database. That server can be unavailable or censor requests, and people outside its operator cannot independently verify that its API key is limited to one field. Either approach also means trusting or building a custom access-control layer. ENSv2's existing Enhanced Access Control lets the owner grant the agent wallet a role for one text-key resource, with no custom contract. Anyone can inspect that scope on-chain; the negative `ens-verify` check demonstrates it by having the agent try a different key and requiring the resolver itself to reject the write.
+
+ENS is part of the working flow, not a profile badge. After a successful push, `push --publish-ens` writes the locator returned by that push to the granted text record using the agent wallet. `ens-verify` then performs both sides of the permission check:
 
 1. It reads the granted text key back and checks that the value matches the expected locator.
 2. It simulates a `setText` call to a different key and requires the resolver's `EACUnauthorizedAccountRoles` error. The negative probe is not broadcast.
