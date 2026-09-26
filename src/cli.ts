@@ -2371,10 +2371,27 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
       return pull(o);
     case 'push-status':
       return pushStatus(o);
+    // Mascot decoration matches push --publish-ens's own dispatch-site pattern above
+    // (issue #194): printed HERE, not inside ensVerify()/ensSetText() themselves, so
+    // it stays CLI-only decoration on stderr and never leaks into a future MCP path.
     case 'ens-verify':
-      return ensVerify(o);
+      try {
+        await ensVerify(o);
+      } catch (e) {
+        printMascot('sad');
+        throw e;
+      }
+      printMascot('happy');
+      return;
     case 'ens-set-text':
-      return ensSetText(o);
+      try {
+        await ensSetText(o);
+      } catch (e) {
+        printMascot('sad');
+        throw e;
+      }
+      printMascot('happy');
+      return;
     case 'publish-latest':
       return publishLatest(o);
     case 'recovery-kit':
@@ -2388,7 +2405,14 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
     case 'agent-wallet':
       return agentWallet(o);
     case 'ens-setup':
-      return ensSetup(o);
+      try {
+        await ensSetup(o);
+      } catch (e) {
+        printMascot('sad');
+        throw e;
+      }
+      printMascot('happy');
+      return;
     case 'doctor':
       return doctor(o);
     case 'ledger':
