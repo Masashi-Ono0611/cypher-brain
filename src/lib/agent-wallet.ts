@@ -3,7 +3,6 @@
 // creates the local keypair; granting ENS permissions and using them are separate work.
 import { mkdir, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { HOME } from './config.js';
 import { backupIdentityFile, writeKeyFile } from './keys.js';
 import { exists } from './util.js';
@@ -25,6 +24,17 @@ export async function agentWallet(o: CliOptions): Promise<void> {
   // Create and protect the home directory before writing any credential into it.
   await mkdir(HOME, { recursive: true, mode: 0o700 });
   await chmod(HOME, 0o700);
+
+  // viem is loaded on demand (not a top-level import) so that commands unrelated to
+  // the ENS agent wallet — doctor included — never require it to be installed, the
+  // same reasoning src/lib/otel.ts applies to the OpenTelemetry packages.
+  let generatePrivateKey: () => `0x${string}`;
+  let privateKeyToAccount: (key: `0x${string}`) => { address: string };
+  try {
+    ({ generatePrivateKey, privateKeyToAccount } = await import('viem/accounts'));
+  } catch {
+    throw new Error("the 'viem' package is not installed — run: npm install viem");
+  }
 
   const privateKey = generatePrivateKey();
   const account = privateKeyToAccount(privateKey);
