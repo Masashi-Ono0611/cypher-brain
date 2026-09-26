@@ -246,7 +246,78 @@
     </table>
   </section>
 
-  <div class="footer">cypher-brain · gbrain · ETHGlobal Tokyo 2026 scoping brief — verified live against macmini gbrain 0.57.0.0, 2026-09-26</div>
+  <section>
+    <div class="label"><span class="n">06</span> &nbsp;The submission target</div>
+    <h2>ENS Track 2 — Continuity Track, existing project</h2>
+    <p class="lead">cypher-brain is the existing project. This section fixes exactly what the prize page requires, so the plan below can't drift from it.</p>
+    <div class="rows">
+      <div class="row"><div class="rk">Track<span class="rs">ens.domains prize page</span></div><div class="rv"><b>Best Integration of ENSv2 into an Existing Project</b> — $4,000, restricted to Continuity Track participants (confirmed registered)</div></div>
+      <div class="row"><div class="rk">Must use</div><div class="rv">ENSv2 on <b>Sepolia</b> — beta, contracts confirmed <b>not final</b> pre-mainnet; Sepolia addresses were redeployed 2026‑09‑15 ("hackathon clean testnet deployment")</div></div>
+      <div class="row"><div class="rk">Must be central</div><div class="rv">ENSv2 has to change what the project can do, <b>not decorate it</b> — the demo must not use hard-coded values</div></div>
+      <div class="row"><div class="rk">Must ship</div><div class="rv">Open-source code (GitHub) + a live demo link, both linked from the submission</div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="label"><span class="n">07</span> &nbsp;The delegation design</div>
+    <h2>Two wallets, two keys, one narrow permission</h2>
+    <p class="lead">The <b>owner wallet</b> grants once, interactively, and is never stored by cypher-brain. The <b>agent wallet</b> is a new keypair cypher-brain holds and uses routinely — and can only ever touch one text-record key.</p>
+    <div class="fig">
+      <svg viewBox="0 0 780 210" role="img" aria-label="Owner wallet grants a scoped role once; agent wallet publishes routinely">
+        <rect x="16" y="30" width="220" height="80" rx="10" fill="var(--surface)" stroke="var(--line)"/>
+        <text x="126" y="58" text-anchor="middle" class="svg-t">Owner wallet</text>
+        <text x="126" y="78" text-anchor="middle" class="svg-l">ens-setup (once)</text>
+        <text x="126" y="94" text-anchor="middle" class="svg-l">never stored by cypher-brain</text>
+
+        <rect x="290" y="30" width="220" height="80" rx="10" fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="400" y="58" text-anchor="middle" class="svg-o">Permissioned Resolver</text>
+        <text x="400" y="78" text-anchor="middle" class="svg-l">grantSetterRoles(setter,</text>
+        <text x="400" y="94" text-anchor="middle" class="svg-l">agentWallet) — scoped to 1 key</text>
+
+        <rect x="564" y="30" width="200" height="80" rx="10" fill="var(--good-tint)" stroke="var(--good-line)"/>
+        <text x="664" y="58" text-anchor="middle" class="svg-t" style="fill:var(--good)">Agent wallet</text>
+        <text x="664" y="78" text-anchor="middle" class="svg-l">ens-publish (routine)</text>
+        <text x="664" y="94" text-anchor="middle" class="svg-l">held by cypher-brain</text>
+
+        <path d="M236 70 L288 70 M510 70 L562 70" stroke="var(--faint)" stroke-width="1.4" marker-end="url(#ar3)"/>
+        <defs><marker id="ar3" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M1 1 L6 4 L1 7" fill="none" stroke="var(--faint)" stroke-width="1.3"/></marker></defs>
+
+        <rect x="464" y="140" width="200" height="56" rx="9" fill="var(--bad-tint)" stroke="var(--bad-line)"/>
+        <text x="564" y="163" text-anchor="middle" class="svg-t" style="fill:var(--bad)">setAddress(...)</text>
+        <text x="564" y="179" text-anchor="middle" class="svg-l">agent wallet → reverts</text>
+        <path d="M664 112 L604 138" stroke="var(--bad)" stroke-width="1.4" stroke-dasharray="3 3" marker-end="url(#ar4)"/>
+        <defs><marker id="ar4" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M1 1 L6 4 L1 7" fill="none" stroke="var(--bad)" stroke-width="1.3"/></marker></defs>
+      </svg>
+      <div class="fig-cap">The revert path is the actual demo evidence — a permission the docs promise, shown holding under an out-of-scope write</div>
+    </div>
+    <div class="pillars">
+      <div class="pillar hi"><span class="pn">SETUP (once)</span><div class="pt"><span>ens-setup</span></div><div class="pd">Owner wallet registers/uses a Sepolia (sub)name, discovers its Permissioned Resolver, grants <code>ROLE_SET_TEXT</code> scoped to one key (e.g. <code>brain.latest</code>) to the agent wallet's address.</div></div>
+      <div class="pillar"><span class="pn">ROUTINE</span><div class="pt"><span>ens-publish</span></div><div class="pd">After a successful <code>push</code>, the agent wallet calls <code>setText(node, 'brain.latest', &lt;locator&gt;)</code> — reading the real locator, never a fixture value.</div></div>
+      <div class="pillar"><span class="pn">PROOF</span><div class="pt"><span>ens-verify</span></div><div class="pd">Read-only check <b>plus</b> a negative test: the agent wallet attempts a write outside its scope and the transaction reverts. This is what makes ENSv2 central, not cosmetic.</div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="label"><span class="n">08</span> &nbsp;Work breakdown</div>
+    <h2>One Epic, five P0 issues, Codex-led implementation</h2>
+    <p class="lead">Claude designs, files issues, reviews, and integrates; <b>Codex implements</b> each issue in its own branch against this repo's existing PR flow (CI + changeset + doc-sync gates unchanged).</p>
+    <div class="legend">
+      <b>P0</b> = required for a functional Track 2 submission. <b>P1</b> = bonus scope if time remains. Issue numbers are filled in once filed on <code>Masashi-Ono0611/cypher-brain</code>.
+    </div>
+    <table>
+      <thead><tr><th>#</th><th>Issue</th><th>What it proves</th></tr></thead>
+      <tbody>
+        <tr><td>P0‑1</td><td>Add <code>viem</code> dependency + agent-wallet keygen</td><td>New Ethereum keypair, held via the existing <code>writeKeyFile()</code> pattern (atomic, 0600, backed up on <code>--force</code>) — no new key-handling code path</td></tr>
+        <tr><td>P0‑2</td><td><code>ens-setup</code> — owner-side one-time registration + role grant</td><td>Owner wallet only ever runs this once, interactively; never persisted by cypher-brain</td></tr>
+        <tr><td>P0‑3</td><td><code>ens-publish</code> — agent wallet publishes the brain pointer</td><td>Reads the real locator from the just-completed push — the "no hard-coded values" requirement</td></tr>
+        <tr><td>P0‑4</td><td><code>ens-verify</code> / doctor extension</td><td>The negative test from Section 07 — the fence actually holds, not just documented</td></tr>
+        <tr><td>P0‑5</td><td>Same-PR doc sync</td><td>README/MANAGEMENT.md/llms.txt (required by this repo's own <code>pr-hygiene.yml</code>) + this HTML's "what shipped" update</td></tr>
+        <tr><td>P1‑6</td><td>ENSIP‑26 <code>agent-context</code> / <code>agent-endpoint</code> records</td><td>Standard self-description keys — sets up the later multi-agent extension of Section 04's AFTER state</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <div class="footer">cypher-brain · gbrain · ETHGlobal Tokyo 2026 scoping brief — verification pass 2026-09-26, implementation plan added 2026-09-26 (not yet built)</div>
 
 </div>
 </body>
