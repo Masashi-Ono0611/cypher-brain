@@ -33,6 +33,15 @@ The second wallet is the agent wallet. This wallet does the daily
 work. It can update only one small piece of information. It cannot do
 anything else.
 
+Without ENSv2, there are two common choices. Give the agent your wallet
+key, and it can sign as you and spend your funds. Or use a central server
+with a database; it can go down or block requests, and other people cannot
+check if its API key is limited to one field. Both choices mean trusting
+someone or building custom access rules. ENSv2 lets the owner grant the
+agent access to one text key, with no custom contract. Anyone can check
+that grant on-chain, and ens-verify shows the agent being rejected when it
+tries a different key.
+
 Now let's watch it work.
 
 Step one: we register a real ENS name on Sepolia testnet. The name is
