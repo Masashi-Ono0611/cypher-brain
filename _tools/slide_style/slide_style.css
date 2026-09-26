@@ -1,0 +1,477 @@
+/* htmlslide-craft version: 27 */
+/* ============================================================
+   htmlslide-craft — HTML スライド共通 CSS
+   デザインSoT: Slide Standard ver.2
+   キャンバス: 1280x720px (16:9)。1px = 0.75pt → 14px = 10.5pt
+   本文の最小フォントは 14px (10.5pt)。例外は .caption (出典等) のみ。
+   レイアウト原則: 本文エリアは縦を使い切る。下 1/3 を空けない。
+   各スライドは「タイトル+リード → 本文(伸ばす) → キーメッセージ帯」で締める。
+   ============================================================ */
+
+:root {
+  /* --- 配色 (下記9色 + チャート系列4色以外を使わない)
+     基準色2つは Telegram 公式 Android クライアントのデフォルトテーマ実装
+     (github.com/DrKLO/Telegram の ThemeColors.java) を参照した値:
+       --main   = 同ソースの TELEGRAM_COLOR 定数
+       --accent = 同ソースのアバター用赤グラデーションの濃い側
+     残りのティント(--main-sub / --sub-hl / --accent-hl)とグレー(--base 系 /
+     --sub-accent)はそこから導出した自前の値で、Telegram が定めた値ではない。
+     新しい色相は足さない(青と赤の2色相 + 無彩色に限る)。
+     ※Telegram の公式ブランドガイドラインが定めるスライド用パレットではなく、
+       Telegram との提携・承認を示すものでもない --- */
+  --base:            #1c2733; /* ベースカラー: 文字 (全体の50-60%) */
+  --base-sub-light:  #eef1f4; /* ベースサブ淡: 囲み・背景。汎用ボックスは無彩色寄りグレー(キーメッセージ帯と混ざらないようにする) */
+  --base-sub-dark:   #a9b4bd; /* ベースサブ濃: 罫線 */
+  --main:            #229af0; /* メイン: 図解・見出し・強調 (20-30%)。Telegram公式 TELEGRAM_COLOR 定数 */
+  --main-sub:        #bfe0f7; /* メインサブ: 図解背景の差分・キーメッセージ帯。mainと同色相のティント(彩度・明度のみ調整) */
+  --accent:          #d45246; /* メインアクセント: 特に注目 (10%以下)。Telegram公式アクセントカラー「Red」 */
+  --accent-hl:       #fbeceb; /* メインハイライト: アクセントの下地 */
+  --sub-accent:      #c4ccd3; /* サブアクセント: デザイン要素 (5%以下)。ニュートラルグレー(追加色相は使わない) */
+  --sub-hl:          #eaf4fb; /* サブハイライト: デザイン要素 (5%以下)。base-sub-lightのグレー化には追従させず青みを残す(強調用途のため意図的に別値) */
+
+  /* --- チャート系列色 (mainの明度4段。色相を増やさずカテゴリを識別する)
+     隣接セグメント同士が見分けられることが要件なので、9色パレットとは別建てにする
+     (旧: c2=main-sub / c3=sub-accent が 1.18:1 で識別不能だった)。
+     輝度を等比で刻み全隣接ペアを 1.83:1 に揃えている。単一色相で4段を刻む場合
+     隣接3.0:1(累計27:1)は白黒間21:1を超えるため達成不能なので、.sb-seg の
+     区切り線を併用して識別性を担保する(色だけに依存させない) --- */
+  --chart-1:         #035087; /* 最下段(主力) */
+  --chart-2:         #0e79c7;
+  --chart-3:         #59abe6;
+  --chart-4:         #c8e0f2; /* 最上段 */
+
+  /* --- タイポグラフィ (px / 括弧内は pt 換算) --- */
+  --fs-caption: 13px;  /* (9.75pt)  出典・キャプション・図版内のみ許可 */
+  --fs-min:     14px;  /* (10.5pt)  読ませる文字の絶対下限 */
+  --fs-body:    17px;  /* (12.75pt) 本文標準 */
+  --fs-subhead: 19px;  /* (14.25pt) 小見出し */
+  --fs-lead:    19px;  /* (14.25pt) リード文 */
+  --fs-title:   30px;  /* (22.5pt)  スライドタイトル */
+  --fs-chapter: 40px;  /* (30pt)    扉・章タイトル */
+  --fs-cover:   48px;  /* (36pt)    表紙タイトル */
+
+  --font: "Noto Sans JP", "Hiragino Kaku Gothic ProN", "Hiragino Sans", sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: #e7eef4; /* スライド外の余白。印刷時は消える */
+  font-family: var(--font);
+  color: var(--base);
+  font-feature-settings: "palt";
+  line-height: 1.6;
+}
+
+/* ---------- スライドキャンバス ---------- */
+.slide {
+  width: 1280px;
+  height: 720px;
+  background: #fff;              /* 原則 白背景 */
+  margin: 24px auto;
+  padding: 40px 56px 24px;       /* 四辺の余白ガイド。下はフッターがフローで続く前提 */
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- ヘッダー (タイトル + リード文) ---------- */
+.slide-title {
+  font-size: var(--fs-title);
+  font-weight: 700;
+  line-height: 1.35;
+}
+.slide-title .divider { color: var(--base-sub-dark); font-weight: 400; margin: 0 2px; } /* 「見出し｜内容」の ｜ */
+.lead {
+  font-size: var(--fs-lead);
+  margin-top: 8px;
+  line-height: 1.6;
+}
+.slide-header { margin-bottom: 22px; }
+
+/* ---------- 本文レイアウト (縦を使い切る) ---------- */
+.slide-body { flex: 1; display: flex; flex-direction: column; gap: 18px; min-height: 0; }
+.cols { display: flex; gap: 22px; flex: 1; min-height: 0; align-items: stretch; }
+.cols > * { flex: 1; min-width: 0; }
+
+/* カラム/囲み: 塗=ベースサブ淡・線なし (枠線は原則禁止)。縦いっぱいに伸びる */
+.box {
+  background: var(--base-sub-light);
+  border: none;
+  border-radius: 10px;
+  padding: 24px 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.box-main { background: var(--main-sub); border: none; border-radius: 10px; padding: 24px 26px; display: flex; flex-direction: column; gap: 10px; } /* 図解でメインと差分を付ける時 */
+.box .note { margin-top: auto; }  /* 補足を箱の底に沈めて空白を締める */
+.pill { border-radius: 999px; }   /* 角丸を強くしたい時はトラック型に振り切る */
+
+/* 番号バッジ (3カラムの視覚アンカー) */
+.num {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 40px; height: 40px; border-radius: 50%;
+  background: var(--main); color: #fff;
+  font-size: var(--fs-subhead); font-weight: 700;
+}
+
+.subhead {
+  font-size: var(--fs-subhead);
+  font-weight: 700;
+  line-height: 1.4;
+}
+.subhead-main { color: var(--main); }
+
+p, li { font-size: var(--fs-body); line-height: 1.75; }
+small, .small { font-size: var(--fs-min); line-height: 1.6; }
+.note { font-size: var(--fs-min); color: var(--base); opacity: .75; }
+
+ul { list-style: none; }
+ul li { padding-left: 1em; text-indent: -1em; margin-bottom: 4px; }
+ul li::before { content: "・"; }   /* 絵文字ビュレット禁止。プレーンな中黒 */
+
+/* ---------- キーメッセージ帯 (スライドの底を締める。原則毎スライド置く) ---------- */
+.takeaway {
+  flex: none;
+  background: var(--main-sub);
+  border-radius: 10px;
+  padding: 18px 28px;
+  font-size: var(--fs-lead);
+  font-weight: 700;
+  line-height: 1.5;
+  text-align: center;
+}
+.takeaway .attn { color: var(--accent); }
+
+/* ---------- 強調 ---------- */
+.em      { font-weight: 700; color: var(--main); }                          /* 通常の強調 */
+.em-hl   { font-weight: 700; color: var(--main); background: var(--sub-hl); padding: 0 3px; } /* 太字+メインカラー+ハイライト。グラデーションのマーカー線は PDF ビューアで黒筋が出るため全面塗りにする */
+.attn    { font-weight: 700; color: var(--accent); }                        /* 特に注目 (使用は全体の10%以下) */
+.attn-hl { font-weight: 700; color: var(--accent); background: var(--accent-hl); padding: 0 3px; }
+
+/* ---------- 表 (行の高さで縦を使い切る) ---------- */
+table { border-collapse: collapse; width: 100%; font-size: var(--fs-body); flex: 1; }
+th, td { padding: 16px 20px; text-align: left; vertical-align: middle; line-height: 1.6; }
+thead th { background: var(--main); color: #fff; font-weight: 700; }
+tbody tr { border-bottom: 1px solid var(--base-sub-dark); }
+tbody tr:nth-child(even) { background: var(--base-sub-light); }
+td .small-note { display: block; font-size: var(--fs-min); opacity: .7; }
+
+/* ---------- 図版プレースホルダ ---------- */
+.figure {
+  background: var(--base-sub-light);
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--base-sub-dark);
+  font-size: var(--fs-min);
+  flex: 1;
+  min-height: 0;
+}
+.figure img { max-width: 100%; max-height: 100%; }
+
+/* ---------- 2軸ポジショニングマップ (他社比較などで使用) ---------- */
+.matrix2x2 {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: var(--base-sub-light);
+  border-radius: 10px;
+  margin: 4px 8px 28px 44px; /* 軸ラベル用の余白 */
+}
+.matrix2x2::before, .matrix2x2::after { content: ""; position: absolute; background: var(--base-sub-dark); }
+.matrix2x2::before { left: 50%; top: 6%; bottom: 6%; width: 1px; } /* 縦の分割線 */
+.matrix2x2::after  { top: 50%; left: 6%; right: 6%; height: 1px; } /* 横の分割線 */
+.matrix-axis-x {
+  position: absolute; left: 50%; bottom: -26px; transform: translateX(-50%);
+  font-size: var(--fs-min); font-weight: 700; color: var(--base); white-space: nowrap;
+}
+.matrix-axis-y {
+  position: absolute; top: 50%; left: -34px; transform: translateY(-50%) rotate(-90deg);
+  font-size: var(--fs-min); font-weight: 700; color: var(--base); white-space: nowrap;
+}
+.matrix-point {
+  position: absolute; transform: translate(-50%, -50%);
+  display: flex; align-items: center; gap: 6px;
+  font-size: var(--fs-min); font-weight: 700; white-space: nowrap; color: var(--base);
+}
+.matrix-point .dot { width: 14px; height: 14px; border-radius: 50%; background: var(--main); flex: none; }
+.matrix-point.self { color: var(--accent); }
+.matrix-point.self .dot { background: var(--accent); width: 18px; height: 18px; }
+
+/* ---------- ウォーターフォール(ブリッジ)チャート (増減の内訳を示す) ---------- */
+.waterfall {
+  flex: 1; min-height: 0; position: relative;
+  display: flex; align-items: stretch; gap: 16px;
+  padding: 34px 20px 34px;
+}
+.waterfall::after { /* ベースライン */
+  content: ""; position: absolute; left: 20px; right: 20px; bottom: 34px;
+  height: 1px; background: var(--base-sub-dark);
+}
+.wf-col { flex: 1; position: relative; }
+.wf-col .bar { position: absolute; left: 4px; right: 4px; border-radius: 6px 6px 0 0; }
+.wf-col.total .bar { background: var(--base-sub-dark); }
+.wf-col.pos .bar { background: var(--main); }
+.wf-col.neg .bar { background: var(--accent); }
+.wf-col .value {
+  position: absolute; bottom: 100%; left: -14px; right: -14px; margin-bottom: 4px;
+  text-align: center; font-size: var(--fs-min); font-weight: 700; white-space: nowrap;
+}
+.wf-col.total .value { color: var(--base); }
+.wf-col.pos .value { color: var(--main); }
+.wf-col.neg .value { color: var(--accent); }
+.wf-col .label {
+  position: absolute; left: -20px; right: -20px; bottom: -28px;
+  text-align: center; font-size: var(--fs-min); font-weight: 700; color: var(--base); white-space: nowrap;
+}
+
+/* ---------- ファネル/TAM-SAM-SOM (市場・商談の逓減を示す) ---------- */
+.funnel { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 4px 0; }
+.funnel-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; }
+.funnel-stage .fs-head { display: flex; align-items: baseline; gap: 12px; }
+.funnel-stage .fs-label { font-size: var(--fs-body); font-weight: 700; color: var(--base); }
+.funnel-stage .fs-value { font-size: var(--fs-subhead); font-weight: 700; color: var(--main); white-space: nowrap; }
+.funnel-stage .fs-bar { height: 34px; background: var(--main); border-radius: 6px; width: 100%; max-width: 100%; } /* width はインラインで上書き指定 (例: width:62%) */
+.fs-conv { flex: none; text-align: center; font-size: var(--fs-min); font-weight: 700; color: var(--base-sub-dark); }
+
+/* ---------- レーダー(スパイダー)チャート (多軸の競合比較) ---------- */
+.radar { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.radar svg { width: auto; height: 100%; max-width: 100%; }
+.radar .grid-ring { fill: none; stroke: var(--base-sub-dark); stroke-width: 1; opacity: .5; }
+.radar .axis-line { stroke: var(--base-sub-dark); stroke-width: 1; opacity: .5; }
+.radar .axis-label { font-family: var(--font); font-size: 15px; font-weight: 700; fill: var(--base); }
+.radar .series-a { fill: var(--main); fill-opacity: .28; stroke: var(--main); stroke-width: 2.5; }
+.radar .series-b { fill: var(--base-sub-dark); fill-opacity: .22; stroke: var(--base-sub-dark); stroke-width: 2.5; }
+.radar-legend { flex: none; display: flex; justify-content: center; gap: 28px; padding-top: 6px; }
+.radar-legend .item { display: flex; align-items: center; gap: 8px; font-size: var(--fs-min); font-weight: 700; color: var(--base); }
+.radar-legend .sw { width: 14px; height: 14px; border-radius: 4px; }
+.radar-legend .sw.a { background: var(--main); }
+.radar-legend .sw.b { background: var(--base-sub-dark); }
+
+/* ---------- イシューツリー(MECE分解図) ---------- */
+.tree { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; }
+.tree-root {
+  flex: none; position: relative; background: var(--main); color: #fff; font-weight: 700;
+  padding: 14px 26px; border-radius: 8px; font-size: var(--fs-body); text-align: center;
+  margin-bottom: 20px; /* 接続線の分の隙間をflowで確保しておく(線自体はposition:absoluteで外に描く) */
+}
+/* position:absoluteで箱の外(下)に描く。display:blockのままだと箱の内側の子要素扱いになり、
+   青い背景の上に線が乗って見える(前後関係が崩れる)ため、必ずabsoluteで箱の外に出す */
+.tree-root::after {
+  content: ""; position: absolute; top: 100%; left: 50%;
+  width: 1px; height: 20px; background: var(--base-sub-dark);
+}
+.tree-level {
+  flex: 1; min-height: 0; width: 100%; display: flex; justify-content: center; gap: 20px;
+}
+.tree-branch { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; position: relative; padding-top: 20px; }
+/* 横の接続線は各branch自身の左右端(gapの半分だけ隣に食い込ませて継ぎ目なく繋ぐ)。
+   最初/最後のbranchだけ、自分の中心で止める(コンテナ端まで伸びる「宙に浮いた線」を防ぐ) */
+.tree-branch::before {
+  content: ""; position: absolute; top: 0; left: -10px; right: -10px; height: 1px; background: var(--base-sub-dark);
+}
+.tree-branch:first-child::before { left: 50%; }
+.tree-branch:last-child::before { right: 50%; }
+.tree-branch::after {
+  content: ""; position: absolute; top: 0; left: 50%; width: 1px; height: 20px; background: var(--base-sub-dark);
+}
+.tree-node {
+  flex: none; background: var(--base-sub-light); font-weight: 700; font-size: var(--fs-min);
+  padding: 10px 14px; border-radius: 8px; text-align: center;
+}
+.tree-leaves { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+.tree-leaf {
+  flex: 1; background: #fff; border: 1px solid var(--base-sub-dark); border-radius: 6px;
+  padding: 8px 12px; font-size: var(--fs-min); display: flex; align-items: center; justify-content: center; text-align: center;
+}
+
+/* ---------- KPIスタットタイル (実績サマリー) ---------- */
+.kpi-row { flex: 1; min-height: 0; display: flex; gap: 20px; }
+.kpi-tile {
+  flex: 1; min-height: 0; background: var(--base-sub-light); border-radius: 10px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  padding: 20px;
+}
+.kpi-tile .kpi-value { font-size: 40px; font-weight: 700; color: var(--main); line-height: 1; white-space: nowrap; }
+.kpi-tile .kpi-value .kpi-unit { font-size: 20px; margin-left: 2px; }
+.kpi-tile .kpi-label { font-size: var(--fs-min); font-weight: 700; color: var(--base); text-align: center; }
+.kpi-tile .kpi-delta { font-size: var(--fs-min); font-weight: 700; }
+.kpi-tile .kpi-delta.up { color: var(--main); }
+.kpi-tile .kpi-delta.down { color: var(--accent); }
+
+/* ---------- 優先度マトリクス (matrix2x2に象限ラベルを重ねる版) ---------- */
+.matrix2x2 .quad-label {
+  position: absolute; font-size: var(--fs-caption); font-weight: 700; color: var(--base-sub-dark);
+  opacity: .8; pointer-events: none;
+}
+
+/* ---------- 矢印・フロー (■と▼の組合せ禁止。三角のみ) ---------- */
+.flow { display: flex; align-items: stretch; gap: 0; flex: none; }
+.flow .step {
+  flex: 1; background: var(--main-sub); border-radius: 10px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 18px 12px; font-size: var(--fs-body); font-weight: 700; text-align: center;
+  line-height: 1.4;
+}
+.flow .step small { font-weight: 400; color: var(--base); margin-top: 4px; }
+.flow .arrow {
+  align-self: center; width: 0; height: 0; margin: 0 10px;
+  border-top: 12px solid transparent; border-bottom: 12px solid transparent;
+  border-left: 16px solid var(--main);
+}
+
+/* ---------- 2x2コンテンツグリッド (SWOT・PEST・アンゾフ成長マトリクス等、象限に文章を書く型) ---------- */
+/* matrix2x2は「点をプロットする」型、quad-gridは「象限そのものに文章を書く」型で使い分ける */
+.quad-grid {
+  flex: 1; min-height: 0; display: grid;
+  grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 14px;
+}
+.quad-cell {
+  background: var(--base-sub-light); border-radius: 10px; padding: 18px 22px;
+  display: flex; flex-direction: column; gap: 6px; min-height: 0;
+}
+.quad-cell .quad-head { font-size: var(--fs-subhead); font-weight: 700; display: flex; align-items: center; gap: 8px; }
+.quad-cell.q-pos .quad-head { color: var(--main); }
+.quad-cell.q-neg .quad-head { color: var(--accent); }
+.quad-cell ul li { font-size: var(--fs-min); }
+
+/* ---------- 5フォース分析 (中心=業界内競争、周囲4方向に力を配置。座標計算不要のグリッド固定レイアウト) ---------- */
+.forces {
+  flex: 1; min-height: 0; display: grid; gap: 14px;
+  grid-template-columns: 1fr 1.3fr 1fr; grid-template-rows: 1fr 1fr 1fr;
+  grid-template-areas: ".    top    ." "left center right" ".    bottom .";
+}
+.forces-center, .forces-item { border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; justify-content: center; gap: 4px; min-height: 0; }
+.forces-center { grid-area: center; background: var(--main); color: #fff; text-align: center; }
+.forces-center .forces-head { font-size: var(--fs-body); font-weight: 700; }
+.forces-item { background: var(--base-sub-light); }
+.forces-item.top { grid-area: top; } .forces-item.bottom { grid-area: bottom; }
+.forces-item.left { grid-area: left; } .forces-item.right { grid-area: right; }
+.forces-item .forces-head { font-size: var(--fs-min); font-weight: 700; color: var(--base); }
+.forces-item p, .forces-center p { font-size: var(--fs-min); line-height: 1.5; }
+
+/* ---------- STPフロー (Segmentation→Targeting→Positioningの3段プロセス。.boxを矢印で繋ぐ) ---------- */
+.stp-flow { flex: 1; min-height: 0; display: flex; align-items: stretch; gap: 0; }
+.stp-flow .box { flex: 1; min-width: 0; }
+.stp-flow .tri-arrow {
+  align-self: center; width: 0; height: 0; margin: 0 14px; flex: none;
+  border-top: 14px solid transparent; border-bottom: 14px solid transparent; border-left: 18px solid var(--main);
+}
+
+/* ---------- ビジネスモデルキャンバス (9ブロック。文言は名詞句で短く=文章を削って14px下限を守る) ---------- */
+.bmc-grid {
+  flex: 1; min-height: 0; display: grid; gap: 10px;
+  grid-template-columns: repeat(5, 1fr); grid-template-rows: 1fr 1fr 0.85fr;
+  grid-template-areas: "kp ka vp cr cs" "kp kr vp ch cs" "cost cost cost rev rev";
+}
+.bmc-cell { background: var(--base-sub-light); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; min-height: 0; }
+.bmc-cell .bmc-head { font-size: var(--fs-min); font-weight: 700; color: var(--main); }
+.bmc-cell ul li { font-size: var(--fs-min); margin-bottom: 2px; }
+.bmc-cell.kp { grid-area: kp; } .bmc-cell.ka { grid-area: ka; } .bmc-cell.vp { grid-area: vp; background: var(--main-sub); }
+.bmc-cell.cr { grid-area: cr; } .bmc-cell.cs { grid-area: cs; } .bmc-cell.kr { grid-area: kr; }
+.bmc-cell.ch { grid-area: ch; } .bmc-cell.cost { grid-area: cost; } .bmc-cell.rev { grid-area: rev; }
+
+/* ---------- ロードマップ/ガントチャート (行=施策・列=期間。バーの left%/width% はインラインで指定) ---------- */
+.gantt { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
+.gantt-header { flex: none; display: flex; padding-left: 190px; gap: 0; }
+.gantt-header span { flex: 1; text-align: center; font-size: var(--fs-min); font-weight: 700; color: var(--base-sub-dark); }
+.gantt-row { flex: 1; min-height: 0; display: flex; align-items: center; gap: 0; }
+.gantt-row .g-label { width: 190px; flex: none; font-size: var(--fs-body); font-weight: 700; padding-right: 14px; }
+.gantt-row .g-track { flex: 1; min-height: 0; position: relative; height: 36px; background: var(--base-sub-light); border-radius: 6px; }
+.gantt-row .g-bar {
+  position: absolute; top: 0; bottom: 0; background: var(--main); border-radius: 6px;
+  display: flex; align-items: center; justify-content: center; color: #fff;
+  font-size: var(--fs-min); font-weight: 700; white-space: nowrap; padding: 0 8px;
+}
+.gantt-row .g-bar.milestone { background: var(--accent); }
+
+/* ---------- RACIバッジ (表の中で使う丸バッジ。表自体は既存のtableをそのまま使う) ---------- */
+.raci-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 64px; height: 28px; padding: 0 10px; border-radius: 14px;
+  font-size: var(--fs-min); font-weight: 700; color: #fff; white-space: nowrap;
+}
+/* 中身は英字略号(R/A/C/I)でなく日本語ラベルを直書きする(凡例なしで意味が伝わるようにするため) */
+.raci-badge.r { background: var(--accent); }   /* 実行: 実行責任者 */
+.raci-badge.a { background: var(--main); }     /* 責任: 説明責任者 */
+.raci-badge.c { background: var(--sub-accent); color: var(--base); } /* 協力: 協業先 */
+.raci-badge.i { background: var(--base-sub-dark); color: var(--base); } /* 報告: 報告先。白文字だと 2.11:1 で読めないため濃色文字(7.17:1) */
+
+/* ---------- フローの強調ステップ (制度転換等、最終ステップだけ結論として目立たせたい時) ---------- */
+.flow .step.highlight { background: var(--sub-hl); }
+
+/* ---------- 積み上げ棒グラフ (複数カテゴリの内訳×時系列推移を示す) ---------- */
+.stack-bar { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 12px; }
+.sb-legend { flex: none; display: flex; gap: 24px; font-size: var(--fs-min); font-weight: 700; }
+.sb-legend-item { display: flex; align-items: center; gap: 6px; }
+.sb-swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; flex: none; }
+.sb-swatch.c1, .sb-seg.c1 { background: var(--chart-1); }
+.sb-swatch.c2, .sb-seg.c2 { background: var(--chart-2); }
+.sb-swatch.c3, .sb-seg.c3 { background: var(--chart-3); }
+.sb-swatch.c4, .sb-seg.c4 { background: var(--chart-4); }
+.stack-bar-chart { flex: 1; min-height: 0; display: flex; align-items: flex-end; gap: 28px; padding-top: 30px; }
+.sb-col { flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; align-items: center; }
+.sb-total { flex: none; font-size: var(--fs-subhead); font-weight: 700; color: var(--main); margin-bottom: 6px; white-space: nowrap; }
+.sb-bar { flex: 1; min-height: 0; width: 100%; max-width: 110px; display: flex; flex-direction: column-reverse; border-radius: 6px 6px 0 0; overflow: hidden; }
+.sb-seg { width: 100%; box-shadow: 0 -1px 0 0 #fff; } /* セグメント間に区切りを入れる(色差1.83:1だけに頼らない) */
+.sb-label { flex: none; margin-top: 8px; font-size: var(--fs-body); font-weight: 700; color: var(--base); }
+
+/* ---------- 基盤展開図 (土台となる1事業から複数事業が派生する構造を示す。tree(上→下)の逆版) ---------- */
+.foundation-diagram { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.fd-branches { flex: 1; min-height: 0; display: flex; gap: 20px; padding-bottom: 46px; }
+.fd-branch {
+  flex: 1; min-width: 0; position: relative;
+  background: var(--base-sub-light); border-radius: 10px; padding: 18px 20px;
+  display: flex; flex-direction: column; gap: 4px; align-items: center; text-align: center;
+}
+.fd-branch::after {
+  content: ""; position: absolute; bottom: -46px; left: 50%;
+  width: 1px; height: 46px; background: var(--base-sub-dark);
+}
+.fd-branch-title { font-size: var(--fs-body); font-weight: 700; }
+.fd-branch-value { font-size: var(--fs-subhead); font-weight: 700; color: var(--main); }
+.fd-branch-note { font-size: var(--fs-caption); color: var(--base-sub-dark); }
+.fd-connector-label {
+  position: absolute; bottom: -36px; left: 50%; transform: translateX(-50%);
+  font-size: var(--fs-caption); font-weight: 700; color: var(--main); white-space: nowrap;
+  background: #fff; padding: 0 6px;
+}
+.fd-base {
+  flex: none; background: var(--main); color: #fff; border-radius: 10px;
+  padding: 18px 26px; font-size: var(--fs-body); font-weight: 700; text-align: center;
+}
+.fd-base .fd-base-sub { font-weight: 400; font-size: var(--fs-min); opacity: .9; }
+
+/* ---------- フッター ----------
+   フローに置く（絶対配置禁止）。出典が長く2行に折り返しても本文に被らず、
+   本文側が溢れれば overflow 検査で検知できる。 */
+.slide-footer {
+  flex: none; margin-top: auto; padding-top: 12px;
+  display: flex; justify-content: space-between; align-items: flex-end;
+  font-size: var(--fs-caption); color: var(--base-sub-dark); gap: 40px;
+}
+.caption, .source { font-size: var(--fs-caption); color: var(--base-sub-dark); } /* 出典・キャプション (下限例外) */
+
+/* ---------- 表紙 ---------- */
+/* フッターの margin-top:auto と対で、先頭要素の margin-top:auto により本文を垂直センタリング */
+.slide.cover { padding: 60px 80px 24px; }
+.cover .cover-bar { margin-top: auto; }
+.cover .cover-title { font-size: var(--fs-cover); font-weight: 700; line-height: 1.35; }
+.cover .cover-sub { font-size: 22px; margin-top: 20px; }
+.cover .cover-meta { font-size: var(--fs-body); margin-top: 12px; color: var(--base-sub-dark); }
+.cover .cover-bar { width: 72px; height: 6px; background: var(--main); margin-bottom: 32px; }
+
+/* ---------- 扉 (章区切り) ---------- */
+.slide.chapter { padding: 60px 80px 24px; }
+.chapter .chapter-no { margin-top: auto; font-size: 22px; font-weight: 700; color: var(--main); letter-spacing: 0.12em; }
+.chapter .chapter-title { font-size: var(--fs-chapter); font-weight: 700; margin-top: 14px; line-height: 1.35; }
+.chapter .chapter-caption { font-size: 22px; color: var(--base-sub-dark); margin-top: 16px; }
+
+/* ---------- 印刷 (HTML→PDF 変換用) ---------- */
+@page { size: 1280px 720px; margin: 0; }
+@media print {
+  body { background: none; }
+  .slide { margin: 0; page-break-after: always; break-after: page; }
+}

@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0098EA">
+<meta name="color-scheme" content="light">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<title>Cypher Brain × ENSv2 — ETHGlobal Tokyo 2026 (ENS Prize, Track 2)</title>
+<meta name="description" content="A narrow, on-chain, revocable ENSv2 permission for the AI agent that updates Cypher Brain's encrypted second-brain pointer — nothing more. ETHGlobal Tokyo 2026, ENS Prize Continuity Track 2.">
+<link rel="canonical" href="https://masashi-ono0611.github.io/cypher-brain/ethglobal.html">
+
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Cypher Brain">
+<meta property="og:title" content="Cypher Brain × ENSv2 — ETHGlobal Tokyo 2026 (ENS Prize, Track 2)">
+<meta property="og:description" content="A narrow, on-chain, revocable ENSv2 permission for the AI agent that updates Cypher Brain's encrypted second-brain pointer — nothing more.">
+<meta property="og:url" content="https://masashi-ono0611.github.io/cypher-brain/ethglobal.html">
+<meta property="og:image" content="https://masashi-ono0611.github.io/cypher-brain/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Cypher Brain, with a cypherpunk hooded dog mascot in sunglasses">
+<meta property="og:locale" content="en_US">
+
+<!-- Twitter / X -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Cypher Brain × ENSv2 — ETHGlobal Tokyo 2026 (ENS Prize, Track 2)">
+<meta name="twitter:description" content="A narrow, on-chain, revocable ENSv2 permission for the AI agent that updates Cypher Brain's encrypted second-brain pointer — nothing more.">
+<meta name="twitter:image" content="https://masashi-ono0611.github.io/cypher-brain/og-image.png">
+<meta name="twitter:image:alt" content="Cypher Brain, with a cypherpunk hooded dog mascot in sunglasses">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --accent:#0098EA; --accent-deep:#0077C0; --accent-tint:#E6F6FE;
+    --ink:#11151A; --muted:#5B6B78; --faint:#65727C;
+    --line:#E4EAEF; --bg:#FFFFFF; --surface:#F5F9FC;
+    --green:#1A7F4B; --green-tint:#EAF6EF; --green-line:#BFE3CE;
+    --amber:#8A6D1B; --amber-tint:#FBF3DD; --amber-line:#E7D4A0;
+    --bad:#C0392B; --bad-tint:#FBECEA; --bad-line:#F0C9C3;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html{-webkit-font-smoothing:antialiased; scroll-behavior:smooth;}
+  body{
+    background:linear-gradient(180deg,#E8F6FE 0%,#FFFFFF 240px);
+    color:var(--ink);
+    font-family:"Geist","Noto Sans JP","Hiragino Sans",-apple-system,Arial,sans-serif;
+    line-height:1.6; font-size:16px;
+  }
+  .wrap{max-width:940px; margin:0 auto; padding:0 28px 100px;}
+  .mono{font-family:"Geist Mono",ui-monospace,Menlo,monospace;}
+
+  /* ---------- hero ---------- */
+  header{padding:72px 0 52px; border-bottom:1px solid var(--line);}
+  .hero-row{display:flex; align-items:center; gap:44px; flex-wrap:wrap;}
+  .hero-text{flex:1 1 440px; min-width:0;}
+  .hero-mascot{flex:0 0 auto; margin-left:auto;}
+  .hero-mascot img{display:block; width:172px; height:172px;}
+  @media(max-width:620px){ .hero-mascot{margin:0 auto;} .hero-mascot img{width:128px; height:128px;} }
+  .kicker{font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:12px; letter-spacing:.16em; text-transform:uppercase; color:var(--accent-deep); font-weight:600; margin-bottom:20px;}
+  h1{font-size:50px; font-weight:800; letter-spacing:-.03em; line-height:1.1; margin-bottom:22px;}
+  h1 .ac{color:var(--accent);}
+  .tagline{font-size:22px; font-weight:500; letter-spacing:-.015em; line-height:1.38; max-width:720px;}
+  .tagline strong{color:var(--accent); font-weight:700;}
+  .sub{font-size:16px; color:var(--muted); margin-top:18px; max-width:690px;}
+  .sub code{color:var(--accent-deep);}
+
+  /* ---------- section scaffold ---------- */
+  section{padding:58px 0; border-bottom:1px solid var(--line);}
+  section:last-of-type{border-bottom:none;}
+  .label{font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--faint); font-weight:600; margin-bottom:14px;}
+  .label .n{color:var(--accent-deep);}
+  h2{font-size:28px; font-weight:700; letter-spacing:-.02em; line-height:1.22; margin-bottom:14px;}
+  .lead{font-size:16.5px; color:var(--muted); max-width:760px;}
+  .lead strong{color:var(--ink); font-weight:600;}
+  code{font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:.85em; background:var(--surface); border:1px solid var(--line); border-radius:5px; padding:1px 5px; color:var(--accent-deep);}
+
+  /* ---------- diagram frame ---------- */
+  .fig{margin:30px 0 6px; background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:28px 24px;}
+  .fig svg{display:block; width:100%; height:auto;}
+  .fig-cap{font-size:12.5px; color:var(--faint); margin-top:14px; text-align:center; font-family:"Geist Mono",ui-monospace,Menlo,monospace;}
+  .svg-t{font-family:"Geist",-apple-system,sans-serif; font-size:13px; fill:var(--ink); font-weight:600;}
+  .svg-s{font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:10.5px; fill:var(--faint);}
+  .svg-l{font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:11.5px; fill:var(--muted);}
+  .svg-o{font-family:"Geist",-apple-system,sans-serif; font-size:13px; fill:var(--accent); font-weight:700;}
+  .svg-g{font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:11.5px; fill:var(--green); font-weight:700;}
+  .svg-r{font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:11.5px; fill:var(--bad); font-weight:700;}
+
+  /* ---------- pillars ---------- */
+  .pillars{display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:28px;}
+  .pillars.two-col{grid-template-columns:repeat(2,1fr);}
+  .pillar{border:1px solid var(--line); border-radius:12px; padding:18px; background:var(--bg);}
+  .pillar.hi{border-color:var(--accent); background:var(--accent-tint);}
+  .pillar.risk{border-color:var(--bad-line); background:var(--bad-tint);}
+  .pillar .pn{font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:11px; color:var(--faint); display:block; margin-bottom:4px; letter-spacing:.08em;}
+  .pillar .pt{font-size:16px; font-weight:700; margin-bottom:6px; letter-spacing:-.01em;}
+  .pillar .pt span{color:var(--accent);}
+  .pillar.risk .pt span{color:var(--bad);}
+  .pillar.hi .pt span{color:var(--green);}
+  .pillar .pd{font-size:13.5px; color:var(--muted); line-height:1.52;}
+  .pillar .pd b{color:var(--ink);}
+
+  /* ---------- stats ---------- */
+  .stats{display:grid; grid-template-columns:repeat(3,1fr); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:14px; overflow:hidden; margin-top:30px;}
+  .stat{background:var(--bg); padding:22px 20px;}
+  .stat .v{font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:34px; font-weight:600; letter-spacing:-.03em; line-height:1;}
+  .stat .v .u{font-size:14px; color:var(--faint); font-weight:500; margin-left:3px;}
+  .stat .k{font-size:13px; color:var(--muted); margin-top:9px; line-height:1.45;}
+  .stat.accent .v{color:var(--accent);}
+  .stat.bad .v{color:var(--bad);}
+  .stat.good .v{color:var(--green);}
+
+  .tag{display:inline-block; font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:11px; font-weight:700; padding:2px 8px; border-radius:6px; letter-spacing:.04em; vertical-align:middle; white-space:nowrap;}
+  .tag.good{background:var(--green-tint); color:var(--green); border:1px solid var(--green-line);}
+  .tag.warn{background:var(--amber-tint); color:var(--amber); border:1px solid var(--amber-line);}
+  .tag.bad{background:var(--bad-tint); color:var(--bad); border:1px solid var(--bad-line);}
+
+  table{width:100%; border-collapse:collapse; margin:26px 0 6px; font-size:14px; background:#fff; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
+  th,td{padding:11px 13px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top;}
+  th{background:var(--surface); color:var(--ink); font-size:12.5px; font-weight:700;}
+  td:first-child,th:first-child{font-weight:700;}
+  tr:last-child td{border-bottom:0;}
+  td a{color:var(--accent-deep);}
+
+  .legend{background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:14px 18px; font-size:13px; margin-top:18px; line-height:1.85; font-family:"Geist Mono",ui-monospace,Menlo,monospace;}
+  .legend .ok{color:var(--green);} .legend .no{color:var(--bad);}
+
+  /* ---------- footer ---------- */
+  footer{padding:46px 0 0;}
+  .foot-links{display:flex; flex-wrap:wrap; gap:10px 22px; font-family:"Geist Mono",ui-monospace,Menlo,monospace; font-size:13px;}
+  .foot-links a{color:var(--muted); text-decoration:none; border-bottom:1px solid var(--line); padding-bottom:1px;}
+  .foot-links a:hover{color:var(--accent); border-color:var(--accent);}
+  .foot-note{font-size:12.5px; color:var(--faint); margin-top:24px; font-family:"Geist Mono",ui-monospace,Menlo,monospace; line-height:1.7;}
+
+  @media(max-width:720px){
+    h1{font-size:36px;} .tagline{font-size:18px;} h2{font-size:23px;}
+    .pillars,.pillars.two-col,.stats{grid-template-columns:1fr;}
+    table{font-size:12.5px;} th,td{padding:9px 8px;}
+    .fig{padding:16px 12px; overflow-x:auto;}
+    .fig svg{width:660px;}
+  }
+  @media print{ *{ -webkit-print-color-adjust:exact !important; print-color-adjust:exact !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ============ HERO ============ -->
+  <header>
+    <div class="hero-row">
+      <div class="hero-text">
+        <div class="kicker">Cypher Brain · ETHGlobal Tokyo 2026 · ENS Prize — Continuity Track, Track 2</div>
+        <h1>Give your AI agent <span class="ac">only what it needs</span>.<br>Nothing more.</h1>
+        <p class="tagline">A stolen agent key should never be able to touch your funds &mdash; or anything outside the one job it was given.</p>
+        <p class="sub">Cypher Brain already encrypts a personal &ldquo;second brain&rdquo; and publishes a pointer to it every night, run by an AI agent. This submission adds <strong>ENSv2 Enhanced Access Control</strong> so that agent holds a narrow, on-chain, revocable permission for exactly one field &mdash; not the owner's wallet.</p>
+      </div>
+      <div class="hero-mascot"><img src="mascot.svg" width="172" height="172" alt="Cypher Brain mascot — a cypherpunk hooded dog in sunglasses"></div>
+    </div>
+    <div class="stats">
+      <div class="stat bad"><div class="v">1<span class="u">key</span></div><div class="k">What the agent wallet is granted &mdash; one text-record field, nothing else</div></div>
+      <div class="stat accent"><div class="v">3</div><div class="k">Independent keys granted, written, and verified live on Sepolia</div></div>
+      <div class="stat good"><div class="v">0</div><div class="k">Spending permission ever given to the agent wallet</div></div>
+    </div>
+  </header>
+
+  <!-- ============ 01 BACKGROUND ============ -->
+  <section>
+    <div class="label"><span class="n">01</span> &nbsp;Background</div>
+    <h2>A second brain that updates itself, every night</h2>
+    <p class="lead"><strong>gbrain</strong> is a personal knowledge base that records conversations, decisions, and things learned, automatically, every day. <strong>Cypher Brain</strong> &mdash; an existing open-source project this submission extends &mdash; encrypts gbrain's contents into one sealed file, stores the ciphertext, and publishes a pointer saying &ldquo;this is the latest version.&rdquo; All three steps run nightly, driven by an AI agent, not a human.</p>
+
+    <div class="fig">
+      <svg viewBox="0 0 760 150" role="img" aria-label="Three-step nightly flow: encrypt gbrain into one file, store the ciphertext, then publish a pointer to the latest version">
+        <rect x="16" y="34" width="216" height="70" rx="10" fill="#fff" stroke="#E4EAEF"/>
+        <text x="124" y="64" text-anchor="middle" class="svg-t">1 &middot; Encrypt</text>
+        <text x="124" y="84" text-anchor="middle" class="svg-s">seal gbrain into one file</text>
+
+        <rect x="272" y="34" width="216" height="70" rx="10" fill="#fff" stroke="#E4EAEF"/>
+        <text x="380" y="64" text-anchor="middle" class="svg-t">2 &middot; Store</text>
+        <text x="380" y="84" text-anchor="middle" class="svg-s">upload ciphertext to a backend</text>
+
+        <rect x="528" y="34" width="216" height="70" rx="10" fill="#E6F6FE" stroke="#0098EA" stroke-width="1.6"/>
+        <text x="636" y="64" text-anchor="middle" class="svg-t" style="fill:#0077C0">3 &middot; Publish pointer</text>
+        <text x="636" y="84" text-anchor="middle" class="svg-s" style="fill:#0077C0">this is where ENSv2 comes in</text>
+
+        <defs><marker id="bg-ar" markerWidth="9" markerHeight="9" refX="5" refY="4" orient="auto"><path d="M1 1 L6 4 L1 7" fill="none" stroke="#5B6B78" stroke-width="1.5"/></marker></defs>
+        <path d="M232 69 L272 69" fill="none" stroke="#5B6B78" stroke-width="1.5" marker-end="url(#bg-ar)"/>
+        <path d="M488 69 L528 69" fill="none" stroke="#0098EA" stroke-width="1.8" marker-end="url(#bg-ar)"/>
+
+        <text x="380" y="128" text-anchor="middle" class="svg-l">runs every night, driven by an AI agent &mdash; not a human</text>
+      </svg>
+      <div class="fig-cap">The agent has to be trusted with step 3. That trust is exactly where the problem starts.</div>
+    </div>
+  </section>
+
+  <!-- ============ 02 PROBLEM ============ -->
+  <section>
+    <div class="label"><span class="n">02</span> &nbsp;Problem</div>
+    <h2>There was no good way to hand an agent this one job</h2>
+    <p class="lead">Giving an agent the authority to publish a pointer, without giving it authority over anything else, had no verifiable answer &mdash; until ENSv2's Enhanced Access Control.</p>
+
+    <table>
+      <thead><tr><th style="width:20%;">Approach</th><th style="width:40%;">How it works</th><th style="width:40%;">The problem</th></tr></thead>
+      <tbody>
+        <tr><td>Share the owner's key</td><td>Give the agent the owner's own wallet key</td><td><span class="tag bad">risk</span> &nbsp;the agent can now sign as the owner, including spending funds</td></tr>
+        <tr><td>Centralized server</td><td>Put a database behind a server with an API key</td><td><span class="tag warn">weak</span> &nbsp;the server can go down or censor requests, and outsiders cannot verify the key is really limited to one field</td></tr>
+        <tr><td>ENSv2 Enhanced Access Control</td><td>Grant the agent wallet a role scoped to one text-record key, on the name's existing Permissioned Resolver</td><td><span class="tag good">this submission</span> &nbsp;a permission limited to one field, provable on-chain by anyone</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============ 03 SOLUTION ============ -->
+  <section>
+    <div class="label"><span class="n">03</span> &nbsp;Solution</div>
+    <h2>Two wallets, one narrow permission, proven both ways</h2>
+    <p class="lead">The owner uses their real wallet once, to grant a separate agent wallet a role for exactly one text-record key. No custom smart contract &mdash; this uses only what ENSv2 already provides.</p>
+
+    <div class="fig">
+      <svg viewBox="0 0 760 150" role="img" aria-label="Owner wallet grants the agent wallet a role for one text key via ens-setup; the agent wallet alone then writes and verifies that key">
+        <rect x="16" y="34" width="220" height="76" rx="10" fill="#fff" stroke="#E4EAEF"/>
+        <text x="126" y="60" text-anchor="middle" class="svg-t">Owner wallet</text>
+        <text x="126" y="79" text-anchor="middle" class="svg-s">the real key</text>
+        <text x="126" y="94" text-anchor="middle" class="svg-s">used once &middot; never saved to disk</text>
+
+        <path d="M236 72 L322 72" fill="none" stroke="#0098EA" stroke-width="1.8" marker-end="url(#sol-ar)"/>
+        <text x="279" y="56" text-anchor="middle" class="svg-o" style="font-size:11.5px;">ens-setup</text>
+
+        <rect x="326" y="34" width="220" height="76" rx="10" fill="#E6F6FE" stroke="#0098EA" stroke-width="1.6"/>
+        <text x="436" y="60" text-anchor="middle" class="svg-t" style="fill:#0077C0">Agent wallet</text>
+        <text x="436" y="79" text-anchor="middle" class="svg-s" style="fill:#0077C0">generated by cypher-brain</text>
+        <text x="436" y="94" text-anchor="middle" class="svg-s" style="fill:#0077C0">handles daily updates alone</text>
+
+        <path d="M546 72 L632 72" fill="none" stroke="#1A7F4B" stroke-width="1.8" marker-end="url(#sol-ok)"/>
+        <text x="589" y="56" text-anchor="middle" class="svg-g" style="font-size:11px;">ens-set-text</text>
+
+        <rect x="636" y="34" width="108" height="76" rx="10" fill="#fff" stroke="#BFE3CE"/>
+        <text x="690" y="60" text-anchor="middle" class="svg-t">Text record</text>
+        <text x="690" y="79" text-anchor="middle" class="svg-s">masa-brain</text>
+        <text x="690" y="94" text-anchor="middle" class="svg-s">= brain pointer</text>
+
+        <defs>
+          <marker id="sol-ar" markerWidth="9" markerHeight="9" refX="5" refY="4" orient="auto"><path d="M1 1 L6 4 L1 7" fill="none" stroke="#0098EA" stroke-width="1.6"/></marker>
+          <marker id="sol-ok" markerWidth="9" markerHeight="9" refX="5" refY="4" orient="auto"><path d="M1 1 L6 4 L1 7" fill="none" stroke="#1A7F4B" stroke-width="1.6"/></marker>
+        </defs>
+        <text x="380" y="132" text-anchor="middle" class="svg-l">the owner is not involved again &mdash; routine updates use the agent key only</text>
+      </svg>
+      <div class="fig-cap"><code>ens-verify</code> then checks both directions: the value matches (positive), and a write to a different key reverts on-chain (negative).</div>
+    </div>
+
+    <div class="legend">
+      <span class="ok">PASS</span> positive: masashi-ono0611 text record 'masa-brain' matches --expected-value<br>
+      <span class="ok">PASS</span> negative: out-of-scope text key 'masa-brain.scope-probe' reverted with <code>EACUnauthorizedAccountRoles</code><br>
+      ENS scope verification: <span class="ok">PASS</span> &mdash; the negative check was simulated; no transaction was broadcast
+    </div>
+  </section>
+
+  <!-- ============ 04 BLAST RADIUS ============ -->
+  <section>
+    <div class="label"><span class="n">04</span> &nbsp;What this makes possible</div>
+    <h2>Even a stolen agent key is contained</h2>
+    <p class="lead">If the agent wallet were ever compromised, here is everything it can &mdash; and cannot &mdash; do. This boundary is verifiable by anyone; it is not our word for it.</p>
+
+    <div class="pillars two-col">
+      <div class="pillar hi"><div class="pt"><span>&check;</span> Update one text key</div><div class="pd">The single key it was granted &mdash; nothing wider.</div></div>
+      <div class="pillar risk"><div class="pt"><span>&cross;</span> Move funds</div><div class="pd">No spending permission exists on the agent wallet.</div></div>
+      <div class="pillar risk"><div class="pt"><span>&cross;</span> Write other text keys</div><div class="pd">Reverts on-chain with <code>EACUnauthorizedAccountRoles</code> &mdash; proven live.</div></div>
+      <div class="pillar risk"><div class="pt"><span>&cross;</span> Act as the owner</div><div class="pd">The owner's real key is never shared or persisted.</div></div>
+    </div>
+  </section>
+
+  <!-- ============ 05 LIVE DEMO EVIDENCE ============ -->
+  <section>
+    <div class="label"><span class="n">05</span> &nbsp;Live demo evidence</div>
+    <h2>Not a simulation &mdash; run for real, on Sepolia</h2>
+    <p class="lead">Every step below actually happened on the Sepolia testnet, on the fresh ENSv2 redeployment (tag <code>sepolia-deployment-2026-09-15</code>), for the name <code>masashi-ono0611.eth</code>.</p>
+
+    <table>
+      <thead><tr><th style="width:34%;">Step</th><th style="width:66%;">Transaction</th></tr></thead>
+      <tbody>
+        <tr><td>Register ENS name</td><td><a href="https://sepolia.etherscan.io/tx/0x792e25195e32f096e5bc8d0486a2a36fbc9de8eb051e2bdb6a30ba81cf9aed1d">commit</a> &middot; <a href="https://sepolia.etherscan.io/tx/0x93909f43c0e58642b5c651e85cdfe64dbc56783dd1f8487a83539174865c6fbb">register</a></td></tr>
+        <tr><td>Deploy Permissioned Resolver</td><td>via ENS <code>VerifiableFactory</code> at <code>0xFe544BFED75001379E01434951623Ea80FbDb3CF</code> &middot; <a href="https://sepolia.etherscan.io/tx/0x92a4dece440260206a548ad0fa6b53c3b7eea15dcf8e3d990565f92baf4dec32">tx</a></td></tr>
+        <tr><td>Grant &mdash; <code>masa-brain</code></td><td><a href="https://sepolia.etherscan.io/tx/0x2b9124bba063e0bb1b03d47093538f9e20e2b094f59fa6309deb00c0f256aac0">ens-setup tx</a></td></tr>
+        <tr><td>Grant &mdash; <code>agent-context</code></td><td><a href="https://sepolia.etherscan.io/tx/0x1ff5cd8229aeb192869185e5664b99646809e37256b973ede82c49b9509a9b8d">ens-setup tx</a></td></tr>
+        <tr><td>Grant &mdash; <code>agent-endpoint[mcp]</code></td><td><a href="https://sepolia.etherscan.io/tx/0x37abc554efa4160fcd975f9a1ed4629f62432718b5d6931d5a34abc48bb6d445">ens-setup tx</a></td></tr>
+        <tr><td>Pointer publish (agent wallet only)</td><td><code>push --backend file</code> then <code>ens-set-text</code> &middot; <a href="https://sepolia.etherscan.io/tx/0x48386ea6e1b1d5ffbf83ed0406a0abecb1456003408cc14bfcb96826b38a7d8d">tx</a></td></tr>
+        <tr><td>ENSIP-26 &mdash; <code>agent-context</code> written</td><td><a href="https://sepolia.etherscan.io/tx/0xce264cb187212dcd406ddcfa65c92decf41856deee5ab0264bbb0c474ee36d0f">tx</a> &middot; passes ens-verify positive/negative</td></tr>
+        <tr><td>ENSIP-26 &mdash; <code>agent-endpoint[mcp]</code> written</td><td><a href="https://sepolia.etherscan.io/tx/0x2cbdf516b6909b652721752fdc238def6914a888dd977288ef982aeca67a53e8">tx</a> &middot; passes ens-verify positive/negative</td></tr>
+      </tbody>
+    </table>
+    <p class="lead" style="margin-top:16px; font-size:14px;">This demo used the free local <code>file</code> storage backend, so it proves the ENS write/scope mechanics, not public retrieval of the encrypted snapshot &mdash; a paid backend (Arweave/Turbo/TON) makes the ciphertext publicly fetchable by anyone with the locator, with no change to the ENS delegation logic.</p>
+  </section>
+
+  <!-- ============ 06 WHAT'S NEXT ============ -->
+  <section>
+    <div class="label"><span class="n">06</span> &nbsp;What's next</div>
+    <h2>One permission foundation, many brain slices</h2>
+    <p class="lead">The permission model is per text-key, not per name &mdash; it already generalizes. Once gbrain can export one encrypted snapshot per use case, each slice (work, travel, a private brain) can get its own independent grant and its own agent wallet, using only what was built here.</p>
+  </section>
+
+  <!-- ============ FOOTER ============ -->
+  <footer>
+    <div class="foot-links">
+      <a href="index.html">&larr; Cypher Brain</a>
+      <a href="https://github.com/Masashi-Ono0611/cypher-brain">cypher-brain on GitHub</a>
+      <a href="https://github.com/Masashi-Ono0611/cypher-brain/issues/972">ENS Track 2 Epic (#972)</a>
+      <a href="https://explorer.ens.dev">ENSv2 Sepolia explorer</a>
+    </div>
+    <div class="foot-note">Cypher Brain × ENSv2 &middot; ETHGlobal Tokyo 2026, ENS Prize Continuity Track 2 &middot; team: Cypher Brain</div>
+  </footer>
+
+</div>
+</body>
+</html>

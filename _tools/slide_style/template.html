@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<!-- htmlslide-craft version: 27 -->
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>スライドテンプレート（HTML版）</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="slide_style.css">
+</head>
+<body>
+
+<!-- ============ 1. 表紙（外部向け） ============ -->
+<section class="slide cover">
+  <div class="cover-bar"></div>
+  <h1 class="cover-title">資料タイトル</h1>
+  <p class="cover-sub">サブタイトル（不要なら削除）</p>
+  <p class="cover-meta">Recent Update：YYYY.MM.DD　株式会社〇〇</p>
+  <footer class="slide-footer"><span>©[Company] Inc.</span></footer>
+</section>
+
+<!-- ============ 2. 扉（章区切り） ============ -->
+<section class="slide chapter">
+  <p class="chapter-no">01&nbsp;&nbsp;CHAPTER TITLE</p>
+  <h2 class="chapter-title">章タイトル</h2>
+  <p class="chapter-caption">英題・副題・リード文等</p>
+  <footer class="slide-footer"><span>©[Company] Inc.</span></footer>
+</section>
+
+<!-- ============ 3. 本文（3カラム + キーメッセージ帯） ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>このスライドで言いたいことを1文で書く</h2>
+    <p class="lead">リード文。スライドの結論を1〜2行で書く。<span class="em-hl">最重要の一節はこの強調</span>を使い、<span class="attn">特に注意を引きたい語のみアクセント色</span>にする。</p>
+  </header>
+  <div class="slide-body">
+    <div class="cols">
+      <div class="box">
+        <span class="num">1</span>
+        <p class="subhead subhead-main">小見出し</p>
+        <p>本文は17px（12.75pt）。読ませる文字は最低でも14px（10.5pt）を下回らない。1カラムあたり4〜6行を目安に書き、下が空くなら文章量か文字サイズを増やす。</p>
+        <p class="note">※ 補足は箱の底に沈む（.note）。空白を締める役割も持つ</p>
+      </div>
+      <div class="box">
+        <span class="num">2</span>
+        <p class="subhead subhead-main">小見出し</p>
+        <p>カラムは「塗：ベースサブ淡／線：なし」で、縦いっぱいに伸ばす。黒線や青線でオブジェクトを囲まない。番号バッジは3カラムの視覚アンカーとして使う。</p>
+        <p class="note">※ バッジ不要なら .num を削除してよい</p>
+      </div>
+      <div class="box">
+        <span class="num">3</span>
+        <p class="subhead subhead-main">小見出し</p>
+        <p>箇条書きはプレーンな中黒。絵文字をビュレットに使わない。強調は1スライド2〜3箇所に絞り、色数を増やさない。</p>
+        <p class="note">※ 4カラム以上に割らない（文字が小さくなるため）</p>
+      </div>
+    </div>
+    <div class="takeaway">スライドの結論をもう一度、帯で言い切る（<span class="attn">最重要語のみアクセント</span>）</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>3</span></footer>
+</section>
+
+<!-- ============ 4. 本文（図版 + テキスト 2カラム） ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>図版とテキストの2カラム構成</h2>
+    <p class="lead">図版は左、論点は右が基本。図版は本文エリアの縦を使い切る大きさにする。</p>
+  </header>
+  <div class="slide-body">
+    <div class="cols">
+      <div class="figure">図版挿入（img を置く）</div>
+      <div style="display:flex; flex-direction:column; gap:16px;">
+        <p class="subhead">小見出し</p>
+        <div class="flow">
+          <div class="step">工程A<small>期間</small></div><div class="arrow"></div>
+          <div class="step">工程B<small>期間</small></div><div class="arrow"></div>
+          <div class="step highlight">結論となる工程C<small>期間</small></div>
+        </div>
+        <!-- 最終ステップだけ結論として目立たせたい時は .step.highlight を付ける(制度転換の図解等) -->
+        <p>ポイントを述べる。数字の出典は算定根拠ファイルにトレースできること。</p>
+        <div class="box" style="flex:1;">
+          <p class="subhead subhead-main" style="font-size:17px;">補足ブロック</p>
+          <ul>
+            <li>右カラムの余りはこの箱で埋める</li>
+            <li>相手に依頼する事項などを書く</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="takeaway">図版スライドも帯で締める</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.　出典：〇〇（YYYY-MM 時点）</span><span>4</span></footer>
+</section>
+
+<!-- ============ 5. 本文（表） ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>比較・一覧は表で示す</h2>
+    <p class="lead">ヘッダ行はメインカラー。4〜6行で本文エリアの縦を使い切る（2〜3行なら表以外の見せ方を検討）。</p>
+  </header>
+  <div class="slide-body">
+    <table>
+      <thead><tr><th style="width:20%;">項目</th><th style="width:40%;">選択肢A</th><th style="width:40%;">選択肢B</th></tr></thead>
+      <tbody>
+        <tr><td><strong>観点1</strong></td><td>内容<span class="small-note">補足を書いてセルの密度を上げる</span></td><td>内容</td></tr>
+        <tr><td><strong>観点2</strong></td><td>内容</td><td><span class="em">優位な方を強調</span></td></tr>
+        <tr><td><strong>観点3</strong></td><td>内容</td><td>内容</td></tr>
+        <tr><td><strong>観点4</strong></td><td>内容</td><td>内容</td></tr>
+      </tbody>
+    </table>
+    <div class="takeaway">表から言えることを帯で言い切る</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>5</span></footer>
+</section>
+
+<!-- ============ 6. 本文（2軸ポジショニングマップ） ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>競合との位置関係は2軸マップで一目で示す</h2>
+    <p class="lead">縦横の軸は「相手にとって意味のある評価軸」を選ぶ。自社は必ず有利な象限（右上が基本）に配置する。</p>
+  </header>
+  <div class="slide-body">
+    <div class="matrix2x2">
+      <span class="matrix-axis-x">軸Xの高い方 →</span>
+      <span class="matrix-axis-y">軸Yの高い方 →</span>
+      <div class="matrix-point self" style="left:78%; top:22%;"><span class="dot"></span>自社</div>
+      <div class="matrix-point" style="left:30%; top:35%;"><span class="dot"></span>競合A</div>
+      <div class="matrix-point" style="left:60%; top:68%;"><span class="dot"></span>競合B</div>
+      <div class="matrix-point" style="left:20%; top:78%;"><span class="dot"></span>競合C</div>
+    </div>
+    <div class="takeaway">自社が位置する象限の意味を、帯で一文にして言い切る</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>6</span></footer>
+</section>
+
+<!-- ============ 7. 本文（ウォーターフォール/ブリッジチャート） ============ -->
+<!--
+  数値例: 前年100 → 新規+30 → 解約-15 → 単価改定+10 → 当年125
+  スケール(max_scale)は起点・終点や累計の最大値より少し大きい 140 に設定(=一番高い棒が最大でも100%を超えない)。
+  各棒の height% = |値| / max_scale * 100。
+  起点・終点(total)は bottom:0%。
+  増加(pos)棒は bottom: 変化前累計/max_scale*100%、height: 増分/max_scale*100%。
+  減少(neg)棒は bottom: 変化後累計/max_scale*100%(=低い方)、height: 減少分/max_scale*100%。
+  累計の推移: 100 →(+30)→ 130 →(-15)→ 115 →(+10)→ 125
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>増減の内訳はウォーターフォールチャートで示す</h2>
+    <p class="lead">起点・終点は total(灰色)、増加は pos(メイン色)、減少は neg(アクセント色)で塗り分ける。</p>
+  </header>
+  <div class="slide-body">
+    <div class="waterfall">
+      <div class="wf-col total">
+        <div class="bar" style="bottom:0%; height:71%;"><span class="value">100</span></div>
+        <span class="label">前年実績</span>
+      </div>
+      <div class="wf-col pos">
+        <div class="bar" style="bottom:71%; height:22%;"><span class="value">+30</span></div>
+        <span class="label">新規獲得</span>
+      </div>
+      <div class="wf-col neg">
+        <div class="bar" style="bottom:82%; height:11%;"><span class="value">−15</span></div>
+        <span class="label">解約</span>
+      </div>
+      <div class="wf-col pos">
+        <div class="bar" style="bottom:82%; height:7%;"><span class="value">+10</span></div>
+        <span class="label">単価改定</span>
+      </div>
+      <div class="wf-col total">
+        <div class="bar" style="bottom:0%; height:89%;"><span class="value">125</span></div>
+        <span class="label">当年実績</span>
+      </div>
+    </div>
+    <div class="takeaway">新規獲得が解約を上回り、単価改定と合わせて<span class="attn">前年比+25%</span>で着地</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>7</span></footer>
+</section>
+
+<!-- ============ 8. 本文（ファネル / TAM-SAM-SOM） ============ -->
+<!--
+  各段の .fs-bar の width% は、一番上の段を基準(100%)にした相対値。
+  例: TAM 500億(基準・100%) → SAM 310億(500の62% → width:62%) → SOM 90億(500の18% → width:18%)
+  .fs-conv には「1つ上の段に対する遷移率」を書く(310/500=62%、90/310≈29%)。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>市場規模・商談の絞り込みはファネルで示す</h2>
+    <p class="lead">各段の帯の長さは、一番上の段を基準にした相対値。遷移率は1つ上の段に対する割合を書く。</p>
+  </header>
+  <div class="slide-body">
+    <div class="funnel">
+      <div class="funnel-stage">
+        <div class="fs-head"><span class="fs-label">認知層（TAM）</span><span class="fs-value">¥500億</span></div>
+        <div class="fs-bar" style="width:100%;"></div>
+      </div>
+      <div class="fs-conv">↓ 62%</div>
+      <div class="funnel-stage">
+        <div class="fs-head"><span class="fs-label">商談化（SAM）</span><span class="fs-value">¥310億</span></div>
+        <div class="fs-bar" style="width:62%;"></div>
+      </div>
+      <div class="fs-conv">↓ 29%</div>
+      <div class="funnel-stage">
+        <div class="fs-head"><span class="fs-label">獲得可能（SOM）</span><span class="fs-value">¥90億</span></div>
+        <div class="fs-bar" style="width:18%;"></div>
+      </div>
+    </div>
+    <div class="takeaway">まずは<span class="attn">SOM ¥90億</span>の獲得を初年度ターゲットとする</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>8</span></footer>
+</section>
+
+<!-- ============ 9. 本文（レーダー/スパイダーチャート） ============ -->
+<!--
+  5軸レーダーチャートの座標計算式(viewBox 440x380、中心(220,200)、最大半径150px)。
+  5軸の方向単位ベクトル(上から時計回り、あらかじめ計算済み。軸数を変える場合は作り直しが必要):
+    軸1(真上):        dx= 0.000, dy=-1.000
+    軸2(右上):        dx= 0.951, dy=-0.309
+    軸3(右下):        dx= 0.588, dy= 0.809
+    軸4(左下):        dx=-0.588, dy= 0.809
+    軸5(左上):        dx=-0.951, dy=-0.309
+  データ点のSVG座標 = 中心 + 方向ベクトル × (値÷満点) × 最大半径150
+  例(自社・軸1「非保管性」95点/100点満点): x=220+0.000×0.95×150=220, y=200-1.000×0.95×150=57.5 → (220,58)
+  背景の同心五角形グリッド(20/40/60/80/100%)・軸線・軸ラベルは固定なので座標を変更しない。
+  変更してよいのは <polygon class="series-a">/<polygon class="series-b"> の points と、凡例・軸ラベルの文言のみ。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>多軸の強み比較はレーダーチャートで示す</h2>
+    <p class="lead">軸は相手の意思決定に関わる評価項目を選ぶ。塗りつぶし面積の広さで優位性が一目で伝わる。</p>
+  </header>
+  <div class="slide-body">
+    <div class="radar">
+      <svg viewBox="-40 0 520 380" xmlns="http://www.w3.org/2000/svg">
+        <polygon class="grid-ring" points="220,50 363,154 308,321 132,321 77,154" />
+        <polygon class="grid-ring" points="220,80 334,163 291,297 149,297 106,163" />
+        <polygon class="grid-ring" points="220,110 306,172 273,273 167,273 134,172" />
+        <polygon class="grid-ring" points="220,140 277,181 255,249 185,249 163,181" />
+        <polygon class="grid-ring" points="220,170 249,191 238,224 202,224 191,191" />
+        <line class="axis-line" x1="220" y1="200" x2="220" y2="50" />
+        <line class="axis-line" x1="220" y1="200" x2="363" y2="154" />
+        <line class="axis-line" x1="220" y1="200" x2="308" y2="321" />
+        <line class="axis-line" x1="220" y1="200" x2="132" y2="321" />
+        <line class="axis-line" x1="220" y1="200" x2="77" y2="154" />
+        <polygon class="series-b" points="220,110 263,186 269,267 167,273 149,177" />
+        <polygon class="series-a" points="220,58 348,158 282,285 145,303 113,165" />
+        <text class="axis-label" x="220" y="26" text-anchor="middle">非保管性</text>
+        <text class="axis-label" x="399" y="138" text-anchor="start">日本語対応</text>
+        <text class="axis-label" x="331" y="358" text-anchor="middle">料金の低さ</text>
+        <text class="axis-label" x="109" y="358" text-anchor="middle">SLA充実度</text>
+        <text class="axis-label" x="41" y="138" text-anchor="end">導入スピード</text>
+      </svg>
+    </div>
+    <div class="radar-legend">
+      <span class="item"><span class="sw a"></span>自社</span>
+      <span class="item"><span class="sw b"></span>競合平均</span>
+    </div>
+    <div class="takeaway">自社は5軸すべてで<span class="attn">競合平均を上回る</span></div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>9</span></footer>
+</section>
+
+<!-- ============ 10. 本文（イシューツリー/MECE分解図） ============ -->
+<!--
+  ルートの論点を、重複・漏れのない(MECE)3つの下位論点に分解し、各下位論点を裏付ける事実を2つずつ添える。
+  下位論点は2〜4個が目安(5個以上は横に潰れて読みにくくなる)。各下位論点の事実は1〜3個が目安。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>論点の分解はイシューツリーで示す</h2>
+    <p class="lead">ルートの論点を、重複・漏れのない下位論点に分解し、それぞれを裏付ける事実を添える。</p>
+  </header>
+  <div class="slide-body">
+    <div class="tree">
+      <div class="tree-root">論点：ステーキング事業へ新規参入すべきか</div>
+      <div class="tree-level">
+        <div class="tree-branch">
+          <div class="tree-node">市場は十分魅力的か</div>
+          <div class="tree-leaves">
+            <div class="tree-leaf">TAM ¥1,000億、年成長率+25%</div>
+            <div class="tree-leaf">競合の対応はまだ手薄</div>
+          </div>
+        </div>
+        <div class="tree-branch">
+          <div class="tree-node">自社に勝ち筋があるか</div>
+          <div class="tree-leaves">
+            <div class="tree-leaf">Non-Custodial設計の優位性</div>
+            <div class="tree-leaf">国内唯一水準の日本語サポート</div>
+          </div>
+        </div>
+        <div class="tree-branch">
+          <div class="tree-node">実行可能か</div>
+          <div class="tree-leaves">
+            <div class="tree-leaf">初期費用ゼロで導入障壁が低い</div>
+            <div class="tree-leaf">1か月以内に運用開始可能</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="takeaway">3つの下位論点すべてが肯定的 → <span class="attn">新規参入を推奨</span></div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>10</span></footer>
+</section>
+
+<!-- ============ 11. 本文（KPIスタットタイル） ============ -->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>実績サマリーはKPIタイルで示す</h2>
+    <p class="lead">主要指標を3〜4枚のタイルに絞る(5枚以上は1枚ずつが小さくなり読みにくい)。</p>
+  </header>
+  <div class="slide-body">
+    <div class="kpi-row">
+      <div class="kpi-tile">
+        <span class="kpi-value">18<span class="kpi-unit">行</span></span>
+        <span class="kpi-label">導入金融機関数</span>
+        <span class="kpi-delta up">前年比 +6行</span>
+      </div>
+      <div class="kpi-tile">
+        <span class="kpi-value">112<span class="kpi-unit">百万円</span></span>
+        <span class="kpi-label">年間ステーキング収益</span>
+        <span class="kpi-delta up">前年比 +40%</span>
+      </div>
+      <div class="kpi-tile">
+        <span class="kpi-value">165<span class="kpi-unit">億円</span></span>
+        <span class="kpi-label">預入資産残高(AUM)</span>
+        <span class="kpi-delta up">前年比 +37%</span>
+      </div>
+      <div class="kpi-tile">
+        <span class="kpi-value">99.9<span class="kpi-unit">%</span></span>
+        <span class="kpi-label">SLA稼働率実績</span>
+        <span class="kpi-delta up">目標達成</span>
+      </div>
+    </div>
+    <div class="takeaway">主要指標はすべて<span class="attn">前年から拡大</span>し、目標水準を維持</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>11</span></footer>
+</section>
+
+<!-- ============ 12. 本文（優先度マトリクス = matrix2x2 + 象限ラベル） ============ -->
+<!--
+  matrix2x2 に .quad-label(4象限の呼び名)を重ねた版。象限ラベルの位置は
+  左上=(25%,15%)・右上=(75%,15%)・左下=(25%,85%)・右下=(75%,85%)で固定(4象限の中心付近)。
+  施策(matrix-point)の位置だけを自分の値で変更する。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>着手の優先順位はImpact-Effortマトリクスで示す</h2>
+    <p class="lead">縦軸=施策のインパクト、横軸=実行のしやすさ。右上(Quick Win)から着手する。</p>
+  </header>
+  <div class="slide-body">
+    <div class="matrix2x2">
+      <span class="matrix-axis-x">実行のしやすさ →</span>
+      <span class="matrix-axis-y">インパクトの大きさ →</span>
+      <span class="quad-label" style="left:25%; top:15%; transform:translate(-50%,-50%);">大型プロジェクト</span>
+      <span class="quad-label" style="left:75%; top:15%; transform:translate(-50%,-50%);">Quick Win</span>
+      <span class="quad-label" style="left:25%; top:85%; transform:translate(-50%,-50%);">後回し</span>
+      <span class="quad-label" style="left:75%; top:85%; transform:translate(-50%,-50%);">すぐ着手可</span>
+      <div class="matrix-point self" style="left:80%; top:20%;"><span class="dot"></span>BTC対応拡充</div>
+      <div class="matrix-point" style="left:65%; top:70%;"><span class="dot"></span>レポート機能改善</div>
+      <div class="matrix-point" style="left:25%; top:25%;"><span class="dot"></span>API高度化</div>
+      <div class="matrix-point" style="left:30%; top:80%;"><span class="dot"></span>資料テンプレ整備</div>
+    </div>
+    <div class="takeaway"><span class="attn">BTC対応拡充</span>をQuick Winとして最優先で着手する</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>12</span></footer>
+</section>
+
+<!-- ============ 13. 本文（SWOT分析） ============ -->
+<!--
+  quad-grid は「象限に文章を書く」型（matrix2x2は「点をプロットする」型で用途が違う）。
+  配置は左上=Strengths・右上=Weaknesses・左下=Opportunities・右下=Threats（内部要因が上段・外部要因が下段）。
+  ポジティブな象限(S・O)は q-pos（メイン色見出し）、ネガティブな象限(W・T)は q-neg（アクセント色見出し）。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>自社の内部・外部要因はSWOTで整理する</h2>
+    <p class="lead">内部要因(強み・弱み)は上段、外部要因(機会・脅威)は下段に置く。3C分析より粒度細かく自社状況を棚卸ししたい時に使う。</p>
+  </header>
+  <div class="slide-body">
+    <div class="quad-grid">
+      <div class="quad-cell q-pos">
+        <p class="quad-head">強み（Strengths）</p>
+        <ul><li>Non-Custodial設計の優位性</li><li>国内唯一水準の日本語サポート</li><li>導入実績と安定稼働の運用実績</li></ul>
+      </div>
+      <div class="quad-cell q-neg">
+        <p class="quad-head">弱み（Weaknesses）</p>
+        <ul><li>対応チェーン数が競合より少ない</li><li>海外拠点を持たず時差対応は不可</li><li>ブランド認知度は海外大手に劣る</li></ul>
+      </div>
+      <div class="quad-cell q-pos">
+        <p class="quad-head">機会（Opportunities）</p>
+        <ul><li>規制整備で委託先分散ニーズが拡大</li><li>競合の日本語対応がまだ手薄</li><li>暗号資産保有層の裾野拡大</li></ul>
+      </div>
+      <div class="quad-cell q-neg">
+        <p class="quad-head">脅威（Threats）</p>
+        <ul><li>海外大手の日本市場参入</li><li>ステーキング報酬率の市場変動</li><li>規制強化による対応コスト増</li></ul>
+      </div>
+    </div>
+    <div class="takeaway">強み・機会を活かし、<span class="attn">対応チェーン数の弱み</span>を次年度投資で埋める</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>13</span></footer>
+</section>
+
+<!-- ============ 14. 本文（PEST分析） ============ -->
+<!--
+  quad-gridの中立版(q-pos/q-negを付けない)。4象限は自社評価でなくマクロ環境要因なので色分けしない。
+  各セルの.numバッジはP/E/S/Tの頭文字(番号バッジの文言を差し替えるだけで新規CSS不要)。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>マクロ環境の追い風はPEST分析で示す</h2>
+    <p class="lead">政治・経済・社会・技術の4視点で、提案の「なぜ今か」を裏付ける外部環境変化を整理する。</p>
+  </header>
+  <div class="slide-body">
+    <div class="quad-grid">
+      <div class="quad-cell">
+        <p class="quad-head"><span class="num" style="width:32px;height:32px;font-size:15px;">P</span>Politics（政治・規制）</p>
+        <ul><li>金融庁が委託先分散の説明責任を明確化</li><li>資金決済法改正の議論が進行中</li></ul>
+      </div>
+      <div class="quad-cell">
+        <p class="quad-head"><span class="num" style="width:32px;height:32px;font-size:15px;">E</span>Economy（経済）</p>
+        <ul><li>低金利環境で非金利収益源への関心が上昇</li><li>暗号資産市場の時価総額が回復基調</li></ul>
+      </div>
+      <div class="quad-cell">
+        <p class="quad-head"><span class="num" style="width:32px;height:32px;font-size:15px;">S</span>Society（社会）</p>
+        <ul><li>暗号資産保有層の拡大で運用ニーズが増加</li><li>新規収益源としての社会的関心の高まり</li></ul>
+      </div>
+      <div class="quad-cell">
+        <p class="quad-head"><span class="num" style="width:32px;height:32px;font-size:15px;">T</span>Technology（技術）</p>
+        <ul><li>Non-Custodial技術の実用性・安全性が向上</li><li>マルチチェーン対応技術の成熟</li></ul>
+      </div>
+    </div>
+    <div class="takeaway">4つの環境変化はいずれも<span class="attn">導入の追い風</span>として働いている</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>14</span></footer>
+</section>
+
+<!-- ============ 15. 本文（5フォース分析） ============ -->
+<!--
+  中心=業界内の競争、周囲4方向=新規参入・代替品・供給者・買い手の交渉力。座標計算は不要（グリッド固定）。
+  中心セル(forces-center)はメイン色で塗って視線を集める。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>業界構造は5フォースで俯瞰する</h2>
+    <p class="lead">業界内の競争を取り巻く4つの力を整理し、自社が置かれた競争環境の全体像を示す。</p>
+  </header>
+  <div class="slide-body">
+    <div class="forces">
+      <div class="forces-item top">
+        <p class="forces-head">新規参入の脅威</p>
+        <p>海外大手のNon-Custodial事業者が日本市場を検討中</p>
+      </div>
+      <div class="forces-item left">
+        <p class="forces-head">供給者の交渉力</p>
+        <p>バリデータ・ノード提供者は分散しており交渉力は低い</p>
+      </div>
+      <div class="forces-center">
+        <p class="forces-head">業界内の競争</p>
+        <p>国内数社が地銀・証券セグメントで競合</p>
+      </div>
+      <div class="forces-item right">
+        <p class="forces-head">買い手の交渉力</p>
+        <p>金融機関は複数社比較が前提で価格交渉力が強い</p>
+      </div>
+      <div class="forces-item bottom">
+        <p class="forces-head">代替品の脅威</p>
+        <p>自社内製化の動きもあるが専門人材の確保が難しい</p>
+      </div>
+    </div>
+    <div class="takeaway">買い手の交渉力が最大の変数 → <span class="attn">価格以外の差別化</span>で対抗する</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>15</span></footer>
+</section>
+
+<!-- ============ 16. 本文（STP分析） ============ -->
+<!--
+  Segmentation→Targeting→Positioningを.box3個+.tri-arrowで繋ぐ横フロー。.boxは既存クラスをそのまま流用。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>狙う顧客と立ち位置はSTPで定義する</h2>
+    <p class="lead">市場を切り分け(S)、狙う層を絞り(T)、その層への立ち位置を一言で言い切る(P)。</p>
+  </header>
+  <div class="slide-body">
+    <div class="stp-flow">
+      <div class="box">
+        <span class="num">S</span>
+        <p class="subhead subhead-main">Segmentation</p>
+        <p>金融機関を「暗号資産の自己保有あり／なし」「委託先1社／複数社」で切り分ける。前者はすでに社内に鍵管理の知見がある層である。</p>
+      </div>
+      <div class="tri-arrow"></div>
+      <div class="box">
+        <span class="num">T</span>
+        <p class="subhead subhead-main">Targeting</p>
+        <p>既に自己保有があり、委託先分散を検討中の地方銀行・証券会社を優先ターゲットとする。稟議の意思決定者が明確な組織を優先する。</p>
+      </div>
+      <div class="tri-arrow"></div>
+      <div class="box">
+        <span class="num">P</span>
+        <p class="subhead subhead-main">Positioning</p>
+        <p>「秘密鍵を預けない、日本語で完結する国内唯一水準の委託先」として位置づける。価格でなく管理リスクの低さで選ばれる立ち位置を取る。</p>
+      </div>
+    </div>
+    <div class="takeaway">狙うのは<span class="attn">委託先分散を検討中の地銀・証券</span>。合言葉は「預けない・日本語で完結」</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>16</span></footer>
+</section>
+
+<!-- ============ 17. 本文（ビジネスモデルキャンバス） ============ -->
+<!--
+  9ブロックはCSS Grid の grid-template-areas で固定配置(Key Partners/Key Activities/Value Proposition/
+  Customer Relationships/Customer Segments/Key Resources/Channels/Cost Structure/Revenue Streams)。
+  文言は名詞句で短く書く(14px下限を守るため、文章でなく体言止めの箇条書きにする)。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>サービスの全体像はビジネスモデルキャンバスで一枚に示す</h2>
+    <p class="lead">サービス内容の詳細に入る前に、全体構造を9ブロックで俯瞰する。</p>
+  </header>
+  <div class="slide-body">
+    <div class="bmc-grid">
+      <div class="bmc-cell kp"><p class="bmc-head">主要パートナー</p><ul><li>バリデータ運営各社</li><li>監査法人</li></ul></div>
+      <div class="bmc-cell ka"><p class="bmc-head">主要活動</p><ul><li>ノード運用監視</li><li>セキュリティ監査対応</li></ul></div>
+      <div class="bmc-cell vp"><p class="bmc-head">提供価値</p><ul><li>Non-Custodial型委託</li><li>日本語で完結</li></ul></div>
+      <div class="bmc-cell cr"><p class="bmc-head">顧客関係</p><ul><li>専任担当制</li><li>月次レポーティング</li></ul></div>
+      <div class="bmc-cell cs"><p class="bmc-head">顧客セグメント</p><ul><li>地方銀行</li><li>証券会社</li></ul></div>
+      <div class="bmc-cell kr"><p class="bmc-head">主要リソース</p><ul><li>Non-Custodial技術</li><li>金融機関向け運用ノウハウ</li></ul></div>
+      <div class="bmc-cell ch"><p class="bmc-head">チャネル</p><ul><li>直販・代理店</li><li>金融機関向けセミナー</li></ul></div>
+      <div class="bmc-cell cost"><p class="bmc-head">コスト構造</p><ul><li>ノード運用費・人件費</li><li>セキュリティ監査費用</li></ul></div>
+      <div class="bmc-cell rev"><p class="bmc-head">収益の流れ</p><ul><li>ステーキング報酬の成功報酬</li><li>追加チェーン導入時のオプション収益</li></ul></div>
+    </div>
+    <div class="takeaway">初期費用ゼロ・成功報酬型の収益構造が、導入ハードルの低さを支えている</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>17</span></footer>
+</section>
+
+<!-- ============ 18. 本文（カスタマージャーニーマップ） ============ -->
+<!--
+  既存の<table>をそのまま流用(新規CSS不要)。列=導入後の顧客体験の段階(4段が目安、5列以上は分割を検討)、
+  行=行動/感情/タッチポイント/課題。感情行は既存の.em(ポジティブ)/.attn(要注意)をそのまま使う。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>導入後の顧客体験はカスタマージャーニーマップで示す</h2>
+    <p class="lead">導入検討から活用定着までの各段階で、相手の行動・感情・課題がどう変わるかを一覧する。</p>
+  </header>
+  <div class="slide-body">
+    <table>
+      <thead><tr><th style="width:16%;"></th><th style="width:21%;">検討</th><th style="width:21%;">契約</th><th style="width:21%;">導入</th><th style="width:21%;">活用</th></tr></thead>
+      <tbody>
+        <tr><td><strong>行動</strong></td><td>他社比較・資料請求</td><td>稟議・契約締結</td><td>環境設定・接続確認</td><td>月次レポート確認</td></tr>
+        <tr><td><strong>感情</strong></td><td>不安<span class="small-note">委託先選定の責任</span></td><td><span class="em">安心</span><span class="small-note">日本語窓口で疑問即解消</span></td><td>安心<span class="small-note">自社主導で負荷小</span></td><td>信頼<span class="small-note">安定稼働の実感</span></td></tr>
+        <tr><td><strong>課題</strong></td><td><span class="attn">比較材料が不足</span></td><td>社内説明資料が必要</td><td>既存システムとの整合確認</td><td>特になし</td></tr>
+      </tbody>
+    </table>
+    <div class="takeaway">検討段階の<span class="attn">比較材料不足</span>を解消する資料提供が、契約への最短ルート</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>18</span></footer>
+</section>
+
+<!-- ============ 19. 本文（アンゾフの成長マトリクス） ============ -->
+<!--
+  quad-gridの再利用(SWOTと同じCSS)。左上=市場浸透(既存市場×既存製品)・右上=新製品開発・
+  左下=新市場開拓・右下=多角化。「既存構成への追加」提案は市場浸透(左上・低リスク)に位置づける。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>今回のご提案の位置づけはアンゾフの成長マトリクスで示す</h2>
+    <p class="lead">縦軸=製品(既存/新規)、横軸=市場(既存/新規)。今回のご提案は最もリスクの低い象限に位置する。</p>
+  </header>
+  <div class="slide-body">
+    <div class="quad-grid">
+      <div class="quad-cell q-pos">
+        <p class="quad-head">市場浸透</p>
+        <ul><li>既存契約への<span class="em">チェーン追加</span></li><li>今回のご提案はここ</li><li>初期費用ゼロで意思決定が速い</li></ul>
+      </div>
+      <div class="quad-cell">
+        <p class="quad-head">新製品開発</p>
+        <ul><li>新たな暗号資産商品の共同開発</li><li>NFT・トークン化商品への展開</li></ul>
+      </div>
+      <div class="quad-cell">
+        <p class="quad-head">新市場開拓</p>
+        <ul><li>海外機関投資家向け展開</li><li>アジア地域の新規顧客開拓</li></ul>
+      </div>
+      <div class="quad-cell q-neg">
+        <p class="quad-head">多角化</p>
+        <ul><li>新規事業領域への参入</li><li>カストディ以外の金融サービス</li></ul>
+      </div>
+    </div>
+    <div class="takeaway">今回のご提案は<span class="attn">最もリスクの低い市場浸透</span>。既存構成への追加だけで完結する</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>19</span></footer>
+</section>
+
+<!-- ============ 20. 本文（ロードマップ/ガントチャート） ============ -->
+<!--
+  行=施策・列=期間。バーの left%/width% はインラインで指定する(期間の合計を100%として按分)。
+  例: 全体6か月のうち、ヒアリングが1〜2か月目なら left:0%; width:33%;
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>複数施策が並行する導入計画はロードマップで示す</h2>
+    <p class="lead">縦に施策、横に期間を並べ、どの施策がいつ動くかを一目で示す。マイルストーンはアクセント色で強調する。</p>
+  </header>
+  <div class="slide-body">
+    <div class="gantt">
+      <div class="gantt-header"><span>1ヶ月目</span><span>2ヶ月目</span><span>3ヶ月目</span><span>4ヶ月目</span><span>5ヶ月目</span><span>6ヶ月目</span></div>
+      <div class="gantt-row">
+        <span class="g-label">ヒアリング・要件整理</span>
+        <div class="g-track"><div class="g-bar" style="left:0%; width:33%;">ヒアリング</div></div>
+      </div>
+      <div class="gantt-row">
+        <span class="g-label">契約・稟議</span>
+        <div class="g-track"><div class="g-bar" style="left:17%; width:33%;">稟議・契約</div></div>
+      </div>
+      <div class="gantt-row">
+        <span class="g-label">環境設定</span>
+        <div class="g-track"><div class="g-bar" style="left:50%; width:33%;">接続・設定</div></div>
+      </div>
+      <div class="gantt-row">
+        <span class="g-label">本番稼働</span>
+        <div class="g-track"><div class="g-bar milestone" style="left:83%; width:17%;">稼働開始</div></div>
+      </div>
+    </div>
+    <div class="takeaway">契約と環境設定を並行させ、<span class="attn">最短6か月</span>で本番稼働を実現する</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>20</span></footer>
+</section>
+
+<!-- ============ 21. 本文（RACIチャート） ============ -->
+<!--
+  既存の<table>をそのまま流用し、セルに.raci-badgeを置くだけ(新規テーブルCSS不要)。
+  R=実行責任者(アクセント色)・A=説明責任者(メイン色)・C=協業先(サブアクセント色)・I=報告先(グレー)。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>導入後の役割分担はRACIチャートで明確化する</h2>
+    <p class="lead">誰が実行し・誰が責任を持ち・誰が協力し・誰に報告するかを工程ごとに一覧する。</p>
+  </header>
+  <div class="slide-body">
+    <table>
+      <thead><tr><th style="width:28%;">工程</th><th style="width:24%;">自社</th><th style="width:24%;">貴行システム部門</th><th style="width:24%;">貴行経営層</th></tr></thead>
+      <tbody>
+        <tr><td><strong>環境設定</strong></td><td><span class="raci-badge r">実行</span></td><td><span class="raci-badge c">協力</span></td><td><span class="raci-badge i">報告</span></td></tr>
+        <tr><td><strong>接続テスト</strong></td><td><span class="raci-badge r">実行</span></td><td><span class="raci-badge a">責任</span></td><td><span class="raci-badge i">報告</span></td></tr>
+        <tr><td><strong>本番稼働判定</strong></td><td><span class="raci-badge c">協力</span></td><td><span class="raci-badge a">責任</span></td><td><span class="raci-badge i">報告</span></td></tr>
+        <tr><td><strong>月次モニタリング</strong></td><td><span class="raci-badge r">実行</span></td><td><span class="raci-badge i">報告</span></td><td><span class="raci-badge i">報告</span></td></tr>
+      </tbody>
+    </table>
+    <div class="takeaway">実行は自社が主導し、貴行は<span class="attn">要所の承認判断</span>に集中いただける体制</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>21</span></footer>
+</section>
+
+<!-- ============ 22. 本文（積み上げ棒グラフ） ============ -->
+<!--
+  複数カテゴリの内訳×時系列推移(例: 売上高の事業別内訳の5年推移)を示したい時に使う。
+  .sb-bar は flex-direction:column-reverse で、DOM順=下から積む順(最初の.sb-segが最下段)にする。
+  カテゴリは4色まで(c1〜c4)。5カテゴリ以上必要ならカテゴリを統合するか複数スライドに分ける。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>複数事業の内訳と時系列推移は積み上げ棒グラフで示す</h2>
+    <p class="lead">売上高の事業別内訳が、年を追ってどう積み上がるかを一目で見せる。</p>
+  </header>
+  <div class="slide-body">
+    <div class="stack-bar">
+      <div class="sb-legend">
+        <span class="sb-legend-item"><span class="sb-swatch c1"></span>事業A(主力)</span>
+        <span class="sb-legend-item"><span class="sb-swatch c2"></span>事業B</span>
+        <span class="sb-legend-item"><span class="sb-swatch c3"></span>事業C</span>
+        <span class="sb-legend-item"><span class="sb-swatch c4"></span>事業D(新規)</span>
+      </div>
+      <div class="stack-bar-chart">
+        <div class="sb-col">
+          <div class="sb-total">10.8億円</div>
+          <div class="sb-bar">
+            <div class="sb-seg c1" style="height:60%;"></div>
+            <div class="sb-seg c2" style="height:18%;"></div>
+            <div class="sb-seg c3" style="height:22%;"></div>
+          </div>
+          <div class="sb-label">1年目</div>
+        </div>
+        <div class="sb-col">
+          <div class="sb-total">15.1億円</div>
+          <div class="sb-bar">
+            <div class="sb-seg c1" style="height:53%;"></div>
+            <div class="sb-seg c2" style="height:20%;"></div>
+            <div class="sb-seg c3" style="height:22%;"></div>
+            <div class="sb-seg c4" style="height:5%;"></div>
+          </div>
+          <div class="sb-label">2年目</div>
+        </div>
+        <div class="sb-col">
+          <div class="sb-total">20.2億円</div>
+          <div class="sb-bar">
+            <div class="sb-seg c1" style="height:49%;"></div>
+            <div class="sb-seg c2" style="height:21%;"></div>
+            <div class="sb-seg c3" style="height:22%;"></div>
+            <div class="sb-seg c4" style="height:8%;"></div>
+          </div>
+          <div class="sb-label">3年目</div>
+        </div>
+      </div>
+    </div>
+    <div class="takeaway">主力事業が土台を支え、新規事業が段階的に積み上がる成長計画</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>22</span></footer>
+</section>
+
+<!-- ============ 23. 本文（基盤展開図） ============ -->
+<!--
+  土台となる1つのコア事業が生む資産(顧客基盤・データ・知見等)を使って、複数の事業が派生する構造を示す。
+  .tree(上→下のMECE分解)の逆版(下→上の資産活用構造)。接続線は.tree-branchと同じ「直線+ラベル」方式を踏襲し、
+  曲線矢印は描かない(過去にイシューツリーの接続線でバグが発生した経緯があるため、実装が安定する直線に統一)。
+  分岐は3〜4本を目安にする(5本以上は1本あたりの横幅が狭くなり文字が収まらない)。
+-->
+<section class="slide">
+  <header class="slide-header">
+    <h2 class="slide-title">見出し<span class="divider">｜</span>1つの基盤事業から複数事業が派生する構造は基盤展開図で示す</h2>
+    <p class="lead">コア事業が積み上げた資産(顧客基盤・データ・知見)を使って、各事業が立ち上がる。</p>
+  </header>
+  <div class="slide-body">
+    <div class="foundation-diagram">
+      <div class="fd-branches">
+        <div class="fd-branch">
+          <p class="fd-branch-title">事業B</p>
+          <p class="fd-branch-value">2.4 → 11.6億円</p>
+          <p class="fd-branch-note">売上計画(1年目→5年目)</p>
+          <span class="fd-connector-label">知見・実績</span>
+        </div>
+        <div class="fd-branch">
+          <p class="fd-branch-title">事業C</p>
+          <p class="fd-branch-value">2.4 → 5.2億円</p>
+          <p class="fd-branch-note">売上計画(1年目→5年目)</p>
+          <span class="fd-connector-label">顧客基盤</span>
+        </div>
+        <div class="fd-branch">
+          <p class="fd-branch-title">事業D(新規)</p>
+          <p class="fd-branch-value">0.2 → 3.2億円</p>
+          <p class="fd-branch-note">売上計画(1年目→5年目)</p>
+          <span class="fd-connector-label">保有データ</span>
+        </div>
+      </div>
+      <div class="fd-base">
+        事業A｜コア事業（基盤）　売上計画 5.8 → 13.2億円
+        <div class="fd-base-sub">顧客基盤・保有データ・知見の3つの資産を生み出す土台</div>
+      </div>
+    </div>
+    <div class="takeaway">各事業は独立ではなく、コア事業の資産を共有して伸びる一体の構造になっている</div>
+  </div>
+  <footer class="slide-footer"><span>©[Company] Inc.</span><span>23</span></footer>
+</section>
+
+</body>
+</html>
