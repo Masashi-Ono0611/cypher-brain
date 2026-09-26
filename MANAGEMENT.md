@@ -60,6 +60,23 @@ for the selected key only. ENS registration alone does not grant resolver text
 roles. Confirm the printed resolver and RPC endpoint before approving a
 transaction; Sepolia contract addresses can change after ENS redeployments.
 
+### Publishing a push's locator to ENS
+
+Once `ens-setup` has granted the agent wallet its scoped role, publish a
+just-completed push's locator to ENS by adding `--publish-ens` to the push
+command:
+
+```sh
+cypher-brain push --in snapshot.age --backend turbo --yes \
+  --publish-ens --name <registered-label> --text-key brain.latest --rpc-url <sepolia-rpc-url>
+```
+
+The CLI uses the locator returned by that upload directly; it does not accept a
+hand-entered locator. It refuses a `--skip-unchanged` result because no new push
+completed. The agent key signs only after the resolver is found and the write
+simulates successfully, and the CLI asks for confirmation before broadcasting.
+Use a trusted HTTPS RPC endpoint; its URL is redacted from parser errors.
+
 ### 1. Encrypt to a backup key (recommended, built in)
 
 `snapshot --recipient` is repeatable. Give it a **primary** and an **offline

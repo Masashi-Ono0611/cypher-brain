@@ -35,6 +35,7 @@ export interface CliOptions {
 
   // boolean flags (BOOL_FLAGS in cli.ts) — absent when not passed
   witness?: boolean;
+  publish_ens?: boolean; // push --publish-ens: publish this push's locator to ENSv2
   force?: boolean;
   passphrase?: boolean;
   wrap_in_place?: boolean;
@@ -95,9 +96,9 @@ export interface CliOptions {
   plan?: string; // push --plan <path.json>: re-validate a plan file written by "estimate --out" before proceeding (#231)
   sss?: string; // keygen --sss <m>-of-<n>: Shamir threshold policy for a disaster-recovery share set (#207) — no default, always explicit
   from_restored_dir?: string; // bagit-export --from-restored-dir <dir>: an already-restored ("restore --out-dir") directory to package as a BagIt 1.0 bag (#217)
-  name?: string; // ens-setup --name <label>: an existing ENSv2 label registered in ETHRegistry
-  text_key?: string; // ens-setup --text-key <key>: the single text key delegated to the agent wallet
-  rpc_url?: string; // ens-setup --rpc-url <url>: Sepolia JSON-RPC endpoint
+  name?: string; // ens-setup / push --publish-ens --name <label>: an existing ENSv2 label registered in ETHRegistry
+  text_key?: string; // ens-setup / push --publish-ens --text-key <key>: the single text key delegated to the agent wallet
+  rpc_url?: string; // ens-setup / push --publish-ens --rpc-url <url>: Sepolia JSON-RPC endpoint
 }
 
 /**

@@ -914,7 +914,7 @@ async function pushCoreLocked(
 // right before backend.put()) — this box is how that later-computed value gets back out
 // to both recordAudit() calls below, since pushCoreLocked() can throw (a partial
 // failure, a signature-upload failure, …) after already setting it.
-export async function push(o: CliOptions): Promise<boolean> {
+export async function pushWithLocator(o: CliOptions): Promise<{ uploaded: boolean; locator: string | null }> {
   const startedAt = Date.now();
   const digestBox: { value: string | null } = { value: null };
   try {
@@ -928,7 +928,7 @@ export async function push(o: CliOptions): Promise<boolean> {
       exitCode: 0,
       startedAt,
     });
-    return result.success;
+    return { uploaded: result.success, locator: result.locator };
   } catch (e) {
     // #818: PushUncertainSpendError is deliberately NOT a PushPartialSuccessError (see
     // that class's own doc comment), so the branch above alone misses it entirely and
@@ -954,6 +954,11 @@ export async function push(o: CliOptions): Promise<boolean> {
     });
     throw e;
   }
+}
+
+// Preserve the boolean API used by the init wizard and any direct library caller.
+export async function push(o: CliOptions): Promise<boolean> {
+  return (await pushWithLocator(o)).uploaded;
 }
 
 // Used only by cypher-brain-mcp's idempotency-key replay path (#220, multi-model review

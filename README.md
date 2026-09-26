@@ -130,6 +130,11 @@ wallet `ROLE_SET_TEXT` on one text key. The owner key is held in process memory
 only. Name registration and resolver proxy deployment are not performed by this
 command; see [MANAGEMENT.md](MANAGEMENT.md#one-time-ensv2-owner-setup).
 
+`push --publish-ens --name <label> --text-key <key> --rpc-url <url>` publishes the
+actual locator returned by that push to the matching ENSv2 text record, signed by
+the agent wallet. It requires the name and key grant created by `ens-setup`; the
+RPC endpoint is redacted in parser diagnostics and should be a trusted HTTPS URL.
+
 The same "anyone holding a recipient's public key can forge ciphertext" point applies
 one layer down, to the tar payload age decrypts to: `restore` inspects every tar entry
 — absolute paths, `..` traversal, FIFO/device/socket entries, a hardlink whose target
@@ -1336,13 +1341,17 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       has to fall back to scraping stderr; "code" is the CB-E0xx identifier when the failure
       matches a known one (MANAGEMENT.md#error-codes), null otherwise.
 
-  cypher-brain push --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--remote <name>:<path>] [--yes] [--plan <path.json>] [--save-locator <path>] [--skip-unchanged] [--digest <hex>] [--force] [--witness] [--sign-identity <path>]
+  cypher-brain push --in <file.age> --backend <file|arweave|turbo|rclone|ton|ton-provider> [--remote <name>:<path>] [--yes] [--plan <path.json>] [--save-locator <path>] [--skip-unchanged] [--digest <hex>] [--force] [--witness] [--sign-identity <path>] [--publish-ens --name <label> --text-key <key> --rpc-url <sepolia-rpc-url>]
       --witness opts into TWO additional Arweave uploads: a public signed catalog entry
       and its detached signature, sharing the same per-run/daily/monthly spend caps.
       Requires the existing sign-identity.key (or --sign-identity); supports arweave/turbo,
       with file for offline tests only. A skipped unchanged push publishes no witness.
       Records locators/digest/time/key id publicly; no plaintext contents are included.
       Regenerate recovery-kit afterward to keep an offline witness anchor current.
+      --publish-ens --name <label> --text-key <key> --rpc-url <sepolia-rpc-url>
+      After a successful upload, write its actual returned locator to that ENSv2 text
+      record using the local agent wallet. Simulates the transaction and asks before
+      sending; skipped --skip-unchanged runs are refused. Use a trusted HTTPS RPC URL.
       Upload ciphertext to storage. Prints ONLY the locator to stdout
       (file: store path; arweave: tx id; turbo: ANS-104 data item id; rclone: the
       --remote value itself; ton: "ton:v1:<bag-id>"; ton-provider: "ton-provider:v1:<bag-id>").

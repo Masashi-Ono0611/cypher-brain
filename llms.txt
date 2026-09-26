@@ -111,6 +111,14 @@ register names or deploy resolver proxies. It may initialize the resolver's
 owner root role and asks before each transaction. Verify the RPC endpoint before
 entering the owner key.
 
+## ENS publication
+
+Append `--publish-ens --name <label> --text-key <key> --rpc-url <sepolia-rpc-url>`
+to `push` to publish that upload's actual returned locator in its ENSv2 text
+record. The CLI uses the local `agent-wallet.key`, simulates the write, and asks
+before broadcasting. A skipped unchanged push is refused. Use a trusted HTTPS
+endpoint; parser diagnostics redact the RPC URL.
+
 ## Key concepts
 
 - **identity** (private key) — the only thing that can decrypt. Lives off the
