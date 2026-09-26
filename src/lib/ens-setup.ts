@@ -2,9 +2,7 @@
 // The owner key is entered only in a masked TTY prompt and is never written to disk.
 import { lstat, readFile } from 'node:fs/promises';
 import { isCancel, password, confirm } from '@clack/prompts';
-import { createPublicClient, createWalletClient, encodeFunctionData, http, parseAbi, type Address } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
-import { sepolia } from 'viem/chains';
+import type { Address } from 'viem';
 import { AGENT_WALLET_DEFAULT_PATH } from './agent-wallet.js';
 import { UsageError } from './errors.js';
 import type { CliOptions } from './types.js';
@@ -16,14 +14,26 @@ const ETH_REGISTRY = '0x657ea849311d3d5823348dded7c2aaafb3ede09e' as Address;
 const ROLE_SET_TEXT = 1n << 4n;
 const ROLE_SET_TEXT_ADMIN = ROLE_SET_TEXT << 128n;
 
-const registryAbi = parseAbi(['function getResolver(string label) view returns (address)']);
-
-const resolverAbi = parseAbi([
-  'function initialize((address account,uint256 roleBitmap)[] grants, bytes[] calls)',
-  'function hasRootRoles(uint256 roleBitmap, address account) view returns (bool)',
-  'function grantSetterRoles(bytes setter, address account) returns (bool)',
-  'function setText(bytes name, string key, string value)',
-]);
+// viem is loaded on demand (not a top-level import) so that commands unrelated to the
+// ENS agent wallet — doctor included — never require it to be installed, the same
+// reasoning src/lib/otel.ts applies to the OpenTelemetry packages and src/lib/agent-wallet.ts
+// applies to its own viem/accounts import (#966).
+async function loadViem() {
+  try {
+    const [core, accounts, chains] = await Promise.all([
+      import('viem'),
+      import('viem/accounts'),
+      import('viem/chains'),
+    ]);
+    return { ...core, ...accounts, sepolia: chains.sepolia };
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND') {
+      throw new Error("the 'viem' package is not installed — run: npm install viem");
+    }
+    throw e; // a real error inside viem itself — don't misreport it as "not installed"
+  }
+}
 
 async function readAgentWallet(path: string): Promise<`0x${string}`> {
   const info = await lstat(path);
@@ -69,6 +79,17 @@ export async function ensSetup(o: CliOptions): Promise<void> {
   if (!process.stdin.isTTY || !process.stderr.isTTY) {
     throw new Error('ens-setup is interactive and requires both stdin and stderr to be a TTY');
   }
+
+  const { createPublicClient, createWalletClient, encodeFunctionData, http, parseAbi, privateKeyToAccount, sepolia } =
+    await loadViem();
+
+  const registryAbi = parseAbi(['function getResolver(string label) view returns (address)']);
+  const resolverAbi = parseAbi([
+    'function initialize((address account,uint256 roleBitmap)[] grants, bytes[] calls)',
+    'function hasRootRoles(uint256 roleBitmap, address account) view returns (bool)',
+    'function grantSetterRoles(bytes setter, address account) returns (bool)',
+    'function setText(bytes name, string key, string value)',
+  ]);
 
   const agentPath = AGENT_WALLET_DEFAULT_PATH;
   const agentPrivateKey = await readAgentWallet(agentPath);
