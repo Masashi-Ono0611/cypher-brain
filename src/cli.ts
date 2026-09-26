@@ -51,7 +51,8 @@ import { schedule } from './lib/schedule.js';
 import { wallet } from './lib/wallet.js';
 import { agentWallet, AGENT_WALLET_DEFAULT_PATH } from './lib/agent-wallet.js';
 import { ensSetup } from './lib/ens-setup.js';
-import { prepareEnsPublisher } from './lib/ens-publish.js';
+import { ensSetText, prepareEnsPublisher } from './lib/ens-publish.js';
+import { ensVerify } from './lib/ens-verify.js';
 import { estimate } from './lib/estimate.js';
 import { doctor } from './lib/doctor.js';
 import { ledger } from './lib/ledger.js';
@@ -139,6 +140,8 @@ const VALUE_FLAGS = new Set([
   'name',
   'text_key',
   'rpc_url',
+  'expected_value',
+  'value',
 ]);
 
 // Flags whose value can itself embed a credential (--pg's connection string carries a
@@ -1204,6 +1207,15 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       --remote (#468). Without --out, --remote has no effect on the estimate itself
       (rclone's cost is always free regardless of destination).
 
+  cypher-brain ens-verify --name <label> --text-key <key> --expected-value <locator> --rpc-url <sepolia-rpc-url>
+      Prove the ENS agent grant is scoped: read back the expected published locator,
+      then simulate a write to a different text key and require EACUnauthorizedAccountRoles.
+      The negative check is simulation-only and never broadcasts a transaction.
+
+  cypher-brain ens-set-text --name <label> --text-key <key> --value <text> --rpc-url <sepolia-rpc-url>
+      Independently write a value to an already-granted ENS text key. Simulates the
+      write and asks for confirmation before broadcasting with the agent wallet.
+
   cypher-brain pull (--locator <id> --backend <…> | --remote <name>:<path> --backend rclone | --from-locator-file <path>) --out <file.age> [--wait <seconds>] [--sha256 <hex>] [--sig-locator <id>] [--force]
       Fetch ciphertext by locator into --out. --from-locator-file reads the locator, its
       backend AND the saved sha256 from a file written by push --save-locator (the recovery
@@ -1610,6 +1622,8 @@ interface FlagIrrelevance {
 }
 
 const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
+  'ens-set-text': [],
+  'ens-verify': [],
   'push-status': [],
   witness: [],
   'agent-wallet': [],
@@ -1859,6 +1873,8 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
  * every command still accepts its own whole entry without this check firing.
  */
 const COMMAND_FLAGS: Record<string, readonly string[]> = {
+  'ens-set-text': ['name', 'text_key', 'value', 'rpc_url'],
+  'ens-verify': ['name', 'text_key', 'expected_value', 'rpc_url'],
   'agent-wallet': [],
   'ens-setup': ['name', 'text_key', 'rpc_url'],
   'agent-wallet keygen': ['force'],
@@ -2355,6 +2371,10 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
       return pull(o);
     case 'push-status':
       return pushStatus(o);
+    case 'ens-verify':
+      return ensVerify(o);
+    case 'ens-set-text':
+      return ensSetText(o);
     case 'publish-latest':
       return publishLatest(o);
     case 'recovery-kit':

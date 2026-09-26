@@ -1,6 +1,7 @@
 // Publish a just-completed push locator to one ENSv2 text record with the agent key.
 import { lstat, readFile } from 'node:fs/promises';
 import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import { confirm, isCancel } from '@clack/prompts';
 import { AGENT_WALLET_DEFAULT_PATH } from './agent-wallet.js';
 import { UsageError } from './errors.js';
@@ -41,9 +42,15 @@ export interface EnsPublishOptions extends CliOptions {
   rpc_url: string;
 }
 
-function validateEnsPublishOptions(o: CliOptions): asserts o is EnsPublishOptions {
-  if (!o.publish_ens || !o.name || !o.text_key || !o.rpc_url) {
-    throw new UsageError('--publish-ens requires --name <label>, --text-key <key>, and --rpc-url <url>');
+interface EnsTextWriteOptions extends CliOptions {
+  name: string;
+  text_key: string;
+  rpc_url: string;
+}
+
+function validateEnsTextWriteOptions(o: CliOptions): asserts o is EnsTextWriteOptions {
+  if (!o.name || !o.text_key || !o.rpc_url) {
+    throw new UsageError('ENS text writes require --name <label>, --text-key <key>, and --rpc-url <url>');
   }
   if (!/^[a-z0-9-]{3,63}$/.test(o.name)) {
     throw new UsageError('--name must be one lowercase ENS label (3–63 ASCII letters, digits, or hyphens)');
@@ -62,6 +69,11 @@ function validateEnsPublishOptions(o: CliOptions): asserts o is EnsPublishOption
       '--rpc-url must be an HTTPS Sepolia endpoint (or local HTTP endpoint) without embedded credentials',
     );
   }
+}
+
+function validateEnsPublishOptions(o: CliOptions): asserts o is EnsPublishOptions {
+  if (!o.publish_ens) throw new UsageError('--publish-ens is required');
+  validateEnsTextWriteOptions(o);
 }
 
 function encodeName(label: string): `0x${string}` {
@@ -122,13 +134,14 @@ async function guardedConfirm(message: string): Promise<boolean> {
   }
 }
 
-export async function prepareEnsPublisher(o: CliOptions): Promise<(locator: string) => Promise<void>> {
-  validateEnsPublishOptions(o);
+async function prepareEnsTextWriter(
+  o: EnsTextWriteOptions,
+): Promise<(value: string, confirmation: string, refusal: string) => Promise<void>> {
   // Same fix as #967's ens-setup.ts (Codex review on #974): clack/prompts writes to
   // stdout by default; checking only stderr let a redirected stdout hide the
   // confirmation prompt/details while input stayed live.
   if (!process.stdin.isTTY || !process.stdout.isTTY || !process.stderr.isTTY) {
-    throw new Error('--publish-ens requires stdin, stdout, and stderr to all be an interactive TTY');
+    throw new Error('ENS text writes require stdin, stdout, and stderr to all be an interactive TTY');
   }
   const viem = await loadViem();
   const {
@@ -195,9 +208,7 @@ export async function prepareEnsPublisher(o: CliOptions): Promise<(locator: stri
     }),
   );
   if (!hasScopedRole) {
-    throw new Error(
-      `agent wallet lacks ROLE_SET_TEXT for '${o.text_key}' on '${o.name}'; run ens-setup before pushing`,
-    );
+    throw new Error(`agent wallet lacks ROLE_SET_TEXT for '${o.text_key}' on '${o.name}'; run ens-setup first`);
   }
 
   console.error(`ENS target: ${o.name} (resolver ${resolver})`);
@@ -205,16 +216,7 @@ export async function prepareEnsPublisher(o: CliOptions): Promise<(locator: stri
   console.error(`Text key: ${o.text_key}`);
   console.error(`Sepolia RPC host: ${rpcHost}`);
 
-  return async (locator: string): Promise<void> => {
-    if (!locator || locator.includes('\n') || locator.includes('\r')) {
-      throw new Error('push returned an empty or malformed locator; refusing to publish it');
-    }
-    // Codex review (#975): the resolver looked up above is cached in this closure. If the
-    // registry's resolver for this name changes between preflight and this call (e.g. a
-    // concurrent ens-setup-style re-init elsewhere), writing to the stale address can
-    // still succeed (the OLD resolver checks its own roles/storage, not whether the
-    // registry still points at it) and this would silently report false success.
-    // Re-resolve immediately before writing and refuse if it moved.
+  async function assertResolverUnchanged(context: string): Promise<void> {
     const currentResolver = await withRedactedRpcErrors(() =>
       publicClient.readContract({
         address: ETH_REGISTRY,
@@ -225,9 +227,39 @@ export async function prepareEnsPublisher(o: CliOptions): Promise<(locator: stri
     );
     if (currentResolver.toLowerCase() !== resolverAddress.toLowerCase()) {
       throw new Error(
-        `ENS label '${o.name}' now resolves to ${currentResolver}, not the ${resolverAddress} checked earlier; refusing to publish to a stale resolver`,
+        `ENS label '${o.name}' now resolves to ${currentResolver}, not the ${resolverAddress} ${context}; refusing to write to a stale resolver`,
       );
     }
+  }
+
+  // Codex review (#975 follow-up on #969, second pass): an interactive confirmation
+  // prompt can sit open for an arbitrary amount of time while a human reads it.
+  // - Escape the literal backslash FIRST so an escaped control char (e.g. an actual ESC
+  //   byte, rendered "\u{001b}") can't be confused with a value that merely CONTAINS the
+  //   four printable characters "\u{001b}" — those now render as "\\u{001b}" instead.
+  // - Also escape bidi override/isolate characters (U+200E/U+200F/U+202A–U+202E/
+  //   U+2066–U+2069), which fall outside the C0/DEL control range but can still reorder
+  //   how the rest of the line displays.
+  // - A sha256 fingerprint of the FULL value (not the truncated display) is appended so
+  //   two different values that happen to share the first 200 escaped characters (and
+  //   the same length) still produce visibly different confirmation prompts.
+  const CONTROL_OR_BIDI = /[\u0000-\u001f\u007f‎‏‪-‮⁦-⁩]/g;
+  function sanitizeForConfirmDisplay(value: string): string {
+    const escaped = value
+      .replace(/\\/g, '\\\\')
+      .replace(CONTROL_OR_BIDI, (c) => `\\u{${c.codePointAt(0)?.toString(16).padStart(4, '0')}}`);
+    const truncated =
+      escaped.length > 200 ? `${escaped.slice(0, 200)}… (truncated, ${value.length} chars total)` : escaped;
+    const fingerprint = createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 12);
+    // Returns the value already wrapped in its own quotes (with the fingerprint outside
+    // them) so the call site doesn't need to add its own — see the call below.
+    return `'${truncated}' (sha256 fingerprint ${fingerprint})`;
+  }
+
+  return async (value: string, confirmation: string, refusal: string): Promise<void> => {
+    // The registry's resolver is cached in this closure. Re-resolve immediately before
+    // writing and refuse if it moved, so a stale resolver cannot accept the write.
+    await assertResolverUnchanged('checked earlier');
     const nameBytes = encodeName(o.name);
     const parameters: Viem.WriteContractParameters<typeof resolverAbi> = {
       account,
@@ -235,25 +267,56 @@ export async function prepareEnsPublisher(o: CliOptions): Promise<(locator: stri
       address: resolverAddress,
       abi: resolverAbi,
       functionName: 'setText' as const,
-      args: [nameBytes, o.text_key, locator] as const,
+      args: [nameBytes, o.text_key, value] as const,
     };
     await withRedactedRpcErrors(() =>
       publicClient.simulateContract(parameters as Viem.SimulateContractParameters<typeof resolverAbi>),
     );
     const approved = await guardedConfirm(
-      `Write the locator from this push to ${o.name} text record '${o.text_key}'? Agent: ${account.address}`,
+      `${confirmation} to ${o.name} text record '${o.text_key}': ${sanitizeForConfirmDisplay(value)}? Agent: ${account.address}`,
     );
-    if (!approved) throw new Error(`ENS publish was not approved; push completed with locator ${locator}`);
+    if (!approved) throw new Error(refusal);
+    // Codex review (#975 follow-up on #969): the confirmation prompt above can stay open
+    // for an arbitrary amount of time while a human decides. Re-check the resolver again
+    // right before broadcasting so a registry change during that window can't leave the
+    // now-stale resolver silently accepting the write.
+    await assertResolverUnchanged('approved above');
     const hash = await withRedactedRpcErrors(() =>
       walletClient.writeContract(parameters as Viem.WriteContractParameters<typeof resolverAbi>),
     );
     const receipt = await withRedactedRpcErrors(() => publicClient.waitForTransactionReceipt({ hash }));
     if (receipt.status !== 'success') {
-      throw new Error(`ENS text-record transaction reverted (${hash}); push locator remains ${locator}`);
+      throw new Error(`ENS text-record transaction reverted (${hash}); check the resolver before retrying`);
     }
     // Confirming the value actually reads back correctly (not just that the receipt says
     // success) is #969's job (ens-verify) — not duplicated here.
     console.error(`ENS text record updated: ${hash}`);
+    console.error(`Updated text key: ${o.text_key}`);
+  };
+}
+
+export async function prepareEnsPublisher(o: CliOptions): Promise<(locator: string) => Promise<void>> {
+  validateEnsPublishOptions(o);
+  const writeText = await prepareEnsTextWriter(o);
+  return async (locator: string): Promise<void> => {
+    if (!locator || locator.includes('\n') || locator.includes('\r')) {
+      throw new Error('push returned an empty or malformed locator; refusing to publish it');
+    }
+    await writeText(
+      locator,
+      'Write the locator from this push',
+      `ENS publish was not approved; push completed with locator ${locator}`,
+    );
     console.error(`Published locator: ${locator}`);
   };
+}
+
+export async function ensSetText(o: CliOptions): Promise<void> {
+  validateEnsTextWriteOptions(o);
+  if (o.value === undefined) throw new UsageError('ens-set-text requires --value <text>');
+  if (o.publish_ens || o.expected_value !== undefined) {
+    throw new UsageError('ens-set-text accepts --name, --text-key, --value, and --rpc-url only');
+  }
+  const writeText = await prepareEnsTextWriter(o);
+  await writeText(o.value, 'Write the supplied value', 'ENS text write was not approved; no transaction was sent');
 }

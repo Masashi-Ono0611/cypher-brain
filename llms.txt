@@ -193,6 +193,8 @@ cypher-brain snapshot --dir <path> --recipient <file> --out <f.age>
 cypher-brain verify --in <f.age>                                # real ciphertext? wrong key rejected?
 cypher-brain wallet create                                      # one-time: signing wallet, required by paid backends (turbo/arweave)
 cypher-brain push --in <f.age> --backend turbo --yes             # pays a one-time bundler fee
+cypher-brain ens-verify --name <label> --text-key <key> --expected-value <locator> --rpc-url <url>  # verify ENS grant scope
+cypher-brain ens-set-text --name <label> --text-key agent-context --value <text> --rpc-url <url>  # set independent ENS agent metadata
 cypher-brain pull --locator <id> --backend turbo --out <f.age>   # plain gateway fetch, no wallet
 cypher-brain restore --in <f.age> --out-dir <dir>
 cypher-brain schedule install --backend turbo --dir <path> --max-spend <n>   # unattended nightly

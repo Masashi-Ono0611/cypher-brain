@@ -134,6 +134,15 @@ command; see [MANAGEMENT.md](MANAGEMENT.md#one-time-ensv2-owner-setup).
 actual locator returned by that push to the matching ENSv2 text record, signed by
 the agent wallet. It requires the name and key grant created by `ens-setup`; the
 RPC endpoint is redacted in parser diagnostics and should be a trusted HTTPS URL.
+After a successful publish, `ens-verify --name <label> --text-key <key>
+--expected-value <locator> --rpc-url <url>` reads that exact record back and
+simulates a write to a different text key. It passes only when the locator matches
+and the out-of-scope simulation reverts with `EACUnauthorizedAccountRoles`; the
+negative probe is never broadcast.
+For independent agent self-description metadata, `ens-set-text --name <label>
+--text-key <key> --value <text> --rpc-url <url>` writes any text key already
+granted by `ens-setup` (for example `agent-context` or `agent-endpoint[mcp]`). It
+simulates the write and asks for confirmation before broadcasting.
 
 The same "anyone holding a recipient's public key can forge ciphertext" point applies
 one layer down, to the tar payload age decrypts to: `restore` inspects every tar entry
@@ -1549,6 +1558,15 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       with an error, rather than writing a plan that is a dead end until re-run with
       --remote (#468). Without --out, --remote has no effect on the estimate itself
       (rclone's cost is always free regardless of destination).
+
+  cypher-brain ens-verify --name <label> --text-key <key> --expected-value <locator> --rpc-url <sepolia-rpc-url>
+      Prove the ENS agent grant is scoped: read back the expected published locator,
+      then simulate a write to a different text key and require EACUnauthorizedAccountRoles.
+      The negative check is simulation-only and never broadcasts a transaction.
+
+  cypher-brain ens-set-text --name <label> --text-key <key> --value <text> --rpc-url <sepolia-rpc-url>
+      Independently write a value to an already-granted ENS text key. Simulates the
+      write and asks for confirmation before broadcasting with the agent wallet.
 
   cypher-brain pull (--locator <id> --backend <…> | --remote <name>:<path> --backend rclone | --from-locator-file <path>) --out <file.age> [--wait <seconds>] [--sha256 <hex>] [--sig-locator <id>] [--force]
       Fetch ciphertext by locator into --out. --from-locator-file reads the locator, its

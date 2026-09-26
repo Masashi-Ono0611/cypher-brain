@@ -26,6 +26,27 @@ the identity (below) **and** the latest locator (`#3`).
 cypher-brain gives you two independent defenses for the identity; **use both**.
 
 ## ENS agent wallet
+After `push --publish-ens` writes the locator, run
+`cypher-brain ens-verify --name <label> --text-key <key> --expected-value <locator> --rpc-url <sepolia-rpc-url>`.
+The positive check reads the configured text record and compares it with the locator
+you supply. The negative check simulates `setText` against a different key and requires
+the resolver's `EACUnauthorizedAccountRoles` revert. It never broadcasts the probe.
+Both checks are required for a PASS; a record read alone does not prove the grant is
+restricted, and a revert alone does not prove the publish landed.
+
+Agent self-description keys such as `agent-context` and `agent-endpoint[mcp]` can
+be granted using `ens-setup --text-key <key>` and written independently of pushes:
+
+```sh
+cypher-brain ens-set-text --name <registered-label> --text-key agent-context \
+  --value 'Personal AI agent focused on continuity' --rpc-url <sepolia-rpc-url>
+cypher-brain ens-set-text --name <registered-label> --text-key 'agent-endpoint[mcp]' \
+  --value 'https://example.com/mcp' --rpc-url <sepolia-rpc-url>
+```
+
+The command uses the same resolver lookup, per-key `ROLE_SET_TEXT` check,
+simulation, interactive confirmation, and agent-wallet signing as `push --publish-ens`.
+Only the resolver write is shared: it does not perform or depend on a push.
 
 For ENS integration, create a dedicated agent signing key with:
 

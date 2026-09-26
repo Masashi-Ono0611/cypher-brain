@@ -16,9 +16,11 @@ export const ROLE_SET_TEXT_ADMIN = ROLE_SET_TEXT << 128n;
 export const ETH_REGISTRY_ABI = ['function getResolver(string label) view returns (address)'] as const;
 
 export const PERMISSIONED_RESOLVER_ABI = [
+  'error EACUnauthorizedAccountRoles(uint256 resource, uint256 roleBitmap, address account)',
   'function initialize((address account,uint256 roleBitmap)[] grants, bytes[] calls)',
   'function hasRootRoles(uint256 roleBitmap, address account) view returns (bool)',
   'function hasRoles(uint256 resource, uint256 roleBitmap, address account) view returns (bool)',
   'function grantSetterRoles(bytes setter, address account) returns (bool)',
   'function setText(bytes name, string key, string value)',
+  'function getText(bytes name, string key) view returns (string)',
 ] as const;
