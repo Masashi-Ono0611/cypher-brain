@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scoped Brain — ETHGlobal Tokyo 2026 verification brief</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    color-scheme: light;
+    --accent:#0D73BD; --accent-tint:#EDF5FB;
+    --ink:#0F1115; --muted:#5B616E; --faint:#72767F;
+    --line:#E5E7EB; --bg:#FFFFFF; --surface:#F7F8FA;
+    --good:#0E7E56; --good-tint:#E9F5EF; --good-line:#C2E5D5;
+    --bad:#C0392B;  --bad-tint:#FBECEA;  --bad-line:#F0C9C3;
+    --warn:#92651E; --warn-tint:#FBF1DF; --warn-line:#EAD9AE;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html{-webkit-font-smoothing:antialiased; scroll-behavior:smooth;}
+  body{background:var(--bg); color:var(--ink); font-family:"IBM Plex Sans","Noto Sans JP","Hiragino Sans",-apple-system,Arial,sans-serif; line-height:1.6; font-size:16px;}
+  .wrap{max-width:960px; margin:0 auto; padding:0 28px 90px;}
+  .mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;}
+
+  header{padding:80px 0 50px; border-bottom:1px solid var(--line);}
+  .kicker{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:12px; letter-spacing:.16em; text-transform:uppercase; color:var(--accent); font-weight:600; margin-bottom:22px;}
+  h1{font-size:60px; font-weight:700; letter-spacing:-.035em; line-height:1.06; margin-bottom:24px;}
+  .tagline{font-size:25px; font-weight:500; letter-spacing:-.015em; line-height:1.34; max-width:720px;}
+  .tagline strong{color:var(--accent); font-weight:700;}
+  .sub{font-size:16px; color:var(--muted); margin-top:18px; max-width:680px;}
+
+  section{padding:56px 0; border-bottom:1px solid var(--line);}
+  section:last-of-type{border-bottom:none;}
+  .label{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--faint); font-weight:600; margin-bottom:14px;}
+  .label .n{color:var(--accent);}
+  h2{font-size:30px; font-weight:700; letter-spacing:-.025em; line-height:1.2; margin-bottom:14px;}
+  .lead{font-size:16.5px; color:var(--muted); max-width:760px;}
+  .lead strong{color:var(--ink); font-weight:600;}
+  code{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:.85em; background:var(--surface); border:1px solid var(--line); border-radius:5px; padding:1px 5px; color:var(--ink);}
+
+  .fig{margin:32px 0 6px; background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:28px 24px; break-inside:avoid;}
+  .fig svg{display:block; width:100%; height:auto;}
+  .fig-cap{font-size:12.5px; color:var(--faint); margin-top:14px; text-align:center; font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;}
+  .svg-t{font-family:"IBM Plex Sans","Noto Sans JP",sans-serif; font-size:13px; fill:var(--ink); font-weight:600;}
+  .svg-s{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:10.5px; fill:var(--faint);}
+  .svg-l{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:12px; fill:var(--muted);}
+  .svg-o{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:13px; fill:var(--accent); font-weight:700;}
+
+  .pillars{display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:28px;}
+  .pillar{border:1px solid var(--line); border-radius:12px; padding:18px; background:var(--bg); break-inside:avoid;}
+  .pillar.hi{border-color:var(--accent); background:var(--accent-tint);}
+  .pillar .pn{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:11px; color:var(--faint); display:block; margin-bottom:4px; letter-spacing:.08em;}
+  .pillar .pt{font-size:16px; font-weight:700; margin-bottom:6px; letter-spacing:-.01em;}
+  .pillar .pt span{color:var(--accent);}
+  .pillar .pd{font-size:13.5px; color:var(--muted); line-height:1.5;}
+  .pillar .pd b{color:var(--ink);}
+
+  .stats{display:grid; grid-template-columns:repeat(3,1fr); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:14px; overflow:hidden; margin-top:28px;}
+  .stat{background:var(--bg); padding:22px 20px;}
+  .stat .v{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:34px; font-weight:600; letter-spacing:-.03em; line-height:1;}
+  .stat .v .u{font-size:14px; color:var(--faint); font-weight:500; margin-left:4px;}
+  .stat .k{font-size:13px; color:var(--muted); margin-top:9px;}
+  .stat.accent .v{color:var(--accent);}
+
+  .rows{margin-top:28px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
+  .row{display:grid; grid-template-columns:220px 1fr; border-top:1px solid var(--line); break-inside:avoid;}
+  .row:first-child{border-top:none;}
+  .row .rk{background:var(--surface); padding:14px 16px; font-size:13.5px; font-weight:700; color:var(--ink); border-right:1px solid var(--line);}
+  .row .rk .rs{display:block; color:var(--faint); font-weight:500; font-size:11px; margin-top:3px; font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;}
+  .row .rv{padding:14px 16px; font-size:14px; color:var(--muted);}
+  .row .rv b{color:var(--ink); font-weight:600;}
+
+  .caps{margin-top:28px; display:grid; grid-template-columns:repeat(2,1fr); gap:12px;}
+  .cap{display:flex; gap:14px; align-items:baseline; border:1px solid var(--line); border-radius:12px; padding:15px 18px; break-inside:avoid;}
+  .cap .cv{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:13px; font-weight:700; color:var(--accent); white-space:nowrap;}
+  .cap .cb{font-size:14px;} .cap .cb b{font-weight:700;}
+
+  .tag{display:inline-block; font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; font-size:11px; font-weight:700; padding:2px 8px; border-radius:6px; letter-spacing:.04em; vertical-align:middle; white-space:nowrap;}
+  .tag.good{background:var(--good-tint); color:var(--good); border:1px solid var(--good-line);}
+  .tag.warn{background:var(--warn-tint); color:var(--warn); border:1px solid var(--warn-line);}
+  .tag.bad{background:var(--bad-tint); color:var(--bad); border:1px solid var(--bad-line);}
+
+  table{width:100%; border-collapse:collapse; margin:28px 0 6px; font-size:14px; background:#fff; border:1px solid var(--line); border-radius:14px; overflow:hidden; break-inside:avoid;}
+  tr{break-inside:avoid;}
+  th,td{padding:12px 16px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top;}
+  th{background:var(--surface); color:var(--ink); font-size:13px; font-weight:700;}
+  tr:last-child td{border-bottom:0;}
+  .yes{color:var(--good); font-weight:700;}
+  .no{color:var(--bad); font-weight:700;}
+  .rng{display:block; font-size:11px; color:var(--faint); font-weight:600; margin-top:2px; line-height:1.3; font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;}
+  .legend{background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:14px 18px; font-size:13.5px; margin-top:24px; line-height:1.85; break-inside:avoid;}
+  .legend b{color:var(--accent);}
+
+  .ba{display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:28px;}
+  .ba .col{border-radius:14px; padding:20px; border:1px solid;}
+  .ba .col.before{background:var(--bad-tint); border-color:var(--bad-line);}
+  .ba .col.after{background:var(--good-tint); border-color:var(--good-line);}
+  .ba .col .clabel{font-weight:700; font-size:12px; font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace; letter-spacing:.06em; display:inline-block; padding:3px 10px; border-radius:6px; color:#fff; margin-bottom:10px;}
+  .ba .col.before .clabel{background:var(--bad);} .ba .col.after .clabel{background:var(--good);}
+  .ba .col ul{padding-left:18px;} .ba .col li{font-size:14px; margin:5px 0;}
+
+  .footer{margin-top:48px; font-size:12.5px; color:var(--faint); font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;}
+
+  @media(max-width:720px){
+    h1{font-size:40px;} .tagline{font-size:20px;} h2{font-size:24px;}
+    .pillars,.stats,.caps,.ba{grid-template-columns:1fr;}
+    .row{grid-template-columns:1fr;} .row .rk{border-right:none; border-bottom:1px solid var(--line);}
+    table{display:block; overflow-x:auto; -webkit-overflow-scrolling:touch;}
+  }
+  @media print{
+    *{ -webkit-print-color-adjust:exact !important; print-color-adjust:exact !important; }
+    .fig, .pillar, .row, .cap, .legend, table, tr { break-inside:avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="kicker">ETHGlobal Tokyo 2026 · Project brief</div>
+    <h1>Scoped Brain<br>Give every AI agent only the part of your brain it needs</h1>
+    <p class="tagline">One personal brain, <strong>selectively exposed</strong> per agent — built on gbrain, Cypher Brain, and ENS delegation.</p>
+    <p class="sub">A live verification pass against the real gbrain instance and Cypher Brain codebase, run ahead of the hackathon build.</p>
+    <div class="stats">
+      <div class="stat accent"><div class="v">11</div><div class="k">gbrain sources today — all connector-scoped, none use-case-scoped</div></div>
+      <div class="stat"><div class="v">7189</div><div class="k">pages in the unscoped <code class="mono">default</code> source</div></div>
+      <div class="stat"><div class="v">1</div><div class="k">MCP client registered, grant declares read+write, no per-agent boundary</div></div>
+    </div>
+  </header>
+
+  <section>
+    <div class="label"><span class="n">01</span> &nbsp;The three-layer thesis</div>
+    <h2>Logical scope, cryptographic scope, delegated identity</h2>
+    <p class="lead">Each layer solves a <strong>different</strong> kind of isolation. Conflating them is the main risk this brief exists to rule out.</p>
+    <div class="fig">
+      <svg viewBox="0 0 780 190" role="img" aria-label="Three layer architecture: gbrain, Cypher Brain, ENS">
+        <rect x="16" y="40" width="230" height="100" rx="10" fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="131" y="68" text-anchor="middle" class="svg-o">gbrain</text>
+        <text x="131" y="90" text-anchor="middle" class="svg-l">logical isolation</text>
+        <text x="131" y="106" text-anchor="middle" class="svg-l">sources + per-client</text>
+        <text x="131" y="120" text-anchor="middle" class="svg-l">read/write grants</text>
+
+        <rect x="276" y="40" width="230" height="100" rx="10" fill="var(--good-tint)" stroke="var(--good-line)"/>
+        <text x="391" y="68" text-anchor="middle" class="svg-t" style="fill:var(--good)">Cypher Brain</text>
+        <text x="391" y="90" text-anchor="middle" class="svg-l">cryptographic isolation</text>
+        <text x="391" y="106" text-anchor="middle" class="svg-l">scoped snapshot, per-</text>
+        <text x="391" y="120" text-anchor="middle" class="svg-l">scope ciphertext</text>
+
+        <rect x="536" y="40" width="230" height="100" rx="10" fill="var(--surface)" stroke="var(--line)"/>
+        <text x="651" y="68" text-anchor="middle" class="svg-t">ENS</text>
+        <text x="651" y="90" text-anchor="middle" class="svg-s">identity + delegation</text>
+        <text x="651" y="106" text-anchor="middle" class="svg-s">which agent wallet may</text>
+        <text x="651" y="120" text-anchor="middle" class="svg-s">update which pointer</text>
+
+        <path d="M246 90 L274 90 M506 90 L534 90" stroke="var(--faint)" stroke-width="1.4" marker-end="url(#ar1)"/>
+        <defs><marker id="ar1" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M1 1 L6 4 L1 7" fill="none" stroke="var(--faint)" stroke-width="1.3"/></marker></defs>
+
+        <text x="131" y="168" text-anchor="middle" class="svg-l">application-level</text>
+        <text x="391" y="168" text-anchor="middle" class="svg-l">actual decrypt access</text>
+        <text x="651" y="168" text-anchor="middle" class="svg-l">onchain config access</text>
+      </svg>
+      <div class="fig-cap">Do not conflate the three: a gbrain grant is not a decrypt key, and an ENS permission is not a decrypt key either</div>
+    </div>
+    <div class="pillars">
+      <div class="pillar hi"><span class="pn">LAYER 1</span><div class="pt"><span>gbrain</span> = logical</div><div class="pd"><b>Sources</b> + per-MCP-client <code>--federated-read</code> / <code>--bound-slug-prefixes</code> grants. Application-level authorization, not a security boundary on its own.</div></div>
+      <div class="pillar"><span class="pn">LAYER 2</span><div class="pt"><span>Cypher Brain</span> = cryptographic</div><div class="pd">Snapshot → encrypt → Arweave today ships <b>one ciphertext for the whole brain</b>. Scoped snapshot is the missing piece.</div></div>
+      <div class="pillar"><span class="pn">LAYER 3</span><div class="pt"><span>ENS</span> = delegation</div><div class="pd">Agent wallet gets a narrow onchain permission (e.g. <code>ROLE_SET_TEXT</code> on one key), never the owner key. Not verified this session.</div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="label"><span class="n">02</span> &nbsp;What gbrain actually has today</div>
+    <h2>Sources are connector-scoped, not use-case-scoped</h2>
+    <p class="lead">Live read from the running instance (macmini, gbrain 0.57.0.0, engine=postgres). <strong>No work / travel / private sources exist yet</strong> — every source maps to a tool, not a use case.</p>
+    <div class="rows">
+      <div class="row"><div class="rk">11 sources registered<span class="rs">gbrain sources status --json</span></div><div class="rv">One per connector: <code>default</code>, <code>antigravity-cli</code>, <code>apple-notes</code>, <code>chatgpt</code>, <code>coast</code>, <code>codex-cli</code>, <code>grok-cli</code>, <code>omi</code>, <code>photos</code>, <code>twitter</code>, <code>workspace-8c4c17df</code>.</div></div>
+      <div class="row"><div class="rk"><code>default</code> source<span class="rs">largest, federated</span></div><div class="rv"><b>7189 pages</b>, <code>federated: true</code> — crosses into every cross-source search by design. This is where unclassified content accumulates.</div></div>
+      <div class="row"><div class="rk">MCP client grants<span class="rs">gbrain mcp admin clients</span></div><div class="rv">One client (<code>air-claude-test</code>) registered with a grant declaring <code>scopes: [read,write]</code>, <code>sourceId: "default"</code>, <code>boundSlugPrefixes: null</code> — read/write on that grant was not separately exercised. &nbsp;<span class="tag warn">! no per-agent boundary set</span></div></div>
+      <div class="row"><div class="rk">Per-agent scoping mechanism<span class="rs">gbrain mcp grant --help</span></div><div class="rv">Confirmed to exist as a CLI primitive: <code>--federated-read S1,S2</code>, <code>--bound-slug-prefixes P1/,P2/</code>, <code>--delegated-slug-prefixes</code>. &nbsp;<span class="tag good">✓ available, just unused</span></div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="label"><span class="n">03</span> &nbsp;Verified capability matrix</div>
+    <h2>What was actually tested, live, this session</h2>
+    <div class="legend">
+      <b>✅ Verified</b> = exercised against the real macmini gbrain instance and observed directly, 2026‑09‑26 (single-page, single-source smoke test — not exhaustive). <b>△ Available, unused</b> = CLI primitive confirmed to exist (via <code>--help</code> or source), not exercised for this behavior. <b>❌ Confirmed absent</b> = checked in source/CLI and not present. <b>— Not tested</b> = out of scope this session, not the same as unavailable.
+    </div>
+    <table>
+      <thead><tr><th>Capability</th><th>Status</th><th>Evidence</th></tr></thead>
+      <tbody>
+        <tr><td>List pages scoped to one source</td><td class="yes">✅</td><td><code>gbrain list --source-id work-test</code> returned exactly 1 page, scoped to that source only — none of the 7189 <code>default</code>-source pages or the other 9 sources leaked in</td></tr>
+        <tr><td>Read a single page scoped to one source</td><td class="yes">✅</td><td><code>gbrain get &lt;slug&gt; --source-id work-test</code> returned only that page's markdown</td></tr>
+        <tr><td>Bulk export scoped to one source</td><td class="no">❌</td><td><code>gbrain export --repo &lt;source-path&gt;</code> exported all 44,485 pages, not just the target source; <code>export.ts</code> comment: "D26 — exports include everything"</td></tr>
+        <tr><td>Cypher Brain scoped snapshot (per-source ciphertext)</td><td class="no">❌</td><td><code>src/lib/snapshot.ts</code> has no gbrain-source concept — its own "source" means input file/dir path, not a gbrain source_id</td></tr>
+        <tr><td>Per-MCP-client source grant (read/write fencing)</td><td class="warn" style="color:var(--warn);">△</td><td>CLI flag exists (<code>mcp grant --federated-read</code>) and is real, but zero clients currently use it</td></tr>
+        <tr><td>ENS permissioned resolver delegation (<code>ROLE_SET_TEXT</code>)</td><td>—</td><td>Not tested this session — ENSv2 contracts are pre-final; spec-level only</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <div class="label"><span class="n">04</span> &nbsp;The path that actually closes the gap</div>
+    <h2>No gbrain fork, no Cypher Brain rewrite required</h2>
+    <p class="lead">The bulk-export gap (row 3 above) is closable with a thin wrapper, not core surgery — <code>list --source-id</code> + <code>get --source-id</code> already do the real work.</p>
+    <div class="fig">
+      <svg viewBox="0 0 780 150" role="img" aria-label="Scoped export pipeline built from existing CLI primitives">
+        <rect x="14" y="42" width="170" height="64" rx="9" fill="var(--bg)" stroke="var(--line)"/>
+        <text x="99" y="68" text-anchor="middle" class="svg-t">list --source-id</text>
+        <text x="99" y="86" text-anchor="middle" class="svg-s">verified working</text>
+
+        <rect x="216" y="42" width="170" height="64" rx="9" fill="var(--bg)" stroke="var(--line)"/>
+        <text x="301" y="68" text-anchor="middle" class="svg-t">get --source-id</text>
+        <text x="301" y="86" text-anchor="middle" class="svg-s">verified working</text>
+
+        <rect x="418" y="42" width="170" height="64" rx="9" fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="503" y="68" text-anchor="middle" class="svg-o">tmp export dir</text>
+        <text x="503" y="86" text-anchor="middle" class="svg-l">new — thin wrapper</text>
+
+        <rect x="620" y="42" width="150" height="64" rx="9" fill="var(--good-tint)" stroke="var(--good-line)"/>
+        <text x="695" y="68" text-anchor="middle" class="svg-t" style="fill:var(--good)">cypher-brain --dir</text>
+        <text x="695" y="86" text-anchor="middle" class="svg-l">no code change</text>
+
+        <path d="M184 74 L214 74 M386 74 L416 74 M588 74 L618 74" stroke="var(--faint)" stroke-width="1.4" marker-end="url(#ar2)"/>
+        <defs><marker id="ar2" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M1 1 L6 4 L1 7" fill="none" stroke="var(--faint)" stroke-width="1.3"/></marker></defs>
+      </svg>
+      <div class="fig-cap">Only the middle step (tmp export dir assembly) is new code — the two left boxes were verified live this session; <code>cypher-brain --dir</code> on the right is existing, unmodified code, not re-exercised this session</div>
+    </div>
+    <div class="ba">
+      <div class="col before"><span class="clabel">BEFORE</span><ul><li><code>default</code> source: 7189 pages, unclassified, federated</li><li>1 MCP client, grant declares read/write, no agent boundary</li><li>Cypher Brain: one ciphertext for the whole brain (per <code>snapshot.ts</code> inspection, not executed this session)</li></ul></div>
+      <div class="col after"><span class="clabel">AFTER (hackathon target)</span><ul><li>use-case sources (<code>work</code> / <code>travel</code> / <code>private</code>)</li><li>per-agent MCP grants via <code>--federated-read</code></li><li>scoped export → encrypt → Arweave, one ciphertext per scope → ENS pointer</li></ul></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="label"><span class="n">05</span> &nbsp;Decisions</div>
+    <h2>What this verification pass settled</h2>
+    <table>
+      <thead><tr><th>Question</th><th>Decision</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Add a <code>--source</code> filter to gbrain's own <code>export</code> command?</td><td><b>Skip (provisional)</b></td><td>The single live smoke test showed <code>list --source-id</code> + <code>get --source-id</code> return exact per-source results with no cross-source leakage; a fuller pass (multiple sources, duplicate slugs, pagination) should confirm before committing to this path over an upstream fix</td></tr>
+        <tr><td>Rewrite Cypher Brain's snapshot core to understand gbrain sources?</td><td><b>Skip</b></td><td><code>snapshot.ts</code> only needs a pre-assembled <code>--dir</code> (confirmed by source inspection); the scoping happens one layer above it, in a new wrapper script — not yet built or run</td></tr>
+        <tr><td>Verify ENS permissioned-resolver delegation this session?</td><td><b>Deferred</b></td><td>ENSv2 contracts are pre-final; needs a dedicated testnet pass, out of scope for a read-only gbrain check</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <div class="footer">cypher-brain · gbrain · ETHGlobal Tokyo 2026 scoping brief — verified live against macmini gbrain 0.57.0.0, 2026-09-26</div>
+
+</div>
+</body>
+</html>
