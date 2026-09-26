@@ -99,6 +99,8 @@ export interface CliOptions {
   name?: string; // ens-setup / push --publish-ens --name <label>: an existing ENSv2 label registered in ETHRegistry
   text_key?: string; // ens-setup / push --publish-ens --text-key <key>: the single text key delegated to the agent wallet
   rpc_url?: string; // ens-setup / push --publish-ens --rpc-url <url>: Sepolia JSON-RPC endpoint
+  expected_value?: string; // ens-verify: expected value already published to the delegated text key
+  value?: string; // ens-set-text --value <text>: value to write to the delegated ENS text key
 }
 
 /**
