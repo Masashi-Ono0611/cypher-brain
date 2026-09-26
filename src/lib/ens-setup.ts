@@ -67,6 +67,10 @@ export async function ensSetup(o: CliOptions): Promise<void> {
   if (!/^[a-z0-9-]+$/.test(o.name) || o.name.length < 3) {
     throw new UsageError('--name must be a single lowercase ENS label (not a full name) with at least 3 characters');
   }
+  // Captured as a local so its narrowed `string` type (not `string | undefined`) survives
+  // into the withRedactedRpcErrors() closures below -- narrowing on a property access
+  // like `o.name` doesn't persist across a closure boundary the way a local const does.
+  const name = o.name;
   if (!o.text_key.trim() || o.text_key.length > 256 || /[\u0000-\u001f\u007f]/.test(o.text_key)) {
     throw new UsageError(
       '--text-key must contain 1–256 printable characters with no control characters (they could obscure the confirmation prompt)',
@@ -116,6 +120,21 @@ export async function ensSetup(o: CliOptions): Promise<void> {
   const agentPrivateKey = await readAgentWallet(agentPath);
   const agentAddress = toAccountOrRedact(agentPrivateKey, 'agent wallet key').address;
   const rpcHost = new URL(o.rpc_url).host;
+
+  // Codex review (final Epic sweep): matches ens-publish.ts's withRedactedRpcErrors --
+  // this file's RPC calls were left unwrapped, so a transport failure could leak the
+  // full RPC URL (path/query, where an Infura/Alchemy-style API key lives) in the
+  // thrown error's message.
+  async function withRedactedRpcErrors<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (e) {
+      throw new Error(
+        `Sepolia RPC call to ${rpcHost} failed: ${e instanceof Error ? e.name : 'unknown error'} (details withheld — may contain the RPC URL's credentials)`,
+      );
+    }
+  }
+
   const { publicClient, walletClient, ownerAddress } = await (async () => {
     const entered = await guardedPrompt(() => password({ message: 'Owner wallet private key (kept in memory only):' }));
     if (isCancel(entered)) throw new Error('ens-setup cancelled');
@@ -129,21 +148,28 @@ export async function ensSetup(o: CliOptions): Promise<void> {
     };
   })();
 
-  const chainId = await publicClient.getChainId();
+  const chainId = await withRedactedRpcErrors(() => publicClient.getChainId());
   if (chainId !== sepolia.id) throw new Error(`RPC endpoint is on chain ${chainId}; expected Sepolia (${sepolia.id})`);
 
-  const resolver = await publicClient.readContract({
-    address: ETH_REGISTRY,
-    abi: registryAbi,
-    functionName: 'getResolver',
-    args: [o.name],
-  });
+  const resolver = await withRedactedRpcErrors(() =>
+    publicClient.readContract({
+      address: ETH_REGISTRY,
+      abi: registryAbi,
+      functionName: 'getResolver',
+      args: [name],
+    }),
+  );
   if (resolver === '0x0000000000000000000000000000000000000000') {
     throw new Error(
       `ENS label '${o.name}' has no registered resolver. Register it and assign its Permissioned Resolver first.`,
     );
   }
-  if ((await publicClient.getCode({ address: resolver })) === undefined) {
+  // Codex review (final Epic sweep): this only checked for `undefined`, so an address
+  // with NO code but that still exists (viem returns '0x', not undefined, for that case
+  // — same distinction ens-publish.ts/ens-verify.ts already handle) was accepted as if a
+  // contract were actually deployed there.
+  const resolverCode = await withRedactedRpcErrors(() => publicClient.getCode({ address: resolver }));
+  if (resolverCode === undefined || resolverCode === '0x') {
     throw new Error(`no contract code found at the resolver returned for '${o.name}'`);
   }
 
@@ -157,12 +183,14 @@ export async function ensSetup(o: CliOptions): Promise<void> {
   console.log(`Sepolia RPC host: ${rpcHost}`);
   console.log('The owner key is held only in process memory and is never saved by cypher-brain.');
 
-  let isAdmin = await publicClient.readContract({
-    address: resolver,
-    abi: resolverAbi,
-    functionName: 'hasRootRoles',
-    args: [ROLE_SET_TEXT_ADMIN, ownerAddress],
-  });
+  let isAdmin = await withRedactedRpcErrors(() =>
+    publicClient.readContract({
+      address: resolver,
+      abi: resolverAbi,
+      functionName: 'hasRootRoles',
+      args: [ROLE_SET_TEXT_ADMIN, ownerAddress],
+    }),
+  );
   if (!isAdmin) {
     // Codex review (#974): PermissionedResolver's initialize() is permissionless on an
     // as-yet-uninitialized proxy — another account could have initialized it first with
@@ -171,37 +199,48 @@ export async function ensSetup(o: CliOptions): Promise<void> {
     // Full mitigation is out of scope for this MVP (would need atomic deploy+init, which
     // ens-setup deliberately doesn't do — see #967's "reuse-only" scope); surface the risk
     // explicitly instead of silently proceeding.
+    // Codex review (final Epic sweep): matches ens-publish.ts's confirm default -- a bare
+    // Enter here previously approved an on-chain transaction (clack's confirm() defaults
+    // to Yes without an explicit initialValue). Default to No for every destructive
+    // confirmation in this file, same as the role-grant prompt below.
     const ok = await guardedPrompt(() =>
       confirm({
         message:
           `Resolver ${resolver} has no root admin yet. Initializing it now grants YOU ROLE_SET_TEXT_ADMIN — ` +
           'but if this proxy was already touched by someone else before this command ran, that step may have ' +
           'already happened under their control instead. Only proceed if you deployed or fully trust this resolver. Continue?',
+        initialValue: false,
       }),
     );
     if (isCancel(ok) || !ok) throw new Error('resolver initialization was not approved');
     const initArgs = [[{ account: ownerAddress, roleBitmap: ROLE_SET_TEXT_ADMIN }], []] as const;
-    await publicClient.simulateContract({
-      account: ownerAddress,
-      address: resolver,
-      abi: resolverAbi,
-      functionName: 'initialize',
-      args: initArgs,
-    });
-    const initHash = await walletClient.writeContract({
-      address: resolver,
-      abi: resolverAbi,
-      functionName: 'initialize',
-      args: initArgs,
-    });
-    const initReceipt = await publicClient.waitForTransactionReceipt({ hash: initHash });
+    await withRedactedRpcErrors(() =>
+      publicClient.simulateContract({
+        account: ownerAddress,
+        address: resolver,
+        abi: resolverAbi,
+        functionName: 'initialize',
+        args: initArgs,
+      }),
+    );
+    const initHash = await withRedactedRpcErrors(() =>
+      walletClient.writeContract({
+        address: resolver,
+        abi: resolverAbi,
+        functionName: 'initialize',
+        args: initArgs,
+      }),
+    );
+    const initReceipt = await withRedactedRpcErrors(() => publicClient.waitForTransactionReceipt({ hash: initHash }));
     if (initReceipt.status !== 'success') throw new Error(`resolver initialization reverted (${initHash})`);
-    isAdmin = await publicClient.readContract({
-      address: resolver,
-      abi: resolverAbi,
-      functionName: 'hasRootRoles',
-      args: [ROLE_SET_TEXT_ADMIN, ownerAddress],
-    });
+    isAdmin = await withRedactedRpcErrors(() =>
+      publicClient.readContract({
+        address: resolver,
+        abi: resolverAbi,
+        functionName: 'hasRootRoles',
+        args: [ROLE_SET_TEXT_ADMIN, ownerAddress],
+      }),
+    );
   }
   if (!isAdmin)
     throw new Error('owner does not have ROLE_SET_TEXT_ADMIN on resolver root; refusing to grant agent access');
@@ -222,23 +261,45 @@ export async function ensSetup(o: CliOptions): Promise<void> {
         `Grant ${agentAddress} ROLE_SET_TEXT for text key '${o.text_key}' on resolver ${resolver}? ` +
         `This is scoped to that key, but NOT to ${o.name} alone — it covers '${o.text_key}' on every name ` +
         'this resolver serves, if it serves more than one. This sends an on-chain transaction.',
+      initialValue: false,
     }),
   );
   if (isCancel(ok) || !ok) throw new Error('role grant was not approved');
-  await publicClient.simulateContract({
-    account: ownerAddress,
-    address: resolver,
-    abi: resolverAbi,
-    functionName: 'grantSetterRoles',
-    args: [setter, agentAddress],
-  });
-  const hash = await walletClient.writeContract({
-    address: resolver,
-    abi: resolverAbi,
-    functionName: 'grantSetterRoles',
-    args: [setter, agentAddress],
-  });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  // Codex review (final Epic sweep): matches ens-publish.ts's assertResolverUnchanged --
+  // the confirmation prompt above can stay open for an arbitrary amount of time while a
+  // human decides. Re-check the registry's resolver again right before broadcasting so a
+  // registry change during that window can't leave the grant landing on a stale resolver.
+  const resolverBeforeGrant = await withRedactedRpcErrors(() =>
+    publicClient.readContract({
+      address: ETH_REGISTRY,
+      abi: registryAbi,
+      functionName: 'getResolver',
+      args: [name],
+    }),
+  );
+  if (resolverBeforeGrant.toLowerCase() !== resolver.toLowerCase()) {
+    throw new Error(
+      `ENS label '${o.name}' now resolves to ${resolverBeforeGrant}, not the ${resolver} approved above; refusing to grant on a stale resolver`,
+    );
+  }
+  await withRedactedRpcErrors(() =>
+    publicClient.simulateContract({
+      account: ownerAddress,
+      address: resolver,
+      abi: resolverAbi,
+      functionName: 'grantSetterRoles',
+      args: [setter, agentAddress],
+    }),
+  );
+  const hash = await withRedactedRpcErrors(() =>
+    walletClient.writeContract({
+      address: resolver,
+      abi: resolverAbi,
+      functionName: 'grantSetterRoles',
+      args: [setter, agentAddress],
+    }),
+  );
+  const receipt = await withRedactedRpcErrors(() => publicClient.waitForTransactionReceipt({ hash }));
   if (receipt.status !== 'success') throw new Error(`scoped role grant reverted (${hash})`);
   console.log(`Scoped role grant confirmed: ${hash}`);
 }
