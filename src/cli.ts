@@ -50,6 +50,7 @@ import { publishLatest } from './lib/ton-dns.js';
 import { schedule } from './lib/schedule.js';
 import { wallet } from './lib/wallet.js';
 import { agentWallet, AGENT_WALLET_DEFAULT_PATH } from './lib/agent-wallet.js';
+import { ensSetup } from './lib/ens-setup.js';
 import { estimate } from './lib/estimate.js';
 import { doctor } from './lib/doctor.js';
 import { ledger } from './lib/ledger.js';
@@ -133,14 +134,18 @@ const VALUE_FLAGS = new Set([
   'plan',
   'sss',
   'from_restored_dir',
+  'name',
+  'text_key',
+  'rpc_url',
 ]);
 
 // Flags whose value can itself embed a credential (--pg's connection string carries a
-// password inline, e.g. postgresql://user:pass@host/db). The "did you mean" hint below
+// password inline, e.g. postgresql://user:pass@host/db; --rpc-url's value is commonly
+// an Infura/Alchemy-style URL with an API key in the path). The "did you mean" hint below
 // otherwise echoes the offending "--flag=value" token's value verbatim; for these flags
 // that would print the secret to stderr (and, under --json, to stdout too). Redacted
 // there only — the flag's actual value, once accepted normally, is unaffected.
-const REDACT_VALUE_FLAGS = new Set(['pg']);
+const REDACT_VALUE_FLAGS = new Set(['pg', 'rpc_url']);
 
 // Every flag name an "unknown flag" error can plausibly suggest (#425 — generalizing
 // #253's own "would be nice-to-have" mention of a did-you-mean suggestion beyond
@@ -518,6 +523,15 @@ const HELP = `cypher-brain — encrypt a gbrain snapshot so only you can read it
       The operator/owner wallet is not stored by cypher-brain. --force first backs up
       an existing key to a sibling .bak-<timestamp>-<random> file. Replacing this key
       changes the agent address; review and update any on-chain permissions separately.
+
+  cypher-brain ens-setup --name <registered-label> --text-key <key> --rpc-url <sepolia-rpc-url>
+      Interactively initialize the existing label's Permissioned Resolver for the owner
+      (if needed), then grant the local agent wallet permission to set exactly one text
+      key. Uses a BYO owner private key entered through a masked prompt; cypher-brain
+      never writes it to disk. This command reuses an already-registered label and
+      resolver; it does not register names or deploy resolver proxies. Sepolia RPC calls
+      and transactions are made only when you run this command. Review the RPC endpoint
+      before entering an owner key.
 
   cypher-brain wallet balance [--wallet <path>] [--address <addr>] [--json] [--chain arweave|ton]
       --chain arweave (default): print what an address can actually spend on the turbo
@@ -1593,6 +1607,7 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
   'push-status': [],
   witness: [],
   'agent-wallet': [],
+  'ens-setup': [],
   // restore's destination is --out-dir; src/lib/restore.ts's restore() never reads o.out.
   // The single highest-traffic instance, since --out means the output on snapshot, pull and
   // wallet create — restore is the one command that spells it differently.
@@ -1839,6 +1854,7 @@ const FLAG_IRRELEVANT: Record<string, FlagIrrelevance[]> = {
  */
 const COMMAND_FLAGS: Record<string, readonly string[]> = {
   'agent-wallet': [],
+  'ens-setup': ['name', 'text_key', 'rpc_url'],
   'agent-wallet keygen': ['force'],
   // init(_o) ignores the options bag entirely (src/lib/wizard.ts) — it is an interactive
   // wizard that asks for everything. Empty is the honest answer, and now a load-bearing
@@ -2322,6 +2338,8 @@ async function dispatchCommand(cmd: string | undefined, o: CliOptions): Promise<
       return wallet(o);
     case 'agent-wallet':
       return agentWallet(o);
+    case 'ens-setup':
+      return ensSetup(o);
     case 'doctor':
       return doctor(o);
     case 'ledger':

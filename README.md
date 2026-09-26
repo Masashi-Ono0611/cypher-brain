@@ -124,6 +124,11 @@ is distinct from the age identity and from any owner wallet: it can exercise onl
 the on-chain permissions explicitly granted to its address, so treat compromise as
 delegated authority exposure and revoke/update permissions when rotating it. The
 owner wallet itself is not stored by cypher-brain.
+`cypher-brain ens-setup` reuses an existing ENSv2 label and Permissioned Resolver,
+prompting for the owner key through a hidden TTY prompt and granting the agent
+wallet `ROLE_SET_TEXT` on one text key. The owner key is held in process memory
+only. Name registration and resolver proxy deployment are not performed by this
+command; see [MANAGEMENT.md](MANAGEMENT.md#one-time-ensv2-owner-setup).
 
 The same "anyone holding a recipient's public key can forge ciphertext" point applies
 one layer down, to the tar payload age decrypts to: `restore` inspects every tar entry
@@ -861,6 +866,15 @@ cypher-brain — encrypt a gbrain snapshot so only you can read it
       The operator/owner wallet is not stored by cypher-brain. --force first backs up
       an existing key to a sibling .bak-<timestamp>-<random> file. Replacing this key
       changes the agent address; review and update any on-chain permissions separately.
+
+  cypher-brain ens-setup --name <registered-label> --text-key <key> --rpc-url <sepolia-rpc-url>
+      Interactively initialize the existing label's Permissioned Resolver for the owner
+      (if needed), then grant the local agent wallet permission to set exactly one text
+      key. Uses a BYO owner private key entered through a masked prompt; cypher-brain
+      never writes it to disk. This command reuses an already-registered label and
+      resolver; it does not register names or deploy resolver proxies. Sepolia RPC calls
+      and transactions are made only when you run this command. Review the RPC endpoint
+      before entering an owner key.
 
   cypher-brain wallet balance [--wallet <path>] [--address <addr>] [--json] [--chain arweave|ton]
       --chain arweave (default): print what an address can actually spend on the turbo
