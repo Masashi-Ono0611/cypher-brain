@@ -41,6 +41,25 @@ the agent address. If rotated, review and update on-chain permissions for the ol
 new addresses separately. This wallet's security boundary is the authority granted
 to its address; it is not the age identity used to decrypt snapshots.
 
+### One-time ENSv2 owner setup
+
+`ens-setup` currently reuses an already registered ENSv2 label with its
+Permissioned Resolver proxy. It does not register a name or deploy a resolver.
+Use a Sepolia RPC endpoint you trust; the command prompts for the owner's
+private key with input hidden, keeps it in process memory only, and does not
+write it to disk. Do not pass owner keys in arguments or environment variables.
+
+```sh
+cypher-brain ens-setup --name <registered-label> --text-key brain.latest --rpc-url <sepolia-rpc-url>
+```
+
+The owner must be able to initialize the resolver with `ROLE_SET_TEXT_ADMIN`
+on root (if it is not initialized) and grant a setter role. The command asks
+before each transaction, then grants the local agent wallet `ROLE_SET_TEXT`
+for the selected key only. ENS registration alone does not grant resolver text
+roles. Confirm the printed resolver and RPC endpoint before approving a
+transaction; Sepolia contract addresses can change after ENS redeployments.
+
 ### 1. Encrypt to a backup key (recommended, built in)
 
 `snapshot --recipient` is repeatable. Give it a **primary** and an **offline

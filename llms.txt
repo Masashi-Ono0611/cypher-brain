@@ -100,6 +100,17 @@ the trusted public key off-box. Doctor warns about local coverage gaps. Arweave
 preserves published evidence against local history rewrites, but a compromised
 signing key can append plausible entries; signatures cannot prove operator intent.
 
+## ENS agent wallet setup
+
+`agent-wallet keygen` creates the local Ethereum agent key. `ens-setup
+--name <registered-label> --text-key <key> --rpc-url <sepolia-rpc-url>` reuses
+an existing ENSv2 Permissioned Resolver on Sepolia and grants that agent one
+text-key setter role. The owner key is entered in a hidden interactive prompt,
+kept in memory only, and never saved by cypher-brain. The command does not
+register names or deploy resolver proxies. It may initialize the resolver's
+owner root role and asks before each transaction. Verify the RPC endpoint before
+entering the owner key.
+
 ## Key concepts
 
 - **identity** (private key) — the only thing that can decrypt. Lives off the
