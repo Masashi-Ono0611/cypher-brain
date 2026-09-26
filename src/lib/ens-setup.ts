@@ -73,11 +73,30 @@ export async function ensSetup(o: CliOptions): Promise<void> {
   if (!/^[a-z0-9-]+$/.test(o.name) || o.name.length < 3) {
     throw new UsageError('--name must be a single lowercase ENS label (not a full name) with at least 3 characters');
   }
-  if (!o.text_key.trim() || o.text_key.length > 256) {
-    throw new UsageError('--text-key must contain 1–256 characters');
+  if (!o.text_key.trim() || o.text_key.length > 256 || /[\u0000-\u001f\u007f]/.test(o.text_key)) {
+    throw new UsageError(
+      '--text-key must contain 1–256 printable characters with no control characters (they could obscure the confirmation prompt)',
+    );
   }
-  if (!process.stdin.isTTY || !process.stderr.isTTY) {
-    throw new Error('ens-setup is interactive and requires both stdin and stderr to be a TTY');
+  // Codex review (#974): http() previously accepted --rpc-url unvalidated. Enforce HTTPS
+  // (or local HTTP for offline testing) with no embedded credentials, same rule #968's
+  // ens-publish.ts already applies to its own --rpc-url.
+  try {
+    const url = new URL(o.rpc_url);
+    const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+    if (url.username || url.password || (url.protocol !== 'https:' && !(local && url.protocol === 'http:'))) {
+      throw new Error();
+    }
+  } catch {
+    throw new UsageError(
+      '--rpc-url must be an HTTPS Sepolia endpoint (or local HTTP endpoint) without embedded credentials',
+    );
+  }
+  // Codex review (#974): clack/prompts writes to stdout by default; only stderr was
+  // checked here, so redirecting stdout hid the prompt/confirmation text while input
+  // stayed live. Require both to be a TTY.
+  if (!process.stdin.isTTY || !process.stdout.isTTY || !process.stderr.isTTY) {
+    throw new Error('ens-setup is interactive and requires stdin, stdout, and stderr to all be a TTY');
   }
 
   const { createPublicClient, createWalletClient, encodeFunctionData, http, parseAbi, privateKeyToAccount, sepolia } =
@@ -91,14 +110,28 @@ export async function ensSetup(o: CliOptions): Promise<void> {
     'function setText(bytes name, string key, string value)',
   ]);
 
+  // Codex review (#974): viem/Noble's own error for an out-of-range secp256k1 scalar
+  // includes the ENTIRE offending value in its message (reproduced) — a regex that only
+  // checks length/hex-ness doesn't catch that, and letting the exception propagate would
+  // print the almost-private-key to the CLI's error output. Wrap both derivations so any
+  // failure becomes a fixed, value-free message instead.
+  function toAccountOrRedact(key: `0x${string}`, label: string) {
+    try {
+      return privateKeyToAccount(key);
+    } catch {
+      throw new Error(`${label} is not a valid secp256k1 private key (value withheld from this message)`);
+    }
+  }
+
   const agentPath = AGENT_WALLET_DEFAULT_PATH;
   const agentPrivateKey = await readAgentWallet(agentPath);
-  const agentAddress = privateKeyToAccount(agentPrivateKey).address;
+  const agentAddress = toAccountOrRedact(agentPrivateKey, 'agent wallet key').address;
+  const rpcHost = new URL(o.rpc_url).host;
   const { publicClient, walletClient, ownerAddress } = await (async () => {
     const entered = await guardedPrompt(() => password({ message: 'Owner wallet private key (kept in memory only):' }));
     if (isCancel(entered)) throw new Error('ens-setup cancelled');
     if (!/^0x[0-9a-fA-F]{64}$/.test(entered)) throw new Error('expected a 32-byte 0x-prefixed owner private key');
-    const account = privateKeyToAccount(entered as `0x${string}`);
+    const account = toAccountOrRedact(entered as `0x${string}`, 'owner wallet key');
     const transport = http(o.rpc_url);
     return {
       ownerAddress: account.address,
@@ -130,7 +163,9 @@ export async function ensSetup(o: CliOptions): Promise<void> {
   console.log(`Owner signer: ${ownerAddress}`);
   console.log(`Agent wallet: ${agentAddress}`);
   console.log(`Text key: ${o.text_key}`);
-  console.log(`RPC endpoint: ${o.rpc_url}`);
+  // Codex review (#974): the full RPC URL can carry an API key in its path/query
+  // (Infura/Alchemy-style); only the host is safe to print. Matches ens-publish.ts (#968).
+  console.log(`Sepolia RPC host: ${rpcHost}`);
   console.log('The owner key is held only in process memory and is never saved by cypher-brain.');
 
   let isAdmin = await publicClient.readContract({
@@ -140,10 +175,19 @@ export async function ensSetup(o: CliOptions): Promise<void> {
     args: [ROLE_SET_TEXT_ADMIN, ownerAddress],
   });
   if (!isAdmin) {
+    // Codex review (#974): PermissionedResolver's initialize() is permissionless on an
+    // as-yet-uninitialized proxy — another account could have initialized it first with
+    // attacker-controlled roles before this command ever runs. Simulation cannot detect
+    // that race (it only checks the CURRENT state, which could already be compromised).
+    // Full mitigation is out of scope for this MVP (would need atomic deploy+init, which
+    // ens-setup deliberately doesn't do — see #967's "reuse-only" scope); surface the risk
+    // explicitly instead of silently proceeding.
     const ok = await guardedPrompt(() =>
       confirm({
         message:
-          'Initialize this resolver with ROLE_SET_TEXT_ADMIN on root for the owner? This sends an on-chain transaction.',
+          `Resolver ${resolver} has no root admin yet. Initializing it now grants YOU ROLE_SET_TEXT_ADMIN — ` +
+          'but if this proxy was already touched by someone else before this command ran, that step may have ' +
+          'already happened under their control instead. Only proceed if you deployed or fully trust this resolver. Continue?',
       }),
     );
     if (isCancel(ok) || !ok) throw new Error('resolver initialization was not approved');
@@ -178,9 +222,17 @@ export async function ensSetup(o: CliOptions): Promise<void> {
     functionName: 'setText',
     args: ['0x', o.text_key, ''],
   });
+  // Codex review (#974): the resolver derives this role's resource from the text KEY
+  // alone (keccak256 of the key string) — the encoded setter's `name` argument is not
+  // part of that derivation and is ignored. On a resolver shared across multiple names,
+  // this grant is NOT scoped to just ${o.name}: it covers '${o.text_key}' on every name
+  // that resolver serves. Say so plainly instead of implying a per-name boundary.
   const ok = await guardedPrompt(() =>
     confirm({
-      message: `Grant ${agentAddress} ROLE_SET_TEXT for only '${o.text_key}' on ${o.name}? This sends an on-chain transaction.`,
+      message:
+        `Grant ${agentAddress} ROLE_SET_TEXT for text key '${o.text_key}' on resolver ${resolver}? ` +
+        `This is scoped to that key, but NOT to ${o.name} alone — it covers '${o.text_key}' on every name ` +
+        'this resolver serves, if it serves more than one. This sends an on-chain transaction.',
     }),
   );
   if (isCancel(ok) || !ok) throw new Error('role grant was not approved');
