@@ -252,7 +252,7 @@
     <p class="lead">cypher-brain is the existing project. This section fixes exactly what the prize page requires, so the plan below can't drift from it.</p>
     <div class="rows">
       <div class="row"><div class="rk">Track<span class="rs">ens.domains prize page</span></div><div class="rv"><b>Best Integration of ENSv2 into an Existing Project</b> — $4,000, restricted to Continuity Track participants (confirmed registered)</div></div>
-      <div class="row"><div class="rk">Must use</div><div class="rv">ENSv2 on <b>Sepolia</b> — beta, contracts confirmed <b>not final</b> pre-mainnet; Sepolia addresses were redeployed 2026‑09‑15 ("hackathon clean testnet deployment")</div></div>
+      <div class="row"><div class="rk">Must use</div><div class="rv">ENSv2 on <b>Sepolia</b> — beta, contracts confirmed <b>not final</b> pre-mainnet; per <code>ensdomains/ensjs</code> PRs #377/#380, Sepolia was redeployed 2026‑09‑15 ("hackathon clean testnet deployment") — <b>pull live addresses at implementation time</b>, do not hardcode from this brief</div></div>
       <div class="row"><div class="rk">Must be central</div><div class="rv">ENSv2 has to change what the project can do, <b>not decorate it</b> — the demo must not use hard-coded values</div></div>
       <div class="row"><div class="rk">Must ship</div><div class="rv">Open-source code (GitHub) + a live demo link, both linked from the submission</div></div>
     </div>
@@ -261,7 +261,7 @@
   <section>
     <div class="label"><span class="n">07</span> &nbsp;The delegation design</div>
     <h2>Two wallets, two keys, one narrow permission</h2>
-    <p class="lead">The <b>owner wallet</b> grants once, interactively, and is never stored by cypher-brain. The <b>agent wallet</b> is a new keypair cypher-brain holds and uses routinely — and can only ever touch one text-record key.</p>
+    <p class="lead">The <b>owner wallet</b> grants once, interactively, and is never stored by cypher-brain. The <b>agent wallet</b> is a new keypair cypher-brain holds and uses routinely, intended to touch only one text-record key. <b>This design is provisional</b> — the exact <code>ROLE_SET_TEXT</code> identifier, the resolver's ABI, and its key-scoping semantics were not published in ENS's docs prose and must be pulled from the deployed <code>contracts-v2</code> source before implementation, not assumed from this diagram.</p>
     <div class="fig">
       <svg viewBox="0 0 780 210" role="img" aria-label="Owner wallet grants a scoped role once; agent wallet publishes routinely">
         <rect x="16" y="30" width="220" height="80" rx="10" fill="var(--surface)" stroke="var(--line)"/>
@@ -288,12 +288,12 @@
         <path d="M664 112 L604 138" stroke="var(--bad)" stroke-width="1.4" stroke-dasharray="3 3" marker-end="url(#ar4)"/>
         <defs><marker id="ar4" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M1 1 L6 4 L1 7" fill="none" stroke="var(--bad)" stroke-width="1.3"/></marker></defs>
       </svg>
-      <div class="fig-cap">The revert path is the actual demo evidence — a permission the docs promise, shown holding under an out-of-scope write</div>
+      <div class="fig-cap">Planned demo evidence, not yet exercised — a revert alone does not prove single-key scoping; the demo needs BOTH a successful write to the granted key AND a rejected write elsewhere (a different text key or another record type)</div>
     </div>
     <div class="pillars">
-      <div class="pillar hi"><span class="pn">SETUP (once)</span><div class="pt"><span>ens-setup</span></div><div class="pd">Owner wallet registers/uses a Sepolia (sub)name, discovers its Permissioned Resolver, grants <code>ROLE_SET_TEXT</code> scoped to one key (e.g. <code>brain.latest</code>) to the agent wallet's address.</div></div>
-      <div class="pillar"><span class="pn">ROUTINE</span><div class="pt"><span>ens-publish</span></div><div class="pd">After a successful <code>push</code>, the agent wallet calls <code>setText(node, 'brain.latest', &lt;locator&gt;)</code> — reading the real locator, never a fixture value.</div></div>
-      <div class="pillar"><span class="pn">PROOF</span><div class="pt"><span>ens-verify</span></div><div class="pd">Read-only check <b>plus</b> a negative test: the agent wallet attempts a write outside its scope and the transaction reverts. This is what makes ENSv2 central, not cosmetic.</div></div>
+      <div class="pillar hi"><span class="pn">SETUP (once)</span><div class="pt"><span>ens-setup</span></div><div class="pd">Owner wallet registers/uses a Sepolia (sub)name, discovers its Permissioned Resolver, grants <code>ROLE_SET_TEXT</code> scoped to one key (e.g. <code>brain.latest</code>) to the agent wallet's address. <b>Depends on:</b> nothing else in this list.</div></div>
+      <div class="pillar"><span class="pn">ROUTINE</span><div class="pt"><span>ens-publish</span></div><div class="pd">After a successful <code>push</code>, the agent wallet calls <code>setText(node, 'brain.latest', &lt;locator&gt;)</code> — reading the real locator, never a fixture value. <b>Depends on:</b> the agent wallet from SETUP already holding its grant.</div></div>
+      <div class="pillar"><span class="pn">PROOF</span><div class="pt"><span>ens-verify</span></div><div class="pd">Two checks, not one: (1) the agent wallet's granted-key write from ROUTINE actually landed, (2) a write outside that scope (different key, or <code>setAddress</code>) reverts. Both together are what make ENSv2 central, not cosmetic. <b>Depends on:</b> SETUP + ROUTINE both working.</div></div>
     </div>
   </section>
 
@@ -302,7 +302,7 @@
     <h2>One Epic, five P0 issues, Codex-led implementation</h2>
     <p class="lead">Claude designs, files issues, reviews, and integrates; <b>Codex implements</b> each issue in its own branch against this repo's existing PR flow (CI + changeset + doc-sync gates unchanged).</p>
     <div class="legend">
-      <b>P0</b> = required for a functional Track 2 submission. <b>P1</b> = bonus scope if time remains. Issue numbers are filled in once filed on <code>Masashi-Ono0611/cypher-brain</code>.
+      <b>P0</b> = required for a functional Track 2 submission. <b>P1</b> = bonus scope if time remains. Issue numbers are filled in once filed on <code>Masashi-Ono0611/cypher-brain</code>. <b>Order:</b> P0‑1 → P0‑2 → P0‑3 → P0‑4, strictly (each depends on the previous landing). <b>Doc sync is per-issue, not deferred</b> — every behavior-changing issue (P0‑1 to P0‑4) carries its own README/MANAGEMENT.md/llms.txt update in the same PR, per this repo's own <code>pr-hygiene.yml</code>; P0‑5 below only covers this HTML brief's final reconciliation. <b>Scope note:</b> this Epic is ENS-only — Section 04's scoped-export wrapper (gbrain <code>--source-id</code> plumbing) is a separate, non-blocking workstream.
     </div>
     <table>
       <thead><tr><th>#</th><th>Issue</th><th>What it proves</th></tr></thead>
@@ -310,9 +310,9 @@
         <tr><td>P0‑1</td><td>Add <code>viem</code> dependency + agent-wallet keygen</td><td>New Ethereum keypair, held via the existing <code>writeKeyFile()</code> pattern (atomic, 0600, backed up on <code>--force</code>) — no new key-handling code path</td></tr>
         <tr><td>P0‑2</td><td><code>ens-setup</code> — owner-side one-time registration + role grant</td><td>Owner wallet only ever runs this once, interactively; never persisted by cypher-brain</td></tr>
         <tr><td>P0‑3</td><td><code>ens-publish</code> — agent wallet publishes the brain pointer</td><td>Reads the real locator from the just-completed push — the "no hard-coded values" requirement</td></tr>
-        <tr><td>P0‑4</td><td><code>ens-verify</code> / doctor extension</td><td>The negative test from Section 07 — the fence actually holds, not just documented</td></tr>
-        <tr><td>P0‑5</td><td>Same-PR doc sync</td><td>README/MANAGEMENT.md/llms.txt (required by this repo's own <code>pr-hygiene.yml</code>) + this HTML's "what shipped" update</td></tr>
-        <tr><td>P1‑6</td><td>ENSIP‑26 <code>agent-context</code> / <code>agent-endpoint</code> records</td><td>Standard self-description keys — sets up the later multi-agent extension of Section 04's AFTER state</td></tr>
+        <tr><td>P0‑4</td><td><code>ens-verify</code> / doctor extension</td><td>The two-part proof from Section 07 (granted-key write lands, out-of-scope write reverts) — the fence actually holds, not just documented</td></tr>
+        <tr><td>P0‑5</td><td>Final brief reconciliation</td><td>Update this HTML's Section 08 status column and footer once P0‑1 to P0‑4 are merged — not a separate code PR</td></tr>
+        <tr><td>P1‑6</td><td>ENSIP‑26 <code>agent-context</code> / <code>agent-endpoint</code> records</td><td>Self-description keys per the ENSIP‑26 spec (confirmed via docs.ens.domains this session) — sets up the later multi-agent extension of Section 04's AFTER state</td></tr>
       </tbody>
     </table>
   </section>
