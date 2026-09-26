@@ -12,7 +12,7 @@ The submission builds on the existing [cypher-brain project](https://github.com/
 
 ## 2. Project description
 
-Scoped Brain connects three separate controls for personal AI memory. **gbrain** provides logical isolation through source-aware access. **Cypher Brain** packages selected local inputs into an age-encrypted snapshot and stores the ciphertext using a configured backend. **ENSv2** gives the snapshot pointer a human-readable identity and lets its owner delegate a narrowly scoped, revocable permission to an agent wallet.
+The broader Scoped Brain design combines three controls for personal AI memory. **gbrain** limits which sources an agent can use. **Cypher Brain** encrypts selected local inputs into a snapshot and stores the ciphertext using a configured backend. **ENSv2** gives that snapshot a public pointer and lets its owner delegate one text-key permission to a separate agent wallet.
 
 The problem is that an agent often needs continuity across sessions, but giving it broad access to a personal memory store or an owner's wallet grants more authority than the task needs. Scoped Brain keeps those boundaries distinct: an application-level source grant is not a decryption key, and an ENS text-record permission is not access to the snapshot contents. The current submission demonstrates the ENS delegation and pointer-publication layer. It does not yet implement automatic per-use-case gbrain export or one encrypted snapshot per use case; those remain separate work.
 
@@ -27,9 +27,9 @@ The owner wallet is entered through a hidden interactive prompt for setup and is
 
 ## 4. What ENSv2 changes
 
-Without ENSv2, the practical alternatives are to give the agent the owner's wallet key, which lets it sign as the owner and spend the owner's funds, or to put a centralized server in front of a database. That server can be unavailable or censor requests, and people outside its operator cannot independently verify that its API key is limited to one field. Either approach also means trusting or building a custom access-control layer. ENSv2's existing Enhanced Access Control lets the owner grant the agent wallet a role for one text-key resource, with no custom contract. Anyone can inspect that scope on-chain; the negative `ens-verify` check demonstrates it by having the agent try a different key and requiring the resolver itself to reject the write.
+Without ENSv2, the practical alternatives are to give the agent the owner's wallet key, which lets it sign as the owner and spend the owner's funds, or to put a centralized server in front of a database. That server can be unavailable or censor requests, and people outside its operator cannot independently verify that its API key is limited to one field. Either approach also means trusting or building a custom access-control layer. ENSv2's existing Enhanced Access Control lets the owner grant the agent wallet a role for one text-key resource, with no custom contract. The role is scoped to the key on that resolver, not to one name; if the resolver serves multiple names, the grant covers that key across them. Anyone can inspect that scope on-chain; the negative `ens-verify` check demonstrates it by having the agent try a different key and requiring the resolver itself to reject the write.
 
-ENS is part of the working flow, not a profile badge. After a successful push, `push --publish-ens` writes the locator returned by that push to the granted text record using the agent wallet. `ens-verify` then performs both sides of the permission check:
+The CLI supports `push --publish-ens`, which writes the locator returned by a successful push to the granted text record. In the live demo documented in section 5, the pointer transaction followed a local `file` push and used `ens-set-text`; `ens-verify` then performed both sides of the permission check:
 
 1. It reads the granted text key back and checks that the value matches the expected locator.
 2. It simulates a `setText` call to a different key and requires the resolver's `EACUnauthorizedAccountRoles` error. The negative probe is not broadcast.

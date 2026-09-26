@@ -9,76 +9,46 @@ the actual transaction hashes to show on screen).
 
 Hi. This is Scoped Brain.
 
-Scoped Brain is a way to keep your personal AI memory safe.
+AI agents need memory, but full access can expose private information
+and put your wallet at risk. The broader Scoped Brain design has three
+layers: gbrain selects memory sources, Cypher Brain encrypts a snapshot,
+and ENS controls who can update its pointer. This demo focuses on the
+ENS permission.
 
-Here is the problem. AI agents need to remember things. But if we give
-an agent full access to our memory, that is risky. The agent could see
-too much. It could even control our whole wallet.
+We use two wallets. The owner uses their wallet to grant the agent
+permission for selected text keys on this resolver. Each grant applies
+to that key wherever this resolver is used. The agent uses its own wallet
+for later updates; the owner does not sign those writes.
 
-Scoped Brain fixes this with three layers.
-
-Layer one: gbrain. This picks only the data an agent needs.
-Layer two: Cypher Brain. This encrypts that data into one small file.
-Layer three: ENS. This gives the file a name, and controls who can
-update that name.
-
-Let me show you the ENS part. This is the new part we built.
-
-We use two wallets.
-
-The first wallet is the owner wallet. This is you. You use it only one
-time. You give one small permission to the second wallet.
-
-The second wallet is the agent wallet. This wallet does the daily
-work. It can update only one small piece of information. It cannot do
-anything else.
-
-Why do we need ENSv2 for this? Let's think about it without ENSv2 first.
-
-One way: give the agent your own wallet key. But then the agent can do
-everything you can do. It could even spend your money. Not safe.
-
-Another way: use a private server with a password. But that server can
-go down. And no one outside can check that the password really works
-for only one small job. You just have to trust it.
-
-ENSv2 gives us a better way. The owner can give the agent power for
-just one small piece of information. This happens in public. No one
-has to write new code to make it safe. And anyone in the world can
-check that this power is really small. Our tool, ens-verify, proves
-it: the agent tries to touch something else, and it fails. Everyone
-can see this proof for themselves.
+Without ENSv2, you could give the agent your wallet key, letting it
+sign or spend as you. Or you could rely on a central server to control
+access; it can go down or block requests, and outsiders cannot verify
+that its key only allows changes to one field. ENSv2 has this permission
+system built in: the owner grants the agent a role for one text key,
+without a custom contract. Anyone can inspect the permission, and
+ens-verify demonstrates the limit by simulating a write to another key
+and checking that the resolver rejects it.
 
 Now let's watch it work.
 
-Step one: we register a real ENS name on Sepolia testnet. The name is
+Step one: we register an ENS name on the Sepolia testnet. It is
 masashi-ono-zero-six-one-one dot eth.
 
-Step two: the owner gives the agent wallet permission for one key. We
-call this key "masa-brain". This key will hold the pointer to the
-encrypted memory file.
+Step two: the owner grants the agent permission for the "masa-brain"
+key, which holds the pointer to the encrypted snapshot.
 
-Step three: the agent wallet writes the pointer. The owner is not
-involved this time. Only the agent wallet signs this transaction.
+Step three: after a local file push, the agent wallet writes the pointer
+with `ens-set-text`. Only the agent wallet signs this transaction.
 
-Step four: we run a check called ens-verify. This check does two
-things.
+Step four: `ens-verify` reads the value back, then simulates a write to
+a different key using the same wallet. The resolver rejects that write
+with `EACUnauthorizedAccountRoles`. The check proves this resolver grant
+is limited to the selected text key; it does not describe other authority
+the wallet might have elsewhere.
 
-First, it reads the value back. It confirms the write worked.
-
-Second, it tries something risky. It tries to write to a DIFFERENT
-key, using the same agent wallet. This must fail. And it does fail.
-The blockchain itself blocks it.
-
-This proves the agent wallet is safe. It can do one small job. It
-cannot do more.
-
-We also tested two more keys. One is called "agent-context". It holds
-information about the agent itself. The other is called
-"agent-endpoint", with the word "mcp" in brackets. It holds a server
-address. Both keys worked the same way: write, then verify.
-
-All of this happened live, on a real testnet. Not a simulation.
+We also wrote and verified two agent-description keys: "agent-context"
+and "agent-endpoint[mcp]". These transactions and the record read ran
+against live Sepolia. The denied write was simulated and not broadcast.
 
 That is Scoped Brain. Give your AI only what it needs. Nothing more.
 
