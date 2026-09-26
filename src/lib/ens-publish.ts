@@ -113,7 +113,9 @@ async function guardedConfirm(message: string): Promise<boolean> {
     } catch {}
   });
   try {
-    const result = await confirm({ message });
+    // Codex review (#975): clack's confirm() defaults to Yes, so a bare Enter approves
+    // broadcasting a transaction. Default to No for this destructive action instead.
+    const result = await confirm({ message, initialValue: false });
     return !isCancel(result) && result;
   } finally {
     setActiveRawInputRestore(null);
@@ -129,35 +131,69 @@ export async function prepareEnsPublisher(o: CliOptions): Promise<(locator: stri
     throw new Error('--publish-ens requires stdin, stdout, and stderr to all be an interactive TTY');
   }
   const viem = await loadViem();
-  const { http, createPublicClient, createWalletClient, keccak256, stringToHex, privateKeyToAccount, sepolia } = viem;
+  const {
+    http,
+    createPublicClient,
+    createWalletClient,
+    keccak256,
+    stringToHex,
+    parseAbi,
+    privateKeyToAccount,
+    sepolia,
+  } = viem;
+  // Codex review (#975): passing the raw human-readable ABI string arrays straight to
+  // readContract/writeContract/simulateContract throws at RUNTIME ("Cannot use 'in'
+  // operator...") even though it typechecks (viem's types accept readonly unknown[], but
+  // that's not the same as its runtime ABI-item lookup accepting un-parsed strings).
+  // Reproduced and confirmed: must go through parseAbi() first, same as ens-setup.ts.
+  const registryAbi = parseAbi(ETH_REGISTRY_ABI);
+  const resolverAbi = parseAbi(PERMISSIONED_RESOLVER_ABI);
   const account = await readAgentAccount(privateKeyToAccount);
   const rpcHost = new URL(o.rpc_url).host;
   const transport = http(o.rpc_url);
   const publicClient = createPublicClient({ chain: sepolia, transport });
   const walletClient = createWalletClient({ account, chain: sepolia, transport });
 
-  const chainId = await publicClient.getChainId();
+  // Codex review (#975): viem's own RPC-transport error messages can retain the full
+  // failing URL (path/query included, so an Infura/Alchemy-style API key survives) even
+  // though only the host is ever deliberately printed. Wrap every RPC call so any thrown
+  // error is replaced with a host-only message before it can reach CLI diagnostics.
+  async function withRedactedRpcErrors<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (e) {
+      throw new Error(
+        `Sepolia RPC call to ${rpcHost} failed: ${e instanceof Error ? e.name : 'unknown error'} (details withheld — may contain the RPC URL's credentials)`,
+      );
+    }
+  }
+
+  const chainId = await withRedactedRpcErrors(() => publicClient.getChainId());
   if (chainId !== sepolia.id) throw new Error(`RPC endpoint is on chain ${chainId}; expected Sepolia (${sepolia.id})`);
-  const resolver = await publicClient.readContract({
-    address: ETH_REGISTRY,
-    abi: ETH_REGISTRY_ABI,
-    functionName: 'getResolver',
-    args: [o.name],
-  });
+  const resolver = await withRedactedRpcErrors(() =>
+    publicClient.readContract({
+      address: ETH_REGISTRY,
+      abi: registryAbi,
+      functionName: 'getResolver',
+      args: [o.name],
+    }),
+  );
   if (resolver === '0x0000000000000000000000000000000000000000') {
     throw new Error(`ENS label '${o.name}' has no registered resolver; run ens-setup first`);
   }
   const resolverAddress = resolver as Address;
-  const resolverCode = await publicClient.getCode({ address: resolverAddress });
+  const resolverCode = await withRedactedRpcErrors(() => publicClient.getCode({ address: resolverAddress }));
   if (resolverCode === undefined || resolverCode === '0x') {
     throw new Error(`no resolver contract code found for ENS label '${o.name}'`);
   }
-  const hasScopedRole = await publicClient.readContract({
-    address: resolverAddress,
-    abi: PERMISSIONED_RESOLVER_ABI,
-    functionName: 'hasRoles',
-    args: [BigInt(keccak256(stringToHex(o.text_key))), ROLE_SET_TEXT, account.address],
-  });
+  const hasScopedRole = await withRedactedRpcErrors(() =>
+    publicClient.readContract({
+      address: resolverAddress,
+      abi: resolverAbi,
+      functionName: 'hasRoles',
+      args: [BigInt(keccak256(stringToHex(o.text_key))), ROLE_SET_TEXT, account.address],
+    }),
+  );
   if (!hasScopedRole) {
     throw new Error(
       `agent wallet lacks ROLE_SET_TEXT for '${o.text_key}' on '${o.name}'; run ens-setup before pushing`,
@@ -173,29 +209,50 @@ export async function prepareEnsPublisher(o: CliOptions): Promise<(locator: stri
     if (!locator || locator.includes('\n') || locator.includes('\r')) {
       throw new Error('push returned an empty or malformed locator; refusing to publish it');
     }
+    // Codex review (#975): the resolver looked up above is cached in this closure. If the
+    // registry's resolver for this name changes between preflight and this call (e.g. a
+    // concurrent ens-setup-style re-init elsewhere), writing to the stale address can
+    // still succeed (the OLD resolver checks its own roles/storage, not whether the
+    // registry still points at it) and this would silently report false success.
+    // Re-resolve immediately before writing and refuse if it moved.
+    const currentResolver = await withRedactedRpcErrors(() =>
+      publicClient.readContract({
+        address: ETH_REGISTRY,
+        abi: registryAbi,
+        functionName: 'getResolver',
+        args: [o.name],
+      }),
+    );
+    if (currentResolver.toLowerCase() !== resolverAddress.toLowerCase()) {
+      throw new Error(
+        `ENS label '${o.name}' now resolves to ${currentResolver}, not the ${resolverAddress} checked earlier; refusing to publish to a stale resolver`,
+      );
+    }
     const nameBytes = encodeName(o.name);
-    const parameters: Viem.WriteContractParameters<typeof PERMISSIONED_RESOLVER_ABI> = {
+    const parameters: Viem.WriteContractParameters<typeof resolverAbi> = {
       account,
       chain: sepolia,
       address: resolverAddress,
-      abi: PERMISSIONED_RESOLVER_ABI,
+      abi: resolverAbi,
       functionName: 'setText' as const,
       args: [nameBytes, o.text_key, locator] as const,
     };
-    await publicClient.simulateContract(
-      parameters as Viem.SimulateContractParameters<typeof PERMISSIONED_RESOLVER_ABI>,
+    await withRedactedRpcErrors(() =>
+      publicClient.simulateContract(parameters as Viem.SimulateContractParameters<typeof resolverAbi>),
     );
     const approved = await guardedConfirm(
       `Write the locator from this push to ${o.name} text record '${o.text_key}'? Agent: ${account.address}`,
     );
     if (!approved) throw new Error(`ENS publish was not approved; push completed with locator ${locator}`);
-    const hash = await walletClient.writeContract(
-      parameters as Viem.WriteContractParameters<typeof PERMISSIONED_RESOLVER_ABI>,
+    const hash = await withRedactedRpcErrors(() =>
+      walletClient.writeContract(parameters as Viem.WriteContractParameters<typeof resolverAbi>),
     );
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    const receipt = await withRedactedRpcErrors(() => publicClient.waitForTransactionReceipt({ hash }));
     if (receipt.status !== 'success') {
       throw new Error(`ENS text-record transaction reverted (${hash}); push locator remains ${locator}`);
     }
+    // Confirming the value actually reads back correctly (not just that the receipt says
+    // success) is #969's job (ens-verify) — not duplicated here.
     console.error(`ENS text record updated: ${hash}`);
     console.error(`Published locator: ${locator}`);
   };
