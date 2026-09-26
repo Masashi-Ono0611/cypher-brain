@@ -56,8 +56,8 @@ The owner supplies the delegated permission once; routine pointer updates use th
   ```
 - **ENSIP-26 records** (agent-wallet only, independent of any push — see #971 below): `agent-context` written ([`0xce264cb187212dcd406ddcfa65c92decf41856deee5ab0264bbb0c474ee36d0f`](https://sepolia.etherscan.io/tx/0xce264cb187212dcd406ddcfa65c92decf41856deee5ab0264bbb0c474ee36d0f)), `agent-endpoint[mcp]` written ([`0x2cbdf516b6909b652721752fdc238def6914a888dd977288ef982aeca67a53e8`](https://sepolia.etherscan.io/tx/0x2cbdf516b6909b652721752fdc238def6914a888dd977288ef982aeca67a53e8)); both independently pass `ens-verify`'s positive/negative check, confirming the bracket-key syntax round-trips correctly.
 - **ENSv2 Sepolia explorer:** [explorer.ens.dev](https://explorer.ens.dev)
-- **Team name:** TODO
-- **Demo video:** TODO
+- **Team name:** Cypher Brain
+- **Demonstration link:** [masashi-ono0611.github.io/cypher-brain/ethglobal.html](https://masashi-ono0611.github.io/cypher-brain/ethglobal.html) — a standalone page with the full walkthrough, the wallet/permission diagram, and every Sepolia transaction hash above. Swap in a screen-recorded demo video link once available.
 - **Deployed frontend:** TODO — this submission is CLI-only; confirm whether ETHGlobal's form requires a URL regardless.
 
 ## 6. Future work
