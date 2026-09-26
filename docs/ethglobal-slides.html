@@ -11,6 +11,12 @@
   /* Deck-local additions only (no new colors, no new layout system) --
      kept minimal per the skill's "copy the template, don't rewrite CSS" rule. */
   .cover-mascot{position:absolute; right:64px; top:50%; transform:translateY(-50%); width:220px; height:220px;}
+  /* .figure's own CSS sets color:var(--base-sub-dark) for its placeholder text
+     ("図版挿入"). Real diagram content placed inside .figure inherits that same
+     muted color unless overridden -- .flow .step's title text has no color of
+     its own (only its nested <small> does), so it was rendering unreadably
+     light. Restore the normal text color explicitly. */
+  .flow .step{color:var(--base);}
   .arch-diagram{display:flex; align-items:stretch; gap:0; height:100%;}
   .arch-layer{flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:20px 16px; border-radius:12px; text-align:center;}
   .arch-layer h3{font-size:19px; font-weight:700; margin:0 0 6px; color:var(--base);}
@@ -27,6 +33,23 @@
   .wallet-arrow{width:120px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px;}
   .wallet-arrow .line{width:100%; height:2px; background:var(--main);}
   .wallet-arrow .label{font-size:12px; font-weight:700; color:var(--main); text-align:center;}
+  .blast-diagram{display:flex; flex-direction:column; align-items:center; width:100%; gap:0;}
+  .blast-source{background:var(--base); color:#fff; padding:14px 28px; border-radius:10px; font-size:17px; font-weight:700; text-align:center;}
+  .blast-source small{display:block; font-weight:400; font-size:12px; color:var(--base-sub-dark); margin-top:2px;}
+  .blast-branches{display:flex; width:100%; justify-content:space-around; height:28px;}
+  .blast-line{width:2px; height:100%;}
+  .blast-line.blast-allow{background:var(--main);}
+  .blast-line.blast-block{background:var(--accent);}
+  .blast-targets{display:flex; width:100%; gap:14px;}
+  .blast-target{flex:1; border-radius:10px; padding:14px 10px; text-align:center; font-size:14px; font-weight:700;}
+  .blast-target .mark{display:block; font-size:22px; margin-bottom:4px; font-weight:700;}
+  .blast-target small{display:block; font-weight:400; font-size:12px; margin-top:6px; line-height:1.4;}
+  .blast-target.allow{background:var(--main-sub); color:var(--base);}
+  .blast-target.allow .mark{color:var(--main);}
+  .blast-target.allow small{color:var(--base);}
+  .blast-target.block{background:var(--accent-hl); color:var(--base);}
+  .blast-target.block .mark{color:var(--accent);}
+  .blast-target.block small{color:var(--base);}
 </style>
 </head>
 <body>
@@ -182,29 +205,30 @@
 <!-- ============ 7. What this makes possible ============ -->
 <section class="slide">
   <header class="slide-header">
-    <h2 class="slide-title">What this makes possible<span class="divider">｜</span>limited blast radius, verifiable by anyone</h2>
-    <p class="lead">If the agent's key is ever stolen, the damage stays limited to that one field.</p>
+    <h2 class="slide-title">What this makes possible<span class="divider">｜</span>even a stolen agent key is contained</h2>
+    <p class="lead">If the agent wallet is ever compromised, here is everything it can, and cannot, do.</p>
   </header>
   <div class="slide-body">
-    <div class="cols">
-      <div class="box">
-        <span class="num">1</span>
-        <p class="subhead subhead-main">Real key used once</p>
-        <p>The owner's real key is used only during setup. It never appears in daily operation.</p>
-        <p class="note">ens-setup runs once per key, interactively, then is never needed again</p>
+    <div class="figure" style="padding:24px;">
+      <div class="blast-diagram">
+        <div class="blast-source">Agent wallet<small>(if stolen)</small></div>
+        <div class="blast-branches">
+          <div class="blast-line blast-allow"></div>
+          <div class="blast-line blast-block"></div>
+          <div class="blast-line blast-block"></div>
+          <div class="blast-line blast-block"></div>
+        </div>
+        <div class="blast-targets">
+          <div class="blast-target allow"><span class="mark">✓</span>Update one text key<small>the single key it was granted</small></div>
+          <div class="blast-target block"><span class="mark">✕</span>Move funds<small>no spending permission exists</small></div>
+          <div class="blast-target block"><span class="mark">✕</span>Write other keys<small>reverts on-chain, proven live</small></div>
+          <div class="blast-target block"><span class="mark">✕</span>Act as the owner<small>owner's real key is never shared</small></div>
+        </div>
       </div>
-      <div class="box">
-        <span class="num">2</span>
-        <p class="subhead subhead-main">Limited blast radius</p>
-        <p>Even if the agent key leaks, it cannot move funds or touch anything else.</p>
-        <p class="note">Confirmed live: a write to any other key reverts on-chain</p>
-      </div>
-      <div class="box">
-        <span class="num">3</span>
-        <p class="subhead subhead-main">Verifiable by anyone</p>
-        <p>This is not just a claim -- anyone in the world can check it on-chain.</p>
-        <p class="note">ens-verify's output is the reusable proof, not our word for it</p>
-      </div>
+    </div>
+    <div class="box" style="margin-top:16px;">
+      <p class="subhead subhead-main" style="font-size:17px;">Not just a claim</p>
+      <p>This boundary is <span class="em">verifiable by anyone</span> -- ens-verify's on-chain proof is public, not our word for it.</p>
     </div>
     <div class="takeaway">This proves the integration is functionally central, not a cosmetic add-on</div>
   </div>
