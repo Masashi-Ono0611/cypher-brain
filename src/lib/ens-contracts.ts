@@ -22,5 +22,21 @@ export const PERMISSIONED_RESOLVER_ABI = [
   'function hasRoles(uint256 resource, uint256 roleBitmap, address account) view returns (bool)',
   'function grantSetterRoles(bytes setter, address account) returns (bool)',
   'function setText(bytes name, string key, string value)',
-  'function getText(bytes name, string key) view returns (string)',
+  // There is NO standalone `getText`/`text` function callable directly on this
+  // resolver — verified against the real ENSv2 source (contracts-v2, tag
+  // sepolia-deployment-2026-09-15, AbstractRecordResolver.sol): text records are
+  // only readable through the ENSIP-10 wildcard-resolution entrypoint below.
+  // `resolve()` decodes `data`'s selector (must match ITextResolver.text's,
+  // i.e. `text(bytes32,string)`), IGNORES the bytes32 arg inside `data`, and
+  // instead re-derives the record from `NameCoder.namehash(name, 0)` — the
+  // DNS-encoded `name` passed as resolve()'s own first argument. The bytes32
+  // placeholder inside the inner calldata can be anything (it's discarded);
+  // ens-verify.ts passes zero. Confirmed on-chain against the live Sepolia
+  // deployment (cast call, 2026-09-27) before this fix.
+  'function resolve(bytes name, bytes data) view returns (bytes)',
 ] as const;
+
+// Used only to ABI-encode the inner `text(node, key)` call embedded in a
+// resolve() call above -- this function is never invoked as a top-level call
+// on the resolver itself (see the comment on `resolve` above).
+export const TEXT_RESOLVER_ABI = ['function text(bytes32 node, string key) view returns (string)'] as const;

@@ -5,7 +5,13 @@ import { lstat, readFile } from 'node:fs/promises';
 import { Buffer } from 'node:buffer';
 import { AGENT_WALLET_DEFAULT_PATH } from './agent-wallet.js';
 import { UsageError } from './errors.js';
-import { ETH_REGISTRY, ETH_REGISTRY_ABI, PERMISSIONED_RESOLVER_ABI, ROLE_SET_TEXT } from './ens-contracts.js';
+import {
+  ETH_REGISTRY,
+  ETH_REGISTRY_ABI,
+  PERMISSIONED_RESOLVER_ABI,
+  ROLE_SET_TEXT,
+  TEXT_RESOLVER_ABI,
+} from './ens-contracts.js';
 import type * as Viem from 'viem';
 import type * as ViemAccounts from 'viem/accounts';
 import type * as ViemChains from 'viem/chains';
@@ -133,6 +139,8 @@ export async function ensVerify(o: {
     keccak256,
     stringToHex,
     parseAbi,
+    encodeFunctionData,
+    decodeAbiParameters,
     privateKeyToAccount,
     sepolia,
     BaseError,
@@ -143,6 +151,7 @@ export async function ensVerify(o: {
   // ens-setup.ts / ens-publish.ts (#966–#968), required here too.
   const registryAbi = parseAbi(ETH_REGISTRY_ABI);
   const resolverAbi = parseAbi(PERMISSIONED_RESOLVER_ABI);
+  const textResolverAbi = parseAbi(TEXT_RESOLVER_ABI);
   const account = await readAccount(privateKeyToAccount);
   const rpcHost = new URL(o.rpc_url).host;
   const client = createPublicClient({ chain: sepolia, transport: http(o.rpc_url) });
@@ -179,14 +188,28 @@ export async function ensVerify(o: {
   if (!code || code === '0x') throw new Error(`no resolver contract code found for ENS label '${o.name}'`);
 
   const name = encodeName(o.name);
-  const actual = await withRedactedRpcErrors(() =>
+  // There is no standalone `getText`/`text` call on this resolver -- verified against the
+  // real ENSv2 source (see the comment on `resolve` in ens-contracts.ts). Text records are
+  // only readable through the ENSIP-10 wildcard-resolution entrypoint: encode the profile
+  // call (`text(node, key)`) as the inner `data`, pass the DNS-encoded `name` as resolve()'s
+  // own first argument (that's what the resolver actually uses to look the record up --
+  // the bytes32 inside `data` is discarded, so a zero placeholder is fine here), then
+  // decode the outer `bytes` return as the ABI-encoded string it wraps.
+  const zeroNode = `0x${'00'.repeat(32)}` as const;
+  const innerCalldata = encodeFunctionData({
+    abi: textResolverAbi,
+    functionName: 'text',
+    args: [zeroNode, o.text_key],
+  });
+  const resolved = await withRedactedRpcErrors(() =>
     client.readContract({
       address: resolverAddress,
       abi: resolverAbi,
-      functionName: 'getText',
-      args: [name, o.text_key],
+      functionName: 'resolve',
+      args: [name, innerCalldata],
     }),
   );
+  const [actual] = decodeAbiParameters([{ type: 'string' }], resolved);
   if (actual !== o.expected_value) {
     throw new Error(
       `ENS positive check failed: '${o.text_key}' is ${actual ? 'set to a different value' : 'empty'}; expected-value does not match the resolver record`,
