@@ -270,3 +270,6 @@ test -p "$FTMP/out/.cypher-brain-restore-INCOMPLETE" \
 
 echo
 echo "RECOVERY SELFTEST PASS"
+
+# #960: deterministic padded-stream regression, sharing this CI-required suite.
+node "${BIN_DEV_ARGS[@]}" "$ROOT/scripts/selftest-tar-eof.mjs"
