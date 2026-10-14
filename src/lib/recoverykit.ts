@@ -439,10 +439,16 @@ async function verifyEmbeddedKeyDecryptsTarget(
     // by an earlier version of this fix leaking `./`, `./brain.tar.gz`, `./manifest.json`
     // into a manual test run). Matches runFileChecks()'s own identical positive-control
     // call (restore.ts) for the exact same reason.
-    await decryptToChild(newDecrypter(identities), () => createReadStream(targetPath), 'tar', ['-tf', '-'], {
-      consStdout: 'ignore',
-      timeoutMs: PIPE_TIMEOUT_MS,
-    });
+    await decryptToChild(
+      newDecrypter(identities),
+      () => createReadStream(targetPath),
+      'tar',
+      ['-tf', '-', '--ignore-zeros'],
+      {
+        consStdout: 'ignore',
+        timeoutMs: PIPE_TIMEOUT_MS,
+      },
+    );
   } catch (e) {
     throw new Error(
       `the ${kind} identity this kit is about to embed CANNOT decrypt the target backup it points at ` +

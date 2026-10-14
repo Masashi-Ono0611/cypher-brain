@@ -332,6 +332,11 @@ const VERIFY_CHANGED_DETAIL =
 // exactly what extraction will read, twice, for its metadata instead of once for its
 // bytes.
 async function inspectRestoreArchive(decrypter: Decrypter, artifact: OpenedRestoreArtifact): Promise<void> {
+  // #960: tar must consume the authenticated stream through EOF, including zero
+  // padding after its end-of-archive marker. Otherwise an early successful exit
+  // races decryptToChild's remaining writes and raises EPIPE. Use the same option
+  // for both inspections, extraction and verify, so concatenated entries are also
+  // inspected before any plaintext is extracted. Keep full age authentication.
   const src = () => artifact.createReadStream();
   // allSettled, not all (Codex review): Promise.all rejects the moment ONE listing
   // fails, and the caller's `finally` would then close the shared descriptor while the
@@ -339,8 +344,14 @@ async function inspectRestoreArchive(decrypter: Decrypter, artifact: OpenedResto
   // use-after-close on the way out of an already-failing restore. Wait for both, then
   // raise the first failure, which is the same error the caller saw before.
   const settled = await Promise.allSettled([
-    decryptToChild(decrypter, src, 'tar', ['-tf', '-'], { consStdout: 'pipe', timeoutMs: PIPE_TIMEOUT_MS }),
-    decryptToChild(decrypter, src, 'tar', ['-tvf', '-'], { consStdout: 'pipe', timeoutMs: PIPE_TIMEOUT_MS }),
+    decryptToChild(decrypter, src, 'tar', ['-tf', '-', '--ignore-zeros'], {
+      consStdout: 'pipe',
+      timeoutMs: PIPE_TIMEOUT_MS,
+    }),
+    decryptToChild(decrypter, src, 'tar', ['-tvf', '-', '--ignore-zeros'], {
+      consStdout: 'pipe',
+      timeoutMs: PIPE_TIMEOUT_MS,
+    }),
   ]);
   const rejected = settled.find((s) => s.status === 'rejected');
   if (rejected) throw rejected.reason;
@@ -1524,7 +1535,7 @@ async function restoreImpl(
         decrypter,
         () => artifact.createReadStream(),
         'tar',
-        ['-xf', '-', '--no-same-owner', '--no-same-permissions', noClobberFlag, '-C', scratchDir],
+        ['-xf', '-', '--ignore-zeros', '--no-same-owner', '--no-same-permissions', noClobberFlag, '-C', scratchDir],
         { timeoutMs: PIPE_TIMEOUT_MS },
       );
     } catch (e) {
@@ -1901,7 +1912,7 @@ async function runFileChecksOn(
   } else if (await exists(identity)) {
     try {
       const decrypter = newDecrypter(await loadIdentities(identity)); // prompts if passphrase-wrapped
-      await decryptToChild(decrypter, () => artifact.createReadStream(), 'tar', ['-tf', '-'], {
+      await decryptToChild(decrypter, () => artifact.createReadStream(), 'tar', ['-tf', '-', '--ignore-zeros'], {
         consStdout: 'ignore',
         timeoutMs: PIPE_TIMEOUT_MS,
       });
