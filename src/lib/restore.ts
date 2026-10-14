@@ -344,11 +344,11 @@ async function inspectRestoreArchive(decrypter: Decrypter, artifact: OpenedResto
   // use-after-close on the way out of an already-failing restore. Wait for both, then
   // raise the first failure, which is the same error the caller saw before.
   const settled = await Promise.allSettled([
-    decryptToChild(decrypter, src, 'tar', ['--ignore-zeros', '-tf', '-'], {
+    decryptToChild(decrypter, src, 'tar', ['-tf', '-', '--ignore-zeros'], {
       consStdout: 'pipe',
       timeoutMs: PIPE_TIMEOUT_MS,
     }),
-    decryptToChild(decrypter, src, 'tar', ['--ignore-zeros', '-tvf', '-'], {
+    decryptToChild(decrypter, src, 'tar', ['-tvf', '-', '--ignore-zeros'], {
       consStdout: 'pipe',
       timeoutMs: PIPE_TIMEOUT_MS,
     }),
@@ -1535,7 +1535,7 @@ async function restoreImpl(
         decrypter,
         () => artifact.createReadStream(),
         'tar',
-        ['--ignore-zeros', '-xf', '-', '--no-same-owner', '--no-same-permissions', noClobberFlag, '-C', scratchDir],
+        ['-xf', '-', '--ignore-zeros', '--no-same-owner', '--no-same-permissions', noClobberFlag, '-C', scratchDir],
         { timeoutMs: PIPE_TIMEOUT_MS },
       );
     } catch (e) {
@@ -1912,7 +1912,7 @@ async function runFileChecksOn(
   } else if (await exists(identity)) {
     try {
       const decrypter = newDecrypter(await loadIdentities(identity)); // prompts if passphrase-wrapped
-      await decryptToChild(decrypter, () => artifact.createReadStream(), 'tar', ['--ignore-zeros', '-tf', '-'], {
+      await decryptToChild(decrypter, () => artifact.createReadStream(), 'tar', ['-tf', '-', '--ignore-zeros'], {
         consStdout: 'ignore',
         timeoutMs: PIPE_TIMEOUT_MS,
       });

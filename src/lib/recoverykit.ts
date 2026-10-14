@@ -443,7 +443,7 @@ async function verifyEmbeddedKeyDecryptsTarget(
       newDecrypter(identities),
       () => createReadStream(targetPath),
       'tar',
-      ['--ignore-zeros', '-tf', '-'],
+      ['-tf', '-', '--ignore-zeros'],
       {
         consStdout: 'ignore',
         timeoutMs: PIPE_TIMEOUT_MS,
