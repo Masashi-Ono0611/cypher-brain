@@ -166,6 +166,9 @@
     "elliptic": "6.6.1",
     "undici": "6.29.0",
     "follow-redirects": "1.16.1",
-    "bigint-buffer": "npm:@trufflesuite/bigint-buffer@1.1.10"
+    "bigint-buffer": "npm:@trufflesuite/bigint-buffer@1.1.10",
+    "hono": "4.13.13",
+    "@hono/node-server": "1.19.15",
+    "qs": "6.16.1"
   }
 }
