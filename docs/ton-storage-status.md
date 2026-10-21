@@ -24,7 +24,7 @@ binaries.
 | **Self-hosted seeder** — droplet seeds our own bags directly, no payment | mainnet | **WORKS, in production** (2026-08-22) |
 | **Self-hosted seeder** | testnet | dogfood only; not used for real backups |
 | **Our droplet as a paid provider** (earns — discoverable by other users) | mainnet | **registered, live, econ params fixed, and has now processed one real contract** — but it's our own (see "We pay a live Go provider" row below): mytonprovider.org registry, now under pubkey `3a7fe754…` (`tsp-canary.service`), telemetry on — the original pubkey `f5f603c7…` daemon (`tonutils-storage-provider.service`) was stopped and disabled 2026-08-25 after a parallel-canary migration (see the bounce=true root-cause and migration writeup below); no THIRD-PARTY-originated paid contract yet, so "does this provider earn from strangers" is still unproven |
-| **Our droplet as a paid provider** | testnet | standing twin (same Go binaries, isolated units) — controlled environment, no real earnings expected |
+| **Our droplet as a paid provider** | testnet | standing twin (same Go binaries, isolated units) — **stopped 2026-10-22** (idle; see below to recreate); controlled environment, no real earnings expected |
 | **We pay a legacy C++ provider** (spends — fabric-contract ecosystem) | mainnet | **GRAVEYARD** (115 listed, 0 active ≤7d, 94 silent >1y) — not pursuing |
 | **We pay a legacy C++ provider** | testnet | **DEAD DAEMONS, live contracts** (2026-08-22 experiment) |
 | **We pay a live Go provider** (spends — mytonprovider.org registry) | mainnet | **WORKS end to end, including a confirmed proof-reward payout** (2026-08-23) — `scripts/go/storage-v1-client` (deploy/notify/status/update-providers/withdraw) deployed and funded a StorageV1 contract for masabrain (481 MB) against our own registered droplet-as-provider, the provider self-reported the full bag downloaded, and a `storage_reward_withdrawal` (op `0xa91baf56`) transaction of 0.119662827 TON from the contract to the provider's registered wallet followed shortly after. Getting there required one real-money field-mapping bug (fixed by an in-place repair, not a re-deploy) — see below. That original contract (pubkey `f5f603c7…`) was orphaned by the 2026-08-25 canary migration, then drained via the new `withdraw` subcommand the next morning (see below) |
@@ -452,8 +452,18 @@ been exercised against a real testnet provider, not just mainnet.
   provider wallet funded with 2 testnet TON. Original purpose was to separate
   protocol from market within the Go scheme; with live third-party Go
   providers now known and reachable, testing against a real third party
-  (see the section above) largely supersedes this twin for that goal — it
-  stays standing as a controlled environment.
+  (see the section above) largely supersedes this twin for that goal.
+  **Stopped on 2026-10-22** (owner decision: not used by the mainnet seeder
+  or by backups; the provider only retried an old contract that lacked the
+  0.08 TON it needs to resume, about 120k log lines per 14 days). The two
+  transient units were stopped with `systemctl stop`, which removes them;
+  the data under `/opt/tsp/testnet-provider` and `/opt/tsp/testnet-provider-storage`
+  and the wallet config were kept. To bring the twin back, start the storage
+  daemon first and then the provider, with the same arguments:
+  `systemd-run --unit tsp-testnet-provider-storage --working-directory /opt/tsp/testnet-provider-storage /opt/tsp/tonutils-storage-bin -daemon -api 127.0.0.1:9956 -db /opt/tsp/testnet-provider-storage/db -network-config /opt/tsp/testnet-bin/testnet-global.config.json -verbosity 2`
+  then `systemd-run --unit tsp-testnet-provider --working-directory /opt/tsp/testnet-provider /opt/tsp/testnet-provider/tonutils-storage-provider-bin -config /opt/tsp/testnet-provider/config.json -db /opt/tsp/testnet-provider/db -network-config /opt/tsp/testnet-bin/testnet-global.config.json -verbosity 2`.
+  Top the provider wallet up with testnet TON before relying on it. The
+  mainnet units (`tonutils-storage`, `tsp-canary`) were not touched.
 - **Registration address bug, and a re-registration mistake it caused
   (2026-08-24/25).** The original mainnet registration above (pubkey
   `f5f603c7…`) turned out to have been submitted from the operator's personal
